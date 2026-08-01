@@ -67,7 +67,6 @@ pub(crate) fn resolve_source_occurrences(
 }
 
 pub(crate) fn absolute_from(base: &Path, value: &Path) -> Result<PathBuf, AppError> {
-    #[cfg(windows)]
     if !value.is_absolute() && matches!(value.components().next(), Some(Component::Prefix(_))) {
         return Err(AppError::Usage(format!(
             "drive-relative Windows path {} is ambiguous; use an absolute path or a path relative to the invocation directory",
