@@ -49,24 +49,30 @@ minor component, and the literal `.x`, for example `dev/1.2.x`.
 
 ## Merge and promote changes
 
-Repository pull requests use squash merge only. Before merging a topic pull
+Repository pull requests use a regular merge commit by default so the commits
+reviewed in the pull request remain part of the branch history. Squash merge is
+also available when the author intentionally wants to replace a noisy topic
+history with one commit. Rebase merge is disabled. Before merging a topic pull
 request:
 
 1. Bring the topic branch up to date with its development-line base.
-2. Wait for the required `CI / gate` check to succeed.
+2. Wait for the required `gate` check in the `CI` workflow to succeed.
 3. Resolve every review conversation.
-4. Squash merge the pull request into the development line.
+4. Merge the pull request into the development line, normally with a merge
+   commit.
 
 GitHub automatically deletes merged, unprotected topic branches when safe. The
 protected development line remains available for the rest of the release.
 
 When a release line is ready, open a pull request from that exact
 `dev/<major>.<minor>.x` branch to `main`, update it with `main`, wait for
-`CI / gate`, resolve all conversations, and squash merge the promotion.
+the `gate` check in the `CI` workflow, resolve all conversations, and merge the
+promotion. Use a regular merge commit unless the pull request deliberately
+documents a reason to squash its history.
 
 The repository initially requires zero approving reviews because it has one
 maintainer, and an author cannot approve their own pull request. Pull requests,
-strict CI, resolved conversations, and linear history are still mandatory. Once
+strict CI, and resolved conversations are still mandatory. Once
 a second regular reviewer has write access, update both branch rulesets together
 to require at least one approving review, document the decision, and verify the
 effective rules before treating the higher count as policy.
