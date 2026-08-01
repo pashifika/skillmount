@@ -24,14 +24,24 @@ const NOT_IMPLEMENTED: &str =
 fn write_stdout(message: &str) -> ExitCode {
     match io::stdout().lock().write_all(message.as_bytes()) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(error) => {
-            let _ = writeln!(
-                io::stderr().lock(),
-                "error: failed to write output: {error}"
-            );
-            ExitCode::FAILURE
+            let exit_code = stdout_error_exit_code(&error);
+            if exit_code == ExitCode::FAILURE {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "error: failed to write output: {error}"
+                );
+            }
+            exit_code
         }
+    }
+}
+
+fn stdout_error_exit_code(error: &io::Error) -> ExitCode {
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
@@ -68,5 +78,26 @@ where
             write_stdout(&format!("SkillMount {}\n", env!("CARGO_PKG_VERSION")))
         }
         Some(_) => reject_not_implemented(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stdout_error_exit_code;
+    use std::io;
+    use std::process::ExitCode;
+
+    #[test]
+    fn broken_pipe_is_a_successful_cli_termination() {
+        let error = io::Error::from(io::ErrorKind::BrokenPipe);
+
+        assert_eq!(stdout_error_exit_code(&error), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn other_stdout_errors_fail_without_panicking() {
+        let error = io::Error::from(io::ErrorKind::Other);
+
+        assert_eq!(stdout_error_exit_code(&error), ExitCode::FAILURE);
     }
 }
