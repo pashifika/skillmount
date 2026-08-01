@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import unittest
 
-from branch_policy import validate_branch_flow
+from branch_policy import main, validate_branch_flow
+
+REPOSITORY = "pashifika/skillmount"
 
 
 class BranchPolicyTests(unittest.TestCase):
@@ -33,7 +35,9 @@ class BranchPolicyTests(unittest.TestCase):
 
         for base, head in cases:
             with self.subTest(base=base, head=head):
-                self.assertIsNone(validate_branch_flow(base, head))
+                self.assertIsNone(
+                    validate_branch_flow(base, head, REPOSITORY, REPOSITORY)
+                )
 
     def test_invalid_branch_flows(self) -> None:
         """Reject skipped development lines, malformed names, and empty slugs."""
@@ -50,7 +54,59 @@ class BranchPolicyTests(unittest.TestCase):
 
         for base, head in cases:
             with self.subTest(base=base, head=head):
-                self.assertIsNotNone(validate_branch_flow(base, head))
+                self.assertIsNotNone(
+                    validate_branch_flow(base, head, REPOSITORY, REPOSITORY)
+                )
+
+    def test_main_promotion_rejects_same_named_branch_from_fork(self) -> None:
+        """Require development-line promotions to originate in this repository."""
+
+        self.assertIsNotNone(
+            validate_branch_flow(
+                "main", "dev/0.1.x", REPOSITORY, "contributor/skillmount"
+            )
+        )
+
+    def test_development_line_accepts_topic_branch_from_fork(self) -> None:
+        """Keep external topic contributions available on development lines."""
+
+        self.assertIsNone(
+            validate_branch_flow(
+                "dev/0.1.x",
+                "feat/external-contribution",
+                REPOSITORY,
+                "contributor/skillmount",
+            )
+        )
+
+    def test_command_line_entry_point_statuses(self) -> None:
+        """Cover usage, accepted, and rejected command-line outcomes."""
+
+        self.assertEqual(main(["branch_policy.py"]), 2)
+        self.assertEqual(
+            main(
+                [
+                    "branch_policy.py",
+                    "main",
+                    "dev/0.1.x",
+                    REPOSITORY,
+                    REPOSITORY,
+                ]
+            ),
+            0,
+        )
+        self.assertEqual(
+            main(
+                [
+                    "branch_policy.py",
+                    "main",
+                    "dev/0.1.x",
+                    REPOSITORY,
+                    "contributor/skillmount",
+                ]
+            ),
+            1,
+        )
 
 
 if __name__ == "__main__":

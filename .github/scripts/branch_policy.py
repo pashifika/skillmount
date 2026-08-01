@@ -12,10 +12,14 @@ TOPIC_BRANCH = re.compile(
 )
 
 
-def validate_branch_flow(base: str, head: str) -> str | None:
+def validate_branch_flow(
+    base: str, head: str, base_repository: str, head_repository: str
+) -> str | None:
     """Return an error message when *head* is not allowed to target *base*."""
 
     if base == "main":
+        if head_repository != base_repository:
+            return "pull requests into main must come from the base repository"
         if DEVELOPMENT_BRANCH.fullmatch(head):
             return None
         return "pull requests into main must come from dev/<major>.<minor>.x"
@@ -34,12 +38,16 @@ def validate_branch_flow(base: str, head: str) -> str | None:
 def main(arguments: list[str]) -> int:
     """Run the command-line branch-policy check."""
 
-    if len(arguments) != 3:
-        print("usage: branch_policy.py <base> <head>", file=sys.stderr)
+    if len(arguments) != 5:
+        print(
+            "usage: branch_policy.py <base> <head> <base-repository> "
+            "<head-repository>",
+            file=sys.stderr,
+        )
         return 2
 
-    base, head = arguments[1:]
-    error = validate_branch_flow(base, head)
+    base, head, base_repository, head_repository = arguments[1:]
+    error = validate_branch_flow(base, head, base_repository, head_repository)
     if error is not None:
         print(f"branch policy rejected {head} -> {base}: {error}", file=sys.stderr)
         return 1

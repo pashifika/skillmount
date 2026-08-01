@@ -4,6 +4,7 @@
 //! mounting, transactions, and agent launching will be added by later changes.
 
 use std::ffi::{OsStr, OsString};
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 const HELP: &str = concat!(
@@ -19,6 +20,25 @@ const HELP: &str = concat!(
 
 const NOT_IMPLEMENTED: &str =
     "error: SkillMount commands are not implemented yet; use --help for available options";
+
+fn write_stdout(message: &str) -> ExitCode {
+    match io::stdout().lock().write_all(message.as_bytes()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "error: failed to write output: {error}"
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn reject_not_implemented() -> ExitCode {
+    let _ = writeln!(io::stderr().lock(), "{NOT_IMPLEMENTED}");
+    ExitCode::from(2)
+}
 
 /// Runs the shared `SkillMount` command-line entry point.
 ///
@@ -36,26 +56,17 @@ where
     let option = args.next();
 
     if args.next().is_some() {
-        eprintln!("{NOT_IMPLEMENTED}");
-        return ExitCode::from(2);
+        return reject_not_implemented();
     }
 
     match option.as_deref() {
-        None => {
-            print!("{HELP}");
-            ExitCode::SUCCESS
-        }
+        None => write_stdout(HELP),
         Some(option) if option == OsStr::new("-h") || option == OsStr::new("--help") => {
-            print!("{HELP}");
-            ExitCode::SUCCESS
+            write_stdout(HELP)
         }
         Some(option) if option == OsStr::new("-V") || option == OsStr::new("--version") => {
-            println!("SkillMount {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
+            write_stdout(&format!("SkillMount {}\n", env!("CARGO_PKG_VERSION")))
         }
-        Some(_) => {
-            eprintln!("{NOT_IMPLEMENTED}");
-            ExitCode::from(2)
-        }
+        Some(_) => reject_not_implemented(),
     }
 }

@@ -26,8 +26,8 @@ fn assert_successful_parity(arguments: &[&str]) -> Output {
 
 #[test]
 fn both_executable_names_share_help_output() {
-    for arguments in [["--help"], ["-h"]] {
-        let output = assert_successful_parity(&arguments);
+    for arguments in [&[][..], &["--help"][..], &["-h"][..]] {
+        let output = assert_successful_parity(arguments);
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("SkillMount"));
         assert!(stdout.contains("Usage: <asm|skillmount> [OPTIONS]"));
