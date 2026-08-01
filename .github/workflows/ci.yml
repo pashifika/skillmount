@@ -42,9 +42,11 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
           BASE_REPOSITORY: ${{ github.repository }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
         run: >-
           python .github/scripts/branch_policy.py
           "$BASE_REF" "$HEAD_REF" "$BASE_REPOSITORY" "$HEAD_REPOSITORY"
+          "$PR_AUTHOR_LOGIN"
       - name: Report non-applicable branch policy
         if: github.event_name != 'pull_request'
         run: echo "Branch policy is not applicable to ${GITHUB_EVENT_NAME} events."
