@@ -1,0 +1,29 @@
+[package]
+name = "skillmount"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+description = "Portable skill mounting for coding agents"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pashifika/skillmount"
+
+[[bin]]
+name = "asm"
+path = "src/bin/asm.rs"
+
+[[bin]]
+name = "skillmount"
+path = "src/bin/skillmount.rs"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - "dev/**"
+  push:
+    branches:
+      - main
+      - "dev/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_DENY_VERSION: "0.20.2"
+  MSRV: "1.85.0"
+  RUST_TOOLCHAIN: "1.97.1"
+
+jobs:
+  branch-policy:
+    name: branch-policy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test branch-policy rules
+        run: python .github/scripts/test_branch_policy.py
+      - name: Validate pull-request branch flow
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: python .github/scripts/branch_policy.py "$BASE_REF" "$HEAD_REF"
+      - name: Report non-applicable branch policy
+        if: github.event_name != 'pull_request'
+        run: echo "Branch policy is not applicable to ${GITHUB_EVENT_NAME} events."
+
+  quality:
+    name: quality
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint all targets and features
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test all features
+        run: cargo test --locked --all-features
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
+      - name: Check dependency policy
+        run: |
+          cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
+          cargo deny check
+      - name: Build with the minimum supported Rust version
+        run: |
+          rustup toolchain install "$MSRV" --profile minimal
+          cargo +"$MSRV" build --locked --all-targets --all-features
+      - name: Build release binaries
+        run: cargo build --locked --release --bins
+
+  test:
+    name: test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - name: windows-x86
+            os: windows-2025
+            target: i686-pc-windows-msvc
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust target
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup target add --toolchain "$RUST_TOOLCHAIN" "${{ matrix.target }}"
+      - name: Build both executables
+        run: cargo build --locked --target "${{ matrix.target }}" --bins
+      - name: Run target tests and executable smoke suite
+        run: cargo test --locked --target "${{ matrix.target }}" --all-features
+
+  gate:
+    name: gate
+    if: ${{ always() }}
+    needs:
+      - branch-policy
+      - quality
+      - test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every CI predecessor to succeed
+        env:
+          BRANCH_POLICY_RESULT: ${{ needs.branch-policy.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          if [[ "$BRANCH_POLICY_RESULT" != "success" || \
+                "$QUALITY_RESULT" != "success" || \
+                "$TEST_RESULT" != "success" ]]; then
+            echo "::error::Required job results: branch-policy=$BRANCH_POLICY_RESULT quality=$QUALITY_RESULT test=$TEST_RESULT"
+            exit 1
+          fi
+          echo "All required CI jobs succeeded."
