@@ -27,3 +27,7 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = "deny"
 pedantic = "deny"
+
+[dependencies]
+clap = { version = "=4.6.5", features = ["derive"] }
+serde_yaml_ng = "=0.10.0"
