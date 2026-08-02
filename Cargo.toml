@@ -22,7 +22,10 @@ strip = "symbols"
 
 [lints.rust]
 missing_docs = "deny"
-unsafe_code = "forbid"
+# `deny` rather than `forbid`: the platform link backends need raw filesystem calls that no safe
+# API exposes, and `forbid` cannot be lifted anywhere. Every `allow` is a whole module that exists
+# only to wrap those calls, and no other module may opt in. See docs/adr/0011.
+unsafe_code = "deny"
 
 [lints.clippy]
 all = "deny"
@@ -31,3 +34,21 @@ pedantic = "deny"
 [dependencies]
 clap = { version = "=4.6.5", features = ["derive"] }
 serde_yaml_ng = "=0.10.0"
+
+# Placement needs an atomic no-replace rename, which `std::fs::rename` does not provide: it
+# replaces. macOS reaches `renameatx_np(RENAME_EXCL)` and other Unix hosts reach
+# `renameat2(RENAME_NOREPLACE)`, both only through libc.
+[target."cfg(unix)".dependencies]
+libc = "=0.2.189"
+
+# Junctions are reparse points. Creating, reading, and identifying one needs `DeviceIoControl`,
+# `CreateFileW`, and `GetFileInformationByHandle`, none of which the standard library exposes.
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_SystemServices",
+] }

@@ -176,14 +176,16 @@ fn physical_identity(path: &Path) -> Option<PhysicalIdentity> {
 
 /// Returns the canonical terminal path that identifies an existing Windows directory.
 ///
-/// The volume-serial and file-index pair is only reachable through the unstable
-/// `windows_by_handle` API or raw FFI, and this crate sets `unsafe_code = "forbid"`.
 /// Canonicalization already collapses symbolic links and junctions, so this key distinguishes
 /// every layout `SkillMount` itself creates. It does not distinguish one directory reached through
-/// two different volume mount points. That residual case needs a real file index and is recorded
-/// as follow-up work for the change that introduces the Windows platform backend, which has to
-/// revisit the `unsafe` lint anyway. Until then the logical key still serializes those callers,
-/// because both spellings share the anchor and suffix.
+/// two different volume mount points, which needs the volume-serial and file-index pair.
+///
+/// That pair is now reachable: `src/link/windows_ffi.rs` reads it, and
+/// [`crate::link::PlatformIdentity`] carries it. Adopting it here means replacing
+/// [`PhysicalIdentity`] with that type across the public lock-resource contract, which belongs to
+/// the change that actually acquires locks rather than to the one that added the backend. See
+/// `docs/adr/0011-scoped-unsafe-for-platform-link-backends.md`. Until then the logical key still
+/// serializes those callers, because both spellings share the anchor and suffix.
 #[cfg(windows)]
 fn physical_identity(path: &Path) -> Option<PhysicalIdentity> {
     let canonical = std::fs::canonicalize(path).ok()?;

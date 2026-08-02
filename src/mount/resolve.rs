@@ -1,18 +1,16 @@
-//! No-follow entry classification and bounded directory link-chain resolution.
+//! No-follow entry classification for read-only planning.
+//!
+//! The walk itself lives in [`crate::link::resolve`], which drives the platform backend. This
+//! module is the planning-facing view of that walk: it collapses the backend's states into the
+//! smaller vocabulary planning reasons about, and it maps the backend's errors back onto the
+//! wrapper exit categories a caller already depends on.
 
-use std::collections::BTreeSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::error::AppError;
-use crate::paths::lexical_normalize;
+use crate::error::{AppError, LinkError};
+use crate::link::resolve::{ChainState, resolve_chain};
 
-/// Maximum number of directory-link hops resolved before an entry is rejected.
-///
-/// The V2 design calls roughly 32 sufficient. The bound is set to the `SKILL.md` chain limit
-/// already used by catalog validation so both layers reject exactly the same pathological
-/// layouts, which keeps a single number to reason about.
-pub const MAX_LINK_DEPTH: usize = 40;
+pub use crate::link::resolve::MAX_LINK_DEPTH;
 
 /// How an entry appears when it is inspected without implicitly following it.
 ///
@@ -83,15 +81,6 @@ pub struct ResolvedEntry {
 }
 
 impl ResolvedEntry {
-    fn new(entry: &Path, kind: PathKind, link_chain: Vec<PathBuf>) -> Self {
-        Self {
-            entry: entry.to_path_buf(),
-            kind,
-            link_chain,
-            terminal: None,
-        }
-    }
-
     /// Returns whether this entry and `other` resolve to the same terminal directory.
     ///
     /// Two unresolvable entries are never equal: an unresolvable state carries no identity that a
@@ -117,106 +106,34 @@ impl ResolvedEntry {
 /// Returns [`AppError::MissingInput`] when the operating system reports a failure other than a
 /// missing path, such as a permission error, or when a resolved directory cannot be canonicalized.
 pub fn classify(entry: &Path) -> Result<ResolvedEntry, AppError> {
-    let metadata = match fs::symlink_metadata(entry) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ResolvedEntry::new(entry, PathKind::Missing, Vec::new()));
-        }
-        Err(error) => {
-            return Err(AppError::MissingInput {
-                path: entry.to_path_buf(),
-                reason: error.to_string(),
-            });
-        }
+    let chain = resolve_chain(crate::link::platform_backend(), entry).map_err(planning_error)?;
+    let kind = match chain.state {
+        ChainState::Missing => PathKind::Missing,
+        ChainState::Directory => PathKind::Directory,
+        ChainState::LinkToDirectory => PathKind::DirectoryLink,
+        ChainState::Broken => PathKind::BrokenLink,
+        ChainState::Cyclic => PathKind::CyclicLink,
+        ChainState::DepthExceeded => PathKind::DepthExceeded,
+        ChainState::Unsupported => PathKind::NotDirectory,
     };
-
-    if !metadata.file_type().is_symlink() {
-        if !metadata.is_dir() {
-            return Ok(ResolvedEntry::new(
-                entry,
-                PathKind::NotDirectory,
-                Vec::new(),
-            ));
-        }
-        let mut resolved = ResolvedEntry::new(entry, PathKind::Directory, Vec::new());
-        resolved.terminal = Some(canonicalize(entry)?);
-        return Ok(resolved);
-    }
-
-    resolve_directory_chain(entry)
-}
-
-/// Walks a directory-link chain to its terminal directory.
-///
-/// Revisit detection compares lexically normalized paths rather than platform file identities.
-/// A real file identity is unavailable on Windows without `unsafe` FFI, which this crate forbids,
-/// so the path set is the portable check and [`MAX_LINK_DEPTH`] is the backstop for the residual
-/// case of one path reachable under two spellings on a case-insensitive volume.
-fn resolve_directory_chain(entry: &Path) -> Result<ResolvedEntry, AppError> {
-    let mut link_chain = Vec::new();
-    let mut visited = BTreeSet::new();
-    let mut current = entry.to_path_buf();
-
-    for _ in 0..MAX_LINK_DEPTH {
-        current = lexical_normalize(&current);
-        if !visited.insert(current.clone()) {
-            return Ok(ResolvedEntry::new(entry, PathKind::CyclicLink, link_chain));
-        }
-
-        let metadata = match fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ResolvedEntry::new(entry, PathKind::BrokenLink, link_chain));
-            }
-            Err(error) => {
-                return Err(AppError::MissingInput {
-                    path: current,
-                    reason: error.to_string(),
-                });
-            }
-        };
-
-        if !metadata.file_type().is_symlink() {
-            if !metadata.is_dir() {
-                return Ok(ResolvedEntry::new(
-                    entry,
-                    PathKind::NotDirectory,
-                    link_chain,
-                ));
-            }
-            let mut resolved = ResolvedEntry::new(entry, PathKind::DirectoryLink, link_chain);
-            resolved.terminal = Some(canonicalize(&current)?);
-            return Ok(resolved);
-        }
-
-        let target = fs::read_link(&current).map_err(|error| AppError::MissingInput {
-            path: current.clone(),
-            reason: error.to_string(),
-        })?;
-        // A relative target resolves against the directory holding the link, never the CWD.
-        current = if target.is_absolute() {
-            target.clone()
-        } else {
-            current
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .join(&target)
-        };
-        link_chain.push(target);
-    }
-
-    Ok(ResolvedEntry::new(
-        entry,
-        PathKind::DepthExceeded,
-        link_chain,
-    ))
-}
-
-fn canonicalize(path: &Path) -> Result<PathBuf, AppError> {
-    fs::canonicalize(path).map_err(|error| AppError::MissingInput {
-        path: path.to_path_buf(),
-        reason: error.to_string(),
+    Ok(ResolvedEntry {
+        entry: entry.to_path_buf(),
+        kind,
+        link_chain: chain.hops.into_iter().map(|hop| hop.raw).collect(),
+        terminal: chain.terminal,
     })
+}
+
+/// Maps a backend failure onto the exit category planning already reports.
+///
+/// An entry the host refuses to describe is a missing-input failure at this layer, exactly as it
+/// was when this module called `std::fs` directly. Only the failures that cannot arise during
+/// read-only classification keep the backend's own category.
+fn planning_error(error: LinkError) -> AppError {
+    match error {
+        LinkError::Inspect { path, reason } => AppError::MissingInput { path, reason },
+        other => AppError::Link(other),
+    }
 }
 
 #[cfg(test)]
