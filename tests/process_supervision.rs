@@ -251,10 +251,8 @@ fn spawn_failure_retains_the_requested_launch_cwd() {
     assert_eq!(output.status.code(), Some(66), "{output:?}\n{outcome}");
     assert_eq!(cleanup_count(&cleanup), 1);
     assert!(outcome.contains("stage: Spawn"), "{outcome}");
-    assert!(
-        outcome.contains(&missing_cwd.display().to_string()),
-        "{outcome}"
-    );
+    let expected_cwd = format!("{missing_cwd:?}");
+    assert!(outcome.contains(&expected_cwd), "{outcome}");
 }
 
 #[test]
