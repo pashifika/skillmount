@@ -310,16 +310,21 @@ fn a_placed_link_is_removed_by_its_recorded_identity_and_the_source_survives() {
     );
 }
 
-#[test]
-fn removal_refuses_every_entry_that_is_no_longer_the_recorded_one() {
-    let recorded = CreatedLink {
+/// Builds the evidence a removal would have recorded for `/root/destination`.
+fn recorded_link(identity: Option<crate::link::PlatformIdentity>) -> CreatedLink {
+    CreatedLink {
         path: PathBuf::from("/root/destination"),
         kind: CreatedLinkKind::Symlink,
         target: PathBuf::from("/root/source"),
         source_canonical: PathBuf::from("/root/source"),
-        identity: None,
-    };
+        identity,
+    }
+}
 
+#[test]
+fn removal_refuses_every_entry_that_is_no_longer_the_recorded_one() {
+    // Kind mismatches are decided before identity is consulted, so they are refused whether or
+    // not one was recorded.
     let cases = [
         (
             RecordingBackend::new().with_directory("/root/destination"),
@@ -333,16 +338,12 @@ fn removal_refuses_every_entry_that_is_no_longer_the_recorded_one() {
             RecordingBackend::new().with_junction("/root/destination", "/root/source"),
             OwnershipMismatch::KindChanged,
         ),
-        (
-            RecordingBackend::new().with_symlink("/root/destination", "/root/elsewhere"),
-            OwnershipMismatch::TargetChanged,
-        ),
     ];
 
     for (backend, expected) in cases {
         assert_eq!(
             backend
-                .remove_link_entry(&recorded)
+                .remove_link_entry(&recorded_link(None))
                 .expect("removal reports"),
             RemoveOutcome::OwnershipMismatch(expected),
             "{expected:?}"
@@ -352,6 +353,42 @@ fn removal_refuses_every_entry_that_is_no_longer_the_recorded_one() {
             "a mismatched entry is left exactly as it is"
         );
     }
+
+    // A retargeted link is only reachable once identity agrees, so this case takes the live
+    // entry's own identity and changes only where the link points.
+    let backend = RecordingBackend::new().with_symlink("/root/destination", "/root/elsewhere");
+    let live = backend
+        .inspect_no_follow(Path::new("/root/destination"))
+        .expect("inspection works");
+
+    assert_eq!(
+        backend
+            .remove_link_entry(&recorded_link(live.identity))
+            .expect("removal reports"),
+        RemoveOutcome::OwnershipMismatch(OwnershipMismatch::TargetChanged)
+    );
+    assert!(backend.contains(Path::new("/root/destination")));
+}
+
+#[test]
+fn an_entry_whose_identity_is_unavailable_is_never_removed() {
+    // The live entry is exactly what was recorded — same kind, same target — and is still refused,
+    // because without an identity on both sides nothing distinguishes it from an identical entry
+    // another process created at the same path.
+    let backend = RecordingBackend::new()
+        .with_directory("/root/source")
+        .with_symlink("/root/destination", "/root/source");
+
+    assert_eq!(
+        backend
+            .remove_link_entry(&recorded_link(None))
+            .expect("removal reports"),
+        RemoveOutcome::OwnershipMismatch(OwnershipMismatch::IdentityUnavailable)
+    );
+    assert!(
+        backend.contains(Path::new("/root/destination")),
+        "leaving an entry behind is recoverable; removing someone else's is not"
+    );
 }
 
 #[test]

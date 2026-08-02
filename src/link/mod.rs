@@ -195,9 +195,12 @@ pub struct LinkRequest {
 /// Ownership evidence for a link entry this process created.
 ///
 /// A later cleanup removes an entry only when the live entry still matches every field recorded
-/// here. Recording the canonical source *and* the raw target *and* the identity is deliberate: the
-/// identity is the strongest evidence but is not guaranteed on every filesystem, and the raw
-/// target still identifies the entry when its target has since disappeared.
+/// here. Recording the canonical source *and* the raw target *and* the identity is deliberate. The
+/// raw target still describes the entry after its target has disappeared, which keeps a dangling
+/// link removable; the canonical source is what diagnostics quote. But the identity is the only
+/// field that distinguishes this process's entry from an identical one someone else created, so an
+/// entry recorded without one is never removed and reports
+/// [`OwnershipMismatch::IdentityUnavailable`] instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedLink {
     /// Path the entry currently occupies: the staged sibling until it is placed.
@@ -249,6 +252,8 @@ pub enum OwnershipMismatch {
     TargetChanged,
     /// The entry has a different platform identity than the recorded one.
     IdentityChanged,
+    /// One of the two identities is missing, so ownership cannot be established.
+    IdentityUnavailable,
 }
 
 impl OwnershipMismatch {
@@ -261,6 +266,7 @@ impl OwnershipMismatch {
             Self::KindChanged => "the link implementation changed",
             Self::TargetChanged => "the link points somewhere else",
             Self::IdentityChanged => "the entry was replaced by a different one",
+            Self::IdentityUnavailable => "the entry cannot be proved to be the recorded one",
         }
     }
 }
@@ -390,14 +396,21 @@ pub(crate) fn verify_ownership(
                 return Ownership::Mismatch(OwnershipMismatch::KindChanged);
             }
             // Identity is checked before the target: an entry someone else recreated pointing at
-            // the same directory is still not the entry this process created.
+            // the same directory is still not the entry this process created, and only the
+            // identity can tell those apart.
+            //
+            // A missing identity on either side is therefore a refusal, not a skipped check.
+            // Falling through to the target alone would remove exactly the recreated entry the
+            // previous paragraph is about. Leaving an entry behind is recoverable — a later
+            // cleanup, or the operator, can remove it once its identity reads again — while
+            // removing someone else's is not, so the unprovable case fails closed.
             match (live.identity.as_ref(), recorded.identity.as_ref()) {
-                (Some(live_identity), Some(recorded_identity))
-                    if live_identity != recorded_identity =>
-                {
-                    return Ownership::Mismatch(OwnershipMismatch::IdentityChanged);
+                (Some(live_identity), Some(recorded_identity)) => {
+                    if live_identity != recorded_identity {
+                        return Ownership::Mismatch(OwnershipMismatch::IdentityChanged);
+                    }
                 }
-                _ => {}
+                _ => return Ownership::Mismatch(OwnershipMismatch::IdentityUnavailable),
             }
             match live.target.as_ref() {
                 Some(target) if target_matches(target) => Ownership::Owned,
