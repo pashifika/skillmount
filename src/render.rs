@@ -1,0 +1,446 @@
+//! Rendering for the read-only commands.
+//!
+//! Every value that could come from the operating system is written as its own indexed line. A
+//! joined command string is never produced: quoting inside one would be reinterpretable, and the
+//! whole point of these commands is that the reader can trust what they see.
+
+use std::ffi::OsStr;
+use std::fmt::Write as _;
+use std::path::Path;
+
+use crate::agent::DiscoverySnapshot;
+use crate::diagnostic::Diagnostic;
+use crate::domain::{RunContext, ShadowReason, SkillCatalog};
+use crate::lock::LockResource;
+use crate::mount::{MountAction, MountPlan};
+use crate::state::transaction_base;
+
+/// Everything a read-only command has observed, ready to render.
+pub(crate) struct ReadOnlyReport<'a> {
+    /// Resolved run context.
+    pub(crate) context: &'a RunContext,
+    /// Validated catalog with full provenance.
+    pub(crate) catalog: &'a SkillCatalog,
+    /// Adapter observation.
+    pub(crate) snapshot: &'a DiscoverySnapshot,
+    /// Deterministic plan built from the observation.
+    pub(crate) plan: &'a MountPlan,
+    /// Requested diagnostic verbosity.
+    pub(crate) verbosity: u8,
+}
+
+impl ReadOnlyReport<'_> {
+    fn verbose(&self) -> bool {
+        self.verbosity > 0
+    }
+
+    /// Renders a path relative to the project root when it lies inside it.
+    ///
+    /// The project root is printed in full in the header, so repeating it on every line only
+    /// pushes the part that differs off the edge of the terminal. Anything outside the project,
+    /// such as a staging root or a Skill source, still prints in full because its location is the
+    /// information the reader needs.
+    fn path(&self, path: &Path) -> String {
+        path.strip_prefix(&self.context.project_root).map_or_else(
+            |_| os_value(path.as_os_str(), self.verbose()),
+            |relative| os_value(relative.as_os_str(), self.verbose()),
+        )
+    }
+}
+
+/// Renders the full read-only report.
+pub(crate) fn render(report: &ReadOnlyReport<'_>) -> String {
+    let mut out = String::new();
+    header(&mut out, report);
+    sources(&mut out, report);
+    overlay(&mut out, report);
+    scopes(&mut out, report);
+    plan(&mut out, report);
+    locks(&mut out, report);
+    recovery(&mut out);
+    arguments(&mut out, report);
+    out
+}
+
+fn header(out: &mut String, report: &ReadOnlyReport<'_>) {
+    let context = report.context;
+    let field = |out: &mut String, label: &str, value: &Path| {
+        let _ = writeln!(out, "{label:<15} {}", path_value(value, report.verbose()));
+    };
+    let _ = writeln!(
+        out,
+        "{:<15} {}",
+        "Agent:",
+        match context.agent {
+            crate::domain::AgentId::Codex => "codex",
+            crate::domain::AgentId::Claude => "claude",
+        }
+    );
+    field(out, "Launch CWD:", &context.launch_cwd);
+    field(out, "Project root:", &context.project_root);
+    let _ = writeln!(
+        out,
+        "{:<15} {}",
+        "Discovery:",
+        report.path(&report.snapshot.discovery_entry)
+    );
+    let _ = writeln!(
+        out,
+        "{:<15} {}",
+        "Backing store:",
+        report.path(&report.snapshot.backing_store)
+    );
+    let _ = writeln!(
+        out,
+        "{:<15} {}",
+        "Store state:",
+        report.snapshot.backing_store_state.label()
+    );
+}
+
+fn sources(out: &mut String, report: &ReadOnlyReport<'_>) {
+    if report.context.skill_sources.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "\nSources:");
+    for source in &report.context.skill_sources {
+        let _ = writeln!(
+            out,
+            "  [{}] {}",
+            source.ordinal + 1,
+            path_value(&source.input_path, report.verbose())
+        );
+    }
+}
+
+/// Renders which source won each logical name, and every origin it displaced.
+fn overlay(out: &mut String, report: &ReadOnlyReport<'_>) {
+    let overrides = report.catalog.override_count();
+    let _ = writeln!(
+        out,
+        "\nOverlay: {} Skill(s), {overrides} source override(s)",
+        report.catalog.resolutions.len()
+    );
+    for resolution in &report.catalog.resolutions {
+        let selected = &resolution.selected;
+        let displaced = resolution
+            .shadowed
+            .iter()
+            .filter(|shadow| shadow.reason == ShadowReason::DifferentSourceOverride)
+            .count();
+        let marker = if displaced > 0 {
+            "OVERRIDE"
+        } else {
+            "SELECT  "
+        };
+        let _ = writeln!(out, "  {marker}  {}", selected.mount_name);
+        // Shadowed origins are only listed in verbose output; the summary above already reports
+        // that precedence was applied, so normal output stays short enough to read before a TUI.
+        if report.verbose() {
+            for shadow in &resolution.shadowed {
+                let _ = writeln!(
+                    out,
+                    "            [{}] {}  ({})",
+                    shadow.origin.source_ordinal + 1,
+                    path_value(&shadow.origin.source_entry, true),
+                    match shadow.reason {
+                        ShadowReason::DifferentSourceOverride => "different source",
+                        ShadowReason::RepeatedCanonicalSource => "same canonical source",
+                    }
+                );
+            }
+        }
+        let _ = writeln!(
+            out,
+            "         -> [{}] {}",
+            selected.origin.source_ordinal + 1,
+            path_value(&selected.origin.source_canonical, report.verbose())
+        );
+    }
+}
+
+/// Renders every namespace the child will search, which is what makes conflicts explainable.
+fn scopes(out: &mut String, report: &ReadOnlyReport<'_>) {
+    let _ = writeln!(out, "\nDiscovery scopes:");
+    for scope in &report.snapshot.scopes {
+        let _ = writeln!(
+            out,
+            "  {:<22} {:<24} {}",
+            scope.kind.label(),
+            scope.state.kind.label(),
+            report.path(&scope.state.entry)
+        );
+        for alias in &scope.aliases {
+            let _ = writeln!(
+                out,
+                "  {:<22} {:<24} {}",
+                "",
+                "also reached through",
+                report.path(alias)
+            );
+        }
+        if report.verbose() {
+            for existing in scope.existing_skills.values() {
+                let _ = writeln!(
+                    out,
+                    "      {:<28} {}",
+                    os_value(&existing.raw_name, true),
+                    existing.kind.label()
+                );
+            }
+        }
+    }
+}
+
+fn plan(out: &mut String, report: &ReadOnlyReport<'_>) {
+    let _ = writeln!(out, "\nPlan:");
+    if report.plan.actions.is_empty() && report.plan.preserved.is_empty() {
+        let _ = writeln!(out, "  (nothing to do)");
+    }
+    for action in &report.plan.actions {
+        match &action.operation {
+            MountAction::CreateDirectory { path } => {
+                let _ = writeln!(out, "  MKDIR  {}", report.path(path));
+            }
+            MountAction::CreateDirectoryLink {
+                source,
+                destination,
+                ..
+            } => {
+                let _ = writeln!(out, "  LINK   {}", report.path(destination));
+                let _ = writeln!(out, "         -> {}", report.path(source));
+            }
+            MountAction::ReuseExistingLink {
+                source,
+                destination,
+            } => {
+                let _ = writeln!(out, "  REUSE  {}", report.path(destination));
+                let _ = writeln!(out, "         -> {}", report.path(source));
+            }
+        }
+        if report.verbose() {
+            let _ = writeln!(
+                out,
+                "         #{} precondition={}",
+                action.id,
+                action.expected_precondition.label()
+            );
+        }
+    }
+    for preserved in &report.plan.preserved {
+        let _ = writeln!(out, "  KEEP   {}", report.path(&preserved.existing));
+        let _ = writeln!(
+            out,
+            "         omitted {}",
+            report.path(&preserved.omitted_source)
+        );
+    }
+}
+
+/// Renders lock resources as observations, never as a promise that applying will not wait.
+fn locks(out: &mut String, report: &ReadOnlyReport<'_>) {
+    if report.snapshot.lock_resources.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "\nLock resources:");
+    for resource in &report.snapshot.lock_resources {
+        let _ = writeln!(
+            out,
+            "  {:<16} {}",
+            resource.kind.label(),
+            report.path(&resource.path)
+        );
+        if report.verbose() {
+            verbose_lock_identity(out, resource);
+        }
+    }
+}
+
+fn verbose_lock_identity(out: &mut String, resource: &LockResource) {
+    let _ = writeln!(
+        out,
+        "                   anchor {}",
+        path_value(&resource.identity.anchor, true)
+    );
+    let _ = writeln!(
+        out,
+        "                   suffix {}",
+        path_value(&resource.identity.suffix, true)
+    );
+    match &resource.identity.physical {
+        Some(identity) => {
+            let _ = writeln!(out, "                   physical {identity}");
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "                   physical (resource does not exist yet)"
+            );
+        }
+    }
+}
+
+/// Reports transaction records that a normal run would examine.
+///
+/// Journal parsing arrives with the transaction change, so a record is reported by presence alone
+/// and deliberately over-reports rather than claiming a state it cannot read. Nothing here opens,
+/// modifies, or removes a record.
+fn recovery(out: &mut String) {
+    let Ok(base) = transaction_base() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return;
+    };
+    let mut records = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return;
+    }
+    records.sort();
+    let _ = writeln!(out, "\nRecovery:");
+    for record in records {
+        let _ = writeln!(out, "  WOULD RECOVER  {}", path_value(&record, false));
+    }
+}
+
+/// Renders each argument layer separately, then the effective argv by index.
+fn arguments(out: &mut String, report: &ReadOnlyReport<'_>) {
+    let launch = &report.plan.launch;
+    let verbose = report.verbose();
+
+    let _ = writeln!(out, "\nExecutable:");
+    let _ = writeln!(out, "  {}", path_value(&launch.executable, verbose));
+
+    let layer = |out: &mut String, label: &str, values: &[std::ffi::OsString]| {
+        let _ = writeln!(out, "{label}:");
+        if values.is_empty() {
+            let _ = writeln!(out, "  (none)");
+            return;
+        }
+        for (index, value) in values.iter().enumerate() {
+            let _ = writeln!(out, "  [{index}] {}", os_value(value, verbose));
+        }
+    };
+    layer(out, "Injected args", &launch.injected_args);
+    layer(out, "Forwarded args", &launch.passthrough_args);
+
+    let _ = writeln!(out, "Effective argv:");
+    for (index, value) in launch.effective_argv().iter().enumerate() {
+        let _ = writeln!(out, "  argv[{index}] = {}", os_value(value, verbose));
+    }
+}
+
+/// Renders warnings collected by the catalog and the adapter.
+pub(crate) fn render_warnings(catalog: &SkillCatalog, snapshot: &DiscoverySnapshot) -> Vec<String> {
+    catalog
+        .warnings
+        .iter()
+        .chain(snapshot.warnings.iter())
+        .map(|warning: &Diagnostic| warning.message.clone())
+        .collect()
+}
+
+fn path_value(path: &Path, verbose: bool) -> String {
+    os_value(path.as_os_str(), verbose)
+}
+
+/// Renders a platform-native value, reversibly when verbose output was requested.
+fn os_value(value: &OsStr, verbose: bool) -> String {
+    if verbose {
+        escaped(value)
+    } else {
+        Path::new(value).display().to_string()
+    }
+}
+
+/// Escapes a value so the original bytes can be recovered from the text.
+///
+/// A backslash doubles, and anything that is not valid text is written as an explicit escape.
+/// The result is never a shell word: it is a display form, and nothing in this crate feeds it
+/// back into a command line.
+#[cfg(unix)]
+fn escaped(value: &OsStr) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut out = String::new();
+    for chunk in value.as_bytes().utf8_chunks() {
+        for character in chunk.valid().chars() {
+            if character == '\\' {
+                out.push_str("\\\\");
+            } else {
+                out.push(character);
+            }
+        }
+        for byte in chunk.invalid() {
+            let _ = write!(out, "\\x{byte:02X}");
+        }
+    }
+    out
+}
+
+/// Escapes a value so the original UTF-16 units can be recovered from the text.
+#[cfg(windows)]
+fn escaped(value: &OsStr) -> String {
+    use std::os::windows::ffi::OsStrExt;
+
+    let units = value.encode_wide().collect::<Vec<_>>();
+    let mut out = String::new();
+    for decoded in char::decode_utf16(units) {
+        match decoded {
+            Ok('\\') => out.push_str("\\\\"),
+            Ok(character) => out.push(character),
+            Err(error) => {
+                let _ = write!(out, "\\u{:04X}", error.unpaired_surrogate());
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{escaped, os_value};
+    use std::ffi::OsString;
+
+    #[test]
+    fn ordinary_values_render_unchanged() {
+        assert_eq!(os_value(&OsString::from("plain-name"), true), "plain-name");
+        assert_eq!(os_value(&OsString::from("plain-name"), false), "plain-name");
+    }
+
+    #[test]
+    fn a_backslash_is_doubled_so_the_escape_stays_reversible() {
+        assert_eq!(escaped(&OsString::from("a\\b")), "a\\\\b");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_bytes_survive_as_explicit_escapes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let value = OsString::from_vec(vec![b'a', 0xFF, b'b']);
+
+        assert_eq!(escaped(&value), "a\\xFFb");
+        assert_ne!(
+            os_value(&value, false),
+            escaped(&value),
+            "the lossy form is only used when verbose output was not requested"
+        );
+    }
+
+    #[test]
+    fn shell_metacharacters_are_not_quoted_into_a_command_string() {
+        let value = OsString::from("a b\"c'd;e");
+
+        let rendered = escaped(&value);
+
+        assert_eq!(rendered, "a b\"c'd;e");
+        assert!(
+            !rendered.starts_with('\'') && !rendered.starts_with('"'),
+            "values are rendered as data, never as shell words"
+        );
+    }
+}

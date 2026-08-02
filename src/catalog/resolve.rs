@@ -3,9 +3,9 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::catalog::CatalogRequest;
-use crate::catalog::discover::{DiscoveredSource, NativeNameKey, RawCandidate};
+use crate::catalog::discover::{DiscoveredSource, RawCandidate};
 use crate::catalog::validate::validate_candidate;
-use crate::domain::{ResolvedSkill, ShadowReason, ShadowedSkill, SkillCatalog};
+use crate::domain::{ResolvedSkill, ShadowReason, ShadowedSkill, SkillCatalog, SkillNameKey};
 use crate::error::{AppError, CatalogError};
 
 #[derive(Debug)]
@@ -17,10 +17,10 @@ pub(super) struct PendingResolution {
 pub(super) fn fold_sources(
     sources: Vec<DiscoveredSource>,
 ) -> Result<Vec<PendingResolution>, AppError> {
-    let mut selected = BTreeMap::<NativeNameKey, PendingResolution>::new();
+    let mut selected = BTreeMap::<SkillNameKey, PendingResolution>::new();
 
     for source in sources {
-        let mut within_source = BTreeMap::<NativeNameKey, RawCandidate>::new();
+        let mut within_source = BTreeMap::<SkillNameKey, RawCandidate>::new();
         for candidate in source.candidates {
             if let Some(first) =
                 within_source.insert(candidate.comparison_key.clone(), candidate.clone())

@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::diagnostic::Diagnostic;
 
@@ -179,7 +179,7 @@ impl SkillName {
     /// Returns the deterministic comparison key.
     #[must_use]
     pub fn comparison_key(&self) -> SkillNameKey {
-        SkillNameKey(self.0.clone())
+        SkillNameKey::new(OsStr::new(&self.0))
     }
 }
 
@@ -224,16 +224,64 @@ impl fmt::Display for SkillNameError {
 
 impl Error for SkillNameError {}
 
-/// ASCII-lowercase logical identity used for deterministic catalog ordering.
+/// ASCII-lowercase logical identity shared by source overlay and discovery inspection.
+///
+/// Discovery entries are arbitrary platform-native names that may not be valid [`SkillName`]
+/// values, so the key is retained as an [`OsString`]. Folding is restricted to ASCII on purpose:
+/// full Unicode case folding is locale-sensitive and would make the comparison key
+/// host-dependent.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SkillNameKey(String);
+pub struct SkillNameKey(OsString);
 
 impl SkillNameKey {
-    /// Returns the comparison key text.
+    /// Builds the comparison key for a platform-native entry name.
     #[must_use]
-    pub fn as_str(&self) -> &str {
+    pub fn new(name: &OsStr) -> Self {
+        Self(ascii_lowercase(name))
+    }
+
+    /// Returns the comparison key as a platform-native value.
+    #[must_use]
+    pub fn as_os_str(&self) -> &OsStr {
         &self.0
     }
+}
+
+impl fmt::Display for SkillNameKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `OsStr::display` is newer than the crate MSRV, so the name is rendered through `Path`.
+        Path::new(&self.0).display().fmt(formatter)
+    }
+}
+
+#[cfg(unix)]
+fn ascii_lowercase(value: &OsStr) -> OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    OsString::from_vec(
+        value
+            .as_bytes()
+            .iter()
+            .map(u8::to_ascii_lowercase)
+            .collect(),
+    )
+}
+
+#[cfg(windows)]
+fn ascii_lowercase(value: &OsStr) -> OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let lowered = value
+        .encode_wide()
+        .map(|unit| {
+            if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) {
+                unit + u16::from(b'a' - b'A')
+            } else {
+                unit
+            }
+        })
+        .collect::<Vec<_>>();
+    OsString::from_wide(&lowered)
 }
 
 /// The source identity retained for a selected or displaced candidate.

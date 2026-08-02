@@ -1,18 +1,22 @@
 //! Shared read-only application boundary.
 
 use std::ffi::OsString;
-use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::error::ErrorKind;
 
+use crate::agent::claude::ClaudeAdapter;
+use crate::agent::codex::CodexAdapter;
+use crate::agent::{AgentAdapter, DiscoverySnapshot};
 use crate::catalog::{CatalogRequest, resolve_catalog};
 use crate::cli::{InspectAgent, ParsedCommand, ReservedUtility, parse_command_from};
-use crate::domain::{AgentId, MountMode};
+use crate::domain::{AgentId, MountMode, RunContext, SkillCatalog};
 use crate::error::{AppError, ExitCategory};
-use crate::paths::{resolve_session, resolve_source_occurrences};
+use crate::mount::MountPlan;
+use crate::paths::{resolve_inspection, resolve_session};
+use crate::render;
 
 pub(crate) fn run_from<I, T>(args: I) -> ExitCode
 where
@@ -45,66 +49,52 @@ where
 fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<(), AppError> {
     match command {
         ParsedCommand::Session(input) => {
+            let dry_run = input.options.dry_run;
             let context = resolve_session(input, invocation_cwd)?;
-            let destination_stores = destination_stores(&context);
-            let request = CatalogRequest {
-                agent: context.agent,
-                validation: context.options.validation,
-                destination_stores: &destination_stores,
-            };
-            let catalog = resolve_catalog(&context.skill_sources, &request)?;
-            Err(AppError::Internal(format!(
-                "catalog resolved {} Skill(s), but mount planning and agent launch are reserved for later changes",
-                catalog.resolutions.len()
-            )))
+            let report = plan_read_only(&context)?;
+
+            if !dry_run {
+                return Err(AppError::Internal(format!(
+                    "planned {} action(s) for {} Skill(s), but applying a plan, acquiring locks, and launching the agent are reserved for later changes",
+                    report.plan.actions.len(),
+                    report.catalog.resolutions.len()
+                )));
+            }
+            emit(&render::render(&render::ReadOnlyReport {
+                context: &context,
+                catalog: &report.catalog,
+                snapshot: &report.snapshot,
+                plan: &report.plan,
+                verbosity: context.options.verbosity,
+            }))?;
+            warn(&render::render_warnings(&report.catalog, &report.snapshot));
+            Ok(())
         }
         ParsedCommand::Inspect(input) => {
-            let invocation_cwd =
-                std::fs::canonicalize(invocation_cwd).map_err(|error| AppError::MissingInput {
-                    path: invocation_cwd.to_path_buf(),
-                    reason: error.to_string(),
-                })?;
-            let occurrences = resolve_source_occurrences(&input.skills_dirs, &invocation_cwd)?;
-            let agent = match input.agent {
-                InspectAgent::Codex | InspectAgent::All => AgentId::Codex,
-                InspectAgent::Claude => AgentId::Claude,
-            };
-            let catalog = resolve_catalog(
-                &occurrences,
-                &CatalogRequest {
-                    agent,
-                    validation: input.validation,
-                    destination_stores: &[],
-                },
-            )?;
             let mut rendered = String::new();
-            writeln!(
-                rendered,
-                "Resolved {} Skill(s); {} logical override(s).",
-                catalog.resolutions.len(),
-                catalog.override_count()
-            )
-            .expect("writing to a String cannot fail");
-            for resolution in catalog.resolutions {
-                writeln!(
-                    rendered,
-                    "  {} <- --skills-dir #{} ({})",
-                    resolution.selected.mount_name,
-                    resolution.selected.origin.source_ordinal + 1,
-                    resolution.selected.origin.source_entry.display()
-                )
-                .expect("writing to a String cannot fail");
-            }
-            if let Err(error) = io::stdout().lock().write_all(rendered.as_bytes()) {
-                if error.kind() != io::ErrorKind::BrokenPipe {
-                    return Err(AppError::Internal(format!(
-                        "failed to write output: {error}"
-                    )));
+            let mut warnings = Vec::new();
+            for agent in inspected_agents(input.agent) {
+                let context = resolve_inspection(
+                    agent,
+                    &input.skills_dirs,
+                    input.validation,
+                    invocation_cwd,
+                )?;
+                let report = plan_read_only(&context)?;
+                if !rendered.is_empty() {
+                    rendered.push('\n');
                 }
+                rendered.push_str(&render::render(&render::ReadOnlyReport {
+                    context: &context,
+                    catalog: &report.catalog,
+                    snapshot: &report.snapshot,
+                    plan: &report.plan,
+                    verbosity: 0,
+                }));
+                warnings.extend(render::render_warnings(&report.catalog, &report.snapshot));
             }
-            for warning in catalog.warnings {
-                let _ = writeln!(io::stderr().lock(), "warning: {}", warning.message);
-            }
+            emit(&rendered)?;
+            warn(&warnings);
             Ok(())
         }
         ParsedCommand::Reserved(utility) => {
@@ -116,6 +106,72 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<(), AppError
                 "{name} is reserved for a later change and is not implemented"
             )))
         }
+    }
+}
+
+/// Everything the read-only pipeline produced for one agent.
+struct ReadOnlyOutcome {
+    catalog: SkillCatalog,
+    snapshot: DiscoverySnapshot,
+    plan: MountPlan,
+}
+
+/// Runs the complete read-only pipeline: catalog, discovery inspection, preliminary plan.
+///
+/// Nothing in this function creates a directory, link, lock, journal, or child process. Both the
+/// `inspect` command and `--dry-run` stop here, and a normal session reuses the same result before
+/// it reaches the mutation boundary.
+fn plan_read_only(context: &RunContext) -> Result<ReadOnlyOutcome, AppError> {
+    let adapter = adapter_for(context.agent);
+    adapter.validate_passthrough_args(&context.passthrough_args)?;
+
+    let destination_stores = destination_stores(context);
+    let catalog = resolve_catalog(
+        &context.skill_sources,
+        &CatalogRequest {
+            agent: context.agent,
+            validation: context.options.validation,
+            destination_stores: &destination_stores,
+        },
+    )?;
+    let snapshot = adapter.inspect_discovery(context)?;
+    let plan = adapter.build_mount_plan(context, &catalog, &snapshot)?;
+    Ok(ReadOnlyOutcome {
+        catalog,
+        snapshot,
+        plan,
+    })
+}
+
+fn adapter_for(agent: AgentId) -> Box<dyn AgentAdapter> {
+    match agent {
+        AgentId::Codex => Box::new(CodexAdapter),
+        AgentId::Claude => Box::new(ClaudeAdapter),
+    }
+}
+
+fn inspected_agents(selection: InspectAgent) -> Vec<AgentId> {
+    match selection {
+        InspectAgent::Codex => vec![AgentId::Codex],
+        InspectAgent::Claude => vec![AgentId::Claude],
+        InspectAgent::All => vec![AgentId::Codex, AgentId::Claude],
+    }
+}
+
+/// Writes report text to stdout, treating a closed pipe as an ordinary end of output.
+fn emit(text: &str) -> Result<(), AppError> {
+    match io::stdout().lock().write_all(text.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(AppError::Internal(format!(
+            "failed to write output: {error}"
+        ))),
+    }
+}
+
+fn warn(messages: &[String]) {
+    for message in messages {
+        let _ = writeln!(io::stderr().lock(), "warning: {message}");
     }
 }
 

@@ -1,17 +1,28 @@
-//! Side-effect-free catalog core and shared executable boundary for `SkillMount`.
+//! Side-effect-free catalog, planning, and shared executable boundary for `SkillMount`.
 //!
 //! This slice parses the complete wrapper contract, resolves platform-native paths, discovers
-//! ordered Skill sources, and produces an immutable validated catalog. Mount planning,
-//! filesystem mutation, transaction recovery, and agent launch intentionally remain outside
-//! this change.
+//! ordered Skill sources, produces an immutable validated catalog, inspects every namespace the
+//! child agent will search, and builds one complete mount plan. Everything up to and including the
+//! plan is read-only: `inspect` and `--dry-run` create no directory, link, lock, journal, or child
+//! process, and `tests/read_only.rs` fails if any of them ever does.
+//!
+//! Applying a plan, acquiring locks, rebuilding under lock, writing a transaction journal,
+//! recovering, and launching the agent intentionally remain outside this change.
 
+pub mod agent;
 mod app;
 pub mod catalog;
 mod cli;
 pub mod diagnostic;
 pub mod domain;
 pub mod error;
+pub mod lock;
+pub mod mount;
 mod paths;
+mod render;
+pub mod state;
+#[cfg(test)]
+mod test_support;
 
 use std::ffi::OsString;
 use std::process::ExitCode;

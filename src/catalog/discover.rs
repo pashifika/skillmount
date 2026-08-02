@@ -2,22 +2,13 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::domain::{SkillOrigin, SkillSource, SourceOccurrence};
+use crate::domain::{SkillNameKey, SkillOrigin, SkillSource, SourceOccurrence};
 use crate::error::{AppError, CatalogError};
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct NativeNameKey(OsString);
-
-impl NativeNameKey {
-    pub(super) fn new(name: &OsStr) -> Self {
-        Self(ascii_lowercase(name))
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct RawCandidate {
     pub(super) raw_name: OsString,
-    pub(super) comparison_key: NativeNameKey,
+    pub(super) comparison_key: SkillNameKey,
     pub(super) origin: SkillOrigin,
     pub(super) canonical_valid: bool,
     pub(super) input_canonical: PathBuf,
@@ -175,7 +166,7 @@ fn candidate(source: &SkillSource, entry: &Path, name: &OsStr, skill_md: PathBuf
     };
     RawCandidate {
         raw_name: name.to_os_string(),
-        comparison_key: NativeNameKey::new(name),
+        comparison_key: SkillNameKey::new(name),
         origin: SkillOrigin {
             source_ordinal: source.ordinal,
             source_entry: entry.to_path_buf(),
@@ -185,34 +176,4 @@ fn candidate(source: &SkillSource, entry: &Path, name: &OsStr, skill_md: PathBuf
         input_canonical: source.canonical_path.clone(),
         skill_md,
     }
-}
-
-#[cfg(unix)]
-fn ascii_lowercase(value: &OsStr) -> OsString {
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-    OsString::from_vec(
-        value
-            .as_bytes()
-            .iter()
-            .map(u8::to_ascii_lowercase)
-            .collect(),
-    )
-}
-
-#[cfg(windows)]
-fn ascii_lowercase(value: &OsStr) -> OsString {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-
-    let lowered = value
-        .encode_wide()
-        .map(|unit| {
-            if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) {
-                unit + u16::from(b'a' - b'A')
-            } else {
-                unit
-            }
-        })
-        .collect::<Vec<_>>();
-    OsString::from_wide(&lowered)
 }

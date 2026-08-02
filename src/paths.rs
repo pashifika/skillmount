@@ -49,6 +49,42 @@ pub(crate) fn resolve_session(
     })
 }
 
+/// Builds a run context for `inspect`, which has no session options to resolve.
+///
+/// Inspection still needs a launch CWD and a project root, because a discovery namespace is only
+/// meaningful relative to them. Defaults match a session started in the invocation directory.
+pub(crate) fn resolve_inspection(
+    agent: AgentId,
+    skills_dirs: &[PathBuf],
+    validation: crate::domain::ValidationLevel,
+    invocation_cwd: &Path,
+) -> Result<RunContext, AppError> {
+    let invocation_cwd = canonical_directory(invocation_cwd)?;
+    let project_root = nearest_git_root(&invocation_cwd)?.unwrap_or_else(|| invocation_cwd.clone());
+    Ok(RunContext {
+        agent,
+        launch_cwd: invocation_cwd.clone(),
+        skill_sources: resolve_source_occurrences(skills_dirs, &invocation_cwd)?,
+        invocation_cwd,
+        project_root,
+        agent_bin: PathBuf::from(agent.executable_name()),
+        passthrough_args: Vec::new(),
+        options: crate::domain::RunOptions {
+            link_mode: crate::domain::LinkMode::Auto,
+            mount_mode: match agent {
+                AgentId::Codex => crate::domain::MountMode::Project,
+                AgentId::Claude => crate::domain::MountMode::Staging,
+            },
+            conflict: crate::domain::ConflictPolicy::Error,
+            validation,
+            dry_run: true,
+            keep_mounts: false,
+            no_recover: false,
+            verbosity: 0,
+        },
+    })
+}
+
 pub(crate) fn resolve_source_occurrences(
     inputs: &[PathBuf],
     invocation_cwd: &Path,
@@ -99,6 +135,42 @@ pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+/// Splits `path` into its deepest existing canonical ancestor and the components below it.
+///
+/// A resource that does not exist yet still needs a stable identity. Returning the two halves
+/// separately lets a caller persist them, which is what lock-resource identity requires: recomputing
+/// the split after intermediate directories appear would move the anchor deeper and change the key.
+///
+/// The anchor is empty only when no ancestor exists, which on both supported platforms means the
+/// path had no root to begin with.
+pub(crate) fn split_existing_anchor(path: &Path) -> (PathBuf, PathBuf) {
+    let mut cursor = path;
+    let mut tail = Vec::new();
+    loop {
+        if let Ok(canonical) = fs::canonicalize(cursor) {
+            let mut suffix = PathBuf::new();
+            for component in tail.iter().rev() {
+                suffix.push(component);
+            }
+            return (canonical, suffix);
+        }
+        let Some(name) = cursor.file_name() else {
+            return (PathBuf::new(), lexical_normalize(path));
+        };
+        tail.push(name.to_os_string());
+        let Some(parent) = cursor.parent() else {
+            return (PathBuf::new(), lexical_normalize(path));
+        };
+        cursor = parent;
+    }
+}
+
+/// Canonicalizes the longest existing prefix of `path` and re-appends the remaining components.
+pub(crate) fn canonical_anchor(path: &Path) -> PathBuf {
+    let (anchor, suffix) = split_existing_anchor(path);
+    lexical_normalize(&anchor.join(suffix))
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf, AppError> {
