@@ -102,6 +102,9 @@ impl LinkBackend for UnixBackend {
                 reason: error.to_string(),
             }
         })?;
+        // `symlink` returns status rather than an object capability. The first observation below
+        // establishes evidence for later operations but cannot prove continuity from this call;
+        // ADR 0015 records the non-cooperating replacement window.
         #[cfg(test)]
         if let Err(error) = super::testing::reach_hook(
             super::testing::HookPoint::AfterLinkCreation,
@@ -121,7 +124,7 @@ impl LinkBackend for UnixBackend {
         let Some(created_target) = created.target.as_ref() else {
             return Err(retained_create_error(
                 request,
-                "the staged entry could not be proved to be the symbolic link just created",
+                "the initial staged entry observation was not a symbolic link",
             ));
         };
         if created.kind != EntryKind::Symlink
@@ -130,7 +133,7 @@ impl LinkBackend for UnixBackend {
         {
             return Err(retained_create_error(
                 request,
-                "the staged entry could not be proved to be the symbolic link just created",
+                "the initial staged entry observation did not match the required symbolic link",
             ));
         }
         #[cfg(test)]

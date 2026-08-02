@@ -85,6 +85,9 @@ impl LinkBackend for WindowsBackend {
         let error = match std::os::windows::fs::symlink_dir(&source_canonical, &request.staged_path)
         {
             Ok(()) => {
+                // `CreateSymbolicLinkW` returns status rather than a handle. The first no-follow
+                // open below establishes evidence for later operations but cannot prove continuity
+                // from the create call; ADR 0015 records that residual window.
                 #[cfg(test)]
                 if let Err(error) = super::testing::reach_hook(
                     super::testing::HookPoint::AfterLinkCreation,
@@ -93,7 +96,7 @@ impl LinkBackend for WindowsBackend {
                 ) {
                     return Err(retained_create_error(request, &error.to_string()));
                 }
-                let opened = match Self::open_entry(&request.staged_path, Access::Delete) {
+                let opened = match Self::open_entry(&request.staged_path, Access::Remove) {
                     Ok(Some(opened)) => opened,
                     Ok(None) => {
                         return Err(retained_create_error(
@@ -115,7 +118,7 @@ impl LinkBackend for WindowsBackend {
                     _ => {
                         return Err(retained_create_error(
                             request,
-                            "the staged entry could not be proved to be the symbolic link just created",
+                            "the initial staged entry observation did not match the required symbolic link",
                         ));
                     }
                 };
@@ -160,6 +163,8 @@ impl LinkBackend for WindowsBackend {
 
     fn create_directory(&self, path: &Path) -> Result<OwnedDirectory, LinkError> {
         fs::create_dir(path).map_err(|error| directory_create_error(path, error.to_string()))?;
+        // `CreateDirectoryW` returns status rather than a handle. ADR 0015 scopes ownership
+        // evidence to the first no-follow open below rather than claiming object continuity here.
         #[cfg(test)]
         if let Err(error) = super::testing::reach_hook(
             super::testing::HookPoint::AfterDirectoryCreation,
@@ -183,7 +188,7 @@ impl LinkBackend for WindowsBackend {
         if opened.entry.kind != EntryKind::Directory || opened.entry.identity.is_none() {
             return Err(retained_directory_create_error(
                 path,
-                "the staged entry could not be proved to be the directory just created",
+                "the initial staged entry observation was not a directory with stable identity",
             ));
         }
         Ok(OwnedDirectory {
@@ -336,7 +341,7 @@ impl LinkBackend for WindowsBackend {
         &self,
         recorded: &OwnedDirectory,
     ) -> Result<RemoveOutcome, LinkError> {
-        let Some(opened) = Self::open_entry(&recorded.path, Access::Delete)? else {
+        let Some(opened) = Self::open_entry(&recorded.path, Access::Remove)? else {
             return Ok(RemoveOutcome::AlreadyAbsent);
         };
         match verify_directory_ownership(&opened.entry, recorded) {
@@ -350,7 +355,11 @@ impl LinkBackend for WindowsBackend {
                     None,
                 )?;
                 match windows_ffi::delete_by_handle(&opened.handle) {
-                    Ok(()) => Ok(RemoveOutcome::Removed),
+                    Ok(()) => {
+                        let removed_identity = opened.entry.identity.clone();
+                        drop(opened);
+                        self.confirm_removal(&recorded.path, removed_identity.as_ref())
+                    }
                     Err(error) if super::is_not_empty(&error) => Ok(RemoveOutcome::NotEmpty),
                     Err(error) => Err(LinkError::Remove {
                         path: recorded.path.clone(),
@@ -362,7 +371,7 @@ impl LinkBackend for WindowsBackend {
     }
 
     fn remove_link_entry(&self, recorded: &CreatedLink) -> Result<RemoveOutcome, LinkError> {
-        let Some(opened) = Self::open_entry(&recorded.path, Access::Delete)? else {
+        let Some(opened) = Self::open_entry(&recorded.path, Access::Remove)? else {
             return Ok(RemoveOutcome::AlreadyAbsent);
         };
         match verify_ownership(&opened.entry, recorded, |target| {
@@ -377,12 +386,15 @@ impl LinkBackend for WindowsBackend {
                     &recorded.path,
                     None,
                 )?;
-                windows_ffi::delete_by_handle(&opened.handle)
-                    .map(|()| RemoveOutcome::Removed)
-                    .map_err(|error| LinkError::Remove {
+                windows_ffi::delete_by_handle(&opened.handle).map_err(|error| {
+                    LinkError::Remove {
                         path: recorded.path.clone(),
                         reason: error.to_string(),
-                    })
+                    }
+                })?;
+                let removed_identity = opened.entry.identity.clone();
+                drop(opened);
+                self.confirm_removal(&recorded.path, removed_identity.as_ref())
             }
         }
     }
@@ -406,6 +418,36 @@ fn rename_opened_no_replace(
 }
 
 impl WindowsBackend {
+    /// Confirms that closing a successful POSIX-disposition handle removed the recorded object.
+    ///
+    /// A different entry may legitimately take the old pathname immediately after the close. Its
+    /// different identity proves the disposed object is no longer there without treating the new
+    /// occupant as an error or attempting to remove it.
+    fn confirm_removal(
+        &self,
+        path: &Path,
+        removed_identity: Option<&PlatformIdentity>,
+    ) -> Result<RemoveOutcome, LinkError> {
+        let live = self
+            .inspect_no_follow(path)
+            .map_err(|error| LinkError::Remove {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "handle disposition succeeded but namespace removal could not be confirmed: \
+                     {error}"
+                ),
+            })?;
+        if live.kind == EntryKind::Missing || live.identity.as_ref() != removed_identity {
+            return Ok(RemoveOutcome::Removed);
+        }
+        Err(LinkError::Remove {
+            path: path.to_path_buf(),
+            reason: "handle disposition returned success but the recorded entry remained visible \
+                     after the handle closed"
+                .to_owned(),
+        })
+    }
+
     /// Opens and fully observes one entry without following a reparse point.
     ///
     /// Every required value comes from `handle`. The caller may discard it for read-only
@@ -474,11 +516,13 @@ impl WindowsBackend {
         Ok(entry)
     }
 
-    /// Creates a junction and proves the created entry resolves where it was meant to.
+    /// Creates a junction and establishes handle evidence that it resolves where it was meant to.
     ///
     /// A junction is an empty directory carrying a mount-point reparse buffer. Once the new
     /// directory is opened and identified, the same handle writes, reads back, and if necessary
     /// rolls back the entry. A failure before that evidence exists leaves the pathname untouched.
+    /// ADR 0015 records that a replacement crossing the status-only create boundary can therefore
+    /// be adopted and receive the mount-point data before SkillMount can distinguish it.
     fn create_junction(
         request: &LinkRequest,
         source_canonical: &Path,
@@ -486,6 +530,8 @@ impl WindowsBackend {
         // `create_dir` fails when the staged path exists, which keeps creation no-replace.
         fs::create_dir(&request.staged_path)
             .map_err(|error| create_error(request, error.to_string()))?;
+        // `CreateDirectoryW` returns status rather than a handle. ADR 0015 scopes ownership
+        // evidence to the first no-follow open below rather than claiming object continuity here.
         #[cfg(test)]
         if let Err(error) = super::testing::reach_hook(
             super::testing::HookPoint::AfterDirectoryCreation,
@@ -507,7 +553,7 @@ impl WindowsBackend {
         if opened.entry.kind != EntryKind::Directory || opened.entry.identity.is_none() {
             return Err(retained_create_error(
                 request,
-                "the staged entry could not be proved to be the junction directory just created",
+                "the initial staged entry observation was not a directory with stable identity",
             ));
         }
 
@@ -756,7 +802,7 @@ fn retained_create_error(request: &LinkRequest, reason: &str) -> LinkError {
     )
 }
 
-/// Rolls back an entry whose ownership is already bound to `handle` and preserves both failures.
+/// Rolls back the entry whose initial evidence is bound to `handle` and preserves both failures.
 fn rollback_create_error(request: &LinkRequest, handle: &OwnedHandle, reason: &str) -> LinkError {
     match windows_ffi::delete_by_handle(handle) {
         Ok(()) => create_error(

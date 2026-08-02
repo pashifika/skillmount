@@ -16,6 +16,8 @@
 
 #![allow(unsafe_code)]
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
@@ -27,13 +29,16 @@ use windows_sys::Win32::Foundation::{
     ERROR_CALL_NOT_IMPLEMENTED, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
     ERROR_NOT_SUPPORTED, FILETIME, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
+#[cfg(test)]
+use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_DISPOSITION_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128, FILE_ID_INFO,
-    FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileDispositionInfo, FileIdInfo, FileRenameInfo, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    OPEN_EXISTING, SetFileInformationByHandle,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_DISPOSITION_FLAG_DELETE,
+    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfoEx,
+    FileIdInfo, FileRenameInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
+    SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
@@ -41,23 +46,80 @@ use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPAR
 use super::reparse::MAXIMUM_REPARSE_DATA_BUFFER_SIZE;
 use super::winpath;
 
+#[cfg(test)]
+thread_local! {
+    static INJECTED_DELETE_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
+}
+
+/// Runs one native test with the next handle disposition forced to fail.
+#[cfg(test)]
+pub(super) fn with_delete_error<R>(code: i32, operation: impl FnOnce() -> R) -> R {
+    INJECTED_DELETE_ERROR.with(|slot| {
+        assert!(
+            slot.replace(Some(code)).is_none(),
+            "delete-error injections cannot be nested"
+        );
+    });
+    let _guard = DeleteErrorGuard;
+    operation()
+}
+
+#[cfg(test)]
+fn take_injected_delete_error() -> Option<io::Error> {
+    INJECTED_DELETE_ERROR
+        .with(Cell::take)
+        .map(io::Error::from_raw_os_error)
+}
+
+#[cfg(test)]
+struct DeleteErrorGuard;
+
+#[cfg(test)]
+impl Drop for DeleteErrorGuard {
+    fn drop(&mut self) {
+        INJECTED_DELETE_ERROR.with(|slot| slot.set(None));
+    }
+}
+
 /// Capabilities required from a no-follow entry handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Access {
     /// Enough to read attributes, identity, and reparse data.
     Inspect,
-    /// Enough to rename or delete the opened entry after inspection.
+    /// Enough to rename the opened entry after inspection while allowing pathname contention.
     Delete,
-    /// Enough to write a reparse buffer and roll back the opened entry.
+    /// Enough to delete the opened entry while excluding ordinary writers and deleters.
+    Remove,
+    /// Enough to write a reparse buffer and roll back while excluding ordinary peer mutation.
     WriteReparseData,
+    /// Attribute-only reparse mutation used to prove the Windows share-mode boundary.
+    #[cfg(test)]
+    AttributeWrite,
 }
 
 impl Access {
     const fn desired(self) -> u32 {
         match self {
             Self::Inspect => FILE_READ_ATTRIBUTES,
-            Self::Delete => FILE_READ_ATTRIBUTES | DELETE,
+            Self::Delete | Self::Remove => FILE_READ_ATTRIBUTES | DELETE,
             Self::WriteReparseData => GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE,
+            #[cfg(test)]
+            Self::AttributeWrite => FILE_WRITE_ATTRIBUTES,
+        }
+    }
+
+    const fn share_mode(self) -> u32 {
+        match self {
+            // Placement deliberately permits a competing rename: the retained handle, rather than
+            // the pathname, is the mutation authority. Read-only inspection has no reason to deny
+            // ordinary sharing either.
+            Self::Inspect | Self::Delete => FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            // Removal and creation rollback exclude ordinary write and delete access. Windows does
+            // not apply share modes to attribute-only access, so ADR 0016 scopes kind and target as
+            // eligibility checks while the retained identity remains the object authority.
+            Self::Remove | Self::WriteReparseData => FILE_SHARE_READ,
+            #[cfg(test)]
+            Self::AttributeWrite => FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         }
     }
 }
@@ -80,7 +142,7 @@ pub(super) fn open_no_follow(path: &Path, access: Access) -> io::Result<OwnedHan
         CreateFileW(
             wide.as_ptr(),
             access.desired(),
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            access.share_mode(),
             ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -417,17 +479,26 @@ pub(super) fn rename_by_handle_no_replace(
     Ok(())
 }
 
-/// Marks the opened entry for deletion.
+/// Requests POSIX-style deletion of the opened entry.
 ///
-/// The disposition applies to the object designated by `handle`. Closing the final handle completes
-/// deletion; no later pathname lookup can redirect it to a replacement entry.
+/// The disposition applies to the object designated by `handle`. Once this delete handle closes,
+/// the object's link is removed from the visible namespace even if existing handles remain open.
+/// Callers exclude ordinary write and delete sharing, so another handle cannot rename the object or
+/// cancel the disposition before that close. ADR 0016 records why basic disposition is insufficient
+/// and why attribute-only reparse mutation does not supersede the retained object identity.
 ///
 /// # Errors
 ///
 /// Returns the operating-system error when the opened entry cannot be marked for deletion.
 pub(super) fn delete_by_handle(handle: &OwnedHandle) -> io::Result<()> {
-    let information = FILE_DISPOSITION_INFO { DeleteFile: true };
-    let length = u32::try_from(size_of::<FILE_DISPOSITION_INFO>()).map_err(|_| {
+    #[cfg(test)]
+    if let Some(error) = take_injected_delete_error() {
+        return Err(error);
+    }
+    let information = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    let length = u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "disposition information is larger than the API accepts",
@@ -438,7 +509,7 @@ pub(super) fn delete_by_handle(handle: &OwnedHandle) -> io::Result<()> {
     let succeeded = unsafe {
         SetFileInformationByHandle(
             raw(handle),
-            FileDispositionInfo,
+            FileDispositionInfoEx,
             (&raw const information).cast(),
             length,
         )

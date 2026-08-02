@@ -5,11 +5,13 @@
 //! links inside it, so undoing it first would leave a directory that is no longer empty and that
 //! cleanup then has to refuse.
 //!
-//! Removal itself is deliberately timid. An entry is removed only when the live entry still matches
-//! every piece of evidence the journal recorded — kind, target, and platform identity for a link;
-//! identity and emptiness for a directory. Anything else is retained and reported. That asymmetry
-//! is the point: a retained entry is a nuisance an operator or a later run can clear, while a
-//! removed one that belonged to somebody else is gone.
+//! Removal itself is deliberately timid. The removal observation must match every piece of evidence
+//! the journal recorded — kind, target, and platform identity for a link; identity and emptiness for
+//! a directory. Windows then retains that verified object handle through disposition; ADR 0016
+//! records why its identity, rather than mutable reparse metadata, remains the authority. Anything
+//! that already mismatches is retained and reported. That asymmetry is the point: a retained entry
+//! is a nuisance an operator or a later run can clear, while a removed one that belonged to somebody
+//! else is gone.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -200,12 +202,17 @@ impl Transaction {
             let Some(index) = self.journal.actions.iter().position(|a| a.id == id) else {
                 continue;
             };
-            if let Some(retained) = self.placement_residue.get(&id) {
+            let placement_residue = self.placement_residue.get(&id).cloned();
+            if let Some(retained) = &placement_residue {
                 report.retained.push(retained.clone());
-                continue;
             }
             let action = self.journal.actions[index].clone();
-            let outcome = self.clear_action(&action, sequence, &mut report);
+            let outcome = self.clear_action(
+                &action,
+                sequence,
+                &mut report,
+                placement_residue.as_ref().map(|entry| entry.path.as_path()),
+            );
 
             // The status is advanced only when nothing this transaction owns remains at either
             // candidate path. Leaving it otherwise is what keeps a retained entry described by the
@@ -220,25 +227,38 @@ impl Transaction {
 
     /// Tries every path an action's entry could occupy, temporary before final.
     ///
-    /// The first path that holds anything decides the outcome. An absent path is not an outcome:
-    /// a staged entry that was already placed is absent at its temporary path and present at its
-    /// final one, and stopping at the first absence would leave the placed entry behind.
+    /// A candidate that cannot be proved is retained and reported, but it does not hide a later
+    /// candidate that may still hold the transaction-owned entry. This matters when handle-bound
+    /// placement moves the verified object while another actor installs a replacement at the old
+    /// staged pathname. A placement residue has already classified one path as retained, so only
+    /// that exact candidate is skipped; it cannot hide the action's other candidate. Once one owned
+    /// entry is removed the scan stops, because an action can own at most one object and a second
+    /// removal would exceed the journal's evidence.
     fn clear_action(
         &self,
         action: &JournalAction,
         sequence: u32,
         report: &mut CleanupReport,
+        preserved_path: Option<&Path>,
     ) -> Outcome {
         if action.kind == RecordedKind::Undecided {
             return self.inspect_undecided_candidates(action, report);
         }
+        let mut kept = preserved_path.is_some();
         for path in action.candidate_paths() {
+            if preserved_path == Some(path.as_path()) {
+                continue;
+            }
             match self.remove_candidate(action, &path) {
                 Ok(RemoveOutcome::AlreadyAbsent) => {}
                 Ok(RemoveOutcome::Removed) => {
                     report.removed.push(path);
                     reached(removal_checkpoint(action.kind), sequence);
-                    return Outcome::Cleared;
+                    return if kept {
+                        Outcome::Kept
+                    } else {
+                        Outcome::Cleared
+                    };
                 }
                 Ok(RemoveOutcome::NotEmpty) => {
                     report.retained.push(RetainedEntry {
@@ -247,24 +267,29 @@ impl Transaction {
                                  removing it would take them with it"
                             .to_owned(),
                     });
-                    return Outcome::Kept;
+                    kept = true;
                 }
                 Ok(RemoveOutcome::OwnershipMismatch(mismatch)) => {
                     report.retained.push(RetainedEntry {
                         path,
                         reason: mismatch_reason(mismatch),
                     });
-                    return Outcome::Kept;
+                    kept = true;
                 }
                 Err(error) => {
                     report.errors.push(error.to_string());
-                    return Outcome::Kept;
+                    kept = true;
                 }
             }
         }
-        // Nothing at either path. The process may have stopped before the entry was created, or a
-        // previous pass may already have removed it; either way there is nothing left to own.
-        Outcome::Cleared
+        if kept {
+            Outcome::Kept
+        } else {
+            // Nothing at either path. The process may have stopped before the entry was created,
+            // or a previous pass may already have removed it; either way there is nothing left to
+            // own.
+            Outcome::Cleared
+        }
     }
 
     /// Inspects both candidates for an intent whose concrete implementation was not durable.

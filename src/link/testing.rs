@@ -76,6 +76,12 @@ pub(crate) fn with_hook<R>(
     operation()
 }
 
+/// Runs one Windows test with the next handle disposition forced to fail.
+#[cfg(windows)]
+pub(crate) fn with_delete_error<R>(code: i32, operation: impl FnOnce() -> R) -> R {
+    super::windows_ffi::with_delete_error(code, operation)
+}
+
 /// Announces one backend boundary to the current test hook.
 pub(crate) fn reach_hook(
     point: HookPoint,

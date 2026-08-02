@@ -93,7 +93,7 @@ impl EntryKind {
     }
 }
 
-/// The link implementation an entry was created with.
+/// The link implementation recorded for an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreatedLinkKind {
     /// A directory symbolic link.
@@ -145,7 +145,7 @@ pub struct LinkTarget {
 /// falls back to the legacy volume-serial and 64-bit index pair, both read from a handle opened
 /// without traversing the entry. The preference matters: Microsoft documents the legacy index as
 /// neither guaranteed unique on `ReFS` nor safe from reuse after a deletion, so on such a volume it
-/// is not on its own a proof that an entry is the one this process created.
+/// is not on its own reliable evidence that a live entry is still the recorded one.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PlatformIdentity(String);
 
@@ -229,28 +229,30 @@ pub struct LinkRequest {
     pub mode: LinkMode,
 }
 
-/// Ownership evidence for a link entry this process created.
+/// Ownership evidence for the link entry recorded at the initial evidence boundary.
 ///
 /// Cleanup requests removal only after the inspected entry matches every field recorded here.
 /// Windows retains the no-follow handle that supplied those fields through removal; Unix rechecks
 /// the pathname immediately before unlink under cooperating-session locks, with the residual
-/// non-cooperating race recorded in ADR 0014. Recording the canonical source *and* the raw target
-/// *and* the identity is deliberate. The raw target still describes the entry after its target has
-/// disappeared, which keeps a dangling link removable; the canonical source is what diagnostics
-/// quote. But the identity is the only field that distinguishes this process's entry from an
-/// identical one someone else created, so an entry recorded without one is never requested for
-/// removal and reports [`OwnershipMismatch::IdentityUnavailable`] instead.
+/// non-cooperating race recorded in ADR 0014. Windows can exclude ordinary writers but not the
+/// attribute-only access that may mutate reparse metadata, so ADR 0016 makes identity the authority
+/// for that retained object after the eligibility check. Recording the canonical source *and* the
+/// raw target *and* the identity is deliberate. The raw target still describes the entry after its
+/// target has disappeared, which keeps a dangling link removable; the canonical source is what
+/// diagnostics quote. But the identity is the only field that distinguishes the recorded entry from
+/// an identical later replacement, so an entry recorded without one is never requested for removal
+/// and reports [`OwnershipMismatch::IdentityUnavailable`] instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedLink {
     /// Path the entry currently occupies: the staged sibling until it is placed.
     pub path: PathBuf,
-    /// Implementation the entry was created with.
+    /// Implementation observed at the initial evidence boundary.
     pub kind: CreatedLinkKind,
     /// Target exactly as written to the entry.
     pub target: PathBuf,
     /// Canonical directory the entry refers to.
     pub source_canonical: PathBuf,
-    /// Platform identity captured at creation, when the host reports one.
+    /// Platform identity captured at the initial evidence boundary, when the host reports one.
     pub identity: Option<PlatformIdentity>,
 }
 
@@ -268,7 +270,7 @@ impl CreatedLink {
     }
 }
 
-/// Ownership evidence for a directory this process created.
+/// Ownership evidence for the directory recorded at the initial evidence boundary.
 ///
 /// A helper directory gets the same treatment as a link, and for the same reason: "it is empty" is
 /// not proof that it is *this* transaction's directory. A user who removed the mounts by hand and
@@ -278,7 +280,7 @@ impl CreatedLink {
 pub struct OwnedDirectory {
     /// Path the directory currently occupies.
     pub path: PathBuf,
-    /// Platform identity captured at creation, when the host reports one.
+    /// Platform identity captured at the initial evidence boundary, when the host reports one.
     pub identity: Option<PlatformIdentity>,
 }
 
@@ -435,8 +437,10 @@ pub trait LinkBackend: sealed::Sealed + Send + Sync {
 
     /// Creates one empty directory at `path`, which must not already exist.
     ///
-    /// The created entry is inspected before it is returned, so the caller receives the platform
-    /// identity that later proves the directory is still the one this transaction made.
+    /// The entry is inspected before it is returned, so the caller receives identity for the
+    /// object observed at the initial evidence boundary. The supported create APIs return status,
+    /// not an object capability, so this does not claim continuity across the create-to-observation
+    /// window; ADR 0015 records that residual scope.
     ///
     /// # Errors
     ///
@@ -478,9 +482,10 @@ pub trait LinkBackend: sealed::Sealed + Send + Sync {
     /// Removes one link entry after it matches the recorded evidence.
     ///
     /// Removal never descends into the target and refuses a regular directory outright. Windows
-    /// verifies and disposes the same no-follow handle. Unix performs a final no-follow check and
-    /// pathname unlink while product callers hold cooperative locks; ADR 0014 records the remaining
-    /// race with processes that do not honor those advisory locks.
+    /// verifies and disposes the same no-follow handle; ADR 0016 scopes mutable reparse metadata
+    /// after that check without weakening the retained object's identity authority. Unix performs a
+    /// final no-follow check and pathname unlink while product callers hold cooperative locks; ADR
+    /// 0014 records the remaining race with processes that do not honor those advisory locks.
     ///
     /// # Errors
     ///
@@ -549,8 +554,8 @@ pub(crate) fn verify_ownership(
             if live.kind != recorded.kind.entry_kind() {
                 return Ownership::Mismatch(OwnershipMismatch::KindChanged);
             }
-            // Identity is checked before the target: an entry someone else recreated pointing at
-            // the same directory is still not the entry this process created, and only the
+            // Identity is checked before the target: an entry replaced after evidence was recorded
+            // may point at the same directory but is still not the recorded entry, and only the
             // identity can tell those apart.
             //
             // A missing identity on either side is therefore a refusal, not a skipped check.
@@ -574,12 +579,12 @@ pub(crate) fn verify_ownership(
     }
 }
 
-/// Decides whether a live entry is still the directory this transaction created.
+/// Decides whether a live entry is still the directory this transaction recorded.
 ///
 /// The identity rule is the same one links use and is here for the same reason: a directory that
 /// someone recreated at the same path with the same name is a different directory, and only the
 /// identity distinguishes them. A missing identity on either side therefore refuses, which leaves
-/// harmless residue instead of removing a directory this process cannot prove it made.
+/// harmless residue instead of removing a directory this process cannot match to its evidence.
 pub(crate) fn verify_directory_ownership(live: &PathEntry, recorded: &OwnedDirectory) -> Ownership {
     match live.kind {
         EntryKind::Missing => Ownership::Absent,
@@ -629,7 +634,8 @@ fn placement_mismatch(ownership: Ownership) -> Option<PlacementMismatch> {
 ///
 /// `create_dir` fails when the path exists, which is what keeps creation no-replace without a
 /// separate existence check. A failed post-create observation retains the path: Unix cannot bind a
-/// later rollback unlink to the directory that was just created.
+/// later rollback unlink to the directory observed at creation; ADR 0015 also records that the
+/// status-only create call cannot prove object continuity into this first observation.
 #[cfg(unix)]
 pub(crate) fn create_directory_entry(
     backend: &dyn LinkBackend,
@@ -652,7 +658,7 @@ pub(crate) fn create_directory_entry(
     if created.kind != EntryKind::Directory || created.identity.is_none() {
         return Err(retained_directory_create_error(
             path,
-            "the staged entry could not be proved to be the directory just created",
+            "the initial staged entry observation was not a directory with stable identity",
         ));
     }
     Ok(OwnedDirectory {

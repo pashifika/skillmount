@@ -10,8 +10,9 @@
 //! these tests exercise the same code path a shipped binary runs minus the checkpoint itself.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, ChildStderr, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
@@ -657,34 +658,52 @@ fn a_cleanup_that_cannot_finish_keeps_its_journal_and_its_evidence() {
 
 #[test]
 fn two_codex_sessions_on_one_store_serialize() {
-    let fixture = Fixture::new("codex-serialized");
-    fixture.skill("alpha");
+    for checkpoint in ["journal-active", "journal-cleaning"] {
+        let fixture = Fixture::new(&format!("codex-serialized-{checkpoint}"));
+        fixture.skill("alpha");
 
-    // The first session pauses while holding its locks, which is the window a second one must not
-    // be able to enter.
-    let mut holder: Child = fixture
-        .command("codex", &[])
-        .env("SKILLMOUNT_HOLD_AT", "journal-active")
-        .env("SKILLMOUNT_HOLD_MS", "4000")
-        .spawn()
-        .expect("the first session should start");
-    wait_for(|| !fixture.journals().is_empty());
+        // The first session pauses while holding its locks, once during apply and once immediately
+        // before cleanup/removal. A second session must not enter either mutation interval.
+        let mut holder: Child = fixture
+            .command("codex", &[])
+            .env("SKILLMOUNT_HOLD_AT", checkpoint)
+            .env("SKILLMOUNT_HOLD_MS", "4000")
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the first session should start");
+        let mut holder_stderr = wait_for_hold(&mut holder, checkpoint);
 
-    let contender = fixture.run("codex", &[]);
-    let _ = holder.wait();
+        let contender = fixture.run("codex", &[]);
+        let holder_status = holder.wait().expect("the first session remains waitable");
+        let mut holder_diagnostics = String::new();
+        holder_stderr
+            .read_to_string(&mut holder_diagnostics)
+            .expect("the first session stderr remains readable");
 
-    assert_eq!(
-        contender.status.code(),
-        Some(75),
-        "a second Codex session on the same store must wait or report a temporary failure: {}",
-        String::from_utf8_lossy(&contender.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&contender.stderr);
-    assert!(
-        stderr.contains("another SkillMount session holds"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("nothing was changed"), "{stderr}");
+        assert_eq!(
+            holder_status.code(),
+            Some(70),
+            "the first session must finish at the reserved launch boundary after holding at \
+             {checkpoint}: {holder_diagnostics}"
+        );
+
+        assert_eq!(
+            contender.status.code(),
+            Some(75),
+            "a second Codex session on the same store must wait or report a temporary failure at \
+             {checkpoint}: {}",
+            String::from_utf8_lossy(&contender.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&contender.stderr);
+        assert!(
+            stderr.contains("another SkillMount session holds"),
+            "{checkpoint}: {stderr}"
+        );
+        assert!(
+            stderr.contains("nothing was changed"),
+            "{checkpoint}: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -808,4 +827,58 @@ fn wait_for(condition: impl Fn() -> bool) {
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("the spawned session never reached an observable state");
+}
+
+fn wait_for_hold(child: &mut Child, checkpoint: &str) -> BufReader<ChildStderr> {
+    let stderr = child.stderr.take().expect("the holder stderr is piped");
+    let expected = format!("failure injection holding at {checkpoint}");
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut stderr = BufReader::new(stderr);
+        let outcome = loop {
+            let mut line = String::new();
+            match stderr.read_line(&mut line) {
+                Ok(0) => break Err("the holder exited before reaching the checkpoint".to_owned()),
+                Ok(_) if line.contains(&expected) => break Ok(stderr),
+                Ok(_) => {}
+                Err(error) => {
+                    break Err(format!("the holder stderr became unreadable: {error}"));
+                }
+            }
+        };
+        let _ = sender.send(outcome);
+    });
+
+    match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(stderr)) => {
+            reader.join().expect("the stderr reader must not panic");
+            stderr
+        }
+        Ok(Err(reason)) => {
+            let kill_result = child.kill();
+            let status = child.wait();
+            reader.join().expect("the stderr reader must not panic");
+            panic!("{reason} {checkpoint}; kill: {kill_result:?}; status: {status:?}");
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let kill_result = child.kill();
+            let status = child.wait();
+            reader.join().expect("the stderr reader must unblock");
+            panic!(
+                "the holder did not reach {checkpoint} within two seconds; kill: {kill_result:?}; \
+                 status: {status:?}"
+            );
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let kill_result = child.kill();
+            let status = child.wait();
+            reader
+                .join()
+                .expect("the stderr reader failure is observable");
+            panic!(
+                "the stderr reader disconnected before {checkpoint}; kill: {kill_result:?}; \
+                 status: {status:?}"
+            );
+        }
+    }
 }

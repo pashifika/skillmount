@@ -134,12 +134,17 @@ fn a_staged_link_is_placed_removed_and_leaves_its_source_untouched() {
 fn failed_post_create_link_inspection_retains_the_staged_path() {
     let fixture = Fixture::new("unix-create-residue");
     let source = fixture.source("source");
+    let replacement_source = fixture.source("replacement-source");
     let staged = fixture.path("staged");
     let hook_path = staged.clone();
+    let hook_target = replacement_source.clone();
 
     let error = with_hook(
         move |event| {
             if event.point == HookPoint::AfterLinkCreation && event.path == hook_path {
+                fs::remove_file(&hook_path).expect("the created link is replaced before evidence");
+                std::os::unix::fs::symlink(&hook_target, &hook_path)
+                    .expect("the replacement takes the staged pathname");
                 return Err(injected_hook_error(&hook_path, "link creation"));
             }
             Ok(())
@@ -154,8 +159,14 @@ fn failed_post_create_link_inspection_retains_the_staged_path() {
         staged.is_symlink(),
         "the ambiguous staged entry is retained"
     );
+    assert_eq!(
+        fs::canonicalize(&staged).expect("the retained replacement resolves"),
+        replacement_source,
+        "failure before initial evidence must not pathname-delete the replacement"
+    );
     fs::remove_file(&staged).expect("the fixture-owned residue is cleaned up");
     assert_source_intact(&source);
+    assert_source_intact(&replacement_source);
 }
 
 #[test]
@@ -167,6 +178,11 @@ fn failed_post_create_directory_inspection_retains_the_staged_path() {
     let error = with_hook(
         move |event| {
             if event.point == HookPoint::AfterDirectoryCreation && event.path == hook_path {
+                fs::remove_dir(&hook_path)
+                    .expect("the created directory is replaced before evidence");
+                fs::create_dir(&hook_path).expect("the replacement takes the staged pathname");
+                fs::write(hook_path.join("their-own-work"), "keep")
+                    .expect("the replacement carries operator state");
                 return Err(injected_hook_error(&hook_path, "directory creation"));
             }
             Ok(())
@@ -178,9 +194,10 @@ fn failed_post_create_directory_inspection_retains_the_staged_path() {
     assert!(matches!(error, LinkError::Create { .. }));
     assert!(error.to_string().contains("retained staged path"));
     assert!(
-        staged.is_dir(),
-        "the ambiguous staged directory is retained"
+        staged.join("their-own-work").is_file(),
+        "the ambiguous staged replacement is retained"
     );
+    fs::remove_file(staged.join("their-own-work")).expect("the fixture residue is emptied");
     fs::remove_dir(&staged).expect("the fixture-owned residue is cleaned up");
 }
 

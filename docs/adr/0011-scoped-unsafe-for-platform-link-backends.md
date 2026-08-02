@@ -34,8 +34,11 @@ expose on the supported release targets:
 - **Object-bound rename and removal.** A pathname check followed by `MoveFileExW` or
   `RemoveDirectoryW` can act on a replacement. Windows can instead retain the no-follow handle that
   supplied attributes, identity, and reparse data. [`FILE_RENAME_INFO`][rename-info] renames that
-  object without replacement, and [`FILE_DISPOSITION_INFO`][disposition-info] deletes that object.
-  The standard library exposes neither handle mutation nor the variable-length rename layout.
+  object without replacement, and [`FILE_DISPOSITION_INFO_EX`][disposition-info] removes that
+  object's visible link with POSIX semantics when the verified handle closes. The standard library
+  exposes neither handle mutation nor the variable-length rename layout. ADR 0016 records why the
+  extended disposition contract replaced basic delete-pending disposition and why identity, rather
+  than mutable reparse metadata, remains the authority after handle verification.
 - **Durable journal replacement on Windows.** `std::fs::rename` replaces a journal but exposes no
   write-through option. The journal must not authorize the next filesystem mutation until its
   namespace replacement is durable, so the audited boundary also wraps `MoveFileExW` with
@@ -54,7 +57,7 @@ normative requirement, or move to `deny` and make every exception explicit and r
 
 [set-info]: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileinformationbyhandle
 [rename-info]: https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_rename_info
-[disposition-info]: https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_disposition_info
+[disposition-info]: https://learn.microsoft.com/windows-hardware/drivers/ddi/ntddk/ns-ntddk-_file_disposition_information_ex
 
 Both modules follow the same rules, which a reviewer can check by reading the two files:
 
@@ -115,7 +118,8 @@ allows: it makes new `unsafe` invisible in review anywhere in the crate, while b
   the MSRV is unchanged.
 - The later locking change already made `LockResourceIdentity::physical` use the link layer's
   `PlatformIdentity`. This hardening reuses that contract; it introduces no second identity type,
-  lock-key version, journal migration, dependency, or compatibility-matrix change.
+  lock-key version, journal migration, or dependency. ADR 0016 separately raises the Windows runtime
+  baseline to Windows 10 version 1709 for POSIX handle disposition.
 
 ## Verification
 
@@ -130,9 +134,12 @@ allows: it makes new `unsafe` invisible in review anywhere in the crate, while b
 - `src/link/unix_tests.rs::exactly_one_of_two_racing_placements_wins_the_destination` and its
   Windows counterpart run two real threads through one destination and require exactly one winner.
   A check-then-rename emulation fails these.
-- Windows native tests replace staged and removal pathnames after handle verification and require
-  placement or disposition to affect the verified object while preserving the replacement. The
-  `FILE_RENAME_INFO` layout test runs under both native x86 and x64 jobs.
+- Windows native tests replace staged pathnames after handle verification and require placement to
+  affect the verified object. Removal tests require the verified handle to exclude a competing
+  delete-capable rename and ordinary reparse writer, exercise the documented attribute-only mutation
+  exception without traversing either target, and require POSIX disposition to remove the visible
+  name while an unrelated inspect handle remains open. The `FILE_RENAME_INFO` layout test runs under
+  both native x86 and x64 jobs.
 - `tests/read_only.rs` continues to snapshot the project, the Skill source, and a redirected home
   directory around every `inspect` and `--dry-run` path, so the new no-follow handle opens cannot
   become writes without a failure.

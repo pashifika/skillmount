@@ -19,7 +19,8 @@ hardening named under [Reserved work](#reserved-work) are not implemented.
 SkillMount is a Rust wrapper CLI that makes Agent Skills stored in external directories visible for
 the intended lifetime of a Codex CLI or Claude Code CLI session. It resolves an ordered catalog,
 inspects the discovery scopes implemented by the selected adapter, produces a deterministic mount
-or preservation outcome for each selected Skill, and owns only the entries its transaction created.
+or preservation outcome for each selected Skill, and removes only entries that still match the
+transaction's recorded ownership evidence.
 
 One package installs two behaviorally identical binaries:
 
@@ -31,6 +32,10 @@ The initial release targets are:
 - `i686-pc-windows-msvc`;
 - `x86_64-pc-windows-msvc`;
 - `aarch64-apple-darwin`.
+
+Windows mutation requires Windows 10 version 1709 or later so verified entries can be unlinked with
+POSIX handle disposition even while unrelated inspect handles remain open. [ADR 0016](adr/0016-require-posix-handle-disposition-on-windows.md)
+records that runtime baseline.
 
 Linux and WSL are not release targets. Linux-specific code exists only where the Ubuntu quality
 job needs to exercise a portable invariant such as atomic no-replace placement. Windows ARM64 and
@@ -208,13 +213,18 @@ no-replace placement. Successful placement returns identity for the object estab
 path before the journal advances to `applied`; a visible mismatch remains journal-backed residue.
 Rollback and ordinary cleanup share the same reverse-order removal path. Windows derives
 attributes, strongest identity, and reparse data from one no-follow handle and retains that handle
-through rename or disposition. Unix performs final no-follow verification before pathname mutation
+through rename or disposition. Kind and target are eligibility checks at the Windows handle
+boundary; retained identity is the authority for later object-bound mutation because attribute-only
+access is exempt from Windows share-mode enforcement. Disposition never traverses a reparse target.
+Unix performs final no-follow verification before pathname mutation
 while the application holds all cooperating-session locks; those advisory state-file locks do not
-exclude another program, so ADR 0014 records the residual final pathname race. A creation whose
-ownership cannot be established is reported and retained rather than removed by an unchecked
-pathname rollback. Recovery eligibility comes from the held lock set, never a recorded PID: PIDs
-are reusable and cannot authorize cleanup. Unreadable or future-schema journals block new mutation
-and are retained for operator inspection.
+exclude another program, so ADR 0014 records the residual final pathname race. Path-based link and
+directory creation returns no object capability on the supported APIs. The first no-follow
+observation establishes evidence for later operations but cannot prove continuity from the create
+call; ADR 0015 records that residual window. Failure before initial evidence is reported and
+retained rather than followed by unchecked pathname rollback. Recovery eligibility comes from the
+held lock set, never a recorded PID: PIDs are reusable and cannot authorize cleanup. Unreadable or
+future-schema journals block new mutation and are retained for operator inspection.
 
 ## Platform and unsafe boundary
 
@@ -236,9 +246,12 @@ decisions. Diagnostics may render a reversible representation only at the output
 macOS uses directory symbolic links and `renameatx_np(RENAME_EXCL)`. Windows prefers a directory
 symbolic link and falls back to a junction only for `ERROR_PRIVILEGE_NOT_HELD` in automatic mode;
 placement uses `SetFileInformationByHandle(FileRenameInfo)` with replacement disabled, and removal
-uses `FileDispositionInfo` on the verified handle. The variable-length rename layout is compiled and
-tested on both Windows x86 and x64. The Linux test branch uses `renameat2(RENAME_NOREPLACE)` but does
-not establish Linux product support.
+uses `FileDispositionInfoEx` with delete and POSIX-semantics flags on a verified handle that excludes
+ordinary write and delete access. Attribute-only reparse mutation can still occur without changing
+that object's identity; the removal handle closes before the backend confirms that its recorded
+identity is no longer visible. The variable-length rename layout is compiled and tested on both
+Windows x86 and x64. The Linux test branch uses `renameat2(RENAME_NOREPLACE)` but does not establish
+Linux product support.
 
 ## Cross-module invariants
 
@@ -254,13 +267,19 @@ The following are product rules rather than style preferences:
    mutating plan is accepted.
 6. No planned destination mutation occurs before its durable intent, and apply rechecks persisted
    preconditions.
-7. Windows mutation verifies and mutates the same no-follow object handle. Unix pathname mutation
-   performs the last available identity check under cooperating-session locks; visible uncertainty
-   is retained and reported, and advisory locks are never described as excluding other programs.
-8. Link removal never recursively descends into a target directory.
-9. Shared application and transaction code own policy and sequencing; agent adapters inspect and
+7. Windows placement verifies and mutates the same no-follow object handle. Windows removal checks
+   kind, target, and identity, then treats the retained identity as object authority; it excludes
+   ordinary write and delete access, uses POSIX disposition, closes that handle, and confirms the
+   recorded identity is no longer visible before reporting success. Attribute-only metadata access
+   does not transfer object authority. Unix pathname mutation performs the last available identity
+   check under cooperating-session locks; visible uncertainty is retained and reported, and advisory
+   locks are never described as excluding other programs.
+8. Initial creation evidence begins at the first no-follow observation, not at a preceding
+   status-only create call. Failure before that boundary retains the path without pathname rollback.
+9. Link removal never recursively descends into a target directory.
+10. Shared application and transaction code own policy and sequencing; agent adapters inspect and
    plan, while the sealed platform backend executes only the link primitives it is asked for.
-10. Product behavior never edits Git state, escalates privileges, or weakens agent permissions.
+11. Product behavior never edits Git state, escalates privileges, or weakens agent permissions.
 
 Tests enforce the observable parts of these rules. Local comments retain the narrower preconditions
 needed to preserve them inside an implementation.
@@ -275,7 +294,8 @@ needed to preserve them inside an implementation.
 - `inspect`, `--dry-run`, concise/verbose plan rendering, and read-only regression tests;
 - Unix/macOS symbolic-link and Windows symbolic-link/junction backends;
 - no-follow link-chain resolution, evidence-bearing atomic no-replace placement, Windows
-  handle-bound mutation, and Unix ownership-checked pathname mutation under cooperative locks;
+  handle-bound mutation after initial observation, Unix ownership-checked pathname mutation under
+  cooperative locks, and documented creation-to-observation residual scope;
 - logical and physical resource locks, versioned journals, write-ahead apply, rollback, cleanup,
   terminal kept state, and stale recovery;
 - crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
