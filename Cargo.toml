@@ -15,6 +15,19 @@ path = "src/bin/asm.rs"
 name = "skillmount"
 path = "src/bin/skillmount.rs"
 
+[[bin]]
+name = "skillmount-fake-agent"
+path = "tests/fixtures/fake_agent.rs"
+required-features = ["test-fixtures"]
+
+[[bin]]
+name = "skillmount-supervisor-harness"
+path = "tests/fixtures/supervisor_harness.rs"
+required-features = ["test-fixtures"]
+
+[features]
+test-fixtures = []
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
@@ -22,9 +35,9 @@ strip = "symbols"
 
 [lints.rust]
 missing_docs = "deny"
-# `deny` rather than `forbid`: the platform link backends need raw filesystem calls that no safe
-# API exposes, and `forbid` cannot be lifted anywhere. Every `allow` is a whole module that exists
-# only to wrap those calls, and no other module may opt in. See docs/adr/0011.
+# `deny` rather than `forbid`: the platform link backends and targeted Windows console forwarding
+# need narrow raw calls that no safe API exposes, and `forbid` cannot be lifted anywhere. Every
+# `allow` is a whole audited FFI module, and no other module may opt in. See ADR 0011 and ADR 0018.
 unsafe_code = "deny"
 
 [lints.clippy]
@@ -48,15 +61,26 @@ sha2 = { version = "=0.11.0", default-features = false }
 # `renameat2(RENAME_NOREPLACE)`, both only through libc.
 [target."cfg(unix)".dependencies]
 libc = "=0.2.189"
+# Signal hooks write only to their internal self-pipe in the handler. The process module consumes
+# origin data and performs all forwarding, waiting, and cleanup in ordinary Rust control flow.
+signal-hook = { version = "=0.4.4", default-features = false, features = ["extended-siginfo"] }
+# `kill`/`killpg` are exposed through a maintained safe API, keeping raw Unix process FFI out of
+# the process supervisor.
+nix = { version = "=0.31.3", default-features = false, features = ["signal"] }
 
 # Junctions are reparse points. Creating, reading, and identifying one needs `DeviceIoControl`,
 # `CreateFileW`, and `GetFileInformationByHandle`, none of which the standard library exposes.
 [target."cfg(windows)".dependencies]
+# `ctrlc` moves console notifications onto its dedicated handler thread; the callback only queues
+# typed events for the ordinary supervision loop.
+ctrlc = "=3.5.2"
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_Ioctl",
     "Win32_System_SystemServices",
+    "Win32_System_Threading",
 ] }

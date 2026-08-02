@@ -33,8 +33,8 @@ project-owned Skill. It treats selected Skills as trusted user code and does not
 manage authentication, elevate privileges, or weaken agent permissions.
 
 Read `docs/architecture.md` before changing cross-module behavior. Its implementation-status
-section distinguishes working catalog/planning/transaction behavior from reserved agent launch,
-operator commands, ownership binding, and release work.
+section distinguishes working catalog/planning/transaction/process-supervision behavior from
+reserved agent-launch integration, operator commands, ownership binding, and release work.
 
 ## Commands
 
@@ -42,6 +42,7 @@ operator commands, ownership binding, and release work.
 SKILLMOUNT_REQUIRE_LINKS=1 cargo test --locked --all-targets
 cargo test --locked --test read_only
 cargo test --locked --test transaction
+cargo test --locked --all-features --test process_supervision
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 env RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
@@ -86,14 +87,16 @@ and transaction code owns ordering and application. `src/link/` is the sealed bo
 platform-specific discovery-entry and mount-link classification and for every mount-link creation,
 placement, and removal. It exposes no recursive removal operation.
 
-`unsafe_code` is denied crate-wide. Only `src/link/unix_ffi.rs` and
-`src/link/windows_ffi.rs` may allow it, under ADR 0011. Every unsafe block needs a `SAFETY` comment,
-and no raw `libc` or `windows_sys` type may cross those module boundaries.
+`unsafe_code` is denied crate-wide. Only `src/link/unix_ffi.rs`, `src/link/windows_ffi.rs`, and
+`src/process/windows_ffi.rs` may allow it, under ADRs 0011 and 0018. Every unsafe block needs a
+`SAFETY` comment, and no raw `libc` or `windows_sys` type may cross those module boundaries.
 
 ## Cross-cutting safety rules
 
 - Keep paths and forwarded arguments as platform-native `PathBuf` and `OsString` values; never
   force them through UTF-8 or a shell.
+- Keep production child launch shell-free with inherited standard streams; redirect only at test
+  harness boundaries, and retain child/process failure precedence over cleanup diagnostics.
 - Preserve rightmost-wins, validate-after-select, and no-fallback catalog behavior.
 - Keep the implemented discovery model synchronized with the architecture baseline. Before adding
   child launch, revalidate the supported agent versions and inspect every scope the child will

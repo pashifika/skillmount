@@ -3,9 +3,43 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use crate::error::ExitCategory;
 use crate::mount::LaunchPlan;
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix as platform;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as platform;
+#[cfg(windows)]
+mod windows_ffi;
+
+#[cfg(not(any(unix, windows)))]
+compile_error!("child process supervision supports only Unix and Windows targets");
+
+const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Native helpers exposed only to feature-gated integration fixtures.
+#[cfg(all(windows, feature = "test-fixtures"))]
+pub mod test_support {
+    use std::io;
+
+    /// Sends `CTRL_BREAK_EVENT` to a console process group created by a test controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error when the console or target group is unavailable.
+    pub fn send_console_break(process_group_id: u32) -> io::Result<()> {
+        super::windows_ffi::generate_console_break(process_group_id)
+    }
+}
 
 /// A completed child-launch request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +58,75 @@ impl SupervisionRequest {
     #[must_use]
     pub const fn launch(&self) -> &LaunchPlan {
         &self.launch
+    }
+}
+
+/// A single-use shell-free child lifecycle boundary.
+#[derive(Debug, Default)]
+pub struct ProcessSupervisor {
+    _single_use: (),
+}
+
+impl ProcessSupervisor {
+    /// Creates a supervisor for one child lifecycle.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { _single_use: () }
+    }
+
+    /// Launches one child, waits through supported interrupts, and invokes cleanup exactly once.
+    ///
+    /// The child inherits all three standard streams. Tests that need captured evidence must
+    /// redirect the process running the supervisor, not alter this launch boundary.
+    pub fn supervise<F>(self, request: SupervisionRequest, cleanup: F) -> SupervisionOutcome
+    where
+        F: FnOnce() -> CleanupOutcome,
+    {
+        let Self { _single_use: () } = self;
+        let mut cleanup = CleanupGuard::new(cleanup);
+        let launch = request.launch;
+        let mut platform = match platform::Platform::install() {
+            Ok(platform) => platform,
+            Err(error) => {
+                return finish(
+                    &mut cleanup,
+                    ChildOutcome::Failed(ProcessFailure::from_io(
+                        ProcessStage::InterruptSetup,
+                        &launch.executable,
+                        &error,
+                    )),
+                    InterruptPath::None,
+                );
+            }
+        };
+
+        let mut command = Command::new(&launch.executable);
+        command
+            .args(&launch.injected_args)
+            .args(&launch.passthrough_args)
+            .current_dir(&launch.cwd)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        platform.configure_command(&mut command);
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                return finish(
+                    &mut cleanup,
+                    ChildOutcome::Failed(ProcessFailure::from_io(
+                        ProcessStage::Spawn,
+                        &launch.executable,
+                        &error,
+                    )),
+                    InterruptPath::None,
+                );
+            }
+        };
+
+        let (child, interrupt) = wait_for_child(&mut child, &mut platform, &launch.executable);
+        finish(&mut cleanup, child, interrupt)
     }
 }
 
@@ -53,6 +156,16 @@ pub struct ProcessFailure {
 }
 
 impl ProcessFailure {
+    fn from_io(stage: ProcessStage, executable: &Path, error: &io::Error) -> Self {
+        Self {
+            stage,
+            executable: executable.to_path_buf(),
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+            reason: error.to_string(),
+        }
+    }
+
     /// Returns which process operation failed.
     #[must_use]
     pub const fn stage(&self) -> ProcessStage {
@@ -101,6 +214,11 @@ pub enum ChildStatus {
         /// Original unsigned status returned by Windows.
         raw_status: u32,
     },
+    /// A Unix status was neither a public exit byte nor a reported terminating signal.
+    ExceptionalUnix {
+        /// Original wait status returned by Unix.
+        raw_status: i32,
+    },
 }
 
 /// Whether the child ran and how its final status was obtained.
@@ -119,8 +237,6 @@ pub enum InterruptKind {
     Interrupt,
     /// Unix `SIGTERM`.
     Terminate,
-    /// Windows `CTRL_BREAK_EVENT` received directly by the wrapper.
-    ConsoleBreak,
 }
 
 /// What happened when the first interrupt reached the child boundary.
@@ -220,6 +336,11 @@ pub enum SupervisionDiagnostic {
         /// Signal number returned by the platform.
         signal: i32,
     },
+    /// A Unix wait status could not be represented by the normal exit or signal variants.
+    ExceptionalUnixStatus {
+        /// Original wait status returned by Unix.
+        raw_status: i32,
+    },
     /// Cleanup failed and retained recovery evidence.
     Cleanup(CleanupFailure),
 }
@@ -293,6 +414,13 @@ fn child_exit(outcome: &ChildOutcome) -> ExitDecision {
             }),
             secondary: Vec::new(),
         },
+        ChildOutcome::Exited(ChildStatus::ExceptionalUnix { raw_status }) => ExitDecision {
+            code: 1,
+            primary: Some(SupervisionDiagnostic::ExceptionalUnixStatus {
+                raw_status: *raw_status,
+            }),
+            secondary: Vec::new(),
+        },
         ChildOutcome::Failed(failure) => ExitDecision {
             code: failure_exit(failure),
             primary: Some(SupervisionDiagnostic::Process(failure.clone())),
@@ -344,6 +472,103 @@ fn add_failure(decision: &mut ExitDecision, code: u8, diagnostic: SupervisionDia
         decision.primary = Some(diagnostic);
     } else {
         decision.secondary.push(diagnostic);
+    }
+}
+
+fn wait_for_child(
+    child: &mut Child,
+    platform: &mut platform::Platform,
+    executable: &Path,
+) -> (ChildOutcome, InterruptPath) {
+    let mut interrupt = InterruptPath::None;
+
+    loop {
+        interrupt = observe_interrupts(child, platform, executable, interrupt);
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                interrupt = observe_interrupts(child, platform, executable, interrupt);
+                return (
+                    ChildOutcome::Exited(platform::child_status(status)),
+                    interrupt,
+                );
+            }
+            Ok(None) => thread::sleep(POLL_INTERVAL),
+            Err(error) => {
+                let failure = ProcessFailure::from_io(ProcessStage::Wait, executable, &error);
+                let termination = platform.force(child, executable);
+                if !matches!(termination, ForceTermination::Failed(_)) {
+                    let _ = child.wait();
+                }
+                return (ChildOutcome::Failed(failure), interrupt);
+            }
+        }
+    }
+}
+
+fn observe_interrupts(
+    child: &mut Child,
+    platform: &mut platform::Platform,
+    executable: &Path,
+    mut path: InterruptPath,
+) -> InterruptPath {
+    for event in platform.pending_interrupts() {
+        let kind = event.kind();
+        path = match path {
+            InterruptPath::None => InterruptPath::Graceful {
+                interrupt: kind,
+                delivery: platform.forward_first(child, &event, executable),
+            },
+            InterruptPath::Graceful {
+                interrupt: first,
+                delivery,
+            } => InterruptPath::Forced {
+                first,
+                delivery,
+                second: kind,
+                termination: platform.force(child, executable),
+            },
+            forced @ InterruptPath::Forced { .. } => forced,
+        };
+    }
+    path
+}
+
+fn finish<F>(
+    cleanup: &mut CleanupGuard<F>,
+    child: ChildOutcome,
+    interrupt: InterruptPath,
+) -> SupervisionOutcome
+where
+    F: FnOnce() -> CleanupOutcome,
+{
+    SupervisionOutcome {
+        child,
+        interrupt,
+        cleanup: cleanup.run(),
+    }
+}
+
+struct CleanupGuard<F> {
+    action: Option<F>,
+}
+
+impl<F> CleanupGuard<F>
+where
+    F: FnOnce() -> CleanupOutcome,
+{
+    const fn new(action: F) -> Self {
+        Self {
+            action: Some(action),
+        }
+    }
+
+    fn run(&mut self) -> CleanupOutcome {
+        let action = self
+            .action
+            .take()
+            .expect("cleanup guard may be consumed only once");
+        action()
     }
 }
 
@@ -454,6 +679,18 @@ mod tests {
                     Some(SupervisionDiagnostic::ExceptionalWindowsStatus {
                         raw_status: 0xc000_013a,
                     }),
+                    vec![],
+                ),
+            },
+            Case {
+                name: "exceptional Unix status",
+                outcome: outcome(
+                    ChildOutcome::Exited(ChildStatus::ExceptionalUnix { raw_status: 0x7f }),
+                    CleanupOutcome::Succeeded,
+                ),
+                expected: decision(
+                    1,
+                    Some(SupervisionDiagnostic::ExceptionalUnixStatus { raw_status: 0x7f }),
                     vec![],
                 ),
             },

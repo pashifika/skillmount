@@ -10,9 +10,10 @@ architecture decision records (ADRs), or the code closest to the behavior. A beh
 as current only after it exists in the tracked source and can be traced to repository evidence.
 
 Status: catalog resolution, discovery inspection, read-only planning, cross-platform link
-primitives, resource locking, durable transactions, cleanup, and stale recovery are implemented.
-Agent child launch, operator commands, release automation, and the remaining transaction-lifetime
-hardening named under [Reserved work](#reserved-work) are not implemented.
+primitives, resource locking, durable transactions, cleanup, stale recovery, and the generic child
+process supervisor are implemented. Agent-specific launch integration, operator commands, release
+automation, and the remaining transaction-lifetime hardening named under
+[Reserved work](#reserved-work) are not implemented.
 
 ## Product definition
 
@@ -26,6 +27,10 @@ One package installs two behaviorally identical binaries:
 
 - `asm`, the primary command used by documentation;
 - `skillmount`, a fallback name that delegates to the same `skillmount::run_from` entry point.
+
+The `test-fixtures` feature additionally exposes fake-agent and supervisor-harness binary targets
+for native integration tests. Default builds, release builds, and normal installation leave that
+feature disabled and continue to produce only the two product binaries.
 
 The initial release targets are:
 
@@ -101,7 +106,7 @@ read-only journal preflight
   -> expand or reacquire the lock set until it stabilizes
   -> persist planned journal
   -> write-ahead apply
-  -> [child launch reserved]
+  -> [agent launch composition reserved]
   -> reverse-order cleanup or terminal kept state
 ```
 
@@ -123,6 +128,7 @@ conflict until recovery removes it. This ordering is the accepted decision in
 | `src/lock/` | Logical/physical resource identities and sorted operating-system advisory locks. |
 | `src/journal/` | Versioned, checksummed write-ahead ownership records and durable storage. |
 | `src/transaction/` | Apply, rollback, ordinary cleanup, kept state, and stale recovery. |
+| `src/process/` | Shell-free direct child launch, inherited streams, platform interruption, exactly-once orderly cleanup, structured status, and exit-policy mapping. |
 | `src/link/` | Sealed platform boundary for no-follow inspection, link creation, no-replace placement, and verified entry removal. |
 | `src/state.rs` | Computes state locations and, only after the mutation boundary, creates their requested final directories with platform-specific access restrictions. |
 | `src/native.rs` | Lossless platform-native path encoding for journals and lock keys. |
@@ -142,6 +148,11 @@ The shared application layer owns ordering and policy. The transaction layer own
 mutation and durable ownership. The sealed link backend provides both read-only inspection and
 narrow mutation primitives; it does not decide when a plan should be applied, recovered, or cleaned
 up. There is no recursive removal operation in the link contract.
+
+The process layer consumes a completed `LaunchPlan` and a single-use cleanup operation. It does not
+select an agent executable, inject agent-specific arguments, apply a mount transaction, or decide
+retention policy. The reserved session-adapter work will compose the existing transaction and
+process boundaries in `src/app.rs` after revalidating each agent's launch contract.
 
 `src/link/` therefore serves two callers without owning their policy:
 
@@ -228,16 +239,18 @@ future-schema journals block new mutation and are retained for operator inspecti
 
 ## Platform and unsafe boundary
 
-The crate sets `unsafe_code = "deny"`. Exactly two modules may opt in:
+The crate sets `unsafe_code = "deny"`. Exactly three modules may opt in:
 
 - `src/link/unix_ffi.rs`;
-- `src/link/windows_ffi.rs`.
+- `src/link/windows_ffi.rs`;
+- `src/process/windows_ffi.rs`.
 
 They wrap filesystem operations that have no safe standard-library equivalent, including atomic
 no-replace placement and Windows reparse-point observation, handle rename, and handle disposition.
 Each unsafe block has a `SAFETY` justification, raw platform types do not cross the module boundary,
 and reparse decoding stays in safe Rust. [ADR 0011](adr/0011-scoped-unsafe-for-platform-link-backends.md)
-records why `deny` with this audited scope replaced crate-wide `forbid`.
+records why `deny` with an audited scope replaced crate-wide `forbid`; [ADR 0018](adr/0018-scope-unsafe-for-windows-console-forwarding.md)
+records the additional one-call Windows console boundary.
 
 Paths and forwarded arguments remain `PathBuf` and `OsString` through every public seam. They are
 never joined into a shell command or converted lossily for policy, journal, lock, or ownership
@@ -252,6 +265,15 @@ that object's identity; the removal handle closes before the backend confirms th
 identity is no longer visible. The variable-length rename layout is compiled and tested on both
 Windows x86 and x64. The Linux test branch uses `renameat2(RENAME_NOREPLACE)` but does not establish
 Linux product support.
+
+Child launch always constructs `Command` directly from the platform-native executable, CWD, and
+the injected-then-passthrough `OsString` arrays. All three streams use `Stdio::inherit()`. On Unix,
+safe `signal-hook` observation and `nix` delivery keep an interactive child in SkillMount's
+foreground group but create a dedicated group when stdin is not a terminal; [ADR 0017](adr/0017-preserve-interactive-unix-foreground-group.md)
+records the job-control proof behind that split. On Windows, `ctrlc` queues console events outside
+the raw handler, the child uses `CREATE_NEW_PROCESS_GROUP`, and the first event is relayed as
+targeted `CTRL_BREAK_EVENT`. The shared loop observes the final child status and invokes its
+single-use orderly cleanup after success, failure, or a supported first-interrupt exit.
 
 ## Cross-module invariants
 
@@ -280,6 +302,11 @@ The following are product rules rather than style preferences:
 10. Shared application and transaction code own policy and sequencing; agent adapters inspect and
    plan, while the sealed platform backend executes only the link primitives it is asked for.
 11. Product behavior never edits Git state, escalates privileges, or weakens agent permissions.
+12. Child launch never uses a shell string, never reorders or duplicates injected/passthrough
+    arguments, and never replaces inherited standard streams with product-owned pipes.
+13. Every ordinary child, spawn, wait, and supported first-interrupt outcome reaches one orderly
+    cleanup attempt. A cleanup failure replaces only child success; otherwise it remains structured
+    secondary evidence behind the primary child or process failure.
 
 Tests enforce the observable parts of these rules. Local comments retain the narrower preconditions
 needed to preserve them inside an implementation.
@@ -298,12 +325,15 @@ needed to preserve them inside an implementation.
   cooperative locks, and documented creation-to-observation residual scope;
 - logical and physical resource locks, versioned journals, write-ahead apply, rollback, cleanup,
   terminal kept state, and stale recovery;
+- generic shell-free child supervision with inherited streams, typed child/interrupt/cleanup
+  outcomes, stable exit precedence, Unix signal-group handling, Windows console-group handling,
+  and feature-gated native fake-agent coverage;
 - crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
 
 ### Reserved work
 
-- child-process supervision and the actual Codex/Claude launch boundary;
-- complete Codex and Claude session adapters built on that supervisor, including discovery-model
+- the actual Codex/Claude launch boundary in the shared application flow;
+- complete Codex and Claude session adapters built on the generic supervisor, including discovery-model
   and argument-contract validation against the supported agent versions;
 - `doctor`, explicit `cleanup`, lock-file reclamation, compatibility evidence, and user recovery
   documentation;
@@ -311,8 +341,9 @@ needed to preserve them inside an implementation.
 - rejecting pre-existing links in application-state directory paths before creation or permission changes;
 - versioned release packaging and publication.
 
-Until child launch is implemented, a normal session applies and then cleans up before returning
-exit category 70. Until operator cleanup is implemented, lock files accumulate for distinct logical
+Until agent-specific launch integration is implemented, a normal session applies and then cleans
+up before returning exit category 70; the generic supervisor is exercised only by its native fake
+agent harness. Until operator cleanup is implemented, lock files accumulate for distinct logical
 and physical lock keys. Owner sidecars are removed on ordinary release but may remain after a crash
 or failed removal; neither file's presence blocks or proves a live session.
 
