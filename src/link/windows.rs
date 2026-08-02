@@ -60,36 +60,38 @@ impl LinkBackend for WindowsBackend {
         let identity = handle
             .as_ref()
             .and_then(|handle| windows_ffi::file_identity(handle).ok())
-            .map(|(volume, index)| PlatformIdentity::from_pair(volume, index));
+            .map(platform_identity);
 
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
-            let kind = if metadata.is_dir() {
-                EntryKind::Directory
-            } else if metadata.is_file() {
-                EntryKind::File
-            } else {
-                EntryKind::Other
-            };
-            return Ok(PathEntry {
+        let plain = |kind| {
+            Ok(PathEntry {
                 path: path.to_path_buf(),
                 kind,
                 target: None,
-                identity,
-            });
+                identity: identity.clone(),
+            })
+        };
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            return plain(attribute_kind(&metadata));
         }
 
-        // A tag this backend does not own — a deduplication stub, a cloud placeholder, an
-        // application execution alias — is an unsupported entry, not a link to follow.
-        let point = handle
+        let decoded = handle
             .and_then(|handle| windows_ffi::read_reparse_point(&handle).ok())
-            .and_then(|buffer| reparse::parse(&buffer).ok());
-        let Some(point) = point else {
-            return Ok(PathEntry {
-                path: path.to_path_buf(),
-                kind: EntryKind::Other,
-                target: None,
-                identity,
-            });
+            .map(|buffer| reparse::parse(&buffer));
+        let point = match decoded {
+            Some(Ok(point)) => point,
+            // A tag this backend does not own but which is *not* a name surrogate does not
+            // redirect: a cloud placeholder, a deduplication stub, a WIM-backed file. Windows
+            // resolves those as the ordinary directory or file their attributes describe, and so
+            // must this — reporting them as unusable would refuse a Skill store for living in a
+            // synced folder.
+            Some(Err(reparse::ReparseError::UnsupportedTag(tag)))
+                if !reparse::is_name_surrogate(tag) =>
+            {
+                return plain(attribute_kind(&metadata));
+            }
+            // A surrogate tag this backend cannot decode *does* redirect, somewhere it cannot
+            // describe, so it stays unusable. So does a buffer it could not read at all.
+            _ => return plain(EntryKind::Other),
         };
         let kind = match point.tag {
             IO_REPARSE_TAG_MOUNT_POINT => EntryKind::Junction,
@@ -134,7 +136,13 @@ impl LinkBackend for WindowsBackend {
         let error = match std::os::windows::fs::symlink_dir(&source_canonical, &request.staged_path)
         {
             Ok(()) => {
-                let created = self.inspect_no_follow(&request.staged_path)?;
+                // Same rollback as `create_junction`: `RemoveDirectoryW` is also what detaches
+                // a directory symbolic link.
+                let created = self
+                    .inspect_no_follow(&request.staged_path)
+                    .inspect_err(|_| {
+                        let _ = windows_ffi::remove_directory_entry(&request.staged_path);
+                    })?;
                 return Ok(CreatedLink {
                     path: request.staged_path.clone(),
                     kind: CreatedLinkKind::Symlink,
@@ -285,8 +293,8 @@ pub(super) fn junction_eligibility(
     if winpath::is_unc(&source_wide) {
         return Err("a junction cannot point at a UNC or network path");
     }
-    if !winpath::is_local_drive_absolute(&source_wide) {
-        return Err("a junction can only point at an absolute local drive path");
+    if !winpath::is_local_absolute(&source_wide) {
+        return Err("a junction can only point at a fully qualified local path");
     }
     if destination != EntryKind::Missing {
         return Err("the staged path is already occupied");
@@ -337,6 +345,33 @@ pub(super) fn classify_symlink_failure(mode: LinkMode, error: &io::Error) -> Sym
 /// Returns whether the failure is specifically the missing symbolic-link privilege.
 pub(super) fn is_privilege_failure(error: &io::Error) -> bool {
     error.raw_os_error() == i32::try_from(ERROR_PRIVILEGE_NOT_HELD).ok()
+}
+
+/// Renders whichever identity the volume reported.
+///
+/// The two forms are tagged apart rather than merged: the legacy 64-bit index is documented as
+/// neither unique on `ReFS` nor safe from reuse after deletion, so an entry read one way must never
+/// look identical to an entry read the other.
+fn platform_identity(identity: windows_ffi::FileIdentity) -> PlatformIdentity {
+    match identity {
+        windows_ffi::FileIdentity::Wide { volume, id } => {
+            PlatformIdentity::new("win-id128", volume, &id)
+        }
+        windows_ffi::FileIdentity::Legacy { volume, index } => {
+            PlatformIdentity::from_pair("win-index64", u64::from(volume), index)
+        }
+    }
+}
+
+/// Classifies an entry from its attributes alone, for everything that does not redirect.
+fn attribute_kind(metadata: &fs::Metadata) -> EntryKind {
+    if metadata.is_dir() {
+        EntryKind::Directory
+    } else if metadata.is_file() {
+        EntryKind::File
+    } else {
+        EntryKind::Other
+    }
 }
 
 /// Builds the immediate target of a reparse point from its substitute name.

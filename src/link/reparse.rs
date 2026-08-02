@@ -19,6 +19,23 @@ pub(crate) const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 /// Largest reparse payload Windows accepts, from `winnt.h`.
 pub(crate) const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
 
+/// The name-surrogate bit, from `winnt.h`'s `IsReparseTagNameSurrogate`.
+const NAME_SURROGATE_BIT: u32 = 0x2000_0000;
+
+/// Returns whether a reparse tag marks an entry that stands in for another name.
+///
+/// Windows sets this bit on symbolic links and mount points — the entries that *redirect*. It
+/// leaves it clear on reparse points that merely annotate an entry it still resolves normally: a
+/// cloud placeholder from `OneDrive` or Dropbox, a deduplication stub, a WIM-backed file. Those are
+/// ordinary directories and files, and the standard library reports them as such
+/// (`FileType::new` in `library/std/src/sys/fs/windows.rs`).
+///
+/// Deciding this from a tag allowlist instead would classify every one of them as unusable, which
+/// is why the bit rather than the tag is the question worth asking.
+pub(crate) const fn is_name_surrogate(tag: u32) -> bool {
+    tag & NAME_SURROGATE_BIT != 0
+}
+
 /// Bytes before `ReparseDataLength` takes effect: tag, data length, and reserved.
 const HEADER_LEN: usize = 8;
 /// The four `USHORT` name offset/length fields shared by both supported tags.
@@ -195,7 +212,7 @@ fn push_wide(buffer: &mut Vec<u8>, name: &[u16]) {
 mod tests {
     use super::{
         IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK, MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
-        ReparseError, build_mount_point, parse,
+        ReparseError, build_mount_point, is_name_surrogate, parse,
     };
 
     fn wide(value: &str) -> Vec<u16> {
@@ -306,6 +323,28 @@ mod tests {
         buffer[10..12].copy_from_slice(&(declared - 1).to_le_bytes());
 
         assert_eq!(parse(&buffer), Err(ReparseError::OddNameLength));
+    }
+
+    #[test]
+    fn only_redirecting_reparse_tags_are_name_surrogates() {
+        assert!(is_name_surrogate(IO_REPARSE_TAG_MOUNT_POINT));
+        assert!(is_name_surrogate(IO_REPARSE_TAG_SYMLINK));
+
+        // Everything below is a real reparse point that Windows still resolves as the ordinary
+        // directory or file it is. Treating one as an unusable entry would refuse a Skill store
+        // that merely lives in a synced folder or on a deduplicated volume.
+        for (tag, what) in [
+            (0x9000_001A_u32, "OneDrive cloud placeholder"),
+            (0x8000_0013, "data deduplication stub"),
+            (0x8000_0017, "WIM-backed file"),
+            (0x8000_001B, "application execution alias"),
+            (0x8000_0018, "Windows Container isolation"),
+        ] {
+            assert!(
+                !is_name_surrogate(tag),
+                "{what} ({tag:#010x}) does not redirect"
+            );
+        }
     }
 
     #[test]

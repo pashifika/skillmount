@@ -24,8 +24,9 @@ use std::ptr;
 use windows_sys::Win32::Foundation::{FILETIME, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, GetFileInformationByHandle, MoveFileExW, OPEN_EXISTING, RemoveDirectoryW,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, MoveFileExW, OPEN_EXISTING, RemoveDirectoryW,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
@@ -84,15 +85,70 @@ pub(super) fn open_no_follow(path: &Path, access: Access) -> io::Result<OwnedHan
     Ok(unsafe { OwnedHandle::from_raw_handle(handle.cast()) })
 }
 
-/// Reads the volume serial number and the 64-bit file index of an open entry.
+/// A stable identity for an open entry, in whichever form the volume supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FileIdentity {
+    /// The 128-bit `FILE_ID_INFO` identity, available since Windows 8.
+    ///
+    /// This is the form ownership verification wants. The legacy 64-bit index below is documented
+    /// as not guaranteed unique on `ReFS` and as reusable after deletion, so on those volumes it is
+    /// not a lifetime capability and cannot by itself authorize a removal.
+    Wide {
+        /// 64-bit volume serial number.
+        volume: u64,
+        /// 128-bit file identifier.
+        id: [u8; 16],
+    },
+    /// The legacy volume-serial and 64-bit index pair, for a volume that reports nothing better.
+    Legacy {
+        /// 32-bit volume serial number.
+        volume: u32,
+        /// 64-bit file index.
+        index: u64,
+    },
+}
+
+/// Reads the strongest identity the volume reports for an open entry.
 ///
-/// Together these identify one entry on one volume, which is what ownership verification needs:
-/// the same path can be a different entry a moment later, but the same identity cannot.
+/// `FILE_ID_INFO` is tried first and the legacy pair is the fallback, because a filesystem or
+/// filter driver that does not implement the newer class fails the call rather than degrading.
 ///
 /// # Errors
 ///
-/// Returns the operating-system error when the information is unavailable.
-pub(super) fn file_identity(handle: &OwnedHandle) -> io::Result<(u64, u64)> {
+/// Returns the operating-system error when neither form is available.
+pub(super) fn file_identity(handle: &OwnedHandle) -> io::Result<FileIdentity> {
+    if let Some(wide) = wide_file_identity(handle) {
+        return Ok(wide);
+    }
+    let (volume, index) = legacy_file_identity(handle)?;
+    Ok(FileIdentity::Legacy { volume, index })
+}
+
+/// Reads `FILE_ID_INFO`, or `None` when the volume does not report it.
+fn wide_file_identity(handle: &OwnedHandle) -> Option<FileIdentity> {
+    let mut information = FILE_ID_INFO {
+        VolumeSerialNumber: 0,
+        FileId: FILE_ID_128 {
+            Identifier: [0; 16],
+        },
+    };
+    let size = u32::try_from(size_of::<FILE_ID_INFO>()).ok()?;
+    // SAFETY: the handle is live for the whole call because it is borrowed, `information` is a
+    // fully initialized value of exactly the type `FileIdInfo` writes, and `size` is that type's
+    // own size. A volume that does not implement the class fails the call and writes nothing.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(raw(handle), FileIdInfo, (&raw mut information).cast(), size)
+    };
+    if succeeded == 0 {
+        return None;
+    }
+    Some(FileIdentity::Wide {
+        volume: information.VolumeSerialNumber,
+        id: information.FileId.Identifier,
+    })
+}
+
+fn legacy_file_identity(handle: &OwnedHandle) -> io::Result<(u32, u64)> {
     let mut information = BY_HANDLE_FILE_INFORMATION {
         dwFileAttributes: 0,
         ftCreationTime: FILETIME {
@@ -122,8 +178,16 @@ pub(super) fn file_identity(handle: &OwnedHandle) -> io::Result<(u64, u64)> {
     }
     let index =
         (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
-    Ok((u64::from(information.dwVolumeSerialNumber), index))
+    Ok((information.dwVolumeSerialNumber, index))
 }
+
+/// An 8-byte-aligned reparse buffer.
+///
+/// `Vec<u8>` has alignment 1. The standard library allocates this control code's output buffer
+/// 8-byte aligned (`Align8` in `library/std/src/sys/fs/windows.rs`), and an audited module has no
+/// business relying on the allocator happening to do the same for a 16 KiB request.
+#[repr(C, align(8))]
+struct AlignedReparseBuffer([u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE]);
 
 /// Reads the raw reparse buffer of an open entry.
 ///
@@ -132,8 +196,8 @@ pub(super) fn file_identity(handle: &OwnedHandle) -> io::Result<(u64, u64)> {
 /// Returns the operating-system error, including `ERROR_NOT_A_REPARSE_POINT` for an ordinary
 /// directory, which the caller treats as "this is not a link" rather than as a failure.
 pub(super) fn read_reparse_point(handle: &OwnedHandle) -> io::Result<Vec<u8>> {
-    let mut buffer = vec![0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
-    let capacity = u32::try_from(buffer.len()).map_err(|_| {
+    let mut buffer = AlignedReparseBuffer([0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE]);
+    let capacity = u32::try_from(buffer.0.len()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "the reparse buffer is larger than the API accepts",
@@ -149,7 +213,7 @@ pub(super) fn read_reparse_point(handle: &OwnedHandle) -> io::Result<Vec<u8>> {
             FSCTL_GET_REPARSE_POINT,
             ptr::null(),
             0,
-            buffer.as_mut_ptr().cast(),
+            buffer.0.as_mut_ptr().cast(),
             capacity,
             &raw mut returned,
             ptr::null_mut(),
@@ -158,8 +222,9 @@ pub(super) fn read_reparse_point(handle: &OwnedHandle) -> io::Result<Vec<u8>> {
     if succeeded == 0 {
         return Err(io::Error::last_os_error());
     }
-    buffer.truncate(returned as usize);
-    Ok(buffer)
+    // The decoder reads the payload byte-wise, so the alignment matters only for the call above.
+    let written = usize::try_from(returned).unwrap_or(buffer.0.len());
+    Ok(buffer.0.get(..written).unwrap_or(&buffer.0).to_vec())
 }
 
 /// Writes a reparse buffer, turning an empty directory into a junction.

@@ -105,10 +105,11 @@ fn a_cycle_is_detected_by_identity_rather_than_by_running_out_of_depth() {
 
 #[test]
 fn the_deepest_resolvable_chain_is_accepted_and_one_hop_more_is_not() {
-    // `hop-k` needs `k + 2` inspections: one per link plus the terminal directory. The deepest
-    // chain the bound allows therefore starts at `hop-(MAX_LINK_DEPTH - 2)`.
+    // `hop-k` is a chain of `k + 1` links, so the deepest one the bound admits starts at
+    // `hop-(MAX_LINK_DEPTH - 1)`. This is the assertion that pins the constant to its own
+    // documentation: a bound of 40 has to accept 40 hops, not 39.
     let backend = RecordingBackend::new().with_directory("/root/store");
-    let deepest = MAX_LINK_DEPTH - 2;
+    let deepest = MAX_LINK_DEPTH - 1;
     for index in 0..=deepest + 1 {
         let target = if index == 0 {
             "/root/store".to_owned()
@@ -121,6 +122,11 @@ fn the_deepest_resolvable_chain_is_accepted_and_one_hop_more_is_not() {
     assert_eq!(
         chain(&backend, &format!("/root/hop-{deepest}")).state,
         ChainState::LinkToDirectory
+    );
+    assert_eq!(
+        chain(&backend, &format!("/root/hop-{deepest}")).hops.len(),
+        MAX_LINK_DEPTH,
+        "the deepest accepted chain is exactly as long as the constant claims"
     );
     assert_eq!(
         chain(&backend, &format!("/root/hop-{}", deepest + 1)).state,

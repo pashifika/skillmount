@@ -55,7 +55,11 @@ impl LinkBackend for UnixBackend {
             path: path.to_path_buf(),
             kind,
             target,
-            identity: Some(PlatformIdentity::from_pair(metadata.dev(), metadata.ino())),
+            identity: Some(PlatformIdentity::from_pair(
+                "unix",
+                metadata.dev(),
+                metadata.ino(),
+            )),
         })
     }
 
@@ -98,7 +102,14 @@ impl LinkBackend for UnixBackend {
             }
         })?;
 
-        let created = self.inspect_no_follow(&request.staged_path)?;
+        // A failure here would otherwise leave the link this function just created. The junction
+        // path on Windows rolls back the directory it makes for the same reason; this keeps both
+        // creation paths agreeing on who owns a half-finished entry.
+        let created = self
+            .inspect_no_follow(&request.staged_path)
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&request.staged_path);
+            })?;
         Ok(CreatedLink {
             path: request.staged_path.clone(),
             kind: CreatedLinkKind::Symlink,

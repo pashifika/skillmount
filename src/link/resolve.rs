@@ -17,11 +17,19 @@ use std::path::{Path, PathBuf};
 use crate::error::LinkError;
 use crate::link::{EntryKind, LinkBackend, LinkTarget, PathEntry, PlatformIdentity};
 
-/// Maximum number of directory-link hops resolved before an entry is rejected.
+/// Maximum number of directory-link hops this walker follows before rejecting an entry.
 ///
 /// The V2 design calls roughly 32 sufficient. The bound is set to the `SKILL.md` chain limit
 /// already used by catalog validation so both layers reject exactly the same pathological
 /// layouts, which keeps a single number to reason about.
+///
+/// It counts the hops this walker *takes*, which are the links occupying the final component of
+/// each path it inspects. A link sitting in an ancestor component — `a/b/c` where `b` is itself a
+/// link — is resolved inside the operating system's own path lookup before the backend ever sees
+/// the entry, so it is neither counted here nor recorded in [`ResolvedChain::hops`]. That is
+/// deliberate: the kernel already bounds its own traversal, and a cycle hidden there surfaces as an
+/// inspection error rather than as [`ChainState::Cyclic`]. This bound governs the chain `SkillMount`
+/// walks, not the total number of indirections the filesystem contains.
 pub const MAX_LINK_DEPTH: usize = 40;
 
 /// Where a directory-link chain ended up.
@@ -147,7 +155,10 @@ pub fn resolve_chain(backend: &dyn LinkBackend, entry: &Path) -> Result<Resolved
     let mut current = observed;
     let mut current_path = entry.to_path_buf();
 
-    for _ in 0..MAX_LINK_DEPTH {
+    // One iteration per entry inspected, which is one per hop plus the terminal it lands on. The
+    // range is inclusive so that a chain of exactly `MAX_LINK_DEPTH` hops resolves and the next one
+    // does not, rather than the bound silently admitting one fewer than it advertises.
+    for _ in 0..=MAX_LINK_DEPTH {
         if !visited.insert(visit_key(&current_path, current.identity.as_ref())) {
             chain.state = ChainState::Cyclic;
             return Ok(chain);

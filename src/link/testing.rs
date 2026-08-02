@@ -178,7 +178,7 @@ impl LinkBackend for RecordingBackend {
         let Some((entry, identity)) = self.lookup(path) else {
             return Ok(PathEntry::plain(path, EntryKind::Missing));
         };
-        let identity = Some(PlatformIdentity::from_pair(0, identity));
+        let identity = Some(PlatformIdentity::from_pair("model", 0, identity));
         Ok(match entry {
             Entry::Directory => PathEntry {
                 path: path.to_path_buf(),
@@ -261,7 +261,7 @@ impl LinkBackend for RecordingBackend {
             kind: CreatedLinkKind::Symlink,
             target: source_canonical.clone(),
             source_canonical,
-            identity: Some(PlatformIdentity::from_pair(0, identity)),
+            identity: Some(PlatformIdentity::from_pair("model", 0, identity)),
         })
     }
 

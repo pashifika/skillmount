@@ -70,12 +70,6 @@ pub enum EntryKind {
 }
 
 impl EntryKind {
-    /// Returns whether the entry is a directory indirection this backend can follow.
-    #[must_use]
-    pub const fn is_directory_link(self) -> bool {
-        matches!(self, Self::Symlink | Self::Junction)
-    }
-
     /// Returns the stable label used in diagnostics.
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -136,16 +130,36 @@ pub struct LinkTarget {
 /// An opaque platform identity for an entry that exists.
 ///
 /// The representation is private so each platform can strengthen its derivation without changing
-/// the contract. Only equality, ordering, and hashing are meaningful. Unix uses the device and
-/// inode pair; Windows uses the volume serial number and the 64-bit file index, both read from a
-/// handle opened without traversing the entry.
+/// the contract. Only equality, ordering, and hashing are meaningful.
+///
+/// Unix uses the device and inode pair. Windows prefers the 128-bit `FILE_ID_INFO` identity and
+/// falls back to the legacy volume-serial and 64-bit index pair, both read from a handle opened
+/// without traversing the entry. The preference matters: Microsoft documents the legacy index as
+/// neither guaranteed unique on `ReFS` nor safe from reuse after a deletion, so on such a volume it
+/// is not on its own a proof that an entry is the one this process created.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PlatformIdentity(String);
 
 impl PlatformIdentity {
+    /// Builds an identity from a volume and a fixed-width identifier.
+    ///
+    /// `derivation` distinguishes identities read different ways, so a value taken from a 64-bit
+    /// index never compares equal to one taken from a 128-bit identifier even if the digits
+    /// coincide. Two readings that disagree that far describe an entry this process cannot prove it
+    /// owns, and refusing is the safe answer.
+    pub(crate) fn new(derivation: &str, volume: u64, identifier: &[u8]) -> Self {
+        use std::fmt::Write as _;
+
+        let mut rendered = format!("{derivation}:{volume:x}:");
+        for byte in identifier {
+            let _ = write!(rendered, "{byte:02x}");
+        }
+        Self(rendered)
+    }
+
     /// Builds an identity from the platform's pair of stable numbers.
-    pub(crate) fn from_pair(volume: u64, index: u64) -> Self {
-        Self(format!("{volume:x}:{index:x}"))
+    pub(crate) fn from_pair(derivation: &str, volume: u64, index: u64) -> Self {
+        Self::new(derivation, volume, &index.to_be_bytes())
     }
 }
 
