@@ -1,13 +1,15 @@
-//! Side-effect-free catalog, planning, and shared executable boundary for `SkillMount`.
+//! Catalog, planning, durable mutation, and the shared executable boundary for `SkillMount`.
 //!
-//! This slice parses the complete wrapper contract, resolves platform-native paths, discovers
-//! ordered Skill sources, produces an immutable validated catalog, inspects every namespace the
-//! child agent will search, and builds one complete mount plan. Everything up to and including the
-//! plan is read-only: `inspect` and `--dry-run` create no directory, link, lock, journal, or child
-//! process, and `tests/read_only.rs` fails if any of them ever does.
+//! The read-only half parses the wrapper contract, preserves platform-native paths, resolves an
+//! ordered Skill catalog, inspects the namespaces in the selected adapter's current discovery
+//! model, and builds one deterministic mount plan. `inspect` and `--dry-run` create no directory,
+//! link, lock, journal, recovery mutation, or child process, and `tests/read_only.rs` fails if any
+//! of them ever does.
 //!
-//! Applying a plan, acquiring locks, rebuilding under lock, writing a transaction journal,
-//! recovering, and launching the agent intentionally remain outside this change.
+//! A mutating session acquires the discovery snapshot's resource locks, recovers incomplete
+//! transactions, builds and stabilizes the full plan under those locks, persists a write-ahead
+//! journal, applies, and cleans up. Agent child launch is the remaining reserved boundary; see
+//! `docs/architecture.md` for current status and the cross-module ordering rules.
 
 pub mod agent;
 mod app;

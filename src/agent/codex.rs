@@ -41,7 +41,7 @@ pub(crate) struct CodexBacking {
     pub(crate) warnings: Vec<Diagnostic>,
 }
 
-/// Applies the V2 design state table for the Codex discovery entry.
+/// Applies the authoritative Codex discovery-entry state table.
 ///
 /// `.agents/skills` is authoritative: when it exists, its configuration decides the outcome.
 /// `.codex/skills` is only a backing candidate, used when the authoritative entry is absent or

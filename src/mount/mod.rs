@@ -21,8 +21,8 @@ pub struct DiscoveryPlan {
 
 /// The destination state an action expects when it is applied.
 ///
-/// The transaction change persists this in the journal and re-checks it under lock, so a plan
-/// built against stale state fails instead of overwriting something that appeared in between.
+/// The transaction persists this in the journal and re-checks it under lock, so a plan built
+/// against stale state fails instead of overwriting something that appeared in between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathPrecondition {
     /// Nothing exists at the destination.
@@ -52,7 +52,7 @@ impl PathPrecondition {
     }
 }
 
-/// One filesystem operation a later transaction would perform.
+/// One filesystem operation a transaction performs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MountAction {
     /// Create a directory that does not exist yet.
@@ -92,7 +92,7 @@ impl MountAction {
         }
     }
 
-    /// Returns whether a later cleanup owns the entry this action produces.
+    /// Returns whether cleanup owns the entry this action produces.
     #[must_use]
     pub const fn is_transaction_owned(&self) -> bool {
         matches!(
@@ -121,8 +121,8 @@ pub struct PlannedMountAction {
 
 /// A selected Skill that was omitted because an existing entry is preserved.
 ///
-/// Preserved entries are reported but generate no action: the V2 design forbids journaling a
-/// mutation for something that is deliberately left alone.
+/// Preserved entries are reported but generate no action. They are deliberately left alone, so a
+/// transaction cannot claim or journal them as something it owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreservedSkill {
     /// Comparison key of the omitted Skill.
@@ -166,7 +166,7 @@ impl LaunchPlan {
     }
 }
 
-/// A complete plan for one session, produced before any mutation.
+/// A complete plan for one session, produced before any action in that plan is applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountPlan {
     /// Adapter the plan belongs to.
@@ -182,7 +182,7 @@ pub struct MountPlan {
 }
 
 impl MountPlan {
-    /// Returns the actions a later cleanup would own.
+    /// Returns the actions cleanup owns.
     pub fn owned_actions(&self) -> impl Iterator<Item = &PlannedMountAction> {
         self.actions
             .iter()

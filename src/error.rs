@@ -254,9 +254,9 @@ pub enum LinkError {
     },
     /// The host cannot provide a guarantee the backend refuses to emulate.
     ///
-    /// Reported instead of a check-then-act sequence. The V2 contract requires atomic no-replace
-    /// placement; emulating it with a separate existence check would reintroduce exactly the race
-    /// the guarantee exists to remove.
+    /// Reported instead of a check-then-act sequence. Placement must be atomic and non-replacing;
+    /// emulating it with a separate existence check would reintroduce exactly the race the
+    /// guarantee exists to remove.
     Unsupported {
         /// Path the unavailable operation targeted.
         path: PathBuf,

@@ -97,11 +97,11 @@ pub struct RunOptions {
     pub conflict: ConflictPolicy,
     /// Metadata validation policy.
     pub validation: ValidationLevel,
-    /// Whether later planning should remain read-only.
+    /// Whether planning should remain read-only.
     pub dry_run: bool,
-    /// Whether later cleanup should retain transaction-owned mounts.
+    /// Whether cleanup should retain transaction-owned mounts.
     pub keep_mounts: bool,
-    /// Whether later transaction recovery is disabled.
+    /// Whether transaction recovery is disabled.
     pub no_recover: bool,
     /// Requested diagnostic verbosity.
     pub verbosity: u8,
@@ -131,7 +131,7 @@ pub struct SkillSource {
     pub canonical_path: PathBuf,
 }
 
-/// Fully resolved, mutation-free input for a later session planner.
+/// Fully resolved, mutation-free input for session planning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunContext {
     /// Selected adapter.
@@ -149,8 +149,8 @@ pub struct RunContext {
     /// A staging layout is addressed by this value, so it cannot be invented during planning: two
     /// identical `--dry-run` invocations would then print different output. A preliminary plan uses
     /// [`crate::state::PENDING_SESSION`] instead, and a mutating run mints the identifier once and
-    /// replans with it before anything is created — which is also what keeps two concurrent Claude
-    /// sessions in separate staging roots.
+    /// replans with it before any transaction-owned staging entry is created — which is also what
+    /// keeps two concurrent Claude sessions in separate staging roots.
     pub session_id: Option<crate::journal::TransactionId>,
     /// Explicit resolved agent path, or the bare executable name for `PATH` lookup.
     pub agent_bin: PathBuf,

@@ -468,7 +468,7 @@ impl TransactionJournal {
         format!("{}.{JOURNAL_EXTENSION}", self.transaction_id)
     }
 
-    /// Returns the lock resources the transaction held, in deterministic acquisition order.
+    /// Returns the recorded lock-resource descriptions in deterministic order.
     #[must_use]
     pub fn lock_resources(&self) -> Vec<LockResource> {
         let mut resources = self

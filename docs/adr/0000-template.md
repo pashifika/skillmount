@@ -50,13 +50,12 @@ that catches a regression instead.
 
 ## When an ADR is required
 
-The V2 design specification is the normative architecture baseline. It is a
-machine-local input rather than a tracked file, so an ADR is the only repository
-record of a divergence from it. An ADR is required for a change that:
+[`docs/architecture.md`](../architecture.md) is the normative current-state
+architecture baseline. An ADR is required for a change that:
 
-- replaces a normative decision in the V2 design, such as an adapter
-  responsibility, a discovery or conflict rule, a data-model contract, a
-  dependency direction, or a public naming rule;
+- replaces a normative decision in that baseline, such as a module or adapter
+  responsibility, a discovery or conflict rule, a mutation ordering, a data-model
+  contract, a dependency direction, or a public naming rule;
 - changes a public contract in `CONTRIBUTING.md`, the CLI surface, or the
   sysexits-style exit-code mapping in `src/error.rs`;
 - adds a dependency whose license or source falls outside `deny.toml`, or that
@@ -67,5 +66,7 @@ record of a divergence from it. An ADR is required for a change that:
   target.
 
 An ADR is not required for ordinary implementation of an already recorded
-decision. Prefer a small explicit ADR over silently diverging from the design
-baseline.
+decision or for updating implementation status after that work lands. Update the
+architecture baseline in the same product change so readers do not have to replay
+ADR history to discover what is currently true. Prefer a small explicit ADR over
+silently diverging from the baseline.

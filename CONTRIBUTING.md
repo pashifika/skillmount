@@ -1,5 +1,17 @@
 # Contributing to SkillMount
 
+Read [docs/architecture.md](docs/architecture.md) before changing cross-module behavior. It is the
+tracked current-state baseline for responsibilities, dependency and mutation boundaries, safety
+invariants, supported targets, and implementation status. Update affected baseline material in the
+same product change; when replacing a normative decision, also add or update a focused ADR from
+[docs/adr/0000-template.md](docs/adr/0000-template.md).
+[ADR 0013](docs/adr/0013-track-current-architecture-and-agent-guidance.md) records this authority
+split and shared-guidance decision.
+
+`AGENTS.md` is intentionally tracked as a symbolic link to `CLAUDE.md` so both coding-agent entry
+points receive one maintained instruction set. Use a Git checkout that materializes symbolic links;
+a regular file containing only the target name does not provide the repository guidance.
+
 SkillMount uses a release-line workflow. Normal changes move from a topic branch
 to the active development line and are then promoted to `main`:
 

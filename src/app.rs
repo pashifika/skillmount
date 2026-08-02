@@ -1,4 +1,4 @@
-//! Shared read-only application boundary.
+//! Shared application orchestration for read-only and mutating commands.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -120,16 +120,15 @@ pub(crate) struct ReadOnlyOutcome {
 
 /// Runs the mutating half of a session: lock, recover, plan, apply, clean up.
 ///
-/// The order is not negotiable, and only *discovery* runs before the lock. Building the whole plan
-/// first would be a mistake: a crashed session can leave a mount pointing at a source this run did
-/// not select, the conflict table would refuse it, and the run would exit before recovery ever got
-/// the chance to remove the very entry it was refusing. Discovery yields the lock set on its own,
-/// which is all that is needed to take the locks and reconcile.
+/// The order is not negotiable, and no complete plan is built before the lock. After the journal
+/// preflight and any staging-control setup, discovery yields the lock set on its own. A
+/// complete plan built earlier would be a mistake: a crashed session can leave a mount pointing at
+/// a source this run did not select, the conflict table would refuse it, and the run would exit
+/// before recovery ever got the chance to remove the very entry it was refusing.
 ///
-/// Launching the child is the one step still reserved. Rather than leave the mounts behind for a
-/// process that never starts, the session cleans up what it applied and reports the boundary it
-/// stopped at, so an ordinary run is observably back where it started. `--keep-mounts` overrides
-/// that, because retaining the mounts is exactly what it asks for.
+/// Launching the child is the one step still reserved. The session therefore runs cleanup before
+/// reporting the boundary; cleanup conservatively retains and reports any entry it cannot safely
+/// remove. `--keep-mounts` bypasses removal because retaining the mounts is exactly what it asks for.
 fn run_session(context: &RunContext) -> Result<(), AppError> {
     // Unknown ownership state is checked before creating even SkillMount's own staging or lock
     // directories. Recovery scans again after locks are held, so a journal appearing between this
@@ -147,7 +146,7 @@ fn run_session(context: &RunContext) -> Result<(), AppError> {
         crate::state::ensure_private_directory(&crate::state::session_root_base()?)?;
     }
 
-    // The identifier is minted before anything is observed, and used for both the staging root and
+    // The identifier is minted before discovery is inspected and used for both the staging root and
     // the journal name. Minting it this early is what keeps two concurrent Claude sessions apart:
     // the placeholder a preliminary plan uses is one shared path, so locking it would serialize two
     // sessions that in reality never touch the same directory.
@@ -285,8 +284,8 @@ fn extend_resources(
 /// Runs the complete read-only pipeline: catalog, discovery inspection, preliminary plan.
 ///
 /// Nothing in this function creates a directory, link, lock, journal, or child process. Both the
-/// `inspect` command and `--dry-run` stop here, and a normal session reuses the same result before
-/// it reaches the mutation boundary.
+/// `inspect` command and `--dry-run` stop here. A normal session calls the same pure pipeline under
+/// its locks after recovery and before applying any planned destination mutation.
 pub(crate) fn plan_read_only(context: &RunContext) -> Result<ReadOnlyOutcome, AppError> {
     let adapter = adapter_for(context.agent);
     adapter.validate_passthrough_args(&context.passthrough_args)?;

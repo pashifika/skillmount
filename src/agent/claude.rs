@@ -48,7 +48,8 @@ impl StagingLayout {
     /// A run that has not minted an identifier yet uses [`PENDING_SESSION`], which is deliberately
     /// unusable as a real directory name on Windows: a preliminary plan must be recognisable as
     /// one, and never accidentally applied. A mutating run replans with its real identifier before
-    /// anything is created, which is also what puts two concurrent sessions in separate roots.
+    /// any transaction-owned staging entry is created, which is also what puts two concurrent
+    /// sessions in separate roots.
     ///
     /// # Errors
     ///
@@ -89,7 +90,7 @@ fn missing_directory_chain(leaf: &Path, boundary: &Path) -> Vec<PathBuf> {
     missing
 }
 
-/// Extracts the directories a passthrough `--add-dir` makes visible to the child.
+/// Extracts the raw directory values named by passthrough `--add-dir` arguments.
 ///
 /// Both `--add-dir=VALUE` and `--add-dir VALUE...` are recognised. The separated form consumes
 /// following values until the next option, because Claude Code accepts several directories per

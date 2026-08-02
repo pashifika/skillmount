@@ -109,14 +109,15 @@ pub fn lock_base() -> Result<PathBuf, AppError> {
     Ok(state_root()?.join("locks"))
 }
 
-/// Creates `path` and every missing parent, restricting access to the current user where the
-/// platform supports it.
+/// Creates `path` and every missing parent, then restricts the requested final path to the current
+/// user where the platform supports it.
 ///
-/// Journals name every directory a session owns and lock files carry session diagnostics, so both
-/// are readable descriptions of what another user could interfere with. Unix applies `0o700` to
-/// each directory this call creates. Windows relies on the per-user ACL that `LOCALAPPDATA`
-/// already carries; tightening it further needs a security descriptor, which has no safe API and
-/// would widen the crate's `unsafe` boundary beyond the two audited link modules of ADR 0011.
+/// Journals name every directory a session owns and lock-owner sidecars carry session diagnostics,
+/// so both are readable descriptions of what another user could interfere with. Unix applies
+/// `0o700` to the requested final directory; intermediate parents created by [`fs::create_dir_all`]
+/// retain their umask-derived modes. Windows relies on the per-user ACL that `LOCALAPPDATA` already
+/// carries; tightening it further needs a security descriptor, which has no safe API and would
+/// widen the crate's `unsafe` boundary beyond the two audited link modules of ADR 0011.
 ///
 /// # Errors
 ///

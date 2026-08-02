@@ -85,7 +85,7 @@ impl LockResourceIdentity {
     }
 }
 
-/// A resource a later transaction would lock, described while planning is still read-only.
+/// A resource the transaction locks, described while planning is still read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockResource {
     /// What the resource protects.

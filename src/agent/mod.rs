@@ -1,7 +1,8 @@
 //! Agent adapter boundary and read-only discovery inspection.
 //!
 //! An adapter observes and describes; it never mutates. Every method here returns a snapshot or a
-//! plan, and the shared transaction layer applies plans in a later change.
+//! plan, and the shared application and transaction layers apply those values after the mutation
+//! boundary.
 
 pub mod claude;
 pub mod codex;
@@ -108,7 +109,7 @@ impl DiscoveryScope {
 pub struct DiscoverySnapshot {
     /// Adapter that produced the snapshot.
     pub agent: AgentId,
-    /// Every scope the child will search, in adapter-defined preflight order.
+    /// Every scope in the adapter's current discovery model, in preflight order.
     pub scopes: Vec<DiscoveryScope>,
     /// Authoritative discovery entry the child reads.
     pub discovery_entry: PathBuf,
@@ -116,7 +117,7 @@ pub struct DiscoverySnapshot {
     pub backing_store: PathBuf,
     /// Observed state of the backing store.
     pub backing_store_state: PathKind,
-    /// Resources a later transaction would lock, in deterministic acquisition order.
+    /// Resources the transaction locks; acquisition derives a deduplicated, sorted key set.
     pub lock_resources: Vec<LockResource>,
     /// Non-fatal observations.
     pub warnings: Vec<Diagnostic>,
@@ -134,9 +135,9 @@ impl DiscoverySnapshot {
 
 /// A read-only agent adapter.
 ///
-/// The V2 design also lists `prepare_command`. It is intentionally absent: it takes an applied
-/// plan and mutates a `Command`, which belongs to the child-process change. Keeping it out means
-/// no implementation of this trait can launch anything.
+/// Command preparation is intentionally absent from this trait: it would consume an applied plan
+/// and mutate a `Command`, while this boundary is restricted to read-only observation and
+/// description. Keeping it out also makes the currently reserved child-launch boundary explicit.
 pub trait AgentAdapter {
     /// Returns the adapter's agent.
     fn id(&self) -> AgentId;
@@ -151,7 +152,7 @@ pub trait AgentAdapter {
     /// Returns [`AppError::Usage`] when an argument is incompatible with mounting Skills.
     fn validate_passthrough_args(&self, args: &[OsString]) -> Result<Vec<Diagnostic>, AppError>;
 
-    /// Inspects every scope the child will search, without modifying any of them.
+    /// Inspects every scope in the adapter's current discovery model without modifying any of them.
     ///
     /// # Errors
     ///
@@ -161,8 +162,8 @@ pub trait AgentAdapter {
 
     /// Builds the complete deterministic plan for a validated catalog.
     ///
-    /// The snapshot is a parameter rather than an internal step so the transaction change can
-    /// re-inspect under lock and rebuild through this same pure function.
+    /// The snapshot is a parameter rather than an internal step so the application can re-inspect
+    /// under lock and rebuild through this same pure function.
     ///
     /// # Errors
     ///
@@ -179,7 +180,7 @@ pub trait AgentAdapter {
 ///
 /// A namespace that is missing or unresolvable yields no visible Skills. Whether that state is
 /// fatal is the adapter's decision: an unusable ancestor scope and an unusable authoritative entry
-/// have different consequences in the V2 state table.
+/// have different consequences in the discovery model.
 ///
 /// # Errors
 ///
