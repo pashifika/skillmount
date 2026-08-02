@@ -563,7 +563,7 @@ fn failure_exit(failure: &ProcessFailure) -> u8 {
         ProcessStage::LaunchValidation | ProcessStage::Spawn
     ) && matches!(
         failure.kind,
-        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory | io::ErrorKind::PermissionDenied
     ) {
         ExitCategory::MissingInput.code()
     } else {
@@ -942,6 +942,7 @@ mod tests {
     #[test]
     fn exit_mapping_preserves_process_failure_categories() {
         let spawn_missing = failure(ProcessStage::Spawn, io::ErrorKind::NotFound);
+        let spawn_invalid_cwd = failure(ProcessStage::Spawn, io::ErrorKind::NotADirectory);
         let wait_failure = failure(ProcessStage::Wait, io::ErrorKind::Other);
         let forward_failure = failure(ProcessStage::ForwardInterrupt, io::ErrorKind::Other);
 
@@ -955,6 +956,18 @@ mod tests {
                 expected: decision(
                     66,
                     Some(SupervisionDiagnostic::Process(spawn_missing)),
+                    vec![],
+                ),
+            },
+            Case {
+                name: "missing launch directory",
+                outcome: outcome(
+                    ChildOutcome::Failed(spawn_invalid_cwd.clone()),
+                    CleanupOutcome::Succeeded,
+                ),
+                expected: decision(
+                    66,
+                    Some(SupervisionDiagnostic::Process(spawn_invalid_cwd)),
                     vec![],
                 ),
             },

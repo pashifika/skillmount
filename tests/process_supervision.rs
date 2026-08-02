@@ -247,9 +247,9 @@ fn spawn_failure_retains_the_requested_launch_cwd() {
         .output()
         .expect("run missing-CWD harness");
 
-    assert_eq!(output.status.code(), Some(66), "{output:?}");
+    let outcome = fs::read_to_string(&outcome).expect("read missing-CWD outcome");
+    assert_eq!(output.status.code(), Some(66), "{output:?}\n{outcome}");
     assert_eq!(cleanup_count(&cleanup), 1);
-    let outcome = fs::read_to_string(outcome).expect("read missing-CWD outcome");
     assert!(outcome.contains("stage: Spawn"), "{outcome}");
     assert!(
         outcome.contains(&missing_cwd.display().to_string()),
