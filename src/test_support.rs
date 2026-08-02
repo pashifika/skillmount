@@ -80,6 +80,20 @@ pub(crate) fn symlink_dir_or_skip(target: &Path, link: &Path) -> bool {
     }
 }
 
+/// Removes a directory link.
+///
+/// The call differs by platform and the wrong one fails rather than doing nothing: Windows treats
+/// a directory symbolic link as a directory entry and rejects `remove_file` with "Access is
+/// denied", while Unix treats every symbolic link as a file and rejects `remove_dir`.
+pub(crate) fn remove_directory_link(path: &Path) {
+    let result = if cfg!(windows) {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.unwrap_or_else(|error| panic!("removing link {} failed: {error}", path.display()));
+}
+
 /// Returns whether the error means the host forbids link creation rather than the test being wrong.
 fn skip_unprivileged(error: &io::Error) -> bool {
     matches!(

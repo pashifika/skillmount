@@ -347,12 +347,23 @@ fn path_value(path: &Path, verbose: bool) -> String {
     os_value(path.as_os_str(), verbose)
 }
 
-/// Renders a platform-native value, reversibly when verbose output was requested.
+/// Marks a value that had to be escaped because it is not representable as text.
+const ESCAPED_PREFIX: &str = "escaped:";
+
+/// Renders a platform-native value, exactly when verbose output was requested.
+///
+/// A value that is already text is its own reversible representation, so it is printed verbatim.
+/// Escaping it unconditionally would double every separator in a Windows path and make the common
+/// case unreadable for no gain. Only a value that is not representable as text is escaped, and it
+/// carries a prefix so a reader can tell the two forms apart. A literal value that would collide
+/// with that prefix is escaped as well.
 fn os_value(value: &OsStr, verbose: bool) -> String {
-    if verbose {
-        escaped(value)
-    } else {
-        Path::new(value).display().to_string()
+    if !verbose {
+        return Path::new(value).display().to_string();
+    }
+    match value.to_str() {
+        Some(text) if !text.starts_with(ESCAPED_PREFIX) => text.to_owned(),
+        _ => format!("{ESCAPED_PREFIX}{}", escaped(value)),
     }
 }
 
@@ -402,7 +413,7 @@ fn escaped(value: &OsStr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{escaped, os_value};
+    use super::{ESCAPED_PREFIX, escaped, os_value};
     use std::ffi::OsString;
 
     #[test]
@@ -412,8 +423,25 @@ mod tests {
     }
 
     #[test]
+    fn a_windows_style_path_keeps_its_single_separators_in_verbose_output() {
+        let value = OsString::from(r"C:\Users\example\.codex\skills");
+
+        assert_eq!(os_value(&value, true), r"C:\Users\example\.codex\skills");
+    }
+
+    #[test]
     fn a_backslash_is_doubled_so_the_escape_stays_reversible() {
         assert_eq!(escaped(&OsString::from("a\\b")), "a\\\\b");
+    }
+
+    #[test]
+    fn a_value_colliding_with_the_marker_is_escaped_so_the_forms_stay_distinct() {
+        let value = OsString::from("escaped:already");
+
+        let rendered = os_value(&value, true);
+
+        assert_eq!(rendered, "escaped:escaped:already");
+        assert!(rendered.starts_with(ESCAPED_PREFIX));
     }
 
     #[cfg(unix)]
@@ -424,9 +452,14 @@ mod tests {
         let value = OsString::from_vec(vec![b'a', 0xFF, b'b']);
 
         assert_eq!(escaped(&value), "a\\xFFb");
+        assert_eq!(
+            os_value(&value, true),
+            "escaped:a\\xFFb",
+            "a value that is not text is marked so a reader knows to decode it"
+        );
         assert_ne!(
             os_value(&value, false),
-            escaped(&value),
+            os_value(&value, true),
             "the lossy form is only used when verbose output was not requested"
         );
     }

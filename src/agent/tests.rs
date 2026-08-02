@@ -12,7 +12,9 @@ use crate::domain::{
 use crate::error::ExitCategory;
 use crate::mount::resolve::{PathKind, classify};
 use crate::mount::{MountAction, MountPlan};
-use crate::test_support::{TestDir, assert_no_side_effects, symlink_dir_or_skip};
+use crate::test_support::{
+    TestDir, assert_no_side_effects, remove_directory_link, symlink_dir_or_skip,
+};
 
 const AUTHORITATIVE: &str = ".agents/skills";
 const COMPATIBILITY: &str = ".codex/skills";
@@ -360,7 +362,7 @@ fn an_unresolvable_authoritative_entry_fails_before_any_action_exists() {
     )
     .expect_err("a broken authoritative entry has no safe destination");
     assert_eq!(error.category(), ExitCategory::Filesystem);
-    std::fs::remove_file(project.authoritative()).expect("reset fixture");
+    remove_directory_link(&project.authoritative());
 
     // Non-directory.
     std::fs::write(project.authoritative(), "not a namespace").expect("file fixture");
