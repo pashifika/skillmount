@@ -23,6 +23,7 @@ pub mod recover;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -52,6 +53,7 @@ pub struct Transaction {
     journal: TransactionJournal,
     path: PathBuf,
     backend: &'static dyn LinkBackend,
+    placement_residue: BTreeMap<u32, cleanup::RetainedEntry>,
 }
 
 /// Renders the transaction without its backend, which is a stateless singleton with no
@@ -62,6 +64,7 @@ impl fmt::Debug for Transaction {
             .debug_struct("Transaction")
             .field("journal", &self.journal)
             .field("path", &self.path)
+            .field("placement_residue", &self.placement_residue)
             .finish_non_exhaustive()
     }
 }
@@ -157,6 +160,7 @@ impl Transaction {
             path: store::journal_path(&journal.transaction_id)?,
             journal,
             backend: platform_backend(),
+            placement_residue: BTreeMap::new(),
         };
         transaction.persist()?;
         crate::checkpoint::reached(crate::checkpoint::Checkpoint::JournalPlanned, 1);
@@ -186,6 +190,7 @@ impl Transaction {
             journal,
             path,
             backend: platform_backend(),
+            placement_residue: BTreeMap::new(),
         })
     }
 

@@ -18,7 +18,8 @@ use crate::error::LinkError;
 use crate::link::resolve::targets_match;
 use crate::link::{
     CreatedLink, CreatedLinkKind, EntryKind, LinkBackend, LinkRequest, LinkTarget, OwnedDirectory,
-    Ownership, PathEntry, PathPlacement, PlatformIdentity, RemoveOutcome, sealed, verify_ownership,
+    Ownership, PathEntry, PlacementMismatch, PlacementOutcome, PlacementResidue, PlatformIdentity,
+    RemoveOutcome, directory_placement_mismatch, link_placement_mismatch, sealed, verify_ownership,
 };
 
 /// The macOS backend.
@@ -101,19 +102,52 @@ impl LinkBackend for UnixBackend {
                 reason: error.to_string(),
             }
         })?;
+        // `symlink` returns status rather than an object capability. The first observation below
+        // establishes evidence for later operations but cannot prove continuity from this call;
+        // ADR 0015 records the non-cooperating replacement window.
+        #[cfg(test)]
+        if let Err(error) = super::testing::reach_hook(
+            super::testing::HookPoint::AfterLinkCreation,
+            &request.staged_path,
+            None,
+        ) {
+            return Err(retained_create_error(request, &error.to_string()));
+        }
 
-        // A failure here would otherwise leave the link this function just created. The junction
-        // path on Windows rolls back the directory it makes for the same reason; this keeps both
-        // creation paths agreeing on who owns a half-finished entry.
-        let created = self
-            .inspect_no_follow(&request.staged_path)
-            .inspect_err(|_| {
-                let _ = fs::remove_file(&request.staged_path);
-            })?;
+        // Unix has no unlink-by-identity operation. If this inspection fails or observes a
+        // replacement, a pathname rollback could delete an entry a non-cooperating process put at
+        // the same name. Retaining the staged path is therefore the only sound failure behavior.
+        let created = match self.inspect_no_follow(&request.staged_path) {
+            Ok(created) => created,
+            Err(error) => return Err(retained_create_error(request, &error.to_string())),
+        };
+        let Some(created_target) = created.target.as_ref() else {
+            return Err(retained_create_error(
+                request,
+                "the initial staged entry observation was not a symbolic link",
+            ));
+        };
+        if created.kind != EntryKind::Symlink
+            || !targets_match(&source_canonical, &created_target.raw)
+            || created.identity.is_none()
+        {
+            return Err(retained_create_error(
+                request,
+                "the initial staged entry observation did not match the required symbolic link",
+            ));
+        }
+        #[cfg(test)]
+        if let Err(error) = super::testing::reach_hook(
+            super::testing::HookPoint::AfterLinkVerification,
+            &request.staged_path,
+            None,
+        ) {
+            return Err(retained_create_error(request, &error.to_string()));
+        }
         Ok(CreatedLink {
             path: request.staged_path.clone(),
             kind: CreatedLinkKind::Symlink,
-            target: source_canonical.clone(),
+            target: created_target.raw.clone(),
             source_canonical,
             identity: created.identity,
         })
@@ -123,28 +157,114 @@ impl LinkBackend for UnixBackend {
         super::create_directory_entry(self, path)
     }
 
-    fn place_path_no_replace(
+    fn place_no_replace(
         &self,
-        staged: &Path,
+        staged: &CreatedLink,
         destination: &Path,
-    ) -> Result<PathPlacement, LinkError> {
-        match super::unix_ffi::rename_no_replace(staged, destination) {
-            Ok(()) => Ok(PathPlacement::Placed),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                Ok(PathPlacement::DestinationExists)
-            }
-            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-                Err(LinkError::Unsupported {
-                    path: destination.to_path_buf(),
-                    reason: format!("no-replace renaming is unavailable here: {error}"),
-                })
-            }
-            Err(error) => Err(LinkError::Place {
-                staged: staged.to_path_buf(),
-                destination: destination.to_path_buf(),
-                reason: error.to_string(),
-            }),
+    ) -> Result<PlacementOutcome<CreatedLink>, LinkError> {
+        #[cfg(test)]
+        super::testing::reach_hook(
+            super::testing::HookPoint::BeforePlacementVerification,
+            &staged.path,
+            Some(destination),
+        )?;
+        let live = self.inspect_no_follow(&staged.path)?;
+        if let Some(mismatch) = link_placement_mismatch(&live, staged, |target| {
+            targets_match(&staged.target, &target.raw)
+        }) {
+            return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                path: staged.path.clone(),
+                mismatch,
+            }));
         }
+        #[cfg(test)]
+        super::testing::reach_hook(
+            super::testing::HookPoint::BeforePlacementMutation,
+            &staged.path,
+            Some(destination),
+        )?;
+        if !place_path_no_replace(&staged.path, destination)? {
+            return Ok(PlacementOutcome::DestinationExists);
+        }
+        #[cfg(test)]
+        super::testing::reach_hook(
+            super::testing::HookPoint::AfterPlacementMutation,
+            destination,
+            None,
+        )?;
+
+        let placed = staged.relocated_to(destination);
+        let live = match self.inspect_no_follow(destination) {
+            Ok(live) => live,
+            Err(error) => {
+                return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                    path: destination.to_path_buf(),
+                    mismatch: PlacementMismatch::InspectionFailed(error.to_string()),
+                }));
+            }
+        };
+        if let Some(mismatch) = link_placement_mismatch(&live, &placed, |target| {
+            targets_match(&placed.target, &target.raw)
+        }) {
+            return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                path: destination.to_path_buf(),
+                mismatch,
+            }));
+        }
+        Ok(PlacementOutcome::Placed(placed))
+    }
+
+    fn place_directory_no_replace(
+        &self,
+        staged: &OwnedDirectory,
+        destination: &Path,
+    ) -> Result<PlacementOutcome<OwnedDirectory>, LinkError> {
+        #[cfg(test)]
+        super::testing::reach_hook(
+            super::testing::HookPoint::BeforePlacementVerification,
+            &staged.path,
+            Some(destination),
+        )?;
+        let live = self.inspect_no_follow(&staged.path)?;
+        if let Some(mismatch) = directory_placement_mismatch(&live, staged) {
+            return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                path: staged.path.clone(),
+                mismatch,
+            }));
+        }
+        #[cfg(test)]
+        super::testing::reach_hook(
+            super::testing::HookPoint::BeforePlacementMutation,
+            &staged.path,
+            Some(destination),
+        )?;
+        if !place_path_no_replace(&staged.path, destination)? {
+            return Ok(PlacementOutcome::DestinationExists);
+        }
+        #[cfg(test)]
+        super::testing::reach_hook(
+            super::testing::HookPoint::AfterPlacementMutation,
+            destination,
+            None,
+        )?;
+
+        let placed = staged.relocated_to(destination);
+        let live = match self.inspect_no_follow(destination) {
+            Ok(live) => live,
+            Err(error) => {
+                return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                    path: destination.to_path_buf(),
+                    mismatch: PlacementMismatch::InspectionFailed(error.to_string()),
+                }));
+            }
+        };
+        if let Some(mismatch) = directory_placement_mismatch(&live, &placed) {
+            return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                path: destination.to_path_buf(),
+                mismatch,
+            }));
+        }
+        Ok(PlacementOutcome::Placed(placed))
     }
 
     fn remove_empty_directory(
@@ -161,15 +281,54 @@ impl LinkBackend for UnixBackend {
         }) {
             Ownership::Absent => Ok(RemoveOutcome::AlreadyAbsent),
             Ownership::Mismatch(mismatch) => Ok(RemoveOutcome::OwnershipMismatch(mismatch)),
-            // `remove_file` unlinks the symbolic link itself. `remove_dir_all` would follow it into
-            // the user's own Skill source, which is why no code path here may ever reach for it.
-            Ownership::Owned => fs::remove_file(&recorded.path)
-                .map(|()| RemoveOutcome::Removed)
-                .map_err(|error| LinkError::Remove {
-                    path: recorded.path.clone(),
-                    reason: error.to_string(),
-                }),
+            Ownership::Owned => {
+                #[cfg(test)]
+                super::testing::reach_hook(
+                    super::testing::HookPoint::BeforeRemovalMutation,
+                    &recorded.path,
+                    None,
+                )?;
+
+                // Product callers hold every logical and physical SkillMount lock across this
+                // final check and unlink, which excludes another cooperating session. Those locks
+                // are advisory state-file locks, not a capability over this directory. A process
+                // that ignores them can still replace the pathname after this inspection and
+                // before `remove_file`; macOS exposes no unlink-by-identity operation to close that
+                // residual window (ADR 0014).
+                let live = self.inspect_no_follow(&recorded.path)?;
+                match verify_ownership(&live, recorded, |target| {
+                    targets_match(&recorded.target, &target.raw)
+                }) {
+                    Ownership::Absent => Ok(RemoveOutcome::AlreadyAbsent),
+                    Ownership::Mismatch(mismatch) => Ok(RemoveOutcome::OwnershipMismatch(mismatch)),
+                    // `remove_file` unlinks the symbolic link itself. `remove_dir_all` would follow
+                    // it into the user's Skill source, so no code path here may ever reach for it.
+                    Ownership::Owned => fs::remove_file(&recorded.path)
+                        .map(|()| RemoveOutcome::Removed)
+                        .map_err(|error| LinkError::Remove {
+                            path: recorded.path.clone(),
+                            reason: error.to_string(),
+                        }),
+                }
+            }
         }
+    }
+}
+
+/// Runs the backend-private atomic pathname rename, returning `false` for destination contention.
+fn place_path_no_replace(staged: &Path, destination: &Path) -> Result<bool, LinkError> {
+    match super::unix_ffi::rename_no_replace(staged, destination) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => Err(LinkError::Unsupported {
+            path: destination.to_path_buf(),
+            reason: format!("no-replace renaming is unavailable here: {error}"),
+        }),
+        Err(error) => Err(LinkError::Place {
+            staged: staged.to_path_buf(),
+            destination: destination.to_path_buf(),
+            reason: error.to_string(),
+        }),
     }
 }
 
@@ -188,5 +347,17 @@ fn inspect_error(path: &Path, error: &io::Error) -> LinkError {
     LinkError::Inspect {
         path: path.to_path_buf(),
         reason: error.to_string(),
+    }
+}
+
+fn retained_create_error(request: &LinkRequest, reason: &str) -> LinkError {
+    LinkError::Create {
+        destination: request.staged_path.clone(),
+        source: request.source.clone(),
+        reason: format!(
+            "{reason}; no pathname rollback was attempted because ownership could not be proved \
+             across unlink; inspect the retained staged path {}",
+            request.staged_path.display()
+        ),
     }
 }

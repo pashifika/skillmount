@@ -11,18 +11,24 @@
 //! privilege. Both are pure functions for exactly that reason.
 //!
 //! Every case that removes something asserts a sentinel file inside the target directory
-//! afterwards. `RemoveDirectoryW` detaches a reparse point rather than descending into it, and this
-//! is the assertion that would fail if that ever stopped being true.
+//! afterwards. Handle disposition detaches the reparse point object rather than descending into
+//! it, and this is the assertion that would fail if that ever stopped being true.
 
 use std::fs;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_DISK_FULL, ERROR_PRIVILEGE_NOT_HELD,
+    ERROR_ACCESS_DENIED, ERROR_DISK_FULL, ERROR_PRIVILEGE_NOT_HELD, ERROR_SHARING_VIOLATION,
+    GENERIC_WRITE,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE,
 };
 
 use crate::domain::LinkMode;
@@ -32,12 +38,15 @@ use crate::link::{
     CreatedLink, CreatedLinkKind, EntryKind, LinkRequest, OwnershipMismatch, PlacementOutcome,
     RemoveOutcome, platform_backend,
 };
-use crate::test_support::TestDir;
+use crate::test_support::{TestDir, symlink_dir_or_skip};
 
+use super::testing::{HookPoint, with_hook};
 use super::windows::{
     SymlinkFailure, classify_symlink_failure, is_privilege_failure, junction_eligibility,
     link_target,
 };
+use super::windows_ffi::{self, Access};
+use super::{reparse, winpath};
 
 /// The file every source directory carries, so a test can prove removal never reached it.
 const SENTINEL: &str = "SKILL.md";
@@ -103,13 +112,25 @@ fn wide(path: &Path) -> Vec<u16> {
 fn host_permits_symlinks(fixture: &Fixture) -> bool {
     let source = fixture.source("probe-source");
     let probe = fixture.path("probe-link");
-    match std::os::windows::fs::symlink_dir(&source, &probe) {
-        Ok(()) => {
-            fs::remove_dir(&probe).expect("the probe link is removed, not its target");
-            true
-        }
-        Err(error) if is_privilege_failure(&error) => false,
-        Err(error) => panic!("the symbolic-link probe failed for an unexpected reason: {error}"),
+    if !symlink_dir_or_skip(&source, &probe) {
+        return false;
+    }
+    fs::remove_dir(&probe).expect("the probe link is removed, not its target");
+    true
+}
+
+fn supported_link_modes(fixture: &Fixture) -> Vec<LinkMode> {
+    let mut modes = vec![LinkMode::Junction];
+    if host_permits_symlinks(fixture) {
+        modes.push(LinkMode::Symlink);
+    }
+    modes
+}
+
+fn injected_hook_error(path: &Path, boundary: &str) -> LinkError {
+    LinkError::Inspect {
+        path: path.to_path_buf(),
+        reason: format!("injected failure at {boundary}"),
     }
 }
 
@@ -184,6 +205,249 @@ fn a_non_privilege_failure_keeps_its_own_error_and_creates_nothing() {
 }
 
 #[test]
+fn handle_bound_removal_preserves_a_required_open_failure() {
+    let fixture = Fixture::new("windows-inspect-sharing-failure");
+    let path = fixture.path("locked-entry");
+    fs::write(&path, "locked").expect("the fixture file is written");
+    let _exclusive = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&path)
+        .expect("the test owns an exclusive handle");
+    let recorded = CreatedLink {
+        path: path.clone(),
+        kind: CreatedLinkKind::Symlink,
+        target: PathBuf::from("unused-target"),
+        source_canonical: PathBuf::from("unused-source"),
+        identity: None,
+    };
+
+    let error = platform_backend()
+        .remove_link_entry(&recorded)
+        .expect_err("a required DELETE handle cannot be silently discarded");
+    let LinkError::Inspect { reason, .. } = error else {
+        panic!("an open failure must remain an inspection error: {error}");
+    };
+    assert!(
+        reason.contains(&format!("os error {ERROR_SHARING_VIOLATION}")),
+        "the original sharing-violation cause must survive: {reason}"
+    );
+}
+
+#[test]
+fn junction_creation_retains_a_directory_when_initial_ownership_cannot_be_proved() {
+    let fixture = Fixture::new("windows-junction-create-residue");
+    let source = fixture.source("source");
+    let staged = fixture.path("staged");
+    let hook_path = staged.clone();
+
+    let error = with_hook(
+        move |event| {
+            if event.point == HookPoint::AfterDirectoryCreation && event.path == hook_path {
+                fs::remove_dir(&hook_path)
+                    .expect("the created directory is replaced before evidence");
+                fs::create_dir(&hook_path).expect("the replacement takes the staged pathname");
+                fs::write(hook_path.join("their-own-work"), "keep")
+                    .expect("the replacement carries operator state");
+                return Err(injected_hook_error(&hook_path, "directory creation"));
+            }
+            Ok(())
+        },
+        || stage(&source, &staged, LinkMode::Junction),
+    )
+    .expect_err("an unproved staged directory cannot be removed by name");
+
+    assert!(error.to_string().contains("retained staged path"));
+    assert_eq!(
+        platform_backend()
+            .inspect_no_follow(&staged)
+            .expect("the retained entry is inspectable")
+            .kind,
+        EntryKind::Directory
+    );
+    assert!(
+        staged.join("their-own-work").is_file(),
+        "failure before initial evidence must not pathname-delete the replacement"
+    );
+    fs::remove_file(staged.join("their-own-work")).expect("the fixture residue is emptied");
+    fs::remove_dir(&staged).expect("the fixture-owned residue is cleaned up");
+    assert_source_intact(&source);
+}
+
+#[test]
+fn junction_creation_rolls_back_a_verified_entry_through_its_handle() {
+    let fixture = Fixture::new("windows-junction-create-rollback");
+    let source = fixture.source("source");
+    let staged = fixture.path("staged");
+    let displaced = fixture.path("displaced");
+    let hook_path = staged.clone();
+    let hook_displaced = displaced.clone();
+
+    let error = with_hook(
+        move |event| {
+            if event.point == HookPoint::AfterLinkVerification && event.path == hook_path {
+                let error = fs::rename(&hook_path, &hook_displaced)
+                    .expect_err("the verified junction handle excludes a pathname redirect");
+                assert_eq!(
+                    error.raw_os_error(),
+                    i32::try_from(ERROR_SHARING_VIOLATION).ok(),
+                    "junction rollback must retain authority over its verified object: {error}"
+                );
+                return Err(injected_hook_error(&hook_path, "link verification"));
+            }
+            Ok(())
+        },
+        || stage(&source, &staged, LinkMode::Junction),
+    )
+    .expect_err("a late injected failure triggers verified rollback");
+
+    assert!(error.to_string().contains("rolled back through its handle"));
+    assert_eq!(
+        platform_backend()
+            .inspect_no_follow(&staged)
+            .expect("the rollback result is inspectable")
+            .kind,
+        EntryKind::Missing
+    );
+    assert_eq!(
+        platform_backend()
+            .inspect_no_follow(&displaced)
+            .expect("the rejected redirect destination is inspectable")
+            .kind,
+        EntryKind::Missing
+    );
+    assert_source_intact(&source);
+}
+
+#[test]
+fn junction_creation_reports_both_the_original_and_handle_rollback_failures() {
+    let fixture = Fixture::new("windows-junction-create-rollback-failure");
+    let source = fixture.source("source");
+    let staged = fixture.path("staged");
+    let hook_path = staged.clone();
+    let access_denied = i32::try_from(ERROR_ACCESS_DENIED).expect("the error code fits");
+
+    let error = windows_ffi::with_delete_error(access_denied, || {
+        with_hook(
+            move |event| {
+                if event.point == HookPoint::AfterLinkVerification && event.path == hook_path {
+                    return Err(injected_hook_error(&hook_path, "link verification"));
+                }
+                Ok(())
+            },
+            || stage(&source, &staged, LinkMode::Junction),
+        )
+    })
+    .expect_err("a failed handle rollback retains the verified entry");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("injected failure at link verification"),
+        "{message}"
+    );
+    assert!(
+        message.contains("handle-bound rollback failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("os error {ERROR_ACCESS_DENIED}")),
+        "{message}"
+    );
+    assert_eq!(
+        platform_backend()
+            .inspect_no_follow(&staged)
+            .expect("the retained junction is inspectable")
+            .kind,
+        EntryKind::Junction
+    );
+    fs::remove_dir(&staged).expect("the fixture-owned junction is cleaned up");
+    assert_source_intact(&source);
+}
+
+#[test]
+fn symlink_creation_distinguishes_unproved_residue_from_verified_rollback() {
+    let fixture = Fixture::new("windows-symlink-create-boundaries");
+    if !host_permits_symlinks(&fixture) {
+        return;
+    }
+    let source = fixture.source("source");
+    let replacement_source = fixture.source("replacement-source");
+    let retained = fixture.path("retained");
+    let retained_hook_path = retained.clone();
+    let retained_hook_target = replacement_source.clone();
+    let error = with_hook(
+        move |event| {
+            if event.point == HookPoint::AfterLinkCreation && event.path == retained_hook_path {
+                fs::remove_dir(&retained_hook_path)
+                    .expect("the created symlink is replaced before evidence");
+                std::os::windows::fs::symlink_dir(&retained_hook_target, &retained_hook_path)
+                    .expect("the replacement takes the staged pathname");
+                return Err(injected_hook_error(&retained_hook_path, "link creation"));
+            }
+            Ok(())
+        },
+        || stage(&source, &retained, LinkMode::Symlink),
+    )
+    .expect_err("ownership has not yet been proved");
+    assert!(error.to_string().contains("retained staged path"));
+    assert_eq!(
+        platform_backend()
+            .inspect_no_follow(&retained)
+            .expect("the retained symlink is inspectable")
+            .kind,
+        EntryKind::Symlink
+    );
+    assert_eq!(
+        fs::canonicalize(&retained).expect("the retained replacement resolves"),
+        replacement_source,
+        "failure before initial evidence must not pathname-delete the replacement"
+    );
+    fs::remove_dir(&retained).expect("the fixture-owned residue is cleaned up");
+
+    let rolled_back = fixture.path("rolled-back");
+    let rollback_displaced = fixture.path("rollback-displaced");
+    let rollback_hook_path = rolled_back.clone();
+    let rollback_hook_displaced = rollback_displaced.clone();
+    let error = with_hook(
+        move |event| {
+            if event.point == HookPoint::AfterLinkVerification && event.path == rollback_hook_path {
+                let error = fs::rename(&rollback_hook_path, &rollback_hook_displaced)
+                    .expect_err("the verified symlink handle excludes a pathname redirect");
+                assert_eq!(
+                    error.raw_os_error(),
+                    i32::try_from(ERROR_SHARING_VIOLATION).ok(),
+                    "symlink rollback must retain authority over its verified object: {error}"
+                );
+                return Err(injected_hook_error(
+                    &rollback_hook_path,
+                    "link verification",
+                ));
+            }
+            Ok(())
+        },
+        || stage(&source, &rolled_back, LinkMode::Symlink),
+    )
+    .expect_err("verified ownership permits handle rollback");
+    assert!(error.to_string().contains("rolled back through its handle"));
+    assert_eq!(
+        platform_backend()
+            .inspect_no_follow(&rolled_back)
+            .expect("the rollback result is inspectable")
+            .kind,
+        EntryKind::Missing
+    );
+    assert_eq!(
+        platform_backend()
+            .inspect_no_follow(&rollback_displaced)
+            .expect("the rejected redirect destination is inspectable")
+            .kind,
+        EntryKind::Missing
+    );
+    assert_source_intact(&source);
+    assert_source_intact(&replacement_source);
+}
+
+#[test]
 fn an_explicit_junction_resolves_to_its_source_and_is_removed_without_touching_it() {
     let fixture = Fixture::new("windows-junction");
     let source = fixture.source("skills/rust");
@@ -225,6 +489,34 @@ fn an_explicit_junction_resolves_to_its_source_and_is_removed_without_touching_i
         RemoveOutcome::Removed
     );
     assert!(!destination.exists());
+    assert_source_intact(&source);
+}
+
+#[test]
+fn posix_disposition_unlinks_a_verified_entry_while_an_inspect_handle_remains_open() {
+    let fixture = Fixture::new("windows-posix-disposition");
+    let source = fixture.source("skills/rust");
+    let destination = fixture.path("mounted");
+    let backend = platform_backend();
+    let created = stage(&source, &destination, LinkMode::Junction).expect("creation succeeds");
+    let held = windows_ffi::open_no_follow(&destination, Access::Inspect)
+        .expect("a shared inspect handle opens");
+
+    assert_eq!(
+        backend
+            .remove_link_entry(&created)
+            .expect("POSIX handle disposition succeeds"),
+        RemoveOutcome::Removed
+    );
+    assert_eq!(
+        backend
+            .inspect_no_follow(&destination)
+            .expect("the old name is inspectable")
+            .kind,
+        EntryKind::Missing,
+        "the visible name must disappear before unrelated read handles close"
+    );
+    drop(held);
     assert_source_intact(&source);
 }
 
@@ -288,6 +580,123 @@ fn removal_refuses_an_entry_whose_reparse_target_changed() {
         RemoveOutcome::Removed
     );
     assert_source_intact(&elsewhere);
+}
+
+#[test]
+fn removal_excludes_pathname_replacement_while_the_verified_handle_is_open() {
+    let fixture = Fixture::new("windows-handle-removal-race");
+    let backend = platform_backend();
+
+    for (index, mode) in supported_link_modes(&fixture).into_iter().enumerate() {
+        let source = fixture.source(&format!("source-{index}"));
+        let replacement_source = fixture.source(&format!("replacement-source-{index}"));
+        let path = fixture.path(&format!("mounted-{index}"));
+        let replacement_path = fixture.path(&format!("replacement-{index}"));
+        let displaced = fixture.path(&format!("displaced-{index}"));
+        let created = stage(&source, &path, mode).expect("creation succeeds");
+        let replacement =
+            stage(&replacement_source, &replacement_path, mode).expect("replacement is staged");
+
+        let hook_path = path.clone();
+        let hook_displaced = displaced.clone();
+        let outcome = with_hook(
+            move |event| {
+                if event.point == HookPoint::BeforeRemovalMutation && event.path == hook_path {
+                    let error = fs::rename(&hook_path, &hook_displaced)
+                        .expect_err("the removal handle excludes another delete-capable mutation");
+                    assert_eq!(
+                        error.raw_os_error(),
+                        i32::try_from(ERROR_SHARING_VIOLATION).ok(),
+                        "the pathname cannot be retargeted after ownership is verified: {error}"
+                    );
+                    let error = fs::OpenOptions::new()
+                        .access_mode(GENERIC_WRITE)
+                        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                        .open(&hook_path)
+                        .expect_err("the removal handle excludes an ordinary reparse writer");
+                    assert_eq!(
+                        error.raw_os_error(),
+                        i32::try_from(ERROR_SHARING_VIOLATION).ok(),
+                        "generic write access cannot change verified reparse data: {error}"
+                    );
+                }
+                Ok(())
+            },
+            || backend.remove_link_entry(&created),
+        )
+        .expect("handle-bound removal succeeds");
+
+        assert_eq!(outcome, RemoveOutcome::Removed, "{mode:?}");
+        assert_eq!(
+            backend
+                .inspect_no_follow(&path)
+                .expect("the removed name can be inspected")
+                .kind,
+            EntryKind::Missing,
+            "the verified object is removed before another entry can take its name"
+        );
+        assert_eq!(
+            backend
+                .inspect_no_follow(&displaced)
+                .expect("the rejected displaced name can be inspected")
+                .kind,
+            EntryKind::Missing
+        );
+        let live_replacement = backend
+            .inspect_no_follow(&replacement_path)
+            .expect("the staged replacement remains inspectable");
+        assert_eq!(live_replacement.identity, replacement.identity, "{mode:?}");
+
+        assert_eq!(
+            backend
+                .remove_link_entry(&replacement)
+                .expect("the replacement owner cleans up"),
+            RemoveOutcome::Removed
+        );
+        assert_source_intact(&source);
+        assert_source_intact(&replacement_source);
+    }
+}
+
+#[test]
+fn attribute_only_reparse_mutation_does_not_change_object_authority() {
+    let fixture = Fixture::new("windows-attribute-reparse-race");
+    let source = fixture.source("source");
+    let replacement_source = fixture.source("replacement-source");
+    let path = fixture.path("mounted");
+    let created = stage(&source, &path, LinkMode::Junction).expect("creation succeeds");
+    let display_name = wide(&replacement_source);
+    let substitute_name = winpath::to_nt_substitute_name(&display_name);
+    let replacement_buffer = reparse::build_mount_point(&substitute_name, &display_name)
+        .expect("the replacement mount-point buffer is valid");
+    let hook_path = path.clone();
+
+    let outcome = with_hook(
+        move |event| {
+            if event.point == HookPoint::BeforeRemovalMutation && event.path == hook_path {
+                let writer = windows_ffi::open_no_follow(&hook_path, Access::AttributeWrite)
+                    .expect("Windows exempts attribute-only access from share-mode checks");
+                windows_ffi::write_reparse_point(&writer, &replacement_buffer)
+                    .expect("FILE_WRITE_ATTRIBUTES can modify the existing reparse point");
+            }
+            Ok(())
+        },
+        || platform_backend().remove_link_entry(&created),
+    )
+    .expect("same-object removal remains safe after attribute-only metadata mutation");
+
+    assert_eq!(outcome, RemoveOutcome::Removed);
+    assert_eq!(
+        platform_backend()
+            .inspect_no_follow(&path)
+            .expect("the disposed name is inspectable")
+            .kind,
+        EntryKind::Missing,
+        "the retained handle removes the recorded object rather than traversing either target"
+    );
+    assert_source_intact(&source);
+    assert_source_intact(&replacement_source);
 }
 
 #[test]
@@ -378,6 +787,133 @@ fn placement_preserves_a_destination_that_appeared_after_staging() {
 }
 
 #[test]
+fn placement_renames_the_verified_handle_not_a_staged_pathname_replacement() {
+    let fixture = Fixture::new("windows-handle-placement-race");
+    let backend = platform_backend();
+
+    for (index, mode) in supported_link_modes(&fixture).into_iter().enumerate() {
+        let source = fixture.source(&format!("source-{index}"));
+        let replacement_source = fixture.source(&format!("replacement-source-{index}"));
+        let staged_path = fixture.path(&format!("staged-{index}"));
+        let replacement_path = fixture.path(&format!("replacement-{index}"));
+        let displaced = fixture.path(&format!("displaced-{index}"));
+        let destination = fixture.path(&format!("destination-{index}"));
+        let created = stage(&source, &staged_path, mode).expect("creation succeeds");
+        let replacement =
+            stage(&replacement_source, &replacement_path, mode).expect("replacement is staged");
+
+        let hook_staged = staged_path.clone();
+        let hook_replacement = replacement_path.clone();
+        let hook_displaced = displaced.clone();
+        let outcome = with_hook(
+            move |event| {
+                if event.point == HookPoint::BeforePlacementMutation && event.path == hook_staged {
+                    fs::rename(&hook_staged, &hook_displaced)
+                        .expect("the verified entry is moved while its handle stays open");
+                    fs::rename(&hook_replacement, &hook_staged)
+                        .expect("a replacement takes the staged pathname");
+                }
+                Ok(())
+            },
+            || backend.place_no_replace(&created, &destination),
+        )
+        .expect("handle-bound placement succeeds");
+        let PlacementOutcome::Placed(placed) = outcome else {
+            panic!("the verified handle must be placed: {outcome:?}");
+        };
+
+        assert_eq!(placed.identity, created.identity, "{mode:?}");
+        assert_eq!(
+            backend
+                .inspect_no_follow(&destination)
+                .expect("the destination is inspectable")
+                .identity,
+            created.identity,
+            "the created object reaches the destination"
+        );
+        assert_eq!(
+            backend
+                .inspect_no_follow(&staged_path)
+                .expect("the staged replacement is inspectable")
+                .identity,
+            replacement.identity,
+            "the pathname replacement is not moved"
+        );
+        assert_eq!(
+            backend
+                .remove_link_entry(&placed)
+                .expect("the placed entry is removed"),
+            RemoveOutcome::Removed
+        );
+        assert_eq!(
+            backend
+                .remove_link_entry(&replacement.relocated_to(&staged_path))
+                .expect("the replacement is removed"),
+            RemoveOutcome::Removed
+        );
+        assert_source_intact(&source);
+        assert_source_intact(&replacement_source);
+    }
+}
+
+#[test]
+fn helper_directory_placement_renames_the_verified_handle() {
+    let fixture = Fixture::new("windows-directory-placement-race");
+    let backend = platform_backend();
+    let staged_path = fixture.path("staged");
+    let replacement_path = fixture.path("replacement");
+    let displaced = fixture.path("displaced");
+    let destination = fixture.path("destination");
+    let created = backend
+        .create_directory(&staged_path)
+        .expect("directory creation succeeds");
+    let replacement = backend
+        .create_directory(&replacement_path)
+        .expect("replacement creation succeeds");
+
+    let hook_staged = staged_path.clone();
+    let hook_replacement = replacement_path.clone();
+    let hook_displaced = displaced.clone();
+    let outcome = with_hook(
+        move |event| {
+            if event.point == HookPoint::BeforePlacementMutation && event.path == hook_staged {
+                fs::rename(&hook_staged, &hook_displaced)
+                    .expect("the verified directory is moved with its handle open");
+                fs::rename(&hook_replacement, &hook_staged)
+                    .expect("a replacement takes the staged pathname");
+            }
+            Ok(())
+        },
+        || backend.place_directory_no_replace(&created, &destination),
+    )
+    .expect("handle-bound directory placement succeeds");
+    let PlacementOutcome::Placed(placed) = outcome else {
+        panic!("the verified directory must be placed: {outcome:?}");
+    };
+
+    assert_eq!(placed.identity, created.identity);
+    assert_eq!(
+        backend
+            .inspect_no_follow(&staged_path)
+            .expect("the replacement is inspectable")
+            .identity,
+        replacement.identity
+    );
+    assert_eq!(
+        backend
+            .remove_empty_directory(&placed)
+            .expect("the placed directory is removed"),
+        RemoveOutcome::Removed
+    );
+    assert_eq!(
+        backend
+            .remove_empty_directory(&replacement.relocated_to(&staged_path))
+            .expect("the replacement directory is removed"),
+        RemoveOutcome::Removed
+    );
+}
+
+#[test]
 fn exactly_one_of_two_racing_placements_wins_the_destination() {
     let fixture = Fixture::new("windows-placement-race");
     let source = fixture.source("skills/rust");
@@ -422,7 +958,7 @@ fn exactly_one_of_two_racing_placements_wins_the_destination() {
             .filter(|outcome| matches!(outcome, PlacementOutcome::Placed(_)))
             .count(),
         1,
-        "MoveFileExW without MOVEFILE_REPLACE_EXISTING must let exactly one racer through"
+        "FileRenameInfo with replacement disabled must let exactly one racer through"
     );
     assert_source_intact(&source);
 }

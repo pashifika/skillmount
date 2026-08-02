@@ -6,29 +6,39 @@
 //! `windows_sys` type crosses back out of it, so a reviewer auditing the raw-pointer surface reads
 //! this file and nothing else.
 //!
-//! Five things the standard library cannot do bring us here: opening a directory without following
-//! its reparse point, reading and writing a reparse buffer, reading a stable file identity,
-//! renaming without replacement, and replacing a durable journal with write-through semantics.
-//! Everything else in the Windows backend uses safe `std::fs`.
+//! The standard library cannot open a directory without following its reparse point, read or write
+//! a reparse buffer, read the strongest stable identity, rename or delete an already-open object,
+//! or replace a durable journal with write-through semantics. Those operations stay here; everything
+//! else in the Windows backend uses safe `std::fs`.
 //!
 //! Handles are wrapped in [`std::os::windows::io::OwnedHandle`] at the boundary, so closing them is
 //! std's responsibility and no `Drop` implementation here can leak or double-close one.
 
 #![allow(unsafe_code)]
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::io;
+use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{FILETIME, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    ERROR_CALL_NOT_IMPLEMENTED, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+    ERROR_NOT_SUPPORTED, FILETIME, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+};
+#[cfg(test)]
+use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_DISPOSITION_FLAG_DELETE,
+    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    OPEN_EXISTING, RemoveDirectoryW,
+    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfoEx,
+    FileIdInfo, FileRenameInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
+    SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
@@ -36,20 +46,80 @@ use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPAR
 use super::reparse::MAXIMUM_REPARSE_DATA_BUFFER_SIZE;
 use super::winpath;
 
-/// Whether a handle is opened to read an entry or to rewrite its reparse data.
+#[cfg(test)]
+thread_local! {
+    static INJECTED_DELETE_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
+}
+
+/// Runs one native test with the next handle disposition forced to fail.
+#[cfg(test)]
+pub(super) fn with_delete_error<R>(code: i32, operation: impl FnOnce() -> R) -> R {
+    INJECTED_DELETE_ERROR.with(|slot| {
+        assert!(
+            slot.replace(Some(code)).is_none(),
+            "delete-error injections cannot be nested"
+        );
+    });
+    let _guard = DeleteErrorGuard;
+    operation()
+}
+
+#[cfg(test)]
+fn take_injected_delete_error() -> Option<io::Error> {
+    INJECTED_DELETE_ERROR
+        .with(Cell::take)
+        .map(io::Error::from_raw_os_error)
+}
+
+#[cfg(test)]
+struct DeleteErrorGuard;
+
+#[cfg(test)]
+impl Drop for DeleteErrorGuard {
+    fn drop(&mut self) {
+        INJECTED_DELETE_ERROR.with(|slot| slot.set(None));
+    }
+}
+
+/// Capabilities required from a no-follow entry handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Access {
     /// Enough to read attributes, identity, and reparse data.
     Inspect,
-    /// Enough to write a reparse buffer, which Windows requires `GENERIC_WRITE` for.
+    /// Enough to rename the opened entry after inspection while allowing pathname contention.
+    Delete,
+    /// Enough to delete the opened entry while excluding ordinary writers and deleters.
+    Remove,
+    /// Enough to write a reparse buffer and roll back while excluding ordinary peer mutation.
     WriteReparseData,
+    /// Attribute-only reparse mutation used to prove the Windows share-mode boundary.
+    #[cfg(test)]
+    AttributeWrite,
 }
 
 impl Access {
     const fn desired(self) -> u32 {
         match self {
             Self::Inspect => FILE_READ_ATTRIBUTES,
-            Self::WriteReparseData => GENERIC_WRITE,
+            Self::Delete | Self::Remove => FILE_READ_ATTRIBUTES | DELETE,
+            Self::WriteReparseData => GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE,
+            #[cfg(test)]
+            Self::AttributeWrite => FILE_WRITE_ATTRIBUTES,
+        }
+    }
+
+    const fn share_mode(self) -> u32 {
+        match self {
+            // Placement deliberately permits a competing rename: the retained handle, rather than
+            // the pathname, is the mutation authority. Read-only inspection has no reason to deny
+            // ordinary sharing either.
+            Self::Inspect | Self::Delete => FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            // Removal and creation rollback exclude ordinary write and delete access. Windows does
+            // not apply share modes to attribute-only access, so ADR 0016 scopes kind and target as
+            // eligibility checks while the retained identity remains the object authority.
+            Self::Remove | Self::WriteReparseData => FILE_SHARE_READ,
+            #[cfg(test)]
+            Self::AttributeWrite => FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         }
     }
 }
@@ -72,7 +142,7 @@ pub(super) fn open_no_follow(path: &Path, access: Access) -> io::Result<OwnedHan
         CreateFileW(
             wide.as_ptr(),
             access.desired(),
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            access.share_mode(),
             ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -93,8 +163,8 @@ pub(super) enum FileIdentity {
     /// The 128-bit `FILE_ID_INFO` identity, available since Windows 8.
     ///
     /// This is the form ownership verification wants. The legacy 64-bit index below is documented
-    /// as not guaranteed unique on `ReFS` and as reusable after deletion, so on those volumes it is
-    /// not a lifetime capability and cannot by itself authorize a removal.
+    /// as not guaranteed unique on `ReFS` and as reusable after deletion, so the two forms stay
+    /// explicitly tagged and are never treated as interchangeable evidence.
     Wide {
         /// 64-bit volume serial number.
         volume: u64,
@@ -110,31 +180,60 @@ pub(super) enum FileIdentity {
     },
 }
 
-/// Reads the strongest identity the volume reports for an open entry.
+/// Attributes and the strongest identity read from one open entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct EntryInformation {
+    /// File attributes reported by `GetFileInformationByHandle`.
+    pub(super) attributes: u32,
+    /// Strongest identity the volume reports.
+    pub(super) identity: FileIdentity,
+}
+
+/// Reads attributes and the strongest identity the volume reports for an open entry.
 ///
-/// `FILE_ID_INFO` is tried first and the legacy pair is the fallback, because a filesystem or
-/// filter driver that does not implement the newer class fails the call rather than degrading.
+/// The legacy information call supplies both attributes and a usable identity. `FILE_ID_INFO` is
+/// then preferred when the filesystem implements it; only documented unsupported-information-class
+/// errors select the legacy value, while other identity-read failures are returned. Keeping both
+/// reads on this handle prevents a pathname lookup from being combined with identity from a
+/// different object.
 ///
 /// # Errors
 ///
-/// Returns the operating-system error when neither form is available.
-pub(super) fn file_identity(handle: &OwnedHandle) -> io::Result<FileIdentity> {
-    if let Some(wide) = wide_file_identity(handle) {
-        return Ok(wide);
-    }
-    let (volume, index) = legacy_file_identity(handle)?;
-    Ok(FileIdentity::Legacy { volume, index })
+/// Returns the operating-system error when required entry information cannot be read. Only an
+/// error that specifically means `FILE_ID_INFO` is unavailable selects the legacy identity.
+pub(super) fn entry_information(handle: &OwnedHandle) -> io::Result<EntryInformation> {
+    let legacy = legacy_file_information(handle)?;
+    let identity = match wide_file_identity(handle) {
+        Ok(identity) => identity,
+        Err(error) if information_class_is_unavailable(&error) => {
+            let index = (u64::from(legacy.nFileIndexHigh) << 32) | u64::from(legacy.nFileIndexLow);
+            FileIdentity::Legacy {
+                volume: legacy.dwVolumeSerialNumber,
+                index,
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(EntryInformation {
+        attributes: legacy.dwFileAttributes,
+        identity,
+    })
 }
 
-/// Reads `FILE_ID_INFO`, or `None` when the volume does not report it.
-fn wide_file_identity(handle: &OwnedHandle) -> Option<FileIdentity> {
+/// Reads `FILE_ID_INFO` without disguising an unexpected identity-read failure as a fallback.
+fn wide_file_identity(handle: &OwnedHandle) -> io::Result<FileIdentity> {
     let mut information = FILE_ID_INFO {
         VolumeSerialNumber: 0,
         FileId: FILE_ID_128 {
             Identifier: [0; 16],
         },
     };
-    let size = u32::try_from(size_of::<FILE_ID_INFO>()).ok()?;
+    let size = u32::try_from(size_of::<FILE_ID_INFO>()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file identity information is larger than the API accepts",
+        )
+    })?;
     // SAFETY: the handle is live for the whole call because it is borrowed, `information` is a
     // fully initialized value of exactly the type `FileIdInfo` writes, and `size` is that type's
     // own size. A volume that does not implement the class fails the call and writes nothing.
@@ -142,15 +241,28 @@ fn wide_file_identity(handle: &OwnedHandle) -> Option<FileIdentity> {
         GetFileInformationByHandleEx(raw(handle), FileIdInfo, (&raw mut information).cast(), size)
     };
     if succeeded == 0 {
-        return None;
+        return Err(io::Error::last_os_error());
     }
-    Some(FileIdentity::Wide {
+    Ok(FileIdentity::Wide {
         volume: information.VolumeSerialNumber,
         id: information.FileId.Identifier,
     })
 }
 
-fn legacy_file_identity(handle: &OwnedHandle) -> io::Result<(u32, u64)> {
+/// Returns whether `FILE_ID_INFO` is genuinely unsupported rather than unreadable.
+fn information_class_is_unavailable(error: &io::Error) -> bool {
+    [
+        ERROR_INVALID_FUNCTION,
+        ERROR_NOT_SUPPORTED,
+        ERROR_INVALID_PARAMETER,
+        ERROR_CALL_NOT_IMPLEMENTED,
+    ]
+    .into_iter()
+    .filter_map(|code| i32::try_from(code).ok())
+    .any(|code| error.raw_os_error() == Some(code))
+}
+
+fn legacy_file_information(handle: &OwnedHandle) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
     let mut information = BY_HANDLE_FILE_INFORMATION {
         dwFileAttributes: 0,
         ftCreationTime: FILETIME {
@@ -178,9 +290,7 @@ fn legacy_file_identity(handle: &OwnedHandle) -> io::Result<(u32, u64)> {
     if succeeded == 0 {
         return Err(io::Error::last_os_error());
     }
-    let index =
-        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
-    Ok((information.dwVolumeSerialNumber, index))
+    Ok(information)
 }
 
 /// An 8-byte-aligned reparse buffer, matching what the standard library uses for the same call.
@@ -203,8 +313,9 @@ struct AlignedReparseBuffer([u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE]);
 ///
 /// # Errors
 ///
-/// Returns the operating-system error, including `ERROR_NOT_A_REPARSE_POINT` for an ordinary
-/// directory, which the caller treats as "this is not a link" rather than as a failure.
+/// Returns the operating-system error. The caller invokes this only after the same handle reported
+/// `FILE_ATTRIBUTE_REPARSE_POINT`, so any read failure remains an inspection error rather than being
+/// reclassified as an ordinary entry.
 pub(super) fn read_reparse_point(handle: &OwnedHandle) -> io::Result<Vec<u8>> {
     let mut buffer = AlignedReparseBuffer([0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE]);
     let capacity = u32::try_from(buffer.0.len()).map_err(|_| {
@@ -271,21 +382,138 @@ pub(super) fn write_reparse_point(handle: &OwnedHandle, buffer: &[u8]) -> io::Re
     Ok(())
 }
 
-/// Atomically renames `from` to `to` on the same volume, failing if `to` already exists.
+/// Renames the opened entry to `destination`, failing if the destination already exists.
 ///
-/// `std::fs::rename` passes `MOVEFILE_REPLACE_EXISTING`, which is exactly the behavior placement
-/// must not have. Omitting the flag makes Windows fail with `ERROR_ALREADY_EXISTS` instead.
+/// `FileRenameInfo` applies to the object designated by `handle`, not to whichever entry happens
+/// to occupy an earlier pathname when the call runs. `ReplaceIfExists` remains false, preserving
+/// the transaction's no-replace placement contract.
 ///
 /// # Errors
 ///
 /// Returns the operating-system error, including [`io::ErrorKind::AlreadyExists`] when the
 /// destination is occupied.
-pub(super) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
-    let from = to_wide(from)?;
-    let to = to_wide(to)?;
-    // SAFETY: both buffers are NUL-terminated and outlive the call. Passing no flags is what makes
-    // the operation refuse to replace an existing destination.
-    let succeeded = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
+pub(super) fn rename_by_handle_no_replace(
+    handle: &OwnedHandle,
+    destination: &Path,
+) -> io::Result<()> {
+    if !destination.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "rename destination {} is not fully qualified",
+                destination.display()
+            ),
+        ));
+    }
+    let mut name = to_wide(destination)?;
+    let terminator = name.pop();
+    debug_assert_eq!(terminator, Some(0));
+    if name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rename destination is empty",
+        ));
+    }
+
+    let name_bytes = name.len().checked_mul(size_of::<u16>()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rename destination is larger than the API accepts",
+        )
+    })?;
+    let name_length = u32::try_from(name_bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rename destination is larger than the API accepts",
+        )
+    })?;
+    let header_length = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let buffer_length = header_length
+        .checked_add(name_bytes)
+        .and_then(|length| length.checked_add(size_of::<u16>()))
+        .map(|length| length.max(size_of::<FILE_RENAME_INFO>()))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rename information is larger than the API accepts",
+            )
+        })?;
+    let api_length = u32::try_from(buffer_length).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rename information is larger than the API accepts",
+        )
+    })?;
+    let words = buffer_length
+        .checked_add(size_of::<usize>() - 1)
+        .map(|bytes| bytes / size_of::<usize>())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rename information is larger than addressable memory",
+            )
+        })?;
+    let mut storage = vec![0_usize; words];
+    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+
+    // SAFETY: `Vec<usize>` supplies at least pointer alignment, which is the strongest alignment
+    // in `FILE_RENAME_INFO`. `words` covers `buffer_length`, the fixed fields are initialized before
+    // the call, and the UTF-16 copy lands in the variable `FileName` tail of exactly `name_bytes`.
+    // The zeroed allocation leaves one trailing UTF-16 NUL outside `FileNameLength`, matching the
+    // standard library's allocation even though the API does not count it. The buffer and borrowed
+    // handle both remain live until `SetFileInformationByHandle` returns.
+    let succeeded = unsafe {
+        (*information).Anonymous.ReplaceIfExists = false;
+        (*information).RootDirectory = ptr::null_mut();
+        (*information).FileNameLength = name_length;
+        ptr::copy_nonoverlapping(
+            name.as_ptr().cast::<u8>(),
+            storage.as_mut_ptr().cast::<u8>().add(header_length),
+            name_bytes,
+        );
+        SetFileInformationByHandle(raw(handle), FileRenameInfo, information.cast(), api_length)
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Requests POSIX-style deletion of the opened entry.
+///
+/// The disposition applies to the object designated by `handle`. Once this delete handle closes,
+/// the object's link is removed from the visible namespace even if existing handles remain open.
+/// Callers exclude ordinary write and delete sharing, so another handle cannot rename the object or
+/// cancel the disposition before that close. ADR 0016 records why basic disposition is insufficient
+/// and why attribute-only reparse mutation does not supersede the retained object identity.
+///
+/// # Errors
+///
+/// Returns the operating-system error when the opened entry cannot be marked for deletion.
+pub(super) fn delete_by_handle(handle: &OwnedHandle) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(error) = take_injected_delete_error() {
+        return Err(error);
+    }
+    let information = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    let length = u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "disposition information is larger than the API accepts",
+        )
+    })?;
+    // SAFETY: `information` is fully initialized, borrowed for exactly its own size, and outlives
+    // the call. `handle` remains live and was opened with `DELETE` access by the caller.
+    let succeeded = unsafe {
+        SetFileInformationByHandle(
+            raw(handle),
+            FileDispositionInfoEx,
+            (&raw const information).cast(),
+            length,
+        )
+    };
     if succeeded == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -321,25 +549,6 @@ pub(super) fn replace_file_write_through(from: &Path, to: &Path) -> io::Result<(
     Ok(())
 }
 
-/// Removes one directory entry, which for a reparse point unlinks the link and not its target.
-///
-/// This is the Windows half of the promise that `SkillMount` never deletes a Skill source.
-/// `RemoveDirectoryW` on a junction detaches the reparse point; it does not descend.
-///
-/// # Errors
-///
-/// Returns the operating-system error, including `ERROR_DIR_NOT_EMPTY` when the entry is a real
-/// directory with contents.
-pub(super) fn remove_directory_entry(path: &Path) -> io::Result<()> {
-    let wide = to_wide(path)?;
-    // SAFETY: `wide` is NUL-terminated and outlives the call.
-    let succeeded = unsafe { RemoveDirectoryW(wide.as_ptr()) };
-    if succeeded == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 /// Returns the raw handle for one call, without transferring ownership.
 fn raw(handle: &OwnedHandle) -> HANDLE {
     handle.as_raw_handle().cast()
@@ -367,4 +576,30 @@ fn to_wide(path: &Path) -> io::Result<Vec<u16>> {
     let mut wide = winpath::to_extended(&encoded);
     wide.push(0);
     Ok(wide)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::{align_of, offset_of, size_of};
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+
+    #[test]
+    fn rename_information_layout_matches_the_active_windows_abi() {
+        let pointer = size_of::<usize>();
+        let root_offset = pointer;
+        let name_length_offset = root_offset + pointer;
+        let name_offset = name_length_offset + size_of::<u32>();
+        let expected_size = if pointer == 8 { 24 } else { 16 };
+
+        assert!(matches!(pointer, 4 | 8), "unsupported pointer width");
+        assert_eq!(align_of::<FILE_RENAME_INFO>(), align_of::<usize>());
+        assert_eq!(offset_of!(FILE_RENAME_INFO, RootDirectory), root_offset);
+        assert_eq!(
+            offset_of!(FILE_RENAME_INFO, FileNameLength),
+            name_length_offset
+        );
+        assert_eq!(offset_of!(FILE_RENAME_INFO, FileName), name_offset);
+        assert_eq!(size_of::<FILE_RENAME_INFO>(), expected_size);
+    }
 }

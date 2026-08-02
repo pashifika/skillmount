@@ -12,7 +12,7 @@ use crate::link::resolve::{ChainState, ComparablePath, MAX_LINK_DEPTH, resolve_c
 use crate::link::testing::{Call, RecordingBackend};
 use crate::link::{
     CreatedLink, CreatedLinkKind, EntryKind, LinkBackend, LinkRequest, OwnershipMismatch,
-    PlacementOutcome, RemoveOutcome,
+    PlacementMismatch, PlacementOutcome, PlacementResidue, RemoveOutcome,
 };
 
 fn chain(backend: &RecordingBackend, entry: &str) -> crate::link::resolve::ResolvedChain {
@@ -283,6 +283,139 @@ fn placement_preserves_a_destination_that_appeared_after_staging() {
         backend.contains(Path::new("/root/staged")),
         "the staged entry stays available for verified rollback"
     );
+}
+
+#[test]
+fn placement_refuses_a_staged_link_replaced_after_its_evidence_was_recorded() {
+    let backend = RecordingBackend::new().with_directory("/root/source");
+    let staged =
+        create(&backend, "/root/source", "/root/staged", LinkMode::Auto).expect("staging works");
+    backend.add_symlink("/root/staged", "/root/source");
+
+    let outcome = backend
+        .place_no_replace(&staged, Path::new("/root/destination"))
+        .expect("an ownership mismatch is a typed outcome");
+
+    assert_eq!(
+        outcome,
+        PlacementOutcome::OwnershipMismatch(PlacementResidue {
+            path: PathBuf::from("/root/staged"),
+            mismatch: PlacementMismatch::Ownership(OwnershipMismatch::IdentityChanged),
+        })
+    );
+    assert!(backend.contains(Path::new("/root/staged")));
+    assert!(
+        !backend.contains(Path::new("/root/destination")),
+        "a replacement must be refused before any destination mutation"
+    );
+}
+
+#[test]
+fn placement_retains_a_final_link_that_mismatches_after_pathname_rename() {
+    let backend = RecordingBackend::new().with_directory("/root/source");
+    let staged =
+        create(&backend, "/root/source", "/root/staged", LinkMode::Auto).expect("staging works");
+    backend.replace_destination_after_next_place_with_file();
+
+    let outcome = backend
+        .place_no_replace(&staged, Path::new("/root/destination"))
+        .expect("a post-placement mismatch is a typed outcome");
+
+    assert_eq!(
+        outcome,
+        PlacementOutcome::OwnershipMismatch(PlacementResidue {
+            path: PathBuf::from("/root/destination"),
+            mismatch: PlacementMismatch::Ownership(OwnershipMismatch::NotALink),
+        })
+    );
+    assert!(backend.contains(Path::new("/root/destination")));
+    assert!(
+        !backend.contains(Path::new("/root/staged")),
+        "the rename occurred, but its mismatched result must never be claimed"
+    );
+}
+
+#[test]
+fn directory_placement_returns_evidence_for_the_directory_at_its_final_path() {
+    let backend = RecordingBackend::new();
+    let staged = backend
+        .create_directory(Path::new("/root/staged"))
+        .expect("directory staging works");
+
+    let PlacementOutcome::Placed(placed) = backend
+        .place_directory_no_replace(&staged, Path::new("/root/destination"))
+        .expect("directory placement works")
+    else {
+        panic!("an empty destination accepts the recorded directory");
+    };
+
+    assert_eq!(placed.path, Path::new("/root/destination"));
+    assert_eq!(placed.identity, staged.identity);
+    assert!(!backend.contains(Path::new("/root/staged")));
+    assert!(backend.contains(Path::new("/root/destination")));
+}
+
+#[test]
+fn directory_placement_refuses_a_replacement_with_a_different_identity() {
+    let backend = RecordingBackend::new();
+    let staged = backend
+        .create_directory(Path::new("/root/staged"))
+        .expect("directory staging works");
+    backend.replace_with_directory(Path::new("/root/staged"));
+
+    let outcome = backend
+        .place_directory_no_replace(&staged, Path::new("/root/destination"))
+        .expect("an ownership mismatch is a typed outcome");
+
+    assert_eq!(
+        outcome,
+        PlacementOutcome::OwnershipMismatch(PlacementResidue {
+            path: PathBuf::from("/root/staged"),
+            mismatch: PlacementMismatch::Ownership(OwnershipMismatch::IdentityChanged),
+        })
+    );
+    assert!(backend.contains(Path::new("/root/staged")));
+    assert!(!backend.contains(Path::new("/root/destination")));
+}
+
+#[test]
+fn directory_placement_preserves_a_destination_that_appeared_after_staging() {
+    let backend = RecordingBackend::new().with_directory("/root/destination");
+    let staged = backend
+        .create_directory(Path::new("/root/staged"))
+        .expect("directory staging works");
+
+    assert_eq!(
+        backend
+            .place_directory_no_replace(&staged, Path::new("/root/destination"))
+            .expect("contention is a typed outcome"),
+        PlacementOutcome::DestinationExists
+    );
+    assert!(backend.contains(Path::new("/root/staged")));
+    assert!(backend.contains(Path::new("/root/destination")));
+}
+
+#[test]
+fn directory_placement_retains_a_final_entry_that_mismatches_after_rename() {
+    let backend = RecordingBackend::new();
+    let staged = backend
+        .create_directory(Path::new("/root/staged"))
+        .expect("directory staging works");
+    backend.replace_destination_after_next_place_with_file();
+
+    let outcome = backend
+        .place_directory_no_replace(&staged, Path::new("/root/destination"))
+        .expect("a post-placement mismatch is a typed outcome");
+
+    assert_eq!(
+        outcome,
+        PlacementOutcome::OwnershipMismatch(PlacementResidue {
+            path: PathBuf::from("/root/destination"),
+            mismatch: PlacementMismatch::Ownership(OwnershipMismatch::NotADirectory),
+        })
+    );
+    assert!(backend.contains(Path::new("/root/destination")));
+    assert!(!backend.contains(Path::new("/root/staged")));
 }
 
 #[test]

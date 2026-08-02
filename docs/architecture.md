@@ -11,15 +11,16 @@ as current only after it exists in the tracked source and can be traced to repos
 
 Status: catalog resolution, discovery inspection, read-only planning, cross-platform link
 primitives, resource locking, durable transactions, cleanup, and stale recovery are implemented.
-Agent child launch, operator commands, release automation, and the ownership-binding hardening
-named under [Reserved work](#reserved-work) are not implemented.
+Agent child launch, operator commands, release automation, and the remaining transaction-lifetime
+hardening named under [Reserved work](#reserved-work) are not implemented.
 
 ## Product definition
 
 SkillMount is a Rust wrapper CLI that makes Agent Skills stored in external directories visible for
 the intended lifetime of a Codex CLI or Claude Code CLI session. It resolves an ordered catalog,
 inspects the discovery scopes implemented by the selected adapter, produces a deterministic mount
-or preservation outcome for each selected Skill, and owns only the entries its transaction created.
+or preservation outcome for each selected Skill, and removes only entries that still match the
+transaction's recorded ownership evidence.
 
 One package installs two behaviorally identical binaries:
 
@@ -31,6 +32,10 @@ The initial release targets are:
 - `i686-pc-windows-msvc`;
 - `x86_64-pc-windows-msvc`;
 - `aarch64-apple-darwin`.
+
+Windows mutation requires Windows 10 version 1709 or later so verified entries can be unlinked with
+POSIX handle disposition even while unrelated inspect handles remain open. [ADR 0016](adr/0016-require-posix-handle-disposition-on-windows.md)
+records that runtime baseline.
 
 Linux and WSL are not release targets. Linux-specific code exists only where the Ubuntu quality
 job needs to exercise a portable invariant such as atomic no-replace placement. Windows ARM64 and
@@ -203,13 +208,23 @@ visible. The journal distinguishes intent, staged identity, final placement, act
 kept state, and failure. Its path codec round-trips arbitrary Unix bytes and Windows UTF-16,
 including unpaired surrogates, rather than passing ownership evidence through UTF-8.
 
-Apply rechecks every planned precondition and uses atomic same-filesystem no-replace placement.
-Rollback and ordinary cleanup share the same reverse-order removal path. Current cleanup verifies
-kind, target, and available platform identity immediately before path-based removal, but does not
-yet bind verification and removal to one object across the remaining verify-act window. Recovery
-eligibility comes from the held lock set, never a recorded PID: PIDs are reusable and cannot
-authorize cleanup. Unreadable or future-schema journals block new mutation and are retained for
-operator inspection.
+Apply rechecks every planned precondition and uses evidence-bearing, atomic same-filesystem
+no-replace placement. Successful placement returns identity for the object established at the final
+path before the journal advances to `applied`; a visible mismatch remains journal-backed residue.
+Rollback and ordinary cleanup share the same reverse-order removal path. Windows derives
+attributes, strongest identity, and reparse data from one no-follow handle and retains that handle
+through rename or disposition. Kind and target are eligibility checks at the Windows handle
+boundary; retained identity is the authority for later object-bound mutation because attribute-only
+access is exempt from Windows share-mode enforcement. Disposition never traverses a reparse target.
+Unix performs final no-follow verification before pathname mutation
+while the application holds all cooperating-session locks; those advisory state-file locks do not
+exclude another program, so ADR 0014 records the residual final pathname race. Path-based link and
+directory creation returns no object capability on the supported APIs. The first no-follow
+observation establishes evidence for later operations but cannot prove continuity from the create
+call; ADR 0015 records that residual window. Failure before initial evidence is reported and
+retained rather than followed by unchecked pathname rollback. Recovery eligibility comes from the
+held lock set, never a recorded PID: PIDs are reusable and cannot authorize cleanup. Unreadable or
+future-schema journals block new mutation and are retained for operator inspection.
 
 ## Platform and unsafe boundary
 
@@ -219,10 +234,10 @@ The crate sets `unsafe_code = "deny"`. Exactly two modules may opt in:
 - `src/link/windows_ffi.rs`.
 
 They wrap filesystem operations that have no safe standard-library equivalent, including atomic
-no-replace placement and Windows reparse-point operations. Each unsafe block has a `SAFETY`
-justification, raw platform types do not cross the module boundary, and buffer parsing stays in safe
-Rust. [ADR 0011](adr/0011-scoped-unsafe-for-platform-link-backends.md) records why `deny` with this
-audited scope replaced crate-wide `forbid`.
+no-replace placement and Windows reparse-point observation, handle rename, and handle disposition.
+Each unsafe block has a `SAFETY` justification, raw platform types do not cross the module boundary,
+and reparse decoding stays in safe Rust. [ADR 0011](adr/0011-scoped-unsafe-for-platform-link-backends.md)
+records why `deny` with this audited scope replaced crate-wide `forbid`.
 
 Paths and forwarded arguments remain `PathBuf` and `OsString` through every public seam. They are
 never joined into a shell command or converted lossily for policy, journal, lock, or ownership
@@ -230,8 +245,13 @@ decisions. Diagnostics may render a reversible representation only at the output
 
 macOS uses directory symbolic links and `renameatx_np(RENAME_EXCL)`. Windows prefers a directory
 symbolic link and falls back to a junction only for `ERROR_PRIVILEGE_NOT_HELD` in automatic mode;
-placement uses a non-replacing `MoveFileExW`. The Linux test branch uses
-`renameat2(RENAME_NOREPLACE)` but does not establish Linux product support.
+placement uses `SetFileInformationByHandle(FileRenameInfo)` with replacement disabled, and removal
+uses `FileDispositionInfoEx` with delete and POSIX-semantics flags on a verified handle that excludes
+ordinary write and delete access. Attribute-only reparse mutation can still occur without changing
+that object's identity; the removal handle closes before the backend confirms that its recorded
+identity is no longer visible. The variable-length rename layout is compiled and tested on both
+Windows x86 and x64. The Linux test branch uses `renameat2(RENAME_NOREPLACE)` but does not establish
+Linux product support.
 
 ## Cross-module invariants
 
@@ -247,13 +267,19 @@ The following are product rules rather than style preferences:
    mutating plan is accepted.
 6. No planned destination mutation occurs before its durable intent, and apply rechecks persisted
    preconditions.
-7. Cleanup requests path-based removal only after matching kind, target, and available platform
-   identity; uncertainty is retained and reported, while object-bound verify-and-remove remains
-   reserved hardening.
-8. Link removal never recursively descends into a target directory.
-9. Shared application and transaction code own policy and sequencing; agent adapters inspect and
+7. Windows placement verifies and mutates the same no-follow object handle. Windows removal checks
+   kind, target, and identity, then treats the retained identity as object authority; it excludes
+   ordinary write and delete access, uses POSIX disposition, closes that handle, and confirms the
+   recorded identity is no longer visible before reporting success. Attribute-only metadata access
+   does not transfer object authority. Unix pathname mutation performs the last available identity
+   check under cooperating-session locks; visible uncertainty is retained and reported, and advisory
+   locks are never described as excluding other programs.
+8. Initial creation evidence begins at the first no-follow observation, not at a preceding
+   status-only create call. Failure before that boundary retains the path without pathname rollback.
+9. Link removal never recursively descends into a target directory.
+10. Shared application and transaction code own policy and sequencing; agent adapters inspect and
    plan, while the sealed platform backend executes only the link primitives it is asked for.
-10. Product behavior never edits Git state, escalates privileges, or weakens agent permissions.
+11. Product behavior never edits Git state, escalates privileges, or weakens agent permissions.
 
 Tests enforce the observable parts of these rules. Local comments retain the narrower preconditions
 needed to preserve them inside an implementation.
@@ -267,7 +293,9 @@ needed to preserve them inside an implementation.
 - Codex and Claude discovery inspection and deterministic read-only planning;
 - `inspect`, `--dry-run`, concise/verbose plan rendering, and read-only regression tests;
 - Unix/macOS symbolic-link and Windows symbolic-link/junction backends;
-- no-follow link-chain resolution, atomic no-replace placement, and ownership-checked removal;
+- no-follow link-chain resolution, evidence-bearing atomic no-replace placement, Windows
+  handle-bound mutation after initial observation, Unix ownership-checked pathname mutation under
+  cooperative locks, and documented creation-to-observation residual scope;
 - logical and physical resource locks, versioned journals, write-ahead apply, rollback, cleanup,
   terminal kept state, and stale recovery;
 - crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
@@ -279,7 +307,6 @@ needed to preserve them inside an implementation.
   and argument-contract validation against the supported agent versions;
 - `doctor`, explicit `cleanup`, lock-file reclamation, compatibility evidence, and user recovery
   documentation;
-- binding link verification and mutation to the same object across the remaining verify-act window;
 - binding a public transaction's lifetime to the lock guard validated when it is opened or adopted;
 - rejecting pre-existing links in application-state directory paths before creation or permission changes;
 - versioned release packaging and publication.

@@ -262,7 +262,7 @@ impl ActionOperation {
 /// The kind of entry an action produces, as recorded for later verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordedKind {
-    /// A regular directory this transaction created.
+    /// A regular directory recorded at this transaction's initial evidence boundary.
     Directory,
     /// A directory symbolic link.
     Symlink,

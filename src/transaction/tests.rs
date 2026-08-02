@@ -13,13 +13,17 @@ use super::{Transaction, recover};
 use crate::app::{ReadOnlyOutcome, plan_read_only};
 use crate::cli::{ParsedCommand, parse_command_from};
 use crate::domain::RunContext;
+use crate::error::{AppError, LinkError};
 use crate::journal::{ActionStatus, TransactionStatus, store};
-use crate::link::OwnershipMismatch;
+#[cfg(windows)]
+use crate::link::testing::with_delete_error;
+use crate::link::testing::{HookPoint, with_hook};
+use crate::link::{OwnershipMismatch, platform_backend};
 use crate::lock::acquire::{HeldLocks, LockOwner, LockPolicy};
 use crate::paths::resolve_session;
 use crate::state::testing::StateRootGuard;
 use crate::test_support::{TestDir, remove_directory_link, symlink_dir_or_skip};
-use crate::transaction::cleanup::JournalRetention;
+use crate::transaction::cleanup::{JournalRetention, RetainedEntry};
 
 /// A project, a Skill source, and a redirected state root.
 struct Session {
@@ -321,6 +325,232 @@ fn a_destination_that_appears_after_planning_stops_the_apply_and_rolls_back() {
 }
 
 #[test]
+fn a_staged_replacement_is_retained_and_never_recorded_as_applied() {
+    let session = Session::codex("txn-staged-replacement", &["alpha"], &[]);
+    let project = session.project();
+    let mounted = project.join(".codex/skills/alpha");
+    let (mut transaction, _locks) = session.open();
+    let staged = transaction
+        .journal()
+        .actions
+        .iter()
+        .find(|action| action.final_path == mounted)
+        .and_then(|action| action.temporary_path.clone())
+        .expect("the Skill link action has a staged path");
+    let displaced = staged.with_extension("displaced");
+    let hook_destination = mounted.clone();
+    let hook_displaced = displaced.clone();
+
+    let failure = with_hook(
+        move |event| {
+            if event.point == HookPoint::BeforePlacementVerification
+                && event.destination.as_deref() == Some(hook_destination.as_path())
+            {
+                fs::rename(&event.path, &hook_displaced)
+                    .expect("the recorded staged entry is moved out of the way");
+                fs::create_dir_all(event.path.join("their-own-work"))
+                    .expect("the staged replacement is created");
+            }
+            Ok(())
+        },
+        || transaction.apply(),
+    )
+    .expect_err("placement must refuse the replacement");
+
+    let journal = on_disk(&transaction);
+    let action = journal
+        .actions
+        .iter()
+        .find(|action| action.final_path == mounted)
+        .expect("the Skill link action is recorded");
+    let temporary = action
+        .temporary_path
+        .as_ref()
+        .expect("an owned action has a staged path");
+    assert_eq!(temporary, &staged);
+    let replacement = platform_backend()
+        .inspect_no_follow(temporary)
+        .expect("the replacement is inspectable");
+
+    assert_eq!(action.status, ActionStatus::Staged);
+    assert_ne!(
+        action.identity, replacement.identity,
+        "the replacement identity must never become transaction evidence"
+    );
+    assert!(temporary.join("their-own-work").is_dir());
+    assert!(
+        failure
+            .retained
+            .iter()
+            .any(|entry| entry.path == *temporary)
+    );
+    assert_eq!(journal.status, TransactionStatus::Failed);
+    remove_directory_link(&displaced);
+}
+
+#[test]
+fn a_destination_created_at_the_placement_boundary_is_preserved() {
+    let session = Session::codex("txn-placement-contention", &["alpha"], &[]);
+    let mounted = session.project().join(".codex/skills/alpha");
+    let (mut transaction, _locks) = session.open();
+    let hook_destination = mounted.clone();
+
+    let failure = with_hook(
+        move |event| {
+            if event.point == HookPoint::BeforePlacementMutation
+                && event.destination.as_deref() == Some(hook_destination.as_path())
+            {
+                fs::create_dir_all(hook_destination.join("their-own-work"))
+                    .expect("the contending destination is created");
+            }
+            Ok(())
+        },
+        || transaction.apply(),
+    )
+    .expect_err("no-replace placement must lose safely");
+
+    assert!(mounted.join("their-own-work").is_dir());
+    assert!(
+        failure
+            .cause
+            .to_string()
+            .contains("another process created the destination"),
+        "{}",
+        failure.cause
+    );
+    let journal = on_disk(&transaction);
+    let action = journal
+        .actions
+        .iter()
+        .find(|action| action.final_path == mounted)
+        .expect("the Skill link action is recorded");
+    assert_eq!(
+        action.status,
+        ActionStatus::RolledBack,
+        "the still-owned staged entry is removed without touching the contender"
+    );
+}
+
+#[test]
+fn an_ambiguous_final_entry_is_retained_by_rollback_and_recovery() {
+    let session = Session::codex("txn-final-residue", &["alpha"], &[]);
+    let mounted = session.project().join(".codex/skills/alpha");
+    let displaced = session.project().join(".codex/skills/displaced-alpha");
+    let (mut transaction, locks) = session.open();
+    let journal_path = transaction.journal_path().to_path_buf();
+    let hook_destination = mounted.clone();
+    let hook_displaced = displaced.clone();
+
+    let failure = with_hook(
+        move |event| {
+            if event.point == HookPoint::AfterPlacementMutation && event.path == hook_destination {
+                fs::rename(&event.path, &hook_displaced)
+                    .expect("the placed entry is moved while its backend handle remains open");
+                fs::create_dir_all(event.path.join("their-own-work"))
+                    .expect("the final replacement is created");
+            }
+            Ok(())
+        },
+        || transaction.apply(),
+    )
+    .expect_err("post-placement ownership must be proved");
+
+    assert!(mounted.join("their-own-work").is_dir());
+    assert!(failure.retained.iter().any(|entry| entry.path == mounted));
+    assert!(journal_path.exists(), "rollback must retain its evidence");
+    drop(failure);
+    drop(transaction);
+    drop(locks);
+
+    let mut recovery_locks = HeldLocks::default();
+    let recovery = recover::recover_stale(&mut recovery_locks).expect("recovery reports residue");
+
+    assert!(mounted.join("their-own-work").is_dir());
+    assert!(
+        recovery
+            .reconciled
+            .iter()
+            .flat_map(|entry| &entry.report.retained)
+            .any(|entry| entry.path == mounted),
+        "{recovery:?}"
+    );
+    assert!(
+        journal_path.exists(),
+        "ambiguous recovery keeps the journal"
+    );
+    assert!(session.source("alpha").join("SKILL.md").is_file());
+    remove_directory_link(&displaced);
+}
+
+#[test]
+fn failed_creation_reports_its_original_cause_and_unproved_staged_residue() {
+    let session = Session::codex("txn-create-residue", &["alpha"], &[]);
+    let (mut transaction, _locks) = session.open();
+    let staged = transaction
+        .journal()
+        .actions
+        .iter()
+        .find(|action| action.operation == crate::journal::ActionOperation::CreateDirectoryLink)
+        .and_then(|action| action.temporary_path.clone())
+        .expect("the link action has a staged path");
+    let hook_staged = staged.clone();
+
+    let failure = with_hook(
+        move |event| {
+            if matches!(
+                event.point,
+                HookPoint::AfterLinkCreation | HookPoint::AfterDirectoryCreation
+            ) && event.path == hook_staged
+            {
+                return Err(LinkError::Inspect {
+                    path: hook_staged.clone(),
+                    reason: "injected post-create inspection failure".to_owned(),
+                });
+            }
+            Ok(())
+        },
+        || transaction.apply(),
+    )
+    .expect_err("unproved creation must stop apply and retain evidence");
+
+    assert!(
+        failure
+            .cause
+            .to_string()
+            .contains("injected post-create inspection failure"),
+        "the original creation cause must survive: {failure}"
+    );
+    assert!(
+        failure.retained.iter().any(|entry| entry.path == staged),
+        "rollback must report the undecided staged path: {:?}",
+        failure.retained
+    );
+    assert!(
+        fs::symlink_metadata(&staged).is_ok(),
+        "the unproved entry is not path-deleted"
+    );
+    let journal = on_disk(&transaction);
+    assert_eq!(journal.status, TransactionStatus::Failed);
+    assert!(
+        journal
+            .errors
+            .iter()
+            .any(|error| error.contains("injected post-create inspection failure")),
+        "the original cause must be durable: {:?}",
+        journal.errors
+    );
+    assert!(
+        journal.errors.iter().any(
+            |error| error.contains("retained") && error.contains(&staged.display().to_string())
+        ),
+        "the retained path must be durable: {:?}",
+        journal.errors
+    );
+
+    remove_directory_link(&staged);
+}
+
+#[test]
 fn rollback_undoes_applied_actions_and_leaves_the_obstruction_alone() {
     let session = Session::codex("txn-rollback", &["alpha"], &[]);
     let project = session.project();
@@ -457,6 +687,207 @@ fn cleanup_removes_everything_it_owns_and_then_removes_the_journal() {
             .join("sources/alpha/SKILL.md")
             .exists(),
         "removing a link must never reach the directory it pointed at"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn disposition_failure_retains_the_mount_and_its_journal_evidence() {
+    let session = Session::codex("txn-disposition-failure", &["alpha"], &[]);
+    let mounted = session.project().join(".codex/skills/alpha");
+    let (mut transaction, _locks) = session.open();
+    transaction.apply().expect("a clean fixture applies");
+    let journal_path = transaction.journal_path().to_path_buf();
+    let before = platform_backend()
+        .inspect_no_follow(&mounted)
+        .expect("the mounted entry is inspectable");
+    let access_denied = i32::try_from(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED)
+        .expect("the Windows error code fits in i32");
+
+    let report = with_delete_error(access_denied, || {
+        transaction
+            .cleanup()
+            .expect("a disposition error is reported as incomplete cleanup")
+    });
+    let after = platform_backend()
+        .inspect_no_follow(&mounted)
+        .expect("the retained mount remains inspectable");
+    let journal = on_disk(&transaction);
+
+    assert_eq!(
+        after.identity, before.identity,
+        "the verified mount is retained"
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains(&format!("os error {access_denied}"))),
+        "the operating-system cause remains visible: {report:?}"
+    );
+    assert_eq!(
+        report.journal_retained,
+        Some(JournalRetention::IncompleteCleanup(journal_path.clone()))
+    );
+    assert!(journal_path.exists(), "cleanup evidence remains durable");
+    assert_eq!(journal.status, TransactionStatus::Failed);
+    assert!(
+        journal
+            .errors
+            .iter()
+            .any(|error| error.contains(&format!("os error {access_denied}"))),
+        "the durable journal records the disposition failure: {:?}",
+        journal.errors
+    );
+}
+
+#[test]
+fn cleanup_checks_the_final_path_after_retaining_a_staged_path_replacement() {
+    let session = Session::codex("txn-staged-replacement-after-apply", &["alpha"], &[]);
+    let project = session.project();
+    let mounted = project.join(".codex/skills/alpha");
+    let (mut transaction, _locks) = session.open();
+    transaction.apply().expect("a clean fixture applies");
+
+    let temporary = transaction
+        .journal()
+        .actions
+        .iter()
+        .find(|action| action.final_path == mounted)
+        .and_then(|action| action.temporary_path.clone())
+        .expect("the mounted Skill has a staged sibling");
+    fs::create_dir_all(temporary.join("their-own-work"))
+        .expect("another actor occupies the old staged pathname");
+
+    let report = transaction
+        .cleanup()
+        .expect("cleanup reports the replacement");
+
+    assert_eq!(
+        platform_backend()
+            .inspect_no_follow(&mounted)
+            .expect("the final path remains inspectable")
+            .kind,
+        crate::link::EntryKind::Missing,
+        "a replacement at the staged pathname must not hide the owned final entry from cleanup"
+    );
+    assert!(
+        temporary.join("their-own-work").is_dir(),
+        "cleanup must preserve the staged-path replacement"
+    );
+    assert!(
+        report.retained.iter().any(|entry| entry.path == temporary),
+        "the replacement remains visible to the operator: {report:?}"
+    );
+    assert!(
+        report.removed.iter().any(|path| path == &mounted),
+        "the independently verified final entry is removed: {report:?}"
+    );
+}
+
+#[test]
+fn rollback_checks_the_final_path_after_a_staged_placement_residue() {
+    let session = Session::codex("txn-placement-residue-final", &["alpha"], &[]);
+    let project = session.project();
+    let mounted = project.join(".codex/skills/alpha");
+    let (mut transaction, _locks) = session.open();
+    transaction.apply().expect("a clean fixture applies");
+
+    let action = transaction
+        .journal()
+        .actions
+        .iter()
+        .find(|action| action.final_path == mounted)
+        .expect("the mounted Skill action is recorded");
+    let action_id = action.id;
+    let temporary = action
+        .temporary_path
+        .clone()
+        .expect("the mounted Skill has a staged sibling");
+    fs::create_dir_all(temporary.join("their-own-work"))
+        .expect("another actor occupies the old staged pathname");
+    transaction.placement_residue.insert(
+        action_id,
+        RetainedEntry {
+            path: temporary.clone(),
+            reason: "injected staged placement mismatch".to_owned(),
+        },
+    );
+
+    let failure = transaction.roll_back(AppError::Filesystem(
+        "injected placement failure".to_owned(),
+    ));
+
+    assert_eq!(
+        platform_backend()
+            .inspect_no_follow(&mounted)
+            .expect("the final path remains inspectable")
+            .kind,
+        crate::link::EntryKind::Missing,
+        "a path-specific placement residue must not hide the independently verified final entry"
+    );
+    assert!(
+        temporary.join("their-own-work").is_dir(),
+        "rollback must preserve the staged-path replacement"
+    );
+    assert!(
+        failure.retained.iter().any(|entry| entry.path == temporary),
+        "the placement residue remains visible to the operator: {failure:?}"
+    );
+}
+
+#[test]
+fn recovery_checks_the_final_path_after_retaining_a_staged_path_replacement() {
+    let session = Session::codex("txn-recovery-staged-replacement", &["alpha"], &[]);
+    let project = session.project();
+    let mounted = project.join(".codex/skills/alpha");
+    let (mut transaction, locks) = session.open();
+    transaction.apply().expect("a clean fixture applies");
+    let journal_path = transaction.journal_path().to_path_buf();
+
+    let temporary = transaction
+        .journal()
+        .actions
+        .iter()
+        .find(|action| action.final_path == mounted)
+        .and_then(|action| action.temporary_path.clone())
+        .expect("the mounted Skill has a staged sibling");
+    fs::create_dir_all(temporary.join("their-own-work"))
+        .expect("another actor occupies the old staged pathname");
+    drop(transaction);
+    drop(locks);
+
+    let mut recovery_locks = HeldLocks::default();
+    let recovery = recover::recover_stale(&mut recovery_locks).expect("recovery reports residue");
+    let report = &recovery
+        .reconciled
+        .first()
+        .expect("the abandoned transaction is reconciled")
+        .report;
+
+    assert_eq!(
+        platform_backend()
+            .inspect_no_follow(&mounted)
+            .expect("the final path remains inspectable")
+            .kind,
+        crate::link::EntryKind::Missing,
+        "recovery must not let a staged-path replacement hide the owned final entry"
+    );
+    assert!(
+        temporary.join("their-own-work").is_dir(),
+        "recovery must preserve the staged-path replacement"
+    );
+    assert!(
+        report.retained.iter().any(|entry| entry.path == temporary),
+        "the replacement remains visible to the operator: {report:?}"
+    );
+    assert!(
+        report.removed.iter().any(|path| path == &mounted),
+        "the independently verified final entry is removed: {report:?}"
+    );
+    assert!(
+        journal_path.exists(),
+        "the retained replacement keeps the recovery evidence durable"
     );
 }
 
