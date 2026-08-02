@@ -1,6 +1,6 @@
 # ADR 0018: Scope unsafe for Windows console forwarding
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR 0019
 - **Date:** 2026-08-03
 - **Supersedes:** _none_
 

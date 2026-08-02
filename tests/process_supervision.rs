@@ -1,6 +1,6 @@
-#![cfg(feature = "test-fixtures")]
-
 //! Native integration coverage for the feature-gated process-supervision fixtures.
+
+#![cfg(feature = "test-fixtures")]
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -38,6 +38,7 @@ impl Drop for TestDir {
 
 #[derive(Debug, PartialEq, Eq)]
 struct FakeRecord {
+    pid: Option<u32>,
     arguments: Vec<Vec<u8>>,
     cwd: Vec<u8>,
     stdin: Option<Vec<u8>>,
@@ -167,6 +168,52 @@ fn interactive_child_keeps_foreground_tty_read_access() {
     assert_eq!(cleanup_count(&cleanup), 1);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn one_terminal_ctrl_c_reaches_an_interactive_child_once() {
+    let root = TestDir::new("foreground-interrupt");
+    let record = root.0.join("record.txt");
+    let cleanup = root.0.join("cleanup.txt");
+    let outcome = root.0.join("outcome.txt");
+    let mut child = Command::new("/usr/bin/script")
+        .args(["-q", "/dev/null", SUPERVISOR_HARNESS])
+        .env("SKILLMOUNT_HARNESS_EXECUTABLE", FAKE_AGENT)
+        .env("SKILLMOUNT_HARNESS_CWD", &root.0)
+        .env("SKILLMOUNT_HARNESS_INJECTED_COUNT", "0")
+        .env("SKILLMOUNT_HARNESS_CLEANUP_COUNTER", &cleanup)
+        .env("SKILLMOUNT_HARNESS_OUTCOME", &outcome)
+        .env("SKILLMOUNT_FAKE_RECORD", &record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "ignore-first")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn waiting harness under a pseudo-terminal");
+    wait_for_event_count(&record, 1);
+
+    std::io::Write::write_all(child.stdin.as_mut().expect("piped script stdin"), b"\x03")
+        .expect("write one terminal interrupt");
+    wait_for_event_count(&record, 2);
+    thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(signal_event_count(&read_record(&record)), 1);
+    assert!(
+        child
+            .try_wait()
+            .expect("poll interactive harness")
+            .is_none(),
+        "one terminal interrupt must not become the child's force-like second event"
+    );
+
+    std::io::Write::write_all(child.stdin.as_mut().expect("piped script stdin"), b"\x03")
+        .expect("write teardown interrupt");
+    let _status = wait_for_exit(&mut child);
+
+    assert_eq!(cleanup_count(&cleanup), 1);
+    let outcome = fs::read_to_string(outcome).expect("read interactive interrupt outcome");
+    assert!(outcome.contains("DeliveredByPlatform"), "{outcome}");
+}
+
 #[test]
 fn spawn_failure_still_runs_cleanup_once_and_maps_to_missing_input() {
     let root = TestDir::new("spawn-failure");
@@ -185,6 +232,47 @@ fn spawn_failure_still_runs_cleanup_once_and_maps_to_missing_input() {
     let outcome = fs::read_to_string(outcome).expect("read spawn outcome");
     assert!(outcome.contains("stage: Spawn"), "{outcome}");
     assert!(outcome.contains("kind: NotFound"), "{outcome}");
+}
+
+#[test]
+fn spawn_failure_retains_the_requested_launch_cwd() {
+    let root = TestDir::new("missing-cwd");
+    let cleanup = root.0.join("cleanup.txt");
+    let outcome = root.0.join("outcome.txt");
+    let missing_cwd = root.0.join("missing launch cwd");
+
+    let output = base_harness(Path::new(FAKE_AGENT), &missing_cwd, 0, &[])
+        .env("SKILLMOUNT_HARNESS_CLEANUP_COUNTER", &cleanup)
+        .env("SKILLMOUNT_HARNESS_OUTCOME", &outcome)
+        .output()
+        .expect("run missing-CWD harness");
+
+    assert_eq!(output.status.code(), Some(66), "{output:?}");
+    assert_eq!(cleanup_count(&cleanup), 1);
+    let outcome = fs::read_to_string(outcome).expect("read missing-CWD outcome");
+    assert!(outcome.contains("stage: Spawn"), "{outcome}");
+    assert!(
+        outcome.contains(&missing_cwd.display().to_string()),
+        "{outcome}"
+    );
+}
+
+#[test]
+fn sequential_supervision_sessions_reuse_the_process_dispatcher() {
+    let root = TestDir::new("sequential-sessions");
+    let record = root.0.join("record.txt");
+    let cleanup = root.0.join("cleanup.txt");
+
+    let output = base_harness(Path::new(FAKE_AGENT), &root.0, 0, &[])
+        .env("SKILLMOUNT_FAKE_RECORD", &record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
+        .env("SKILLMOUNT_HARNESS_CLEANUP_COUNTER", &cleanup)
+        .env("SKILLMOUNT_HARNESS_RUNS", "2")
+        .output()
+        .expect("run sequential supervision harness");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(cleanup_count(&cleanup), 2);
 }
 
 #[test]
@@ -216,6 +304,32 @@ fn cleanup_failure_never_overwrites_a_failed_child() {
 }
 
 #[test]
+fn interrupt_during_cleanup_returns_to_platform_default_handling() {
+    let root = TestDir::new("cleanup-interrupt");
+    let record = root.0.join("record.txt");
+    let cleanup = root.0.join("cleanup.txt");
+    let mut command = base_harness(Path::new(FAKE_AGENT), &root.0, 0, &[]);
+    command
+        .env("SKILLMOUNT_FAKE_RECORD", &record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
+        .env("SKILLMOUNT_HARNESS_CLEANUP_COUNTER", &cleanup)
+        .env("SKILLMOUNT_HARNESS_CLEANUP_DELAY_MS", "10000")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_controller_target(&mut command);
+    let mut child = command.spawn().expect("spawn cleanup-interrupt harness");
+    wait_for_cleanup_count(&cleanup, 1);
+
+    send_interrupt(child.id());
+    if wait_for_exit_within(&mut child, Duration::from_secs(2)).is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the active dispatcher swallowed an interrupt during cleanup");
+    }
+}
+
+#[test]
 fn first_interrupt_reaches_waiting_child_then_cleanup_runs_once() {
     let root = TestDir::new("first-interrupt");
     let record = root.0.join("record.txt");
@@ -234,7 +348,13 @@ fn first_interrupt_reaches_waiting_child_then_cleanup_runs_once() {
     assert_eq!(signal_event_count(&read_record(&record)), 1);
     let outcome = fs::read_to_string(outcome).expect("read interrupt outcome");
     assert!(outcome.contains("Graceful"), "{outcome}");
+    #[cfg(unix)]
     assert!(outcome.contains("Forwarded"), "{outcome}");
+    #[cfg(windows)]
+    {
+        assert!(outcome.contains("Break"), "{outcome}");
+        assert!(outcome.contains("DeliveredByPlatform"), "{outcome}");
+    }
 }
 
 #[cfg(unix)]
@@ -290,6 +410,29 @@ fn second_interrupt_forces_the_waiting_child_then_cleanup_runs_once() {
     assert!(outcome.contains("Terminated"), "{outcome}");
 }
 
+#[cfg(unix)]
+#[test]
+fn two_handler_occurrences_reach_the_force_path_without_an_intermediate_drain() {
+    let root = TestDir::new("queued-interrupts");
+    let record = root.0.join("record.txt");
+    let cleanup = root.0.join("cleanup.txt");
+    let outcome = root.0.join("outcome.txt");
+    let mut child = waiting_harness(&root.0, &record, &cleanup, &outcome, "ignore-first")
+        .env("SKILLMOUNT_HARNESS_SELF_INTERRUPTS", "2")
+        .spawn()
+        .expect("spawn queued-interrupt harness");
+
+    if wait_for_exit_within(&mut child, Duration::from_secs(2)).is_none() {
+        send_interrupt(child.id());
+        let _ = wait_for_exit(&mut child);
+        panic!("two completed signal-handler invocations did not reach the force path");
+    }
+
+    assert_eq!(cleanup_count(&cleanup), 1);
+    let outcome = fs::read_to_string(outcome).expect("read queued-interrupt outcome");
+    assert!(outcome.contains("Forced"), "{outcome}");
+}
+
 #[test]
 fn first_interrupt_reaches_a_child_process_group_descendant() {
     let root = TestDir::new("descendant");
@@ -312,6 +455,71 @@ fn first_interrupt_reaches_a_child_process_group_descendant() {
     assert_eq!(signal_event_count(&read_record(&record)), 1);
     assert_eq!(signal_event_count(&read_record(&descendant)), 1);
     assert_eq!(cleanup_count(&cleanup), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn second_interrupt_terminates_the_windows_job_descendant_before_cleanup() {
+    let root = TestDir::new("windows-job-descendant");
+    let record = root.0.join("parent-record.txt");
+    let descendant = root.0.join("descendant-record.txt");
+    let cleanup = root.0.join("cleanup.txt");
+    let outcome = root.0.join("outcome.txt");
+    let mut command = waiting_harness(
+        &root.0,
+        &record,
+        &cleanup,
+        &outcome,
+        "descendant-ignore-all",
+    );
+    command.env("SKILLMOUNT_FAKE_DESCENDANT_RECORD", &descendant);
+    configure_controller_target(&mut command);
+    let mut child = command.spawn().expect("spawn Windows Job Object harness");
+    wait_for_event_count(&record, 1);
+    wait_for_event_count(&descendant, 1);
+    let descendant_pid = read_record(&descendant)
+        .pid
+        .expect("fake descendant records its PID");
+
+    send_interrupt(child.id());
+    wait_for_event_count(&record, 2);
+    wait_for_event_count(&descendant, 2);
+    send_interrupt(child.id());
+    let status = wait_for_exit(&mut child);
+
+    assert!(!status.success(), "{status:?}");
+    assert_eq!(cleanup_count(&cleanup), 1);
+    assert!(
+        !skillmount::process::test_support::process_is_running(descendant_pid)
+            .expect("query descendant liveness"),
+        "cleanup ran while descendant {descendant_pid} remained alive"
+    );
+    let outcome = fs::read_to_string(outcome).expect("read Windows Job Object outcome");
+    assert!(outcome.contains("Forced"), "{outcome}");
+    assert!(outcome.contains("Terminated"), "{outcome}");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_batch_launch_is_rejected_before_implicit_shell_execution() {
+    let root = TestDir::new("windows-batch");
+    let batch = root.0.join("agent.CMD");
+    let sentinel = root.0.join("batch-ran");
+    let cleanup = root.0.join("cleanup.txt");
+    let outcome = root.0.join("outcome.txt");
+    fs::write(&batch, "@echo launched>batch-ran\r\n").expect("write batch fixture");
+
+    let output = base_harness(&batch, &root.0, 0, &[])
+        .env("SKILLMOUNT_HARNESS_CLEANUP_COUNTER", &cleanup)
+        .env("SKILLMOUNT_HARNESS_OUTCOME", &outcome)
+        .output()
+        .expect("run batch validation harness");
+
+    assert_eq!(output.status.code(), Some(70), "{output:?}");
+    assert_eq!(cleanup_count(&cleanup), 1);
+    assert!(!sentinel.exists(), "the batch file reached cmd.exe");
+    let outcome = fs::read_to_string(outcome).expect("read batch validation outcome");
+    assert!(outcome.contains("stage: LaunchValidation"), "{outcome}");
 }
 
 #[cfg(windows)]
@@ -385,13 +593,16 @@ fn read_record(path: &Path) -> FakeRecord {
     let mut lines = text.lines();
     assert_eq!(lines.next(), Some("SMFAKE1"));
     let mut record = FakeRecord {
+        pid: None,
         arguments: Vec::new(),
         cwd: Vec::new(),
         stdin: None,
         events: Vec::new(),
     };
     for line in lines {
-        if let Some(value) = line.strip_prefix("arg=") {
+        if let Some(value) = line.strip_prefix("pid=") {
+            record.pid = Some(value.parse::<u32>().expect("valid fake-agent PID"));
+        } else if let Some(value) = line.strip_prefix("arg=") {
             record.arguments.push(decode_hex(value));
         } else if let Some(value) = line.strip_prefix("cwd=") {
             record.cwd = decode_hex(value);
@@ -425,6 +636,20 @@ fn cleanup_count(path: &Path) -> usize {
         .count()
 }
 
+fn wait_for_cleanup_count(path: &Path, expected: usize) {
+    let started = Instant::now();
+    while started.elapsed() < TIMEOUT {
+        if fs::read_to_string(path).map_or(0, |text| text.lines().count()) >= expected {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "timed out waiting for {expected} cleanup invocation(s) at {}",
+        path.display()
+    );
+}
+
 fn signal_event_count(record: &FakeRecord) -> usize {
     record
         .events
@@ -454,16 +679,23 @@ fn wait_for_event_count(path: &Path, expected: usize) {
 }
 
 fn wait_for_exit(child: &mut Child) -> ExitStatus {
-    let started = Instant::now();
-    while started.elapsed() < TIMEOUT {
-        if let Some(status) = child.try_wait().expect("poll harness child") {
-            return status;
-        }
-        thread::sleep(Duration::from_millis(10));
+    if let Some(status) = wait_for_exit_within(child, TIMEOUT) {
+        return status;
     }
     let _ = child.kill();
     let _ = child.wait();
     panic!("timed out waiting for supervisor harness {}", child.id());
+}
+
+fn wait_for_exit_within(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if let Some(status) = child.try_wait().expect("poll harness child") {
+            return Some(status);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    None
 }
 
 #[cfg(unix)]

@@ -7,12 +7,20 @@ use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
-use signal_hook::iterator::SignalsInfo;
-use signal_hook::iterator::exfiltrator::WithOrigin;
 
+use super::event::{EventLedger, EventSession};
+use super::unix_ffi;
 use super::{
     ChildStatus, ForceTermination, InterruptDelivery, InterruptKind, ProcessFailure, ProcessStage,
 };
+
+static EVENTS: EventLedger = EventLedger::new();
+
+// The shared platform seam is fallible because Windows rejects implicit-shell executables.
+#[allow(clippy::unnecessary_wraps)]
+pub(super) fn validate_executable(_executable: &Path) -> io::Result<()> {
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Grouping {
@@ -21,19 +29,20 @@ enum Grouping {
 }
 
 pub(super) struct Platform {
-    signals: SignalsInfo<WithOrigin>,
+    events: EventSession,
     grouping: Grouping,
 }
 
 impl Platform {
     pub(super) fn install() -> io::Result<Self> {
-        let signals = SignalsInfo::<WithOrigin>::new([SIGINT, SIGTERM])?;
+        unix_ffi::install()?;
+        let events = EVENTS.acquire()?;
         let grouping = if io::stdin().is_terminal() {
             Grouping::SharedForeground
         } else {
             Grouping::Dedicated
         };
-        Ok(Self { signals, grouping })
+        Ok(Self { events, grouping })
     }
 
     pub(super) fn configure_command(&self, command: &mut Command) {
@@ -42,35 +51,45 @@ impl Platform {
         }
     }
 
+    // The shared platform seam prepares a fallible Windows containment object before spawn.
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    pub(super) fn prepare_containment(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    // The shared platform seam attaches a child to Windows containment immediately after spawn.
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    pub(super) fn attach(&mut self, _child: &Child) -> io::Result<()> {
+        Ok(())
+    }
+
     pub(super) fn pending_interrupts(&mut self) -> Vec<Interrupt> {
-        self.signals
+        self.events
             .pending()
-            .filter_map(|origin| {
-                let kind = match origin.signal {
-                    SIGINT => InterruptKind::Interrupt,
-                    SIGTERM => InterruptKind::Terminate,
-                    _ => return None,
-                };
-                Some(Interrupt {
-                    kind,
-                    signal: origin.signal,
-                    delivered_by_platform: self.grouping == Grouping::SharedForeground
-                        && origin.process.is_none(),
-                })
-            })
+            .into_iter()
+            .filter_map(|kind| self.interrupt(kind))
             .collect()
+    }
+
+    pub(super) fn begin_finalization(&mut self) -> Result<(), Vec<Interrupt>> {
+        self.events.begin_finalization().map_err(|events| {
+            events
+                .into_iter()
+                .filter_map(|kind| self.interrupt(kind))
+                .collect()
+        })
     }
 
     pub(super) fn forward_first(
         &self,
         child: &mut Child,
-        interrupt: &Interrupt,
+        interrupt: Interrupt,
         executable: &Path,
     ) -> InterruptDelivery {
         if interrupt.delivered_by_platform {
             return InterruptDelivery::DeliveredByPlatform;
         }
-        if child_has_exited(child) {
+        if self.grouping == Grouping::SharedForeground && child_has_exited(child) {
             return InterruptDelivery::ChildAlreadyExited;
         }
 
@@ -80,6 +99,7 @@ impl Platform {
                 return InterruptDelivery::Failed(ProcessFailure::from_io(
                     ProcessStage::ForwardInterrupt,
                     executable,
+                    None,
                     &io::Error::new(io::ErrorKind::InvalidInput, error.to_string()),
                 ));
             }
@@ -97,7 +117,7 @@ impl Platform {
     }
 
     pub(super) fn force(&self, child: &mut Child, executable: &Path) -> ForceTermination {
-        if child_has_exited(child) {
+        if self.grouping == Grouping::SharedForeground && child_has_exited(child) {
             return ForceTermination::ChildAlreadyExited;
         }
 
@@ -116,12 +136,47 @@ impl Platform {
             Err(error) => ForceTermination::Failed(ProcessFailure::from_io(
                 ProcessStage::ForceTermination,
                 executable,
+                None,
                 &error,
             )),
         }
     }
+
+    pub(super) fn domain_is_empty(&self, child: &Child) -> io::Result<bool> {
+        if self.grouping == Grouping::SharedForeground {
+            return Ok(true);
+        }
+
+        let pid = child_pid(child)?;
+        match killpg(pid, None) {
+            Ok(()) | Err(Errno::EPERM) => Ok(false),
+            Err(Errno::ESRCH) => Ok(true),
+            Err(error) => Err(errno_to_io(error)),
+        }
+    }
+
+    fn interrupt(&self, kind: InterruptKind) -> Option<Interrupt> {
+        let signal = match kind {
+            InterruptKind::Interrupt => SIGINT,
+            InterruptKind::Terminate => SIGTERM,
+            InterruptKind::Break => return None,
+        };
+        Some(Interrupt {
+            kind,
+            signal,
+            delivered_by_platform: self.grouping == Grouping::SharedForeground
+                && kind == InterruptKind::Interrupt,
+        })
+    }
 }
 
+pub(super) fn record_signal(signal: i32, kind: InterruptKind) {
+    if !EVENTS.record(kind) {
+        let _ = signal_hook::low_level::emulate_default_handler(signal);
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(super) struct Interrupt {
     kind: InterruptKind,
     signal: i32,
@@ -129,7 +184,7 @@ pub(super) struct Interrupt {
 }
 
 impl Interrupt {
-    pub(super) const fn kind(&self) -> InterruptKind {
+    pub(super) const fn kind(self) -> InterruptKind {
         self.kind
     }
 }
@@ -168,6 +223,7 @@ fn delivery_result(result: io::Result<()>, executable: &Path) -> InterruptDelive
         Err(error) => InterruptDelivery::Failed(ProcessFailure::from_io(
             ProcessStage::ForwardInterrupt,
             executable,
+            None,
             &error,
         )),
     }
@@ -198,7 +254,7 @@ mod tests {
 
         let delivery = platform.forward_first(
             &mut child,
-            &Interrupt {
+            Interrupt {
                 kind: InterruptKind::Interrupt,
                 signal: SIGINT,
                 delivered_by_platform: false,

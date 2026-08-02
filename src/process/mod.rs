@@ -4,14 +4,17 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::Duration;
 
 use crate::error::ExitCategory;
 use crate::mount::LaunchPlan;
 
+mod driver;
+mod event;
+
 #[cfg(unix)]
 mod unix;
+#[cfg(unix)]
+mod unix_ffi;
 #[cfg(unix)]
 use unix as platform;
 #[cfg(windows)]
@@ -23,8 +26,6 @@ mod windows_ffi;
 
 #[cfg(not(any(unix, windows)))]
 compile_error!("child process supervision supports only Unix and Windows targets");
-
-const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Native helpers exposed only to feature-gated integration fixtures.
 #[cfg(all(windows, feature = "test-fixtures"))]
@@ -38,6 +39,15 @@ pub mod test_support {
     /// Returns the operating-system error when the console or target group is unavailable.
     pub fn send_console_break(process_group_id: u32) -> io::Result<()> {
         super::windows_ffi::generate_console_break(process_group_id)
+    }
+
+    /// Reports whether a fixture process is still running.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error when the process cannot be opened or queried.
+    pub fn process_is_running(process_id: u32) -> io::Result<bool> {
+        super::windows_ffi::process_is_running(process_id)
     }
 }
 
@@ -74,10 +84,12 @@ impl ProcessSupervisor {
         Self { _single_use: () }
     }
 
-    /// Launches one child, waits through supported interrupts, and invokes cleanup exactly once.
+    /// Launches one child, waits through supported interrupts, and coordinates one cleanup.
     ///
     /// The child inherits all three standard streams. Tests that need captured evidence must
-    /// redirect the process running the supervisor, not alter this launch boundary.
+    /// redirect the process running the supervisor, not alter this launch boundary. Cleanup runs
+    /// only when no child was spawned or the managed process domain is proven dead; otherwise it
+    /// is deferred so durable recovery evidence remains intact.
     pub fn supervise<F>(self, request: SupervisionRequest, cleanup: F) -> SupervisionOutcome
     where
         F: FnOnce() -> CleanupOutcome,
@@ -85,6 +97,20 @@ impl ProcessSupervisor {
         let Self { _single_use: () } = self;
         let mut cleanup = CleanupGuard::new(cleanup);
         let launch = request.launch;
+        if let Err(error) = platform::validate_executable(&launch.executable) {
+            return finish(
+                &mut cleanup,
+                ChildOutcome::Failed(ProcessFailure::from_io(
+                    ProcessStage::LaunchValidation,
+                    &launch.executable,
+                    Some(&launch.cwd),
+                    &error,
+                )),
+                InterruptPath::None,
+                Vec::new(),
+                driver::CleanupPermit::without_child(),
+            );
+        }
         let mut platform = match platform::Platform::install() {
             Ok(platform) => platform,
             Err(error) => {
@@ -93,52 +119,108 @@ impl ProcessSupervisor {
                     ChildOutcome::Failed(ProcessFailure::from_io(
                         ProcessStage::InterruptSetup,
                         &launch.executable,
+                        Some(&launch.cwd),
                         &error,
                     )),
                     InterruptPath::None,
+                    Vec::new(),
+                    driver::CleanupPermit::without_child(),
                 );
             }
         };
+        if let Err(error) = platform.prepare_containment() {
+            let interrupt = prepare_finalization(&mut platform, InterruptPath::None);
+            return finish(
+                &mut cleanup,
+                ChildOutcome::Failed(ProcessFailure::from_io(
+                    ProcessStage::ContainmentSetup,
+                    &launch.executable,
+                    Some(&launch.cwd),
+                    &error,
+                )),
+                interrupt,
+                Vec::new(),
+                driver::CleanupPermit::without_child(),
+            );
+        }
 
-        let mut command = Command::new(&launch.executable);
-        command
-            .args(&launch.injected_args)
-            .args(&launch.passthrough_args)
-            .current_dir(&launch.cwd)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+        let mut command = launch_command(&launch);
         platform.configure_command(&mut command);
 
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
+                let interrupt = prepare_finalization(&mut platform, InterruptPath::None);
                 return finish(
                     &mut cleanup,
                     ChildOutcome::Failed(ProcessFailure::from_io(
                         ProcessStage::Spawn,
                         &launch.executable,
+                        Some(&launch.cwd),
                         &error,
                     )),
-                    InterruptPath::None,
+                    interrupt,
+                    Vec::new(),
+                    driver::CleanupPermit::without_child(),
                 );
             }
         };
+        if let Err(error) = platform.attach(&child) {
+            let failure = ProcessFailure::from_io(
+                ProcessStage::ContainmentSetup,
+                &launch.executable,
+                Some(&launch.cwd),
+                &error,
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            let interrupt = prepare_finalization(&mut platform, InterruptPath::None);
+            return defer_cleanup(&mut cleanup, vec![failure], interrupt);
+        }
 
-        let (child, interrupt) = wait_for_child(&mut child, &mut platform, &launch.executable);
-        finish(&mut cleanup, child, interrupt)
+        let mut backend = NativeBackend::new(&mut child, &mut platform, &launch);
+        match driver::supervise(&mut backend) {
+            driver::DriverResult::Proven {
+                child,
+                interrupt,
+                failures,
+                permit,
+            } => finish(&mut cleanup, child, interrupt, failures, permit),
+            driver::DriverResult::Uncertain {
+                failures,
+                interrupt,
+            } => defer_cleanup(&mut cleanup, failures, interrupt),
+        }
     }
+}
+
+fn launch_command(launch: &LaunchPlan) -> Command {
+    let mut command = Command::new(&launch.executable);
+    command
+        .args(&launch.injected_args)
+        .args(&launch.passthrough_args)
+        .current_dir(&launch.cwd)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    command
 }
 
 /// The process operation that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessStage {
+    /// Rejecting a launch that cannot preserve the shell-free contract.
+    LaunchValidation,
     /// Installing safe parent interrupt observation before spawn.
     InterruptSetup,
+    /// Establishing the platform-managed process domain.
+    ContainmentSetup,
     /// Starting the child executable.
     Spawn,
     /// Observing the final child status.
     Wait,
+    /// Proving that the platform-managed process domain is empty.
+    ContainmentProbe,
     /// Relaying the first interrupt to the child.
     ForwardInterrupt,
     /// Applying the second-interrupt force path.
@@ -150,16 +232,23 @@ pub enum ProcessStage {
 pub struct ProcessFailure {
     stage: ProcessStage,
     executable: PathBuf,
+    cwd: Option<PathBuf>,
     kind: io::ErrorKind,
     raw_os_error: Option<i32>,
     reason: String,
 }
 
 impl ProcessFailure {
-    fn from_io(stage: ProcessStage, executable: &Path, error: &io::Error) -> Self {
+    fn from_io(
+        stage: ProcessStage,
+        executable: &Path,
+        cwd: Option<&Path>,
+        error: &io::Error,
+    ) -> Self {
         Self {
             stage,
             executable: executable.to_path_buf(),
+            cwd: cwd.map(Path::to_path_buf),
             kind: error.kind(),
             raw_os_error: error.raw_os_error(),
             reason: error.to_string(),
@@ -176,6 +265,12 @@ impl ProcessFailure {
     #[must_use]
     pub fn executable(&self) -> &Path {
         &self.executable
+    }
+
+    /// Returns the requested launch directory when it was available at the failure boundary.
+    #[must_use]
+    pub fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
     }
 
     /// Returns the portable I/O error classification.
@@ -228,6 +323,8 @@ pub enum ChildOutcome {
     Exited(ChildStatus),
     /// Supervision failed before or while the child was running.
     Failed(ProcessFailure),
+    /// The child or its managed process domain may still be alive.
+    Uncertain,
 }
 
 /// One supported parent interruption source.
@@ -237,6 +334,8 @@ pub enum InterruptKind {
     Interrupt,
     /// Unix `SIGTERM`.
     Terminate,
+    /// Windows `CTRL_BREAK_EVENT`.
+    Break,
 }
 
 /// What happened when the first interrupt reached the child boundary.
@@ -301,16 +400,18 @@ pub struct CleanupFailure {
     pub recovery_command: Vec<OsString>,
 }
 
-/// The single orderly cleanup attempt performed after supervision.
+/// The disposition of the single orderly cleanup operation after supervision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CleanupOutcome {
     /// Cleanup completed under the caller's selected retention policy.
     Succeeded,
     /// Cleanup left durable recovery evidence.
     Failed(CleanupFailure),
+    /// Cleanup was deliberately not invoked because process death was not proven.
+    Deferred,
 }
 
-/// Complete observable result of supervising one child and running cleanup once.
+/// Complete observable result of supervising one child and coordinating cleanup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupervisionOutcome {
     /// Final child or process-boundary outcome.
@@ -319,6 +420,8 @@ pub struct SupervisionOutcome {
     pub interrupt: InterruptPath,
     /// Result of the one orderly cleanup attempt.
     pub cleanup: CleanupOutcome,
+    /// Ordered process-operation failures observed while reaching the final liveness state.
+    pub attempt_failures: Vec<ProcessFailure>,
 }
 
 /// One primary or secondary operator-facing supervision diagnostic.
@@ -326,6 +429,8 @@ pub struct SupervisionOutcome {
 pub enum SupervisionDiagnostic {
     /// A process operation failed.
     Process(ProcessFailure),
+    /// Process liveness remained uncertain without a more specific recorded failure.
+    LivenessUncertain,
     /// A Windows child returned a status outside the public wrapper range.
     ExceptionalWindowsStatus {
         /// Original unsigned Windows status.
@@ -362,7 +467,15 @@ pub struct ExitDecision {
 /// status or another process failure; in that case it remains structured secondary context.
 #[must_use]
 pub fn map_exit(outcome: &SupervisionOutcome) -> ExitDecision {
-    let mut decision = child_exit(&outcome.child);
+    let mut decision = child_exit(&outcome.child, &outcome.attempt_failures);
+
+    for failure in &outcome.attempt_failures {
+        add_failure(
+            &mut decision,
+            ExitCategory::Internal.code(),
+            SupervisionDiagnostic::Process(failure.clone()),
+        );
+    }
 
     for failure in interrupt_failures(&outcome.interrupt) {
         add_failure(
@@ -383,7 +496,7 @@ pub fn map_exit(outcome: &SupervisionOutcome) -> ExitDecision {
     decision
 }
 
-fn child_exit(outcome: &ChildOutcome) -> ExitDecision {
+fn child_exit(outcome: &ChildOutcome, attempt_failures: &[ProcessFailure]) -> ExitDecision {
     match outcome {
         ChildOutcome::Exited(ChildStatus::Exited(code)) => ExitDecision {
             code: *code,
@@ -426,16 +539,32 @@ fn child_exit(outcome: &ChildOutcome) -> ExitDecision {
             primary: Some(SupervisionDiagnostic::Process(failure.clone())),
             secondary: Vec::new(),
         },
+        ChildOutcome::Uncertain => {
+            let mut failures = attempt_failures.iter();
+            let primary = failures
+                .next()
+                .map_or(SupervisionDiagnostic::LivenessUncertain, |failure| {
+                    SupervisionDiagnostic::Process(failure.clone())
+                });
+            ExitDecision {
+                code: ExitCategory::Internal.code(),
+                primary: Some(primary),
+                secondary: failures
+                    .map(|failure| SupervisionDiagnostic::Process(failure.clone()))
+                    .collect(),
+            }
+        }
     }
 }
 
 fn failure_exit(failure: &ProcessFailure) -> u8 {
-    if failure.stage == ProcessStage::Spawn
-        && matches!(
-            failure.kind,
-            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
-        )
-    {
+    if matches!(
+        failure.stage,
+        ProcessStage::LaunchValidation | ProcessStage::Spawn
+    ) && matches!(
+        failure.kind,
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+    ) {
         ExitCategory::MissingInput.code()
     } else {
         ExitCategory::Internal.code()
@@ -467,6 +596,9 @@ fn interrupt_failures(path: &InterruptPath) -> Vec<&ProcessFailure> {
 }
 
 fn add_failure(decision: &mut ExitDecision, code: u8, diagnostic: SupervisionDiagnostic) {
+    if decision.primary.as_ref() == Some(&diagnostic) || decision.secondary.contains(&diagnostic) {
+        return;
+    }
     if decision.code == 0 && decision.primary.is_none() {
         decision.code = code;
         decision.primary = Some(diagnostic);
@@ -475,69 +607,44 @@ fn add_failure(decision: &mut ExitDecision, code: u8, diagnostic: SupervisionDia
     }
 }
 
-fn wait_for_child(
-    child: &mut Child,
+fn prepare_finalization(
     platform: &mut platform::Platform,
-    executable: &Path,
-) -> (ChildOutcome, InterruptPath) {
-    let mut interrupt = InterruptPath::None;
-
+    mut path: InterruptPath,
+) -> InterruptPath {
     loop {
-        interrupt = observe_interrupts(child, platform, executable, interrupt);
-
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                interrupt = observe_interrupts(child, platform, executable, interrupt);
-                return (
-                    ChildOutcome::Exited(platform::child_status(status)),
-                    interrupt,
-                );
-            }
-            Ok(None) => thread::sleep(POLL_INTERVAL),
-            Err(error) => {
-                let failure = ProcessFailure::from_io(ProcessStage::Wait, executable, &error);
-                let termination = platform.force(child, executable);
-                if !matches!(termination, ForceTermination::Failed(_)) {
-                    let _ = child.wait();
+        match platform.begin_finalization() {
+            Ok(()) => return path,
+            Err(events) => {
+                for event in events {
+                    let kind = event.kind();
+                    path = match path {
+                        InterruptPath::None => InterruptPath::Graceful {
+                            interrupt: kind,
+                            delivery: InterruptDelivery::ChildAlreadyExited,
+                        },
+                        InterruptPath::Graceful {
+                            interrupt: first,
+                            delivery,
+                        } => InterruptPath::Forced {
+                            first,
+                            delivery,
+                            second: kind,
+                            termination: ForceTermination::ChildAlreadyExited,
+                        },
+                        forced @ InterruptPath::Forced { .. } => forced,
+                    };
                 }
-                return (ChildOutcome::Failed(failure), interrupt);
             }
         }
     }
-}
-
-fn observe_interrupts(
-    child: &mut Child,
-    platform: &mut platform::Platform,
-    executable: &Path,
-    mut path: InterruptPath,
-) -> InterruptPath {
-    for event in platform.pending_interrupts() {
-        let kind = event.kind();
-        path = match path {
-            InterruptPath::None => InterruptPath::Graceful {
-                interrupt: kind,
-                delivery: platform.forward_first(child, &event, executable),
-            },
-            InterruptPath::Graceful {
-                interrupt: first,
-                delivery,
-            } => InterruptPath::Forced {
-                first,
-                delivery,
-                second: kind,
-                termination: platform.force(child, executable),
-            },
-            forced @ InterruptPath::Forced { .. } => forced,
-        };
-    }
-    path
 }
 
 fn finish<F>(
     cleanup: &mut CleanupGuard<F>,
     child: ChildOutcome,
     interrupt: InterruptPath,
+    attempt_failures: Vec<ProcessFailure>,
+    permit: driver::CleanupPermit,
 ) -> SupervisionOutcome
 where
     F: FnOnce() -> CleanupOutcome,
@@ -545,7 +652,134 @@ where
     SupervisionOutcome {
         child,
         interrupt,
-        cleanup: cleanup.run(),
+        cleanup: cleanup.run(permit),
+        attempt_failures,
+    }
+}
+
+fn defer_cleanup<F>(
+    cleanup: &mut CleanupGuard<F>,
+    attempt_failures: Vec<ProcessFailure>,
+    interrupt: InterruptPath,
+) -> SupervisionOutcome
+where
+    F: FnOnce() -> CleanupOutcome,
+{
+    SupervisionOutcome {
+        child: ChildOutcome::Uncertain,
+        interrupt,
+        cleanup: cleanup.defer(),
+        attempt_failures,
+    }
+}
+
+struct NativeBackend<'a> {
+    child: &'a mut Child,
+    platform: &'a mut platform::Platform,
+    executable: &'a Path,
+    cwd: &'a Path,
+    root_status: Option<ChildStatus>,
+    armed: bool,
+}
+
+impl<'a> NativeBackend<'a> {
+    fn new(
+        child: &'a mut Child,
+        platform: &'a mut platform::Platform,
+        launch: &'a LaunchPlan,
+    ) -> Self {
+        Self {
+            child,
+            platform,
+            executable: &launch.executable,
+            cwd: &launch.cwd,
+            root_status: None,
+            armed: true,
+        }
+    }
+}
+
+impl driver::Backend for NativeBackend<'_> {
+    type Event = platform::Interrupt;
+
+    fn pending_events(&mut self) -> Vec<Self::Event> {
+        self.platform.pending_interrupts()
+    }
+
+    fn event_kind(&self, event: Self::Event) -> InterruptKind {
+        event.kind()
+    }
+
+    fn probe(&mut self) -> driver::Probe {
+        if self.root_status.is_none() {
+            match self.child.try_wait() {
+                Ok(Some(status)) => self.root_status = Some(platform::child_status(status)),
+                Ok(None) => return driver::Probe::Running,
+                Err(error) => {
+                    return driver::Probe::Uncertain(ProcessFailure::from_io(
+                        ProcessStage::Wait,
+                        self.executable,
+                        Some(self.cwd),
+                        &error,
+                    ));
+                }
+            }
+        }
+
+        match self.platform.domain_is_empty(self.child) {
+            Ok(true) => driver::Probe::ProvenDead(
+                self.root_status
+                    .expect("a domain probe requires a reaped root child"),
+            ),
+            Ok(false) => driver::Probe::Running,
+            Err(error) => driver::Probe::Uncertain(ProcessFailure::from_io(
+                ProcessStage::ContainmentProbe,
+                self.executable,
+                Some(self.cwd),
+                &error,
+            )),
+        }
+    }
+
+    fn deliver_first(&mut self, event: Self::Event) -> InterruptDelivery {
+        self.platform
+            .forward_first(self.child, event, self.executable)
+    }
+
+    fn force(&mut self) -> ForceTermination {
+        self.platform.force(self.child, self.executable)
+    }
+
+    fn begin_finalization(&mut self) -> Result<(), Vec<Self::Event>> {
+        self.platform.begin_finalization()
+    }
+
+    fn timeout_failure(&self) -> ProcessFailure {
+        ProcessFailure::from_io(
+            ProcessStage::Wait,
+            self.executable,
+            Some(self.cwd),
+            &io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the managed process domain did not terminate after force",
+            ),
+        )
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for NativeBackend<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let termination = self.platform.force(self.child, self.executable);
+        if !matches!(termination, ForceTermination::Failed(_)) {
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -563,25 +797,31 @@ where
         }
     }
 
-    fn run(&mut self) -> CleanupOutcome {
+    fn run(&mut self, _permit: driver::CleanupPermit) -> CleanupOutcome {
         let action = self
             .action
             .take()
             .expect("cleanup guard may be consumed only once");
         action()
     }
+
+    fn defer(&mut self) -> CleanupOutcome {
+        drop(self.action.take());
+        CleanupOutcome::Deferred
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::ffi::OsString;
     use std::io;
     use std::path::PathBuf;
 
     use super::{
-        ChildOutcome, ChildStatus, CleanupFailure, CleanupOutcome, ExitDecision, ForceTermination,
-        InterruptDelivery, InterruptKind, InterruptPath, ProcessFailure, ProcessStage,
-        SupervisionDiagnostic, SupervisionOutcome, map_exit,
+        ChildOutcome, ChildStatus, CleanupFailure, CleanupGuard, CleanupOutcome, ExitDecision,
+        ForceTermination, InterruptDelivery, InterruptKind, InterruptPath, ProcessFailure,
+        ProcessStage, SupervisionDiagnostic, SupervisionOutcome, defer_cleanup, map_exit,
     };
 
     fn failure(stage: ProcessStage, kind: io::ErrorKind) -> ProcessFailure {
@@ -589,6 +829,7 @@ mod tests {
         ProcessFailure {
             stage,
             executable: PathBuf::from("agent"),
+            cwd: None,
             kind: error.kind(),
             raw_os_error: error.raw_os_error(),
             reason: error.to_string(),
@@ -609,6 +850,7 @@ mod tests {
             child,
             interrupt: InterruptPath::None,
             cleanup,
+            attempt_failures: Vec::new(),
         }
     }
 
@@ -737,6 +979,7 @@ mod tests {
                         delivery: InterruptDelivery::Failed(forward_failure.clone()),
                     },
                     cleanup: CleanupOutcome::Succeeded,
+                    attempt_failures: Vec::new(),
                 },
                 expected: decision(
                     70,
@@ -788,6 +1031,7 @@ mod tests {
                         termination: ForceTermination::Terminated,
                     },
                     cleanup: CleanupOutcome::Failed(cleanup.clone()),
+                    attempt_failures: Vec::new(),
                 },
                 expected: decision(
                     70,
@@ -796,5 +1040,25 @@ mod tests {
                 ),
             },
         ]);
+    }
+
+    #[test]
+    fn uncertain_liveness_defers_cleanup_and_preserves_failures() {
+        let cleanup_called = Cell::new(false);
+        let mut cleanup = CleanupGuard::new(|| {
+            cleanup_called.set(true);
+            CleanupOutcome::Succeeded
+        });
+        let wait = failure(ProcessStage::Wait, io::ErrorKind::Other);
+
+        let outcome = defer_cleanup(&mut cleanup, vec![wait.clone()], InterruptPath::None);
+        let decision = map_exit(&outcome);
+
+        assert!(!cleanup_called.get());
+        assert_eq!(outcome.child, ChildOutcome::Uncertain);
+        assert_eq!(outcome.cleanup, CleanupOutcome::Deferred);
+        assert_eq!(outcome.attempt_failures, std::slice::from_ref(&wait));
+        assert_eq!(decision.code, 70);
+        assert_eq!(decision.primary, Some(SupervisionDiagnostic::Process(wait)));
     }
 }

@@ -26,6 +26,7 @@ fn main() -> ExitCode {
 fn run() -> io::Result<ExitCode> {
     let record_path = required_path(RECORD_ENV)?;
     let recorder = Recorder::create(record_path)?;
+    recorder.number("pid", std::process::id())?;
     for argument in env::args_os().skip(1) {
         recorder.os("arg", &argument)?;
     }
@@ -35,12 +36,18 @@ fn run() -> io::Result<ExitCode> {
     match behavior.as_str() {
         "exit" => recorder.event("ready")?,
         "streams" => use_inherited_streams(&recorder)?,
-        "wait" => wait_for_interrupt(&recorder, false)?,
-        "ignore-first" => wait_for_interrupt(&recorder, true)?,
+        "wait" => wait_for_interrupt(&recorder, Some(1))?,
+        "ignore-first" => wait_for_interrupt(&recorder, Some(2))?,
+        "ignore-all" => wait_for_interrupt(&recorder, None)?,
         "descendant-wait" => {
             let descendant_record = required_path(DESCENDANT_RECORD_ENV)?;
-            spawn_descendant(&descendant_record)?;
-            wait_for_interrupt(&recorder, false)?;
+            spawn_descendant(&descendant_record, "wait")?;
+            wait_for_interrupt(&recorder, Some(1))?;
+        }
+        "descendant-ignore-all" => {
+            let descendant_record = required_path(DESCENDANT_RECORD_ENV)?;
+            spawn_descendant(&descendant_record, "ignore-all")?;
+            wait_for_interrupt(&recorder, None)?;
         }
         other => {
             return Err(io::Error::new(
@@ -78,10 +85,10 @@ fn use_inherited_streams(recorder: &Recorder) -> io::Result<()> {
     stderr.flush()
 }
 
-fn spawn_descendant(record_path: &Path) -> io::Result<()> {
+fn spawn_descendant(record_path: &Path, behavior: &str) -> io::Result<()> {
     Command::new(env::current_exe()?)
         .env(RECORD_ENV, record_path)
-        .env(BEHAVIOR_ENV, "wait")
+        .env(BEHAVIOR_ENV, behavior)
         .env_remove(DESCENDANT_RECORD_ENV)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -91,7 +98,7 @@ fn spawn_descendant(record_path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn wait_for_interrupt(recorder: &Recorder, ignore_first: bool) -> io::Result<()> {
+fn wait_for_interrupt(recorder: &Recorder, exit_after: Option<usize>) -> io::Result<()> {
     use signal_hook::consts::signal::{SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
 
@@ -99,7 +106,7 @@ fn wait_for_interrupt(recorder: &Recorder, ignore_first: bool) -> io::Result<()>
     recorder.event("ready")?;
     for (index, signal) in (&mut signals).into_iter().enumerate() {
         recorder.event(&format!("signal:{signal}"))?;
-        if !ignore_first || index > 0 {
+        if exit_after.is_some_and(|limit| index + 1 >= limit) {
             return Ok(());
         }
     }
@@ -110,7 +117,7 @@ fn wait_for_interrupt(recorder: &Recorder, ignore_first: bool) -> io::Result<()>
 }
 
 #[cfg(windows)]
-fn wait_for_interrupt(recorder: &Recorder, ignore_first: bool) -> io::Result<()> {
+fn wait_for_interrupt(recorder: &Recorder, exit_after: Option<usize>) -> io::Result<()> {
     use std::sync::mpsc;
 
     let (sender, receiver) = mpsc::channel();
@@ -121,7 +128,7 @@ fn wait_for_interrupt(recorder: &Recorder, ignore_first: bool) -> io::Result<()>
     recorder.event("ready")?;
     for (index, ()) in receiver.into_iter().enumerate() {
         recorder.event("console")?;
-        if !ignore_first || index > 0 {
+        if exit_after.is_some_and(|limit| index + 1 >= limit) {
             return Ok(());
         }
     }
@@ -147,6 +154,10 @@ impl Recorder {
 
     fn event(&self, event: &str) -> io::Result<()> {
         self.append(&format!("event={event}\n"))
+    }
+
+    fn number(&self, name: &str, value: u32) -> io::Result<()> {
+        self.append(&format!("{name}={value}\n"))
     }
 
     fn bytes(&self, name: &str, value: &[u8]) -> io::Result<()> {

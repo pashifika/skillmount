@@ -1,6 +1,6 @@
 # ADR 0017: Preserve the interactive Unix foreground group
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR 0019
 - **Date:** 2026-08-03
 - **Supersedes:** _none_
 

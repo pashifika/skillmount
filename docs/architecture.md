@@ -128,7 +128,7 @@ conflict until recovery removes it. This ordering is the accepted decision in
 | `src/lock/` | Logical/physical resource identities and sorted operating-system advisory locks. |
 | `src/journal/` | Versioned, checksummed write-ahead ownership records and durable storage. |
 | `src/transaction/` | Apply, rollback, ordinary cleanup, kept state, and stale recovery. |
-| `src/process/` | Shell-free direct child launch, inherited streams, platform interruption, exactly-once orderly cleanup, structured status, and exit-policy mapping. |
+| `src/process/` | Shell-free direct child launch, inherited streams, reusable platform interruption, liveness-gated cleanup coordination, structured status, and exit-policy mapping. |
 | `src/link/` | Sealed platform boundary for no-follow inspection, link creation, no-replace placement, and verified entry removal. |
 | `src/state.rs` | Computes state locations and, only after the mutation boundary, creates their requested final directories with platform-specific access restrictions. |
 | `src/native.rs` | Lossless platform-native path encoding for journals and lock keys. |
@@ -239,18 +239,22 @@ future-schema journals block new mutation and are retained for operator inspecti
 
 ## Platform and unsafe boundary
 
-The crate sets `unsafe_code = "deny"`. Exactly three modules may opt in:
+The crate sets `unsafe_code = "deny"`. Exactly four modules may opt in:
 
 - `src/link/unix_ffi.rs`;
 - `src/link/windows_ffi.rs`;
+- `src/process/unix_ffi.rs`;
 - `src/process/windows_ffi.rs`.
 
-They wrap filesystem operations that have no safe standard-library equivalent, including atomic
-no-replace placement and Windows reparse-point observation, handle rename, and handle disposition.
-Each unsafe block has a `SAFETY` justification, raw platform types do not cross the module boundary,
-and reparse decoding stays in safe Rust. [ADR 0011](adr/0011-scoped-unsafe-for-platform-link-backends.md)
-records why `deny` with an audited scope replaced crate-wide `forbid`; [ADR 0018](adr/0018-scope-unsafe-for-windows-console-forwarding.md)
-records the additional one-call Windows console boundary.
+The two `src/link/` modules wrap filesystem operations that have no safe standard-library
+equivalent, including atomic no-replace placement and Windows reparse-point observation, handle
+rename, and handle disposition. The process FFI modules wrap process-lifetime Unix signal
+registration and Windows console-handler and Job Object operations. Each unsafe block has a
+`SAFETY` justification, raw platform types do not cross its module boundary, and event storage,
+process policy, and reparse decoding stay in safe Rust.
+[ADR 0011](adr/0011-scoped-unsafe-for-platform-link-backends.md) records why `deny` with an audited
+scope replaced crate-wide `forbid`; [ADR 0019](adr/0019-supervise-process-domains-through-reusable-native-dispatchers.md)
+records the two process boundaries.
 
 Paths and forwarded arguments remain `PathBuf` and `OsString` through every public seam. They are
 never joined into a shell command or converted lossily for policy, journal, lock, or ownership
@@ -268,12 +272,15 @@ Linux product support.
 
 Child launch always constructs `Command` directly from the platform-native executable, CWD, and
 the injected-then-passthrough `OsString` arrays. All three streams use `Stdio::inherit()`. On Unix,
-safe `signal-hook` observation and `nix` delivery keep an interactive child in SkillMount's
-foreground group but create a dedicated group when stdin is not a terminal; [ADR 0017](adr/0017-preserve-interactive-unix-foreground-group.md)
-records the job-control proof behind that split. On Windows, `ctrlc` queues console events outside
-the raw handler, the child uses `CREATE_NEW_PROCESS_GROUP`, and the first event is relayed as
-targeted `CTRL_BREAK_EVENT`. The shared loop observes the final child status and invokes its
-single-use orderly cleanup after success, failure, or a supported first-interrupt exit.
+a process-lifetime handler records occurrences in an atomic ledger. Interactive children remain in
+SkillMount's foreground group and receive shared-group `SIGINT` directly; non-interactive children
+use a dedicated process group for forwarding, force, and liveness probing. On Windows, a raw
+process-lifetime handler preserves Ctrl+C versus Ctrl+Break identity, the child inherits the
+wrapper's console group, and a kill-on-close Job Object contains ordinary descendants. The private
+driver distinguishes running, proven-dead, and uncertain domains, retries force and liveness
+checks within fixed bounds, and exposes a cleanup permit only after no child was spawned or the
+managed domain is proven empty. [ADR 0019](adr/0019-supervise-process-domains-through-reusable-native-dispatchers.md)
+records the native evidence, residual containment limits, and replacement of ADRs 0017 and 0018.
 
 ## Cross-module invariants
 
@@ -304,9 +311,13 @@ The following are product rules rather than style preferences:
 11. Product behavior never edits Git state, escalates privileges, or weakens agent permissions.
 12. Child launch never uses a shell string, never reorders or duplicates injected/passthrough
     arguments, and never replaces inherited standard streams with product-owned pipes.
-13. Every ordinary child, spawn, wait, and supported first-interrupt outcome reaches one orderly
-    cleanup attempt. A cleanup failure replaces only child success; otherwise it remains structured
-    secondary evidence behind the primary child or process failure.
+13. Exactly one orderly cleanup operation runs when no child was spawned or the managed process
+    domain is proven dead. Uncertain liveness defers cleanup and preserves recovery evidence. A
+    cleanup failure replaces only child success; otherwise it remains structured secondary
+    evidence behind the primary child or process failure.
+14. The process-lifetime event dispatcher preserves the first two handler occurrences for one
+    active session, linearizes finalization against event recording, and returns inactive or
+    finalizing events to platform default handling.
 
 Tests enforce the observable parts of these rules. Local comments retain the narrower preconditions
 needed to preserve them inside an implementation.
@@ -326,8 +337,9 @@ needed to preserve them inside an implementation.
 - logical and physical resource locks, versioned journals, write-ahead apply, rollback, cleanup,
   terminal kept state, and stale recovery;
 - generic shell-free child supervision with inherited streams, typed child/interrupt/cleanup
-  outcomes, stable exit precedence, Unix signal-group handling, Windows console-group handling,
-  and feature-gated native fake-agent coverage;
+  outcomes, stable exit precedence, reusable native event dispatch, liveness-gated cleanup, Unix
+  signal-group handling, Windows console identity and Job Object containment, and feature-gated
+  native fake-agent coverage;
 - crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
 
 ### Reserved work

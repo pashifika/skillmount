@@ -26,7 +26,7 @@ path = "tests/fixtures/supervisor_harness.rs"
 required-features = ["test-fixtures"]
 
 [features]
-test-fixtures = []
+test-fixtures = ["dep:ctrlc"]
 
 [profile.release]
 codegen-units = 1
@@ -35,9 +35,9 @@ strip = "symbols"
 
 [lints.rust]
 missing_docs = "deny"
-# `deny` rather than `forbid`: the platform link backends and targeted Windows console forwarding
+# `deny` rather than `forbid`: the platform link backends and native process dispatch/containment
 # need narrow raw calls that no safe API exposes, and `forbid` cannot be lifted anywhere. Every
-# `allow` is a whole audited FFI module, and no other module may opt in. See ADR 0011 and ADR 0018.
+# `allow` is a whole audited FFI module, and no other module may opt in. See ADR 0011 and ADR 0019.
 unsafe_code = "deny"
 
 [lints.clippy]
@@ -71,9 +71,9 @@ nix = { version = "=0.31.3", default-features = false, features = ["signal"] }
 # Junctions are reparse points. Creating, reading, and identifying one needs `DeviceIoControl`,
 # `CreateFileW`, and `GetFileInformationByHandle`, none of which the standard library exposes.
 [target."cfg(windows)".dependencies]
-# `ctrlc` moves console notifications onto its dedicated handler thread; the callback only queues
-# typed events for the ordinary supervision loop.
-ctrlc = "=3.5.2"
+# The fake-agent fixture uses `ctrlc` to observe its inherited console events. Product supervision
+# preserves the raw event type through the audited process FFI module instead.
+ctrlc = { version = "=3.5.2", optional = true }
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -81,6 +81,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_JobObjects",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
