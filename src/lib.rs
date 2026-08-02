@@ -25,6 +25,7 @@ pub mod lock;
 pub mod mount;
 mod native;
 mod paths;
+pub mod process;
 mod render;
 pub mod state;
 #[cfg(test)]
