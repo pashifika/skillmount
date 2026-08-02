@@ -388,7 +388,7 @@ fn second_interrupt_forces_the_waiting_child_then_cleanup_runs_once() {
     let record = root.0.join("record.txt");
     let cleanup = root.0.join("cleanup.txt");
     let outcome = root.0.join("outcome.txt");
-    let mut command = waiting_harness(&root.0, &record, &cleanup, &outcome, "ignore-first");
+    let mut command = waiting_harness(&root.0, &record, &cleanup, &outcome, "ignore-all");
     configure_controller_target(&mut command);
     let mut child = command.spawn().expect("spawn force-path harness");
     wait_for_event_count(&record, 1);
@@ -398,12 +398,12 @@ fn second_interrupt_forces_the_waiting_child_then_cleanup_runs_once() {
     send_interrupt(child.id());
     let status = wait_for_exit(&mut child);
 
+    let outcome = fs::read_to_string(outcome).expect("read force outcome");
     assert!(
         !status.success(),
-        "the force path should not report child success"
+        "the force path should not report child success: {status:?}\n{outcome}"
     );
     assert_eq!(cleanup_count(&cleanup), 1);
-    let outcome = fs::read_to_string(outcome).expect("read force outcome");
     assert!(outcome.contains("Forced"), "{outcome}");
     assert!(outcome.contains("Terminated"), "{outcome}");
 }
