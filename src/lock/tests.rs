@@ -442,17 +442,36 @@ fn holder_diagnostics_are_recorded_without_becoming_liveness_evidence() {
         &owner,
     )
     .expect("uncontended");
-    let contents = std::fs::read_to_string(
-        crate::state::lock_base()
-            .unwrap()
-            .join(resource.lock_keys()[0].file_name()),
-    )
-    .expect("the holder description is readable");
+    // Read *while the lock is held*, which is the only moment the description is useful and the
+    // one Windows makes hard: a byte-range lock there is mandatory, so a description written into
+    // the lock file itself would be unreadable through any other handle. The sidecar exists for
+    // exactly this assertion.
+    let description = crate::state::lock_base()
+        .unwrap()
+        .join(format!("{}.owner", resource.lock_keys()[0]));
+    let contents = std::fs::read_to_string(&description)
+        .expect("the holder description is readable while the lock is held");
+    let lock_file = crate::state::lock_base()
+        .unwrap()
+        .join(resource.lock_keys()[0].file_name());
+    let lock_file_length = std::fs::metadata(&lock_file).unwrap().len();
     drop(held);
 
     assert!(contents.contains("transaction=abc123"));
     assert!(contents.contains("pid=4242"));
-    assert!(contents.contains("not evidence"));
+    assert!(
+        contents.contains("is evidence that anyone still holds it"),
+        "the description must say plainly that it is not liveness: {contents}"
+    );
+    assert_eq!(
+        lock_file_length, 0,
+        "the lock file carries no content, so nothing has to be read out of a locked range"
+    );
+    assert!(
+        !description.exists(),
+        "releasing the lock clears the description, so a contention message never names a session \
+         that already finished"
+    );
 }
 
 #[test]
@@ -464,10 +483,12 @@ fn a_stale_holder_record_never_authorizes_taking_the_lock_or_blocks_it() {
         LockResource::describe(LockResourceKind::BackingStore, &root, &root.join("s")).unwrap();
     let directory = crate::state::lock_base().unwrap();
     crate::state::ensure_private_directory(&directory).unwrap();
-    // A crashed session's file, naming a pid the operating system has since handed to something
-    // else. Nothing is holding the lock.
+    // A crashed session's leftovers: an empty lock file and a description naming a pid the
+    // operating system has since handed to something else. Nothing is holding the lock.
+    std::fs::write(directory.join(resource.lock_keys()[0].file_name()), b"")
+        .expect("fixture write");
     std::fs::write(
-        directory.join(resource.lock_keys()[0].file_name()),
+        directory.join(format!("{}.owner", resource.lock_keys()[0])),
         format!("transaction=dead pid={}\n", std::process::id()),
     )
     .expect("fixture write");

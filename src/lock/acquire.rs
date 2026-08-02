@@ -15,8 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fs4::{FileExt, TryLockError};
@@ -113,10 +112,12 @@ impl LockOwner {
 #[derive(Debug)]
 struct HeldLock {
     file: File,
+    description: PathBuf,
 }
 
 impl Drop for HeldLock {
     fn drop(&mut self) {
+        clear_holder(&self.description);
         // Closing the handle releases the lock on both platforms; unlocking first makes the release
         // explicit and independent of when the handle is finalized.
         let _ = FileExt::unlock(&self.file);
@@ -317,8 +318,10 @@ fn take(key: &LockKey, policy: LockPolicy, owner: &LockOwner) -> Result<Taken, A
     state::ensure_private_directory(&directory)?;
     let path = directory.join(key.file_name());
 
-    // The file is opened without truncation: truncating before the lock is taken would erase the
-    // current holder's diagnostics from outside the lock.
+    // The lock file stays empty; the holder description lives beside it. Windows byte-range locks
+    // are mandatory, so a locked file cannot be read through any other handle — including by the
+    // process that holds it. Writing the diagnostics into the locked file would therefore make them
+    // unreadable exactly when they are wanted, which is while somebody else holds the lock.
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -339,7 +342,7 @@ fn take(key: &LockKey, policy: LockPolicy, owner: &LockOwner) -> Result<Taken, A
             Err(TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
                     return Ok(Taken::Busy {
-                        holder: read_holder(&path),
+                        holder: read_holder(key),
                         path,
                     });
                 }
@@ -355,32 +358,57 @@ fn take(key: &LockKey, policy: LockPolicy, owner: &LockOwner) -> Result<Taken, A
     }
 
     state::restrict_to_owner(&path)?;
-    write_holder(&file, owner);
-    Ok(Taken::Held(HeldLock { file }))
+    write_holder(key, owner);
+    Ok(Taken::Held(HeldLock {
+        file,
+        description: holder_path(key)?,
+    }))
+}
+
+/// Returns the sidecar that carries the holder description for `key`.
+///
+/// # Errors
+///
+/// Returns [`AppError::MissingInput`] when the platform state location cannot be resolved.
+fn holder_path(key: &LockKey) -> Result<PathBuf, AppError> {
+    Ok(state::lock_base()?.join(format!("{key}.owner")))
 }
 
 /// Records who holds the lock, for diagnostics only.
 ///
-/// Best effort: a lock that is held but whose description could not be written is still held, and
-/// failing the session over an unwritten diagnostic would trade a correct outcome for a cosmetic
-/// one.
-fn write_holder(file: &File, owner: &LockOwner) {
-    use std::io::{Seek, SeekFrom};
-
-    let mut handle = file;
+/// Written to a sidecar rather than to the lock file, because a Windows byte-range lock is
+/// mandatory and would make the description unreadable while the lock is held. Best effort in every
+/// other respect too: a lock that is held but whose description could not be written is still held,
+/// and failing the session over an unwritten diagnostic would trade a correct outcome for a
+/// cosmetic one.
+fn write_holder(key: &LockKey, owner: &LockOwner) {
+    let Ok(path) = holder_path(key) else {
+        return;
+    };
     let description = format!(
-        "transaction={} pid={}\nthis file records who holds the lock; its existence is not evidence that anyone does\n",
+        "transaction={} pid={}\nthis file records who last took the lock; neither it nor the lock file is evidence that anyone still holds it\n",
         owner.transaction, owner.pid
     );
-    let _ = handle.set_len(0);
-    let _ = handle.seek(SeekFrom::Start(0));
-    let _ = handle.write_all(description.as_bytes());
-    let _ = handle.flush();
+    if std::fs::write(&path, description).is_ok() {
+        let _ = state::restrict_to_owner(&path);
+    }
+}
+
+/// Removes the holder description once the lock is released.
+///
+/// Leaving it behind would be harmless — nothing reads it as liveness — but removing it keeps a
+/// contention message from naming a session that finished long ago.
+fn clear_holder(path: &Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 /// Reads the holder description, which may be absent, stale, or unreadable.
-fn read_holder(path: &std::path::Path) -> Option<String> {
-    let contents = std::fs::read_to_string(path).ok()?;
+///
+/// Every one of those is expected. The description is written after the lock is taken and removed
+/// when it is released, so a reader can always catch it mid-flight, and a crashed holder leaves one
+/// behind. It is never treated as evidence that the lock is held.
+fn read_holder(key: &LockKey) -> Option<String> {
+    let contents = std::fs::read_to_string(holder_path(key).ok()?).ok()?;
     let first = contents.lines().next()?.trim();
     (!first.is_empty()).then(|| first.to_owned())
 }
