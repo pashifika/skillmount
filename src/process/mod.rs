@@ -4,11 +4,12 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::error::ExitCategory;
 use crate::mount::LaunchPlan;
 
-const POST_ROOT_DOMAIN_POLLS: usize = 600;
+const POST_ROOT_DOMAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 mod driver;
 mod event;
@@ -700,7 +701,7 @@ struct NativeBackend<'a> {
     executable: &'a Path,
     cwd: &'a Path,
     root_status: Option<ChildStatus>,
-    post_root_domain_polls: usize,
+    post_root_domain_started: Option<Instant>,
     armed: bool,
 }
 
@@ -716,7 +717,7 @@ impl<'a> NativeBackend<'a> {
             executable: &launch.executable,
             cwd: &launch.cwd,
             root_status: None,
-            post_root_domain_polls: 0,
+            post_root_domain_started: None,
             armed: true,
         }
     }
@@ -756,8 +757,10 @@ impl driver::Backend for NativeBackend<'_> {
             ),
             Ok(false) => {
                 if !self.platform.post_root_containment_is_stable() {
-                    self.post_root_domain_polls += 1;
-                    if self.post_root_domain_polls >= POST_ROOT_DOMAIN_POLLS {
+                    let started = self
+                        .post_root_domain_started
+                        .get_or_insert_with(Instant::now);
+                    if started.elapsed() >= POST_ROOT_DOMAIN_TIMEOUT {
                         return driver::Probe::Uncertain(ProcessFailure::from_io(
                             ProcessStage::ContainmentProbe,
                             self.executable,
