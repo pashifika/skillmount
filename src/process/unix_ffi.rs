@@ -31,11 +31,15 @@ fn register_handlers() -> Result<Registrations, StoredError> {
 }
 
 fn register(signal: i32, kind: InterruptKind) -> io::Result<SigId> {
-    // SAFETY: the callback performs only lock-free atomic operations through `record_signal` or
-    // invokes signal-hook's async-signal-safe default-action emulation for SIGINT/SIGTERM. It does
-    // not allocate, lock, perform Rust I/O, or unwind across the signal boundary.
+    // SAFETY: the callback first snapshots the active event-session token, then performs only
+    // lock-free atomic operations through `record_signal` or invokes signal-hook's
+    // async-signal-safe default-action emulation for SIGINT/SIGTERM. It does not allocate, lock,
+    // perform Rust I/O, or unwind across the signal boundary.
     unsafe {
-        signal_hook::low_level::register(signal, move || super::unix::record_signal(signal, kind))
+        signal_hook::low_level::register(signal, move || {
+            let token = super::unix::signal_token();
+            super::unix::record_signal(token, signal, kind);
+        })
     }
 }
 

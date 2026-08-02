@@ -17,6 +17,8 @@ pub(super) trait Backend {
     fn pending_events(&mut self) -> Vec<Self::Event>;
     fn event_kind(&self, event: Self::Event) -> InterruptKind;
     fn probe(&mut self) -> Probe;
+    // Death proof seals the process identity: this classification must not perform delivery.
+    fn classify_after_proof(&self, event: Self::Event) -> InterruptDelivery;
     fn deliver_first(&mut self, event: Self::Event) -> InterruptDelivery;
     fn force(&mut self) -> ForceTermination;
     fn begin_finalization(&mut self) -> Result<(), Vec<Self::Event>>;
@@ -80,6 +82,7 @@ pub(super) fn supervise<B: Backend>(backend: &mut B) -> DriverResult {
             Probe::Uncertain(failure) => {
                 let primary = failure.clone();
                 let forced = force_and_confirm(backend, vec![failure]);
+                let interrupt = record_failure_force(interrupt, forced.termination.clone());
                 return match forced.status {
                     Some(_status) => proven(
                         backend,
@@ -87,7 +90,12 @@ pub(super) fn supervise<B: Backend>(backend: &mut B) -> DriverResult {
                         interrupt,
                         forced.failures,
                     ),
-                    None => uncertain(backend, interrupt, forced.failures),
+                    None => uncertain(
+                        backend,
+                        interrupt,
+                        forced.failures,
+                        ProvenChild::Failed(primary),
+                    ),
                 };
             }
         }
@@ -107,7 +115,12 @@ pub(super) fn terminate_after_failure<B: Backend>(
             InterruptPath::None,
             forced.failures,
         ),
-        None => uncertain(backend, InterruptPath::None, forced.failures),
+        None => uncertain(
+            backend,
+            InterruptPath::None,
+            forced.failures,
+            ProvenChild::Failed(primary),
+        ),
     }
 }
 
@@ -123,7 +136,7 @@ fn handle_event<B: Backend>(backend: &mut B, event: B::Event, path: InterruptPat
             let path = match path {
                 InterruptPath::None => InterruptPath::Graceful {
                     interrupt: kind,
-                    delivery: backend.deliver_first(event),
+                    delivery: backend.classify_after_proof(event),
                 },
                 path => record_already_exited(path, kind),
             };
@@ -135,6 +148,7 @@ fn handle_event<B: Backend>(backend: &mut B, event: B::Event, path: InterruptPat
             ))
         }
         Probe::Uncertain(failure) => {
+            let primary = failure.clone();
             let delivery_failure = failure.clone();
             let forced = force_and_confirm(backend, vec![failure]);
             let path = record_event_force(
@@ -144,54 +158,22 @@ fn handle_event<B: Backend>(backend: &mut B, event: B::Event, path: InterruptPat
                 Some(delivery_failure),
             );
             match forced.status {
-                Some(status) => EventResult::Complete(proven(
+                Some(_status) => EventResult::Complete(proven(
                     backend,
-                    ChildOutcome::Exited(status),
+                    ChildOutcome::Failed(primary),
                     path,
                     forced.failures,
                 )),
-                None => EventResult::Complete(uncertain(backend, path, forced.failures)),
+                None => EventResult::Complete(uncertain(
+                    backend,
+                    path,
+                    forced.failures,
+                    ProvenChild::Failed(primary),
+                )),
             }
         }
         Probe::Running => match path {
-            InterruptPath::None => {
-                let delivery = backend.deliver_first(event);
-                let path = InterruptPath::Graceful {
-                    interrupt: kind,
-                    delivery: delivery.clone(),
-                };
-                if let InterruptDelivery::Failed(failure) = delivery {
-                    match backend.probe() {
-                        Probe::ProvenDead(status) => EventResult::Complete(proven(
-                            backend,
-                            ChildOutcome::Exited(status),
-                            InterruptPath::Graceful {
-                                interrupt: kind,
-                                delivery: InterruptDelivery::ChildAlreadyExited,
-                            },
-                            Vec::new(),
-                        )),
-                        Probe::Running => EventResult::Continue(path),
-                        Probe::Uncertain(probe_failure) => {
-                            let forced = force_and_confirm(backend, vec![failure, probe_failure]);
-                            let path = record_failure_force(path, forced.termination.clone());
-                            match forced.status {
-                                Some(status) => EventResult::Complete(proven(
-                                    backend,
-                                    ChildOutcome::Exited(status),
-                                    path,
-                                    forced.failures,
-                                )),
-                                None => {
-                                    EventResult::Complete(uncertain(backend, path, forced.failures))
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    EventResult::Continue(path)
-                }
-            }
+            InterruptPath::None => handle_first_running_event(backend, event, kind),
             InterruptPath::Graceful { .. } | InterruptPath::Forced { .. } => {
                 let forced = force_and_confirm(backend, Vec::new());
                 let path = record_event_force(path, kind, forced.termination.clone(), None);
@@ -202,10 +184,73 @@ fn handle_event<B: Backend>(backend: &mut B, event: B::Event, path: InterruptPat
                         path,
                         forced.failures,
                     )),
-                    None => EventResult::Complete(uncertain(backend, path, forced.failures)),
+                    None => EventResult::Complete(uncertain(
+                        backend,
+                        path,
+                        forced.failures,
+                        ProvenChild::Exited,
+                    )),
                 }
             }
         },
+    }
+}
+
+fn handle_first_running_event<B: Backend>(
+    backend: &mut B,
+    event: B::Event,
+    kind: InterruptKind,
+) -> EventResult {
+    let delivery = backend.deliver_first(event);
+    let path = InterruptPath::Graceful {
+        interrupt: kind,
+        delivery: delivery.clone(),
+    };
+    let InterruptDelivery::Failed(failure) = delivery else {
+        return EventResult::Continue(path);
+    };
+
+    match backend.probe() {
+        Probe::ProvenDead(status) => EventResult::Complete(proven(
+            backend,
+            ChildOutcome::Exited(status),
+            InterruptPath::Graceful {
+                interrupt: kind,
+                delivery: InterruptDelivery::ChildAlreadyExited,
+            },
+            Vec::new(),
+        )),
+        Probe::Running => {
+            complete_after_delivery_failure(backend, path, vec![failure], ProvenChild::Exited)
+        }
+        Probe::Uncertain(probe_failure) => {
+            let primary = probe_failure.clone();
+            complete_after_delivery_failure(
+                backend,
+                path,
+                vec![failure, probe_failure],
+                ProvenChild::Failed(primary),
+            )
+        }
+    }
+}
+
+fn complete_after_delivery_failure<B: Backend>(
+    backend: &mut B,
+    path: InterruptPath,
+    failures: Vec<ProcessFailure>,
+    proven_child: ProvenChild,
+) -> EventResult {
+    let forced = force_and_confirm(backend, failures);
+    let path = record_failure_force(path, forced.termination.clone());
+    match forced.status {
+        Some(status) => EventResult::Complete(proven(
+            backend,
+            proven_child.resolve(status),
+            path,
+            forced.failures,
+        )),
+        None => EventResult::Complete(uncertain(backend, path, forced.failures, proven_child)),
     }
 }
 
@@ -238,13 +283,12 @@ fn force_and_confirm<B: Backend>(
         for _ in 0..polls {
             match backend.probe() {
                 Probe::ProvenDead(status) => {
+                    if let Some(failed) = failed.clone() {
+                        failures.push(failed);
+                    }
                     return ForceResult {
                         status: Some(status),
-                        termination: if matches!(termination, ForceTermination::Terminated) {
-                            ForceTermination::Terminated
-                        } else {
-                            ForceTermination::ChildAlreadyExited
-                        },
+                        termination,
                         failures,
                     };
                 }
@@ -306,6 +350,7 @@ fn uncertain<B: Backend>(
     backend: &mut B,
     mut interrupt: InterruptPath,
     mut failures: Vec<ProcessFailure>,
+    proven_child: ProvenChild,
 ) -> DriverResult {
     loop {
         match backend.begin_finalization() {
@@ -338,9 +383,23 @@ fn uncertain<B: Backend>(
                     failures = forced.failures;
                 }
                 if let Some(status) = proven_status {
-                    return proven(backend, ChildOutcome::Exited(status), interrupt, failures);
+                    return proven(backend, proven_child.resolve(status), interrupt, failures);
                 }
             }
+        }
+    }
+}
+
+enum ProvenChild {
+    Exited,
+    Failed(ProcessFailure),
+}
+
+impl ProvenChild {
+    fn resolve(self, status: ChildStatus) -> ChildOutcome {
+        match self {
+            Self::Exited => ChildOutcome::Exited(status),
+            Self::Failed(failure) => ChildOutcome::Failed(failure),
         }
     }
 }
@@ -440,9 +499,7 @@ fn record_failure_force(path: InterruptPath, termination: ForceTermination) -> I
             second,
             termination,
         },
-        InterruptPath::None => {
-            unreachable!("failure-triggered force requires an observed first interrupt")
-        }
+        InterruptPath::None => InterruptPath::None,
     }
 }
 
@@ -460,6 +517,8 @@ mod tests {
         probes: VecDeque<Probe>,
         force: VecDeque<ForceTermination>,
         delivery: InterruptDelivery,
+        post_proof_delivery: InterruptDelivery,
+        delivery_calls: usize,
         finalization_events: VecDeque<Vec<InterruptKind>>,
         finalized: bool,
         disarmed: bool,
@@ -480,7 +539,12 @@ mod tests {
             self.probes.pop_front().unwrap_or(Probe::Running)
         }
 
+        fn classify_after_proof(&self, _event: Self::Event) -> InterruptDelivery {
+            self.post_proof_delivery.clone()
+        }
+
         fn deliver_first(&mut self, _event: Self::Event) -> InterruptDelivery {
+            self.delivery_calls += 1;
             self.delivery.clone()
         }
 
@@ -528,6 +592,8 @@ mod tests {
                 ForceTermination::Failed(force_two.clone()),
             ]),
             delivery: InterruptDelivery::DeliveredByPlatform,
+            post_proof_delivery: InterruptDelivery::DeliveredByPlatform,
+            delivery_calls: 0,
             finalization_events: VecDeque::new(),
             finalized: false,
             disarmed: false,
@@ -554,6 +620,8 @@ mod tests {
             ]),
             force: VecDeque::from([ForceTermination::Terminated]),
             delivery: InterruptDelivery::DeliveredByPlatform,
+            post_proof_delivery: InterruptDelivery::DeliveredByPlatform,
+            delivery_calls: 0,
             finalization_events: VecDeque::new(),
             finalized: false,
             disarmed: false,
@@ -591,6 +659,8 @@ mod tests {
                 ForceTermination::Failed(force_two.clone()),
             ]),
             delivery: InterruptDelivery::DeliveredByPlatform,
+            post_proof_delivery: InterruptDelivery::DeliveredByPlatform,
+            delivery_calls: 0,
             finalization_events: VecDeque::new(),
             finalized: false,
             disarmed: false,
@@ -613,6 +683,8 @@ mod tests {
             probes: VecDeque::from([Probe::ProvenDead(ChildStatus::Exited(0))]),
             force: VecDeque::new(),
             delivery: InterruptDelivery::DeliveredByPlatform,
+            post_proof_delivery: InterruptDelivery::DeliveredByPlatform,
+            delivery_calls: 0,
             finalization_events: VecDeque::new(),
             finalized: false,
             disarmed: false,
@@ -632,6 +704,179 @@ mod tests {
         );
         assert!(backend.finalized);
         assert!(backend.disarmed);
+        assert_eq!(backend.delivery_calls, 0);
+    }
+
+    #[test]
+    fn forward_only_event_after_death_proof_is_classified_without_delivery() {
+        let mut backend = ScriptedBackend {
+            events: VecDeque::from([vec![InterruptKind::Interrupt]]),
+            probes: VecDeque::from([Probe::ProvenDead(ChildStatus::Exited(0))]),
+            force: VecDeque::new(),
+            delivery: InterruptDelivery::Failed(failure(ProcessStage::ForwardInterrupt)),
+            post_proof_delivery: InterruptDelivery::ChildAlreadyExited,
+            delivery_calls: 0,
+            finalization_events: VecDeque::new(),
+            finalized: false,
+            disarmed: false,
+        };
+
+        let result = supervise(&mut backend);
+
+        let DriverResult::Proven { interrupt, .. } = result else {
+            panic!("a reaped child is proven dead");
+        };
+        assert_eq!(
+            interrupt,
+            InterruptPath::Graceful {
+                interrupt: InterruptKind::Interrupt,
+                delivery: InterruptDelivery::ChildAlreadyExited,
+            }
+        );
+        assert_eq!(backend.delivery_calls, 0);
+    }
+
+    #[test]
+    fn failed_delivery_to_a_running_child_forces_and_confirms_death() {
+        let delivery = failure(ProcessStage::ForwardInterrupt);
+        let mut backend = ScriptedBackend {
+            events: VecDeque::from([vec![InterruptKind::Interrupt]]),
+            probes: VecDeque::from([
+                Probe::Running,
+                Probe::Running,
+                Probe::ProvenDead(ChildStatus::Exited(0)),
+            ]),
+            force: VecDeque::from([ForceTermination::Terminated]),
+            delivery: InterruptDelivery::Failed(delivery.clone()),
+            post_proof_delivery: InterruptDelivery::ChildAlreadyExited,
+            delivery_calls: 0,
+            finalization_events: VecDeque::new(),
+            finalized: false,
+            disarmed: false,
+        };
+
+        let result = supervise(&mut backend);
+
+        let DriverResult::Proven {
+            child,
+            interrupt,
+            failures,
+            ..
+        } = result
+        else {
+            panic!("force followed by death proof should complete supervision");
+        };
+        assert_eq!(child, ChildOutcome::Exited(ChildStatus::Exited(0)));
+        assert_eq!(failures.as_slice(), std::slice::from_ref(&delivery));
+        assert_eq!(
+            interrupt,
+            InterruptPath::Forced {
+                first: InterruptKind::Interrupt,
+                delivery: InterruptDelivery::Failed(delivery),
+                second: None,
+                termination: ForceTermination::Terminated,
+            }
+        );
+    }
+
+    #[test]
+    fn failed_delivery_without_death_proof_defers_cleanup() {
+        let delivery = failure(ProcessStage::ForwardInterrupt);
+        let force_one = failure(ProcessStage::ForceTermination);
+        let force_two = failure(ProcessStage::ForceTermination);
+        let mut backend = ScriptedBackend {
+            events: VecDeque::from([vec![InterruptKind::Interrupt]]),
+            probes: VecDeque::from([Probe::Running, Probe::Running]),
+            force: VecDeque::from([
+                ForceTermination::Failed(force_one.clone()),
+                ForceTermination::Failed(force_two.clone()),
+            ]),
+            delivery: InterruptDelivery::Failed(delivery.clone()),
+            post_proof_delivery: InterruptDelivery::ChildAlreadyExited,
+            delivery_calls: 0,
+            finalization_events: VecDeque::new(),
+            finalized: false,
+            disarmed: false,
+        };
+
+        let result = supervise(&mut backend);
+
+        let DriverResult::Uncertain {
+            interrupt,
+            failures,
+        } = result
+        else {
+            panic!("failed force without death proof must remain uncertain");
+        };
+        assert_eq!(failures, [delivery.clone(), force_one, force_two]);
+        assert!(matches!(
+            interrupt,
+            InterruptPath::Forced {
+                delivery: InterruptDelivery::Failed(failure),
+                second: None,
+                ..
+            } if failure == delivery
+        ));
+    }
+
+    #[test]
+    fn post_interrupt_probe_failure_records_the_internal_force_path() {
+        let wait = failure(ProcessStage::Wait);
+        let mut backend = ScriptedBackend {
+            events: VecDeque::from([vec![InterruptKind::Interrupt]]),
+            probes: VecDeque::from([
+                Probe::Running,
+                Probe::Uncertain(wait.clone()),
+                Probe::ProvenDead(ChildStatus::Exited(9)),
+            ]),
+            force: VecDeque::from([ForceTermination::Terminated]),
+            delivery: InterruptDelivery::Forwarded,
+            post_proof_delivery: InterruptDelivery::ChildAlreadyExited,
+            delivery_calls: 0,
+            finalization_events: VecDeque::new(),
+            finalized: false,
+            disarmed: false,
+        };
+
+        let result = supervise(&mut backend);
+
+        let DriverResult::Proven {
+            child, interrupt, ..
+        } = result
+        else {
+            panic!("death proof should complete supervision");
+        };
+        assert_eq!(child, ChildOutcome::Failed(wait));
+        assert!(matches!(
+            interrupt,
+            InterruptPath::Forced {
+                second: None,
+                termination: ForceTermination::Terminated,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn force_failure_remains_recorded_when_the_next_probe_proves_death() {
+        let force = failure(ProcessStage::ForceTermination);
+        let mut backend = ScriptedBackend {
+            events: VecDeque::new(),
+            probes: VecDeque::from([Probe::ProvenDead(ChildStatus::Exited(0))]),
+            force: VecDeque::from([ForceTermination::Failed(force.clone())]),
+            delivery: InterruptDelivery::Forwarded,
+            post_proof_delivery: InterruptDelivery::ChildAlreadyExited,
+            delivery_calls: 0,
+            finalization_events: VecDeque::new(),
+            finalized: false,
+            disarmed: false,
+        };
+
+        let result = force_and_confirm(&mut backend, Vec::new());
+
+        assert_eq!(result.status, Some(ChildStatus::Exited(0)));
+        assert_eq!(result.termination, ForceTermination::Failed(force.clone()));
+        assert_eq!(result.failures, [force]);
     }
 
     #[test]
@@ -641,7 +886,7 @@ mod tests {
         let force_two = failure(ProcessStage::ForceTermination);
         let mut probes = VecDeque::from([Probe::Uncertain(wait.clone())]);
         probes.extend((0..FAILURE_RECHECK_POLLS * 2).map(|_| Probe::Running));
-        probes.push_back(Probe::ProvenDead(ChildStatus::Exited(0)));
+        probes.push_back(Probe::ProvenDead(ChildStatus::Exited(9)));
         let mut backend = ScriptedBackend {
             events: VecDeque::new(),
             probes,
@@ -651,6 +896,8 @@ mod tests {
                 ForceTermination::Terminated,
             ]),
             delivery: InterruptDelivery::DeliveredByPlatform,
+            post_proof_delivery: InterruptDelivery::DeliveredByPlatform,
+            delivery_calls: 0,
             finalization_events: VecDeque::from([
                 vec![InterruptKind::Interrupt, InterruptKind::Terminate],
                 Vec::new(),
@@ -662,6 +909,7 @@ mod tests {
         let result = supervise(&mut backend);
 
         let DriverResult::Proven {
+            child,
             failures,
             interrupt,
             ..
@@ -669,6 +917,7 @@ mod tests {
         else {
             panic!("the finalization event should trigger force and a death proof");
         };
+        assert_eq!(child, ChildOutcome::Failed(wait.clone()));
         assert_eq!(failures, [wait.clone(), force_one, force_two]);
         assert_eq!(
             interrupt,

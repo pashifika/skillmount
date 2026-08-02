@@ -431,6 +431,63 @@ fn two_handler_occurrences_reach_the_force_path_without_an_intermediate_drain() 
     assert!(outcome.contains("Forced"), "{outcome}");
 }
 
+#[cfg(unix)]
+#[test]
+fn queued_interrupt_after_child_exit_does_not_touch_the_reaped_process_group() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let root = TestDir::new("post-proof-interrupt");
+    let record = root.0.join("record.txt");
+    let cleanup = root.0.join("cleanup.txt");
+    let outcome = root.0.join("outcome.txt");
+    let mut child = base_harness(Path::new(FAKE_AGENT), &root.0, 0, &[])
+        .env("SKILLMOUNT_FAKE_RECORD", &record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "streams")
+        .env("SKILLMOUNT_HARNESS_CLEANUP_COUNTER", &cleanup)
+        .env("SKILLMOUNT_HARNESS_OUTCOME", &outcome)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn post-proof interrupt harness");
+    wait_for_event_count(&record, 1);
+
+    let pid = Pid::from_raw(i32::try_from(child.id()).expect("Unix PID fits i32"));
+    kill(pid, Signal::SIGSTOP).expect("stop supervisor before queuing an interrupt");
+    let queued = kill(pid, Signal::SIGINT);
+    drop(child.stdin.take());
+
+    let started = Instant::now();
+    let mut child_finished_input = false;
+    while started.elapsed() < TIMEOUT {
+        if fs::read_to_string(&record).is_ok_and(|text| text.contains("stdin=")) {
+            child_finished_input = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if child_finished_input {
+        thread::sleep(Duration::from_millis(100));
+    }
+    let resumed = kill(pid, Signal::SIGCONT);
+
+    queued.expect("queue SIGINT while the supervisor is stopped");
+    resumed.expect("resume supervisor after the child has exited");
+    assert!(
+        child_finished_input,
+        "the child did not finish inherited stdin while its supervisor was stopped"
+    );
+
+    let status = wait_for_exit(&mut child);
+
+    assert!(status.success(), "{status:?}");
+    assert_eq!(cleanup_count(&cleanup), 1);
+    let outcome = fs::read_to_string(outcome).expect("read post-proof interrupt outcome");
+    assert!(outcome.contains("ChildAlreadyExited"), "{outcome}");
+    assert!(!outcome.contains("ForwardInterrupt"), "{outcome}");
+}
+
 #[test]
 fn first_interrupt_reaches_a_child_process_group_descendant() {
     let root = TestDir::new("descendant");

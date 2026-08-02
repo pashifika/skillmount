@@ -272,16 +272,19 @@ Linux product support.
 
 Child launch always constructs `Command` directly from the platform-native executable, CWD, and
 the injected-then-passthrough `OsString` arrays. All three streams use `Stdio::inherit()`. On Unix,
-a process-lifetime handler records occurrences in a generation-tagged atomic ledger. A leased
-session remains armed until the platform topology can expose a child exactly once; shared Unix and
-Windows sessions therefore return pre-exposure events to default handling, while a dedicated Unix
-session may queue the sole delivery before spawn. Interactive Unix children remain in SkillMount's
-foreground group and receive shared-group `SIGINT` directly; non-interactive children use a
-dedicated process group for forwarding, force, and liveness probing. Once a dedicated-group leader
-has been reaped, SkillMount never signals that reusable numeric process-group identifier. It uses a
-bounded passive emptiness probe and defers cleanup if identity-safe proof is unavailable. On
-Windows, a raw process-lifetime handler preserves Ctrl+C versus Ctrl+Break identity, the child
-inherits the wrapper's console group, and a kill-on-close Job Object contains ordinary descendants.
+a process-lifetime handler snapshots a generation-tagged token at callback entry and records
+occurrences in an atomic ledger. A leased session remains armed until the platform topology can
+expose a child exactly once; shared Unix and Windows sessions therefore return pre-exposure events
+to default handling, while a dedicated Unix session may queue the sole delivery before spawn.
+Interactive Unix children remain in SkillMount's foreground group and receive shared-group
+`SIGINT` directly; non-interactive children use a dedicated process group for forwarding, force,
+and liveness probing. The interactive managed domain ends at the direct child: foreground
+descendants and `SIGINT` targeted only at SkillMount remain the explicit residual boundaries in
+ADR 0019. Once a dedicated-group leader has been reaped, SkillMount never signals that reusable
+numeric process-group identifier. It uses a bounded passive emptiness probe and defers cleanup if
+identity-safe proof is unavailable. On Windows, a raw process-lifetime handler preserves Ctrl+C
+versus Ctrl+Break identity, the child inherits the wrapper's console group, and a kill-on-close Job
+Object contains ordinary descendants.
 The private driver distinguishes running, proven-dead, and uncertain domains, retries force and
 liveness checks within fixed bounds, and exposes a cleanup permit only after no child was spawned
 or the managed domain is proven empty. Its lifecycle guard performs only a best-effort force and

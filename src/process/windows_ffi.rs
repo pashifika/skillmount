@@ -51,8 +51,9 @@ fn register_console_handler() -> Result<(), StoredError> {
 }
 
 unsafe extern "system" fn console_handler(raw_event: u32) -> windows_sys::core::BOOL {
+    let token = super::windows::console_event_token();
     decode_console_event(raw_event)
-        .is_some_and(super::windows::record_console_event)
+        .is_some_and(|kind| super::windows::record_console_event(token, kind))
         .into()
 }
 

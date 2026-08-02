@@ -734,6 +734,10 @@ impl driver::Backend for NativeBackend<'_> {
         event.kind()
     }
 
+    fn classify_after_proof(&self, event: Self::Event) -> InterruptDelivery {
+        self.platform.classify_after_proof(event)
+    }
+
     fn probe(&mut self) -> driver::Probe {
         if self.root_status.is_none() {
             match self.child.try_wait() {

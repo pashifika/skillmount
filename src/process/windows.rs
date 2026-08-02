@@ -2,7 +2,7 @@ use std::io;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 
-use super::event::{EventLedger, EventSession};
+use super::event::{EventLedger, EventSession, EventToken};
 use super::windows_ffi::{self, JobObject};
 use super::{
     ChildStatus, ForceTermination, InterruptDelivery, InterruptKind, ProcessFailure, ProcessStage,
@@ -87,6 +87,11 @@ impl Platform {
                 .filter_map(Interrupt::from_kind)
                 .collect()
         })
+    }
+
+    #[allow(clippy::unused_self)]
+    pub(super) const fn classify_after_proof(&self, _interrupt: Interrupt) -> InterruptDelivery {
+        InterruptDelivery::DeliveredByPlatform
     }
 
     // Windows console delivery already reached the shared group before this observation.
@@ -206,8 +211,12 @@ impl Interrupt {
     }
 }
 
-pub(super) fn record_console_event(kind: InterruptKind) -> bool {
-    EVENTS.record(kind)
+pub(super) fn console_event_token() -> EventToken {
+    EVENTS.token()
+}
+
+pub(super) fn record_console_event(token: EventToken, kind: InterruptKind) -> bool {
+    EVENTS.record(token, kind)
 }
 
 pub(super) fn child_status(status: ExitStatus) -> ChildStatus {

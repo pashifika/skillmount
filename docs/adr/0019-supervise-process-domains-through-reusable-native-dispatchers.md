@@ -25,11 +25,12 @@ empty. The regressions and deterministic failure cases are tracked in
 and the cleanup permit SHALL be constructible only for the no-child state or `ProvenDead`.
 Process-lifetime native dispatchers SHALL record handler occurrences in the private atomic ledger
 in `src/process/event.rs`. Each lease SHALL carry a non-repeating generation and begin armed rather
-than active, so a handler already executing for one lease cannot write into a later lease. A shared
-topology SHALL activate only after its child is exposed; inactive, armed, and finalizing events
-return to platform default handling. A dedicated Unix topology MAY activate before spawn because
-the child cannot receive that platform event directly and the queued occurrence becomes the sole
-forwarded delivery after spawn.
+than active. Each callback SHALL snapshot its generation-tagged token before decoding or otherwise
+classifying the event, so a handler already executing for one lease cannot write into a later
+lease. A shared topology SHALL activate only after its child is exposed; inactive, armed, and
+finalizing events return to platform default handling. A dedicated Unix topology MAY activate
+before spawn because the child cannot receive that platform event directly and the queued
+occurrence becomes the sole forwarded delivery after spawn.
 
 Unix SHALL retain ADR 0017's interactive foreground versus non-interactive dedicated-group split,
 but classify shared-group `SIGINT` from topology rather than sender metadata. Windows SHALL keep the

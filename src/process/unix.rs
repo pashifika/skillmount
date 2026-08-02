@@ -8,7 +8,7 @@ use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 
-use super::event::{EventLedger, EventSession};
+use super::event::{EventLedger, EventSession, EventToken};
 use super::unix_ffi;
 use super::{
     ChildStatus, ForceTermination, InterruptDelivery, InterruptKind, ProcessFailure, ProcessStage,
@@ -85,6 +85,15 @@ impl Platform {
                 .filter_map(|kind| self.interrupt(kind))
                 .collect()
         })
+    }
+
+    #[allow(clippy::unused_self)]
+    pub(super) const fn classify_after_proof(&self, interrupt: Interrupt) -> InterruptDelivery {
+        if interrupt.delivered_by_platform {
+            InterruptDelivery::DeliveredByPlatform
+        } else {
+            InterruptDelivery::ChildAlreadyExited
+        }
     }
 
     pub(super) fn forward_first(
@@ -203,8 +212,12 @@ impl Platform {
     }
 }
 
-pub(super) fn record_signal(signal: i32, kind: InterruptKind) {
-    if !EVENTS.record(kind) {
+pub(super) fn signal_token() -> EventToken {
+    EVENTS.token()
+}
+
+pub(super) fn record_signal(token: EventToken, signal: i32, kind: InterruptKind) {
+    if !EVENTS.record(token, kind) {
         let _ = signal_hook::low_level::emulate_default_handler(signal);
     }
 }
@@ -283,36 +296,27 @@ fn errno_to_io(error: Errno) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Stdio;
-
     use super::*;
 
     #[test]
-    fn forwarding_tolerates_a_child_that_is_already_reaped() {
+    fn post_proof_delivery_never_touches_a_reaped_dedicated_group() {
         let platform = Platform::install().expect("install Unix signal observation");
-        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
-        command
-            .arg("--help")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        platform.configure_command(&mut command);
-        let mut child = command.spawn().expect("spawn short-lived child");
-        child.wait().expect("reap short-lived child");
-
-        let delivery = platform.forward_first(
-            &mut child,
-            Interrupt {
+        assert_eq!(
+            platform.classify_after_proof(Interrupt {
                 kind: InterruptKind::Interrupt,
                 signal: SIGINT,
                 delivered_by_platform: false,
-            },
-            Path::new("test executable"),
-            Path::new("test cwd"),
-            false,
+            }),
+            InterruptDelivery::ChildAlreadyExited
         );
-
-        assert_eq!(delivery, InterruptDelivery::ChildAlreadyExited);
+        assert_eq!(
+            platform.classify_after_proof(Interrupt {
+                kind: InterruptKind::Interrupt,
+                signal: SIGINT,
+                delivered_by_platform: true,
+            }),
+            InterruptDelivery::DeliveredByPlatform
+        );
     }
 
     #[test]

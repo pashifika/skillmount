@@ -22,6 +22,12 @@ pub(super) struct EventLedger {
     state: AtomicU32,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct EventToken {
+    observed: u32,
+    generation: u32,
+}
+
 impl EventLedger {
     pub(super) const fn new() -> Self {
         Self {
@@ -61,12 +67,19 @@ impl EventLedger {
         })
     }
 
-    pub(super) fn record(&self, kind: InterruptKind) -> bool {
+    pub(super) fn token(&self) -> EventToken {
         let observed = self.state.load(Ordering::SeqCst);
-        self.record_from(observed, generation(observed), kind)
+        EventToken {
+            observed,
+            generation: generation(observed),
+        }
     }
 
-    fn record_from(&self, mut observed: u32, lease_generation: u32, kind: InterruptKind) -> bool {
+    pub(super) fn record(&self, token: EventToken, kind: InterruptKind) -> bool {
+        let EventToken {
+            mut observed,
+            generation: lease_generation,
+        } = token;
         loop {
             if generation(observed) != lease_generation || observed & PHASE_MASK != PHASE_ACTIVE {
                 return false;
@@ -263,10 +276,10 @@ mod tests {
         let mut session = LEDGER.acquire().expect("acquire event session");
         session.activate().expect("activate event session");
 
-        assert!(LEDGER.record(InterruptKind::Interrupt));
-        assert!(LEDGER.record(InterruptKind::Terminate));
-        assert!(LEDGER.record(InterruptKind::Break));
-        assert!(LEDGER.record(InterruptKind::Break));
+        assert!(record(&LEDGER, InterruptKind::Interrupt));
+        assert!(record(&LEDGER, InterruptKind::Terminate));
+        assert!(record(&LEDGER, InterruptKind::Break));
+        assert!(record(&LEDGER, InterruptKind::Break));
 
         assert_eq!(
             session.pending(),
@@ -283,14 +296,14 @@ mod tests {
         static LEDGER: EventLedger = EventLedger::new();
         let mut session = LEDGER.acquire().expect("acquire event session");
         session.activate().expect("activate event session");
-        assert!(LEDGER.record(InterruptKind::Interrupt));
+        assert!(record(&LEDGER, InterruptKind::Interrupt));
 
         assert_eq!(
             session.begin_finalization(),
             Err(vec![InterruptKind::Interrupt])
         );
         assert_eq!(session.begin_finalization(), Ok(()));
-        assert!(!LEDGER.record(InterruptKind::Terminate));
+        assert!(!record(&LEDGER, InterruptKind::Terminate));
 
         drop(session);
         let mut next = LEDGER.acquire().expect("reuse process dispatcher");
@@ -301,10 +314,11 @@ mod tests {
     fn armed_session_returns_events_to_platform_until_the_child_is_exposed() {
         static LEDGER: EventLedger = EventLedger::new();
         let mut session = LEDGER.acquire().expect("acquire armed event session");
+        let pre_exposure = LEDGER.token();
 
-        assert!(!LEDGER.record(InterruptKind::Interrupt));
         session.activate().expect("expose child to event delivery");
-        assert!(LEDGER.record(InterruptKind::Interrupt));
+        assert!(!LEDGER.record(pre_exposure, InterruptKind::Interrupt));
+        assert!(record(&LEDGER, InterruptKind::Interrupt));
         assert_eq!(session.pending(), [InterruptKind::Interrupt]);
     }
 
@@ -313,15 +327,18 @@ mod tests {
         static LEDGER: EventLedger = EventLedger::new();
         let mut first = LEDGER.acquire().expect("acquire first session");
         first.activate().expect("activate first session");
-        let stale = LEDGER.state.load(Ordering::SeqCst);
-        let stale_generation = generation(stale);
+        let stale = LEDGER.token();
         assert_eq!(first.begin_finalization(), Ok(()));
         drop(first);
 
         let mut second = LEDGER.acquire().expect("acquire second session");
         second.activate().expect("activate second session");
 
-        assert!(!LEDGER.record_from(stale, stale_generation, InterruptKind::Terminate));
+        assert!(!LEDGER.record(stale, InterruptKind::Terminate));
         assert!(second.pending().is_empty());
+    }
+
+    fn record(ledger: &EventLedger, kind: InterruptKind) -> bool {
+        ledger.record(ledger.token(), kind)
     }
 }
