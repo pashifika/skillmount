@@ -47,6 +47,15 @@ mod sealed {
     pub trait Sealed {}
 }
 
+/// Replaces one file and waits for the Windows namespace update to reach disk.
+///
+/// Kept as a crate-only wrapper so the raw Win32 call stays inside the audited FFI module while
+/// the journal store can use its durability guarantee.
+#[cfg(windows)]
+pub(crate) fn replace_file_write_through(from: &Path, to: &Path) -> std::io::Result<()> {
+    windows_ffi::replace_file_write_through(from, to)
+}
+
 /// How an entry appears when it is inspected without following it.
 ///
 /// A symbolic link and a Windows junction are distinguished here, unlike in

@@ -102,14 +102,18 @@ pub struct ReconciledTransaction {
 ///
 /// Returns [`AppError::Journal`] when the journal directory cannot be enumerated, and
 /// [`AppError::Filesystem`] when a lock file cannot be opened. A journal that cannot be interpreted
-/// is reported rather than returned as an error: it must not stop the healthy ones beside it from
-/// being reconciled.
+/// stops this pass before any healthy journal is reconciled. Unknown ownership state is a global
+/// fail-closed condition for mutation; removing entries from a healthy transaction beside it would
+/// violate the future-schema guarantee that no destination is touched.
 pub fn recover_stale(already_held: &mut HeldLocks) -> Result<RecoveryReport, AppError> {
     let scan: JournalScan = store::scan()?;
     let mut report = RecoveryReport {
         unreadable: scan.rejected.clone(),
         ..RecoveryReport::default()
     };
+    if !report.unreadable.is_empty() {
+        return Ok(report);
+    }
 
     for scanned in scan.incomplete() {
         let resources = scanned.journal.lock_resources();
@@ -184,20 +188,12 @@ fn claim(
     resources: &[LockResource],
     already_held: &HeldLocks,
 ) -> Result<Option<HeldLocks>, AppError> {
-    let missing = resources
-        .iter()
-        .filter(|resource| {
-            !resource
-                .lock_keys()
-                .iter()
-                .all(|key| already_held.holds(key))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
+    if already_held.holds_all(resources) {
         return Ok(Some(HeldLocks::default()));
     }
-    Ok(HeldLocks::try_acquire_all(&missing, &LockOwner::preliminary())?.ok())
+    Ok(already_held
+        .try_acquire_missing(resources, &LockOwner::preliminary())?
+        .ok())
 }
 
 impl Transaction {
@@ -207,15 +203,56 @@ impl Transaction {
     /// [`crate::journal::TransactionStatus::is_incomplete`], so a `kept` transaction keeps its
     /// mounts and a `completed` one has nothing left to reconcile.
     fn cleanup_recovered(&mut self) -> Result<CleanupReport, AppError> {
-        // `keep_mounts` is honoured across a crash. An operator who asked for the mounts to survive
-        // the session did not ask for them to survive only an orderly exit.
-        if self.journal.keep_mounts {
-            self.advance(crate::journal::TransactionStatus::Kept)?;
-            return Ok(CleanupReport {
-                journal_retained: Some(self.journal_path().to_path_buf()),
-                ..CleanupReport::default()
-            });
-        }
+        // `keep_mounts` becomes terminal only through the orderly cleanup entry in `cleanup`.
+        // Reaching recovery proves the earlier process did not durably finish that boundary, so a
+        // planned, applying, active, cleaning, or failed transaction must be reconciled exactly
+        // like any other incomplete transaction. Persisting `cleaning` below also clears the flag,
+        // so a second crash cannot later reinterpret the same partial apply as requested retention.
+        self.journal.keep_mounts = false;
         self.cleanup()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::claim;
+    use crate::lock::acquire::{HeldLocks, LockOwner, LockPolicy};
+    use crate::lock::{LockResource, LockResourceKind};
+    use crate::state::testing::StateRootGuard;
+    use crate::test_support::TestDir;
+
+    #[test]
+    fn a_partial_overlap_claims_only_the_unheld_physical_key() {
+        let fixture = TestDir::new("recovery-partial-lock");
+        let _guard = StateRootGuard::set(fixture.path());
+        let root = std::fs::canonicalize(fixture.path()).unwrap();
+        let store = root.join("store");
+        std::fs::create_dir_all(&store).expect("store fixture");
+        let full = LockResource::describe(LockResourceKind::BackingStore, &root, &store).unwrap();
+        assert_eq!(
+            full.lock_keys().len(),
+            2,
+            "the resource must have both keys"
+        );
+
+        let mut logical_only = full.clone();
+        logical_only.identity.physical = None;
+        let mut current = HeldLocks::acquire(
+            &[logical_only],
+            LockPolicy::immediate(),
+            &LockOwner::preliminary(),
+        )
+        .expect("the current session holds the logical key");
+
+        let newly_claimed = claim(std::slice::from_ref(&full), &current)
+            .expect("the missing lock file is available")
+            .expect("the journal is stale, not active");
+        assert_eq!(
+            newly_claimed.keys().count(),
+            1,
+            "claim must not reacquire the logical key this process already holds"
+        );
+        current.absorb(newly_claimed);
+        assert!(current.holds_all(&[full]));
     }
 }

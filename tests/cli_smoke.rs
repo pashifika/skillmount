@@ -103,17 +103,44 @@ fn temporary_fixture(label: &str) -> PathBuf {
 #[test]
 fn wrapper_maps_missing_and_invalid_catalog_inputs_to_stable_codes() {
     let fixture = temporary_fixture("errors");
+    let project = fixture.join("project");
+    let state = fixture.join("state");
+    fs::create_dir(&project).expect("throwaway project fixture");
     let missing = fixture.join("missing");
-    let missing_output = run(ASM, &["codex", "--skills-dir", &missing.to_string_lossy()]);
+    let missing_output = run_session(
+        ASM,
+        &project,
+        &state,
+        &["codex", "--skills-dir", &missing.to_string_lossy()],
+    );
     assert_eq!(missing_output.status.code(), Some(66));
     assert!(String::from_utf8_lossy(&missing_output.stderr).contains(&*missing.to_string_lossy()));
+    assert!(
+        !project.join(".agents").exists() && !project.join(".codex").exists(),
+        "a missing catalog must not mutate the throwaway project"
+    );
+    assert_eq!(
+        journal_count(&state),
+        0,
+        "catalog validation never opens a transaction journal"
+    );
 
     let invalid = fixture.join("invalid");
     fs::create_dir(&invalid).expect("invalid Skill fixture");
     fs::write(invalid.join("SKILL.md"), "not frontmatter\n").expect("invalid SKILL.md");
-    let invalid_output = run(ASM, &["codex", "--skills-dir", &invalid.to_string_lossy()]);
+    let invalid_output = run_session(
+        ASM,
+        &project,
+        &state,
+        &["codex", "--skills-dir", &invalid.to_string_lossy()],
+    );
     assert_eq!(invalid_output.status.code(), Some(65));
     assert!(String::from_utf8_lossy(&invalid_output.stderr).contains("invalid selected Skill"));
+    assert!(
+        !project.join(".agents").exists() && !project.join(".codex").exists(),
+        "an invalid catalog must not mutate the throwaway project"
+    );
+    assert_eq!(journal_count(&state), 0);
 
     fs::remove_dir_all(fixture).expect("fixture cleanup");
 }

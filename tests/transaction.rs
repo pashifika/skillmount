@@ -314,6 +314,53 @@ fn recovery_removes_an_entry_placed_before_its_applied_record() {
 }
 
 #[test]
+fn auto_link_intent_with_an_unrecorded_kind_retains_every_existing_candidate() {
+    let fixture = Fixture::new("auto-link-undecided");
+    fixture.skill("bootstrap");
+
+    // Establish the normal pre-existing Codex layout without relying on a test-only link helper.
+    // The kept bootstrap transaction owns that layout and remains terminal throughout this test.
+    let bootstrap = fixture.run("codex", &["--keep-mounts"]);
+    assert_eq!(bootstrap.status.code(), Some(70));
+    fs::remove_file(fixture.sources.join("bootstrap/SKILL.md"))
+        .expect("bootstrap is no longer selected");
+    fixture.skill("alpha");
+
+    // With all helper entries already present, alpha is the first and only owned action. `auto`
+    // has created its staged link here, but the chosen symlink/junction kind and identity have not
+    // reached the journal yet.
+    let stopped = fixture.run_stopping_at("codex", "temporary-created@1", &[]);
+    assert!(!stopped.status.success());
+    let store = fixture.project.join(".codex/skills");
+    let staged_before = fs::read_dir(&store)
+        .expect("pre-existing store")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".skillmount-"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(staged_before.len(), 1, "the auto-link window must exist");
+
+    let recovered = fixture.run("codex", &[]);
+    let stderr = String::from_utf8_lossy(&recovered.stderr);
+
+    assert_eq!(recovered.status.code(), Some(70), "{stderr}");
+    assert!(stderr.contains("concrete kind and identity"), "{stderr}");
+    assert!(
+        staged_before.iter().all(|path| exists(path)),
+        "unproven auto-link candidates must be retained"
+    );
+    assert_eq!(
+        fixture.journals().len(),
+        2,
+        "the terminal bootstrap journal and the unreconciled auto-link journal remain"
+    );
+}
+
+#[test]
 fn recovery_never_removes_an_entry_a_user_replaced_after_the_crash() {
     let fixture = Fixture::new("replaced-after-crash");
     fixture.skill("alpha");
@@ -387,6 +434,15 @@ fn a_kept_transaction_survives_every_later_session() {
 
     let kept = fixture.run("codex", &["--keep-mounts"]);
     assert_eq!(kept.status.code(), Some(70));
+    let kept_stderr = String::from_utf8_lossy(&kept.stderr);
+    assert!(
+        kept_stderr.contains("retained because --keep-mounts was requested"),
+        "intentional retention must be diagnosed as requested: {kept_stderr}"
+    );
+    assert!(
+        !kept_stderr.contains("cleanup could not finish"),
+        "intentional retention is not a cleanup failure: {kept_stderr}"
+    );
     let mounted = fixture.project.join(".codex/skills/alpha");
     assert!(exists(&mounted), "--keep-mounts retains the mounts");
     assert_eq!(fixture.journals().len(), 1, "the kept journal is retained");
@@ -413,7 +469,47 @@ fn a_kept_transaction_survives_every_later_session() {
 }
 
 #[test]
-fn a_journal_this_build_cannot_interpret_is_retained_and_reported() {
+fn keep_enabled_crashes_before_terminal_keep_are_reconciled() {
+    for boundary in [
+        "journal-planned",
+        "journal-applying",
+        "action-staged@5",
+        "journal-active",
+        "journal-cleaning",
+    ] {
+        let fixture = Fixture::new(&format!("keep-crash-{boundary}"));
+        fixture.skill("alpha");
+
+        let stopped = fixture.run_stopping_at("codex", boundary, &["--keep-mounts"]);
+        assert!(
+            !stopped.status.success(),
+            "the keep-enabled session must stop at {boundary}: {}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+
+        let recovered = fixture.run("codex", &[]);
+
+        assert_eq!(
+            recovered.status.code(),
+            Some(70),
+            "the incomplete keep request must reconcile at {boundary}: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        assert!(
+            fixture.project_tree().is_empty(),
+            "partial keep state must not become permanent at {boundary}: {:?}",
+            fixture.project_tree()
+        );
+        assert!(
+            fixture.journals().is_empty(),
+            "no partial keep journal may become terminal at {boundary}: {:?}",
+            fixture.journals()
+        );
+    }
+}
+
+#[test]
+fn a_journal_this_build_cannot_interpret_blocks_every_mutating_run() {
     let fixture = Fixture::new("corrupt-journal");
     fixture.skill("alpha");
     fs::create_dir_all(fixture.transactions()).expect("transaction directory");
@@ -424,8 +520,8 @@ fn a_journal_this_build_cannot_interpret_is_retained_and_reported() {
 
     assert_eq!(
         output.status.code(),
-        Some(70),
-        "an unrelated corrupt journal must not brick every session: {}",
+        Some(75),
+        "unknown recovery state must fail closed before planning or mutation: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
@@ -438,6 +534,15 @@ fn a_journal_this_build_cannot_interpret_is_retained_and_reported() {
         "skillmount-journal 99 unix deadbeef\n",
         "a journal that cannot be read is never rewritten or removed"
     );
+    assert!(
+        fixture.project_tree().is_empty(),
+        "the unknown journal must block every project mutation: {:?}",
+        fixture.project_tree()
+    );
+    assert!(
+        !fixture.state.join("locks").exists(),
+        "the read-only rejection preflight must run before new lock-state mutation"
+    );
 
     let refused = fixture.run("codex", &["--no-recover"]);
     assert_eq!(
@@ -445,6 +550,56 @@ fn a_journal_this_build_cannot_interpret_is_retained_and_reported() {
         Some(75),
         "under --no-recover an uninterpretable journal is a hard stop"
     );
+}
+
+#[test]
+fn a_corrupt_current_schema_journal_also_blocks_an_ordinary_run() {
+    let fixture = Fixture::new("corrupt-current-journal");
+    fixture.skill("alpha");
+    fs::create_dir_all(fixture.transactions()).expect("transaction directory");
+    let corrupt = fixture.transactions().join("aaaa-cccc.journal");
+    fs::write(&corrupt, "skillmount-journal 1 unix deadbeef\n").expect("corrupt journal");
+
+    let output = fixture.run("codex", &[]);
+
+    assert_eq!(output.status.code(), Some(75));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&*corrupt.to_string_lossy()), "{stderr}");
+    assert!(
+        stderr.contains("account for every recorded path"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&corrupt).expect("retained journal"),
+        "skillmount-journal 1 unix deadbeef\n"
+    );
+    assert!(fixture.project_tree().is_empty());
+}
+
+#[test]
+fn an_unknown_journal_blocks_recovery_of_healthy_neighbors_before_any_removal() {
+    let fixture = Fixture::new("unknown-blocks-healthy-recovery");
+    fixture.skill("alpha");
+    let stopped = fixture.run_stopping_at("codex", "journal-active", &[]);
+    assert!(!stopped.status.success());
+    let before = fixture.project_tree();
+    assert!(
+        exists(&fixture.project.join(".codex/skills/alpha")),
+        "the healthy incomplete journal must own a visible mount: {before:?}"
+    );
+    let unknown = fixture.transactions().join("ffff-future.journal");
+    fs::write(&unknown, "skillmount-journal 99 unix deadbeef\n").expect("future journal");
+
+    let output = fixture.run("codex", &[]);
+
+    assert_eq!(output.status.code(), Some(75));
+    assert_eq!(
+        fixture.project_tree(),
+        before,
+        "unknown state must stop the whole recovery pass before a healthy neighbor is changed"
+    );
+    assert_eq!(fixture.journals().len(), 2);
+    assert!(unknown.exists());
 }
 
 #[test]

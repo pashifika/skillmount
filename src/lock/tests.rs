@@ -269,6 +269,65 @@ fn sessions_that_discover_resources_in_opposite_orders_lock_in_one_order() {
 }
 
 #[test]
+fn two_phased_sessions_restart_instead_of_crossing_the_global_order() {
+    let fixture = TestDir::new("lock-phased-order");
+    let _guard = StateRootGuard::set(fixture.path());
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let (resources, _) = opposing_resources(&root);
+    let first = resources[0].clone();
+    let second = resources[1].clone();
+    let (earlier, later) = if first.lock_keys()[0] < second.lock_keys()[0] {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    // Session A discovered only the later key. Session B discovered only the earlier one. If A
+    // incrementally waited on the earlier key while B waited on the later key, the phases would
+    // cross. A must instead retire its preliminary set.
+    let mut session_a = HeldLocks::acquire(
+        std::slice::from_ref(&later),
+        LockPolicy::immediate(),
+        &LockOwner::preliminary(),
+    )
+    .expect("the later phase starts uncontended");
+    let mut session_b = HeldLocks::acquire(
+        std::slice::from_ref(&earlier),
+        LockPolicy::immediate(),
+        &LockOwner::preliminary(),
+    )
+    .expect("the earlier phase starts uncontended");
+
+    assert!(session_a.requires_reacquire(std::slice::from_ref(&earlier)));
+    let inversion = session_a
+        .acquire_more(
+            std::slice::from_ref(&earlier),
+            LockPolicy::immediate(),
+            &LockOwner::preliminary(),
+        )
+        .expect_err("the lock layer must reject an accidental backwards acquisition");
+    assert_eq!(inversion.category(), crate::error::ExitCategory::Internal);
+
+    drop(session_a);
+    session_b
+        .acquire_more(
+            std::slice::from_ref(&later),
+            LockPolicy::immediate(),
+            &LockOwner::preliminary(),
+        )
+        .expect("the session already holding the earlier key may finish in order");
+    drop(session_b);
+
+    let restarted = HeldLocks::acquire(
+        &[later, earlier],
+        LockPolicy::immediate(),
+        &LockOwner::preliminary(),
+    )
+    .expect("the retired session reacquires the complete union in sorted order");
+    assert_eq!(restarted.keys().count(), 2);
+}
+
+#[test]
 fn one_resource_reached_twice_takes_a_single_lock() {
     let fixture = TestDir::new("lock-dedupe");
     let _guard = StateRootGuard::set(fixture.path());
@@ -391,6 +450,44 @@ fn a_partial_acquisition_releases_what_it_already_took() {
             .is_ok(),
         "the free lock must not stay held by the attempt that failed on the other one"
     );
+}
+
+#[test]
+fn a_missing_key_contention_keeps_the_partly_overlapping_resource_path() {
+    let fixture = TestDir::new("lock-partial-diagnostic");
+    let _guard = StateRootGuard::set(fixture.path());
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let store = root.join("store");
+    std::fs::create_dir_all(&store).expect("store fixture");
+    let alias = root.join("alias");
+    if !symlink_dir_or_skip(&store, &alias) {
+        return;
+    }
+
+    let full = LockResource::describe(LockResourceKind::BackingStore, &root, &store).unwrap();
+    let alias_resource =
+        LockResource::describe(LockResourceKind::BackingStore, &root, &alias).unwrap();
+    let _physical_blocker = HeldLocks::acquire(
+        std::slice::from_ref(&alias_resource),
+        LockPolicy::immediate(),
+        &LockOwner::preliminary(),
+    )
+    .expect("the alias holds the shared physical key");
+    let mut logical_only = full.clone();
+    logical_only.identity.physical = None;
+    let current = HeldLocks::acquire(
+        &[logical_only],
+        LockPolicy::immediate(),
+        &LockOwner::preliminary(),
+    )
+    .expect("the current process already holds only the logical key");
+
+    let contention = current
+        .try_acquire_missing(std::slice::from_ref(&full), &LockOwner::preliminary())
+        .expect("lock files are available")
+        .expect_err("the exact missing physical key is held by the alias");
+
+    assert_eq!(contention.resources, vec![store]);
 }
 
 #[test]

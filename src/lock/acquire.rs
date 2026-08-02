@@ -126,9 +126,10 @@ impl Drop for HeldLock {
 
 /// Every advisory lock a session currently holds.
 ///
-/// The set is append-only for the lifetime of a session, which is what keeps the sorted acquisition
-/// order meaningful: a later addition is checked against what is already held, never re-ordered
-/// against it.
+/// The set is append-only while it is live. A later addition is accepted only when every new key
+/// sorts after the keys already held. When discovery expands the set with an earlier key, the
+/// application drops this set and reacquires the complete union in one sorted pass before it
+/// re-runs recovery and filesystem inspection.
 #[derive(Debug, Default)]
 pub struct HeldLocks {
     locks: BTreeMap<LockKey, HeldLock>,
@@ -196,10 +197,15 @@ impl HeldLocks {
         policy: LockPolicy,
         owner: &LockOwner,
     ) -> Result<(), AppError> {
-        for (key, paths) in sorted_keys(resources) {
-            if self.locks.contains_key(&key) {
-                continue;
-            }
+        let missing = self.missing_keys(resources);
+        if self.requires_reacquire_for_keys(&missing) {
+            return Err(AppError::Internal(
+                "additional resource locks would violate the global acquisition order; release \
+                 and reacquire the complete lock set before continuing"
+                    .to_owned(),
+            ));
+        }
+        for (key, paths) in missing {
             match take(&key, policy, owner)? {
                 Taken::Held(lock) => {
                     self.locks.insert(key, lock);
@@ -220,6 +226,18 @@ impl HeldLocks {
         Ok(())
     }
 
+    /// Returns whether acquiring the missing keys for `resources` would move backwards in the
+    /// global order.
+    ///
+    /// A caller that receives `true` must drop this set, reacquire the union in a fresh sorted
+    /// pass, then repeat any recovery and filesystem inspection performed across the unlocked
+    /// interval. Merely unlocking and continuing with a plan built before the gap would make the
+    /// order safe while leaving the plan racy.
+    #[must_use]
+    pub fn requires_reacquire(&self, resources: &[LockResource]) -> bool {
+        self.requires_reacquire_for_keys(&self.missing_keys(resources))
+    }
+
     /// Takes every lock in `resources` only if all of them are free right now.
     ///
     /// Returns the contention that stopped it, without holding any of the locks it managed to take.
@@ -233,8 +251,27 @@ impl HeldLocks {
         resources: &[LockResource],
         owner: &LockOwner,
     ) -> Result<Result<Self, LockContention>, AppError> {
+        Self::default().try_acquire_missing(resources, owner)
+    }
+
+    /// Takes exactly the keys in `resources` that this set does not already hold.
+    ///
+    /// The returned set contains only newly acquired keys. Resource paths remain attached to each
+    /// key so a contention still names the journal resource an operator recognises. This is the
+    /// recovery claim operation: passing whole partly-overlapping resources to
+    /// [`HeldLocks::try_acquire_all`] would attempt to lock an already-held key again and falsely
+    /// classify the stale transaction as active.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::Filesystem`] when a lock file cannot be created.
+    pub fn try_acquire_missing(
+        &self,
+        resources: &[LockResource],
+        owner: &LockOwner,
+    ) -> Result<Result<Self, LockContention>, AppError> {
         let mut held = Self::default();
-        for (key, paths) in sorted_keys(resources) {
+        for (key, paths) in self.missing_keys(resources) {
             match take(&key, LockPolicy::immediate(), owner)? {
                 Taken::Held(lock) => {
                     held.locks.insert(key, lock);
@@ -275,6 +312,22 @@ impl HeldLocks {
     /// Returns the held keys in acquisition order.
     pub fn keys(&self) -> impl Iterator<Item = &LockKey> {
         self.locks.keys()
+    }
+
+    fn missing_keys(&self, resources: &[LockResource]) -> Vec<(LockKey, Vec<PathBuf>)> {
+        sorted_keys(resources)
+            .into_iter()
+            .filter(|(key, _)| !self.locks.contains_key(key))
+            .collect()
+    }
+
+    fn requires_reacquire_for_keys(&self, missing: &[(LockKey, Vec<PathBuf>)]) -> bool {
+        let Some(highest_held) = self.locks.last_key_value().map(|(key, _)| key) else {
+            return false;
+        };
+        missing
+            .first()
+            .is_some_and(|(lowest_missing, _)| lowest_missing < highest_held)
     }
 }
 

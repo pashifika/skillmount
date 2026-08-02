@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use super::codec::{self, Line};
-use super::store::{self, JournalScan};
+use super::store::{self, JournalScan, PersistFault};
 use super::{
     ActionOperation, ActionStatus, JournalAction, JournalLock, RecordedKind, SourceResolution,
     TransactionId, TransactionJournal, TransactionStatus,
@@ -264,6 +264,40 @@ fn persistence_is_atomic_and_leaves_no_temporary_file() {
         .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
         .count();
     assert_eq!(leftovers, 0, "a durable write must not leave its temporary");
+}
+
+#[test]
+fn every_persistence_boundary_fails_closed_under_injection() {
+    for (label, fault, destination_exists) in [
+        ("after-file-sync", PersistFault::AfterFileSync, false),
+        ("after-replacement", PersistFault::AfterReplacement, true),
+        ("directory-sync", PersistFault::DirectorySync, true),
+        ("after-durability", PersistFault::AfterDurability, true),
+    ] {
+        let fixture = TestDir::new(&format!("journal-fault-{label}"));
+        let _guard = StateRootGuard::set(fixture.path());
+        let journal = sample(TransactionStatus::Planned);
+        let path = store::journal_path(&journal.transaction_id).unwrap();
+
+        let error = store::with_persist_fault(fault, || store::persist(&journal, &path))
+            .expect_err("an injected boundary must never return success");
+
+        assert_eq!(error.category(), ExitCategory::Filesystem);
+        assert_eq!(path.exists(), destination_exists, "fault at {label}");
+        if destination_exists {
+            assert_eq!(
+                store::load(&path).expect("a completed replacement stays readable"),
+                journal,
+                "fault at {label} must never expose a partial journal"
+            );
+        }
+        let leftovers = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(leftovers, 0, "fault at {label} leaked a temporary file");
+    }
 }
 
 #[test]

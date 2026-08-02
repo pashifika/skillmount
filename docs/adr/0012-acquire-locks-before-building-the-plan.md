@@ -36,9 +36,18 @@ table. The design's "preliminary plan" step asks for strictly more than locking 
 snapshot's lock set, reconcile incomplete transactions, build the full plan, acquire any lock the
 rebuilt plan added, open the journal, apply, clean up.
 
-Discovery, not a plan, is what precedes lock acquisition. The plan is built exactly once, under the
-lock and after recovery, and it is the plan that gets applied. There is no "preliminary plan" and no
-"rebuild".
+Incremental acquisition preserves one global order across both observations. A newly observed key
+may be appended only when it sorts after every held key. If it sorts before one, the session drops
+the preliminary set, reacquires the accumulated union in one sorted pass, and then reruns recovery
+and filesystem inspection. The unlocked interval is never bridged with an old plan. A monotonic
+expansion also triggers recovery and inspection again because its first observation was made before
+the newly acquired key was held. Repeated expansion is bounded and fails closed if the set does not
+stabilize.
+
+Discovery, not a plan, is what precedes lock acquisition. The first plan is built under locks and
+after recovery, and only the final stable plan is applied. There is no unlocked "preliminary plan".
+A plan is rebuilt only when its snapshot expands the lock set, after those locks are held and
+recovery has run again; earlier observations are discarded rather than applied across that gap.
 
 The identifier is minted before discovery rather than at journal creation, because a Claude staging
 layout is addressed by it. A preliminary layout uses the `crate::state::PENDING_SESSION` placeholder,
@@ -101,5 +110,8 @@ The decision is enforced by tests rather than by review:
   `::a_partially_locked_session_cannot_open_a_transaction` fail if the lock guard is weakened.
 - `tests/transaction.rs::two_isolated_claude_sessions_do_not_serialize` fails if the identifier is
   minted after discovery, because both sessions then lock the placeholder path.
+- `src/lock/tests.rs::two_phased_sessions_restart_instead_of_crossing_the_global_order` forces two
+  sessions to begin with opposite phases and proves the later-key holder retires rather than
+  acquiring backwards.
 
 Evidence: `rasen/changes/implement-transaction-recovery-and-locking/evidence/verification-report.md`.

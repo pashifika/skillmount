@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use crate::checkpoint::{Checkpoint, reached};
 use crate::error::AppError;
 use crate::journal::{ActionStatus, JournalAction, RecordedKind, TransactionStatus, store};
-use crate::link::{CreatedLink, CreatedLinkKind, OwnedDirectory, OwnershipMismatch, RemoveOutcome};
+use crate::link::{
+    CreatedLink, CreatedLinkKind, EntryKind, OwnedDirectory, OwnershipMismatch, RemoveOutcome,
+};
 
 use super::Transaction;
 
@@ -45,8 +47,27 @@ pub struct CleanupReport {
     pub retained: Vec<RetainedEntry>,
     /// Failures the operating system reported while removing a verified entry.
     pub errors: Vec<String>,
-    /// Whether the journal survived the pass and still needs attention.
-    pub journal_retained: Option<PathBuf>,
+    /// Why the journal survives this pass.
+    pub journal_retained: Option<JournalRetention>,
+}
+
+/// Why a cleanup report leaves its journal on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JournalRetention {
+    /// An orderly session reached the durable keep boundary requested by `--keep-mounts`.
+    RequestedKeep(PathBuf),
+    /// Cleanup did not finish, so the journal remains recovery evidence.
+    IncompleteCleanup(PathBuf),
+}
+
+impl JournalRetention {
+    /// Returns the retained journal path independent of the disposition.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::RequestedKeep(path) | Self::IncompleteCleanup(path) => path,
+        }
+    }
 }
 
 impl CleanupReport {
@@ -66,11 +87,18 @@ impl CleanupReport {
         for error in &self.errors {
             lines.push(format!("cleanup error: {error}"));
         }
-        if let Some(path) = &self.journal_retained {
-            lines.push(format!(
-                "transaction journal {} is retained because cleanup could not finish",
-                path.display()
-            ));
+        if let Some(retention) = &self.journal_retained {
+            match retention {
+                JournalRetention::RequestedKeep(path) => lines.push(format!(
+                    "transaction journal {} and its mounts were retained because --keep-mounts \
+                     was requested; they require an explicit cleanup policy",
+                    path.display()
+                )),
+                JournalRetention::IncompleteCleanup(path) => lines.push(format!(
+                    "transaction journal {} is retained because cleanup could not finish",
+                    path.display()
+                )),
+            }
         }
         lines
     }
@@ -89,16 +117,20 @@ impl Transaction {
     /// that fails or is refused is reported in the [`CleanupReport`] rather than as an error,
     /// because the remaining entries still have to be attempted.
     pub fn cleanup(&mut self) -> Result<CleanupReport, AppError> {
+        // Enter cleanup durably before deciding whether this orderly session may terminalize a
+        // keep request. A crash in planned, applying, active, failed, or even at this cleaning
+        // boundary remains incomplete and recovery reconciles it; only the following durable
+        // `kept` transition turns requested retention into a terminal state.
+        self.advance(TransactionStatus::Cleaning)?;
+        reached(Checkpoint::JournalCleaning, 1);
         if self.journal.keep_mounts {
             self.advance(TransactionStatus::Kept)?;
             return Ok(CleanupReport {
-                journal_retained: Some(self.path.clone()),
+                journal_retained: Some(JournalRetention::RequestedKeep(self.path.clone())),
                 ..CleanupReport::default()
             });
         }
 
-        self.advance(TransactionStatus::Cleaning)?;
-        reached(Checkpoint::JournalCleaning, 1);
         let mut report = self.remove_owned_entries()?;
 
         if report.needs_attention() {
@@ -108,7 +140,7 @@ impl Transaction {
                 self.record_error(line);
             }
             self.advance(TransactionStatus::Failed)?;
-            report.journal_retained = Some(self.path.clone());
+            report.journal_retained = Some(JournalRetention::IncompleteCleanup(self.path.clone()));
             return Ok(report);
         }
 
@@ -193,6 +225,9 @@ impl Transaction {
         sequence: u32,
         report: &mut CleanupReport,
     ) -> Outcome {
+        if action.kind == RecordedKind::Undecided {
+            return self.inspect_undecided_candidates(action, report);
+        }
         for path in action.candidate_paths() {
             match self.remove_candidate(action, &path) {
                 Ok(RemoveOutcome::AlreadyAbsent) => {}
@@ -226,6 +261,45 @@ impl Transaction {
         // Nothing at either path. The process may have stopped before the entry was created, or a
         // previous pass may already have removed it; either way there is nothing left to own.
         Outcome::Cleared
+    }
+
+    /// Inspects both candidates for an intent whose concrete implementation was not durable.
+    ///
+    /// An `auto` link can be created before the backend's selected kind and identity reach the
+    /// journal. With no ownership proof it may not be removed, but its existence must not be
+    /// rewritten as absence either. Both paths are inspected because a crash can leave the entry
+    /// before or after the atomic placement boundary.
+    fn inspect_undecided_candidates(
+        &self,
+        action: &JournalAction,
+        report: &mut CleanupReport,
+    ) -> Outcome {
+        let mut kept = false;
+        for path in action.candidate_paths() {
+            match self.backend.inspect_no_follow(&path) {
+                Ok(entry) if entry.kind == EntryKind::Missing => {}
+                Ok(entry) => {
+                    kept = true;
+                    report.retained.push(RetainedEntry {
+                        path,
+                        reason: format!(
+                            "the entry exists as {} but its concrete kind and identity were not \
+                             durably recorded, so ownership cannot be proved",
+                            entry.kind.label()
+                        ),
+                    });
+                }
+                Err(error) => {
+                    kept = true;
+                    report.errors.push(error.to_string());
+                }
+            }
+        }
+        if kept {
+            Outcome::Kept
+        } else {
+            Outcome::Cleared
+        }
     }
 
     /// Attempts one candidate path with the evidence recorded for the action.
@@ -266,9 +340,7 @@ impl Transaction {
                     identity: action.identity.clone(),
                 })?)
             }
-            // An entry whose implementation was never recorded was never created: the journal
-            // reached `intent` and stopped before the backend chose. There is nothing to verify
-            // against, so nothing may be removed.
+            // Handled by `inspect_undecided_candidates`, which must inspect both paths together.
             RecordedKind::Undecided => Ok(RemoveOutcome::AlreadyAbsent),
         }
     }

@@ -29,6 +29,12 @@ expose on the supported release targets:
 - **Stable file identity.** `MetadataExt::volume_serial_number` and `MetadataExt::file_index` are
   behind the unstable `windows_by_handle` feature. Ownership verification and link-cycle detection
   both want a real identity rather than a path spelling.
+- **Durable journal replacement on Windows.** `std::fs::rename` replaces a journal but exposes no
+  write-through option. The journal must not authorize the next filesystem mutation until its
+  namespace replacement is durable, so the audited boundary also wraps `MoveFileExW` with
+  `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`. Microsoft documents successful return from
+  that flag combination as the file having actually moved on disk; a checksum alone would only
+  detect torn contents, not a lost or rolled-back directory entry.
 
 `forbid` cannot be lifted by an inner `allow` anywhere in the crate; that is its defining property
 and the reason it is stronger than `deny`. So the choice is binary: keep `forbid` and drop a

@@ -14,12 +14,16 @@ use crate::catalog::{CatalogRequest, resolve_catalog};
 use crate::cli::{InspectAgent, ParsedCommand, ReservedUtility, parse_command_from};
 use crate::domain::{AgentId, MountMode, RunContext, SkillCatalog};
 use crate::error::{AppError, ExitCategory};
-use crate::journal::TransactionId;
+use crate::journal::store::RejectedJournal;
+use crate::journal::{TransactionId, store};
 use crate::lock::acquire::{HeldLocks, LockOwner, LockPolicy};
 use crate::mount::MountPlan;
 use crate::paths::{resolve_inspection, resolve_session};
 use crate::render;
 use crate::transaction::{Transaction, recover};
+
+/// Maximum discovery/recovery passes allowed while a mutating lock set expands.
+const MAX_LOCK_SET_PASSES: usize = 8;
 
 pub(crate) fn run_from<I, T>(args: I) -> ExitCode
 where
@@ -127,6 +131,14 @@ pub(crate) struct ReadOnlyOutcome {
 /// stopped at, so an ordinary run is observably back where it started. `--keep-mounts` overrides
 /// that, because retaining the mounts is exactly what it asks for.
 fn run_session(context: &RunContext) -> Result<(), AppError> {
+    // Unknown ownership state is checked before creating even SkillMount's own staging or lock
+    // directories. Recovery scans again after locks are held, so a journal appearing between this
+    // read-only preflight and acquisition still fails closed rather than entering a new plan.
+    let scan = store::scan()?;
+    if !scan.rejected.is_empty() {
+        return Err(unreadable_journals_error(&scan.rejected));
+    }
+
     // SkillMount's own storage is created here rather than planned as a transaction action. Every
     // session shares it, so an action that created it would make two concurrent runs contend on a
     // directory neither of them owns. Only a staging session needs it, and creating it anyway
@@ -148,15 +160,42 @@ fn run_session(context: &RunContext) -> Result<(), AppError> {
     let policy = LockPolicy::from_env();
 
     let preliminary = adapter_for(context.agent).inspect_discovery(&context)?;
-    let mut locks = HeldLocks::acquire(&preliminary.lock_resources, policy, &owner)?;
+    let mut required_resources = preliminary.lock_resources;
+    let mut locks = HeldLocks::acquire(&required_resources, policy, &owner)?;
 
-    reconcile_incomplete_transactions(&context, &mut locks)?;
+    // Recovery or an external filesystem change can make the rebuilt snapshot add a physical key.
+    // A new key that sorts after the held set can be appended safely. A key that sorts before it
+    // requires dropping the set and taking the complete union in one order. That unlocked gap is
+    // never hidden from the rest of the pipeline: recovery and filesystem inspection run again
+    // after every restart and after every monotonic expansion.
+    let mut stable = None;
+    for _ in 0..MAX_LOCK_SET_PASSES {
+        reconcile_incomplete_transactions(&context, &mut locks)?;
 
-    // Built under the lock and after recovery, because recovery may have removed mounts discovery
-    // saw a moment ago. A plan that disagrees with the filesystem it is about to change is exactly
-    // what every precondition check exists to catch.
-    let rebuilt = plan_read_only(&context)?;
-    locks.acquire_more(&rebuilt.snapshot.lock_resources, policy, &owner)?;
+        // Built under the lock and after recovery, because recovery may have removed mounts
+        // discovery saw a moment ago. A plan that disagrees with the filesystem it is about to
+        // change is exactly what every precondition check exists to catch.
+        let rebuilt = plan_read_only(&context)?;
+        if locks.holds_all(&rebuilt.snapshot.lock_resources) {
+            stable = Some(rebuilt);
+            break;
+        }
+
+        extend_resources(&mut required_resources, &rebuilt.snapshot.lock_resources);
+        if locks.requires_reacquire(&rebuilt.snapshot.lock_resources) {
+            drop(locks);
+            locks = HeldLocks::acquire(&required_resources, policy, &owner)?;
+            continue;
+        }
+
+        locks.acquire_more(&rebuilt.snapshot.lock_resources, policy, &owner)?;
+    }
+    let rebuilt = stable.ok_or_else(|| {
+        AppError::Temporary(format!(
+            "the resource lock set did not stabilize after {MAX_LOCK_SET_PASSES} inspections; \
+             nothing was mounted"
+        ))
+    })?;
 
     let mut transaction = Transaction::open_with(
         &context,
@@ -183,10 +222,9 @@ fn run_session(context: &RunContext) -> Result<(), AppError> {
 
 /// Recovers or refuses, according to `--no-recover`.
 ///
-/// A journal this build cannot interpret never blocks an ordinary run. It is reported and left
-/// untouched, and whatever it owns is visible to discovery like any other entry — so the conflict
-/// table decides, which is the layer that already knows how to refuse safely. Under `--no-recover`
-/// the operator has asked for the opposite, and the same journal is a hard stop.
+/// A journal this build cannot interpret blocks every mutating run. Its unknown ownership record
+/// may describe a path discovery cannot see or a future state this build does not understand, so
+/// planning around the visible filesystem is not a safe substitute for recovery evidence.
 fn reconcile_incomplete_transactions(
     context: &RunContext,
     locks: &mut HeldLocks,
@@ -204,8 +242,44 @@ fn reconcile_incomplete_transactions(
     }
 
     let report = recover::recover_stale(locks)?;
+    if !report.unreadable.is_empty() {
+        return Err(unreadable_journals_error(&report.unreadable));
+    }
     warn(&report.describe());
     Ok(())
+}
+
+/// Builds the fail-closed operator diagnostic for journals this build cannot account for.
+fn unreadable_journals_error(rejected: &[RejectedJournal]) -> AppError {
+    AppError::Temporary(format!(
+        "cannot start a mutating session while transaction state is unreadable or uses an \
+         unsupported schema; every journal was retained and no new plan was applied:\n{}\n\
+         inspect these files and account for every recorded path before moving or removing them, \
+         then retry",
+        rejected
+            .iter()
+            .map(|rejected| {
+                format!(
+                    "transaction journal {} cannot be interpreted: {}",
+                    rejected.path.display(),
+                    rejected.reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    ))
+}
+
+/// Extends an accumulated lock-resource description without duplicating identical observations.
+fn extend_resources(
+    resources: &mut Vec<crate::lock::LockResource>,
+    additional: &[crate::lock::LockResource],
+) {
+    for resource in additional {
+        if !resources.contains(resource) {
+            resources.push(resource.clone());
+        }
+    }
 }
 
 /// Runs the complete read-only pipeline: catalog, discovery inspection, preliminary plan.

@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::Transaction;
+use super::{Transaction, recover};
 use crate::app::{ReadOnlyOutcome, plan_read_only};
 use crate::cli::{ParsedCommand, parse_command_from};
 use crate::domain::RunContext;
@@ -19,6 +19,7 @@ use crate::lock::acquire::{HeldLocks, LockOwner, LockPolicy};
 use crate::paths::resolve_session;
 use crate::state::testing::StateRootGuard;
 use crate::test_support::{TestDir, remove_directory_link, symlink_dir_or_skip};
+use crate::transaction::cleanup::JournalRetention;
 
 /// A project, a Skill source, and a redirected state root.
 struct Session {
@@ -614,14 +615,50 @@ fn keep_mounts_retains_everything_and_reaches_a_terminal_state() {
 
     assert!(project.join(".codex/skills/alpha").exists());
     assert_eq!(
-        report.journal_retained.as_deref(),
+        report.journal_retained.as_ref().map(JournalRetention::path),
         Some(transaction.journal_path())
     );
+    assert!(matches!(
+        report.journal_retained,
+        Some(JournalRetention::RequestedKeep(_))
+    ));
     let journal = on_disk(&transaction);
     assert_eq!(journal.status, TransactionStatus::Kept);
     assert!(
         journal.status.is_terminal(),
         "a kept transaction must never be reconciled by a later run"
+    );
+}
+
+#[test]
+fn a_failed_keep_enabled_transaction_is_reconciled_instead_of_terminalized() {
+    let session = Session::codex("txn-keep-failed", &["alpha"], &["--keep-mounts"]);
+    let project = session.project();
+    let (mut transaction, locks) = session.open();
+    let journal_path = transaction.journal_path().to_path_buf();
+
+    // Drift the first planned helper path after the journal opens. Apply records `failed`, but the
+    // directory is user state with no transaction identity and must survive recovery.
+    fs::create_dir(project.join(".codex")).expect("operator-created drift");
+    transaction
+        .apply()
+        .expect_err("the drift must leave an incomplete failed journal");
+    assert_eq!(on_disk(&transaction).status, TransactionStatus::Failed);
+    drop(transaction);
+    drop(locks);
+
+    let mut recovery_locks = HeldLocks::default();
+    let report = recover::recover_stale(&mut recovery_locks).expect("recovery completes");
+
+    assert_eq!(report.reconciled.len(), 1, "{report:?}");
+    assert!(report.active.is_empty(), "{report:?}");
+    assert!(
+        project.join(".codex").is_dir(),
+        "recovery must not remove the unowned drift"
+    );
+    assert!(
+        !journal_path.exists(),
+        "a failed keep request is incomplete, not terminal retention"
     );
 }
 
