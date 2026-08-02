@@ -62,7 +62,7 @@ impl Access {
 ///
 /// Returns the operating-system error, including [`io::ErrorKind::NotFound`] for a missing entry.
 pub(super) fn open_no_follow(path: &Path, access: Access) -> io::Result<OwnedHandle> {
-    let wide = to_wide(path);
+    let wide = to_wide(path)?;
     // SAFETY: `wide` is NUL-terminated and outlives the call. The security-attributes and template
     // arguments are null, which the API documents as "defaults, no template". The returned handle
     // is checked against `INVALID_HANDLE_VALUE` before it is adopted.
@@ -181,11 +181,19 @@ fn legacy_file_identity(handle: &OwnedHandle) -> io::Result<(u32, u64)> {
     Ok((information.dwVolumeSerialNumber, index))
 }
 
-/// An 8-byte-aligned reparse buffer.
+/// An 8-byte-aligned reparse buffer, matching what the standard library uses for the same call.
 ///
-/// `Vec<u8>` has alignment 1. The standard library allocates this control code's output buffer
-/// 8-byte aligned (`Align8` in `library/std/src/sys/fs/windows.rs`), and an audited module has no
-/// business relying on the allocator happening to do the same for a 16 KiB request.
+/// The alignment is defensive parity, not a requirement. Both reparse control codes are
+/// `METHOD_BUFFERED` — the transfer method is the low two bits of the code, and
+/// `FSCTL_GET_REPARSE_POINT` is `0x0009_00A8` while `FSCTL_SET_REPARSE_POINT` is `0x0009_00A4`, so
+/// both are zero. The I/O manager therefore copies each buffer through a system allocation of its
+/// own and no driver ever reads or writes this memory directly.
+///
+/// It is kept anyway because it costs nothing, because `Align8` in
+/// `library/std/src/sys/fs/windows.rs` does the same for this control code, and because a reader
+/// auditing raw-pointer code should not have to re-derive the transfer method to be satisfied. The
+/// *input* buffer on the write side is deliberately left as the caller's slice: aligning it would
+/// mean copying 16 KiB for a guarantee the kernel does not need either.
 #[repr(C, align(8))]
 struct AlignedReparseBuffer([u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE]);
 
@@ -204,9 +212,9 @@ pub(super) fn read_reparse_point(handle: &OwnedHandle) -> io::Result<Vec<u8>> {
         )
     })?;
     let mut returned: u32 = 0;
-    // SAFETY: `buffer` is a live allocation of exactly `capacity` bytes and is not aliased. The
-    // input arguments are null with a zero length, which this control code expects. `returned`
-    // receives the byte count and is read only after the call reports success.
+    // SAFETY: `buffer` is a live, exclusively borrowed value of exactly `capacity` bytes. The input
+    // arguments are null with a zero length, which this control code expects. `returned` receives
+    // the byte count and is read only after the call reports success.
     let succeeded = unsafe {
         DeviceIoControl(
             raw(handle),
@@ -271,8 +279,8 @@ pub(super) fn write_reparse_point(handle: &OwnedHandle, buffer: &[u8]) -> io::Re
 /// Returns the operating-system error, including [`io::ErrorKind::AlreadyExists`] when the
 /// destination is occupied.
 pub(super) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
-    let from = to_wide(from);
-    let to = to_wide(to);
+    let from = to_wide(from)?;
+    let to = to_wide(to)?;
     // SAFETY: both buffers are NUL-terminated and outlive the call. Passing no flags is what makes
     // the operation refuse to replace an existing destination.
     let succeeded = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
@@ -292,7 +300,7 @@ pub(super) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
 /// Returns the operating-system error, including `ERROR_DIR_NOT_EMPTY` when the entry is a real
 /// directory with contents.
 pub(super) fn remove_directory_entry(path: &Path) -> io::Result<()> {
-    let wide = to_wide(path);
+    let wide = to_wide(path)?;
     // SAFETY: `wide` is NUL-terminated and outlives the call.
     let succeeded = unsafe { RemoveDirectoryW(wide.as_ptr()) };
     if succeeded == 0 {
@@ -307,9 +315,25 @@ fn raw(handle: &OwnedHandle) -> HANDLE {
 }
 
 /// Encodes a path as the NUL-terminated extended-form wide string every call above expects.
-fn to_wide(path: &Path) -> Vec<u16> {
+///
+/// An interior NUL is refused rather than encoded. Every Win32 call here reads up to the first NUL,
+/// so a path containing one would silently address a shorter, different path — and two of these
+/// calls move and delete entries. The Unix module rejects the same input for the same reason, by
+/// way of `CString::new`; doing it here keeps the two boundaries honest about the same hazard
+/// instead of one of them relying on the input never occurring.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when the path contains an interior NUL.
+fn to_wide(path: &Path) -> io::Result<Vec<u16>> {
     let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if encoded.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path {} contains an interior NUL", path.display()),
+        ));
+    }
     let mut wide = winpath::to_extended(&encoded);
     wide.push(0);
-    wide
+    Ok(wide)
 }
