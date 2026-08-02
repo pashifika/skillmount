@@ -1,7 +1,8 @@
 //! Agent adapter boundary and read-only discovery inspection.
 //!
 //! An adapter observes and describes; it never mutates. Every method here returns a snapshot or a
-//! plan, and the shared transaction layer applies plans in a later change.
+//! plan, and the shared application and transaction layers apply those values after the mutation
+//! boundary.
 
 pub mod claude;
 pub mod codex;
@@ -134,9 +135,9 @@ impl DiscoverySnapshot {
 
 /// A read-only agent adapter.
 ///
-/// The V2 design also lists `prepare_command`. It is intentionally absent: it takes an applied
-/// plan and mutates a `Command`, which belongs to the child-process change. Keeping it out means
-/// no implementation of this trait can launch anything.
+/// Command preparation is intentionally absent from this trait: it would consume an applied plan
+/// and mutate a `Command`, while this boundary is restricted to read-only observation and
+/// description. Keeping it out also makes the currently reserved child-launch boundary explicit.
 pub trait AgentAdapter {
     /// Returns the adapter's agent.
     fn id(&self) -> AgentId;

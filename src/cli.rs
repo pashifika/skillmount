@@ -32,7 +32,7 @@ enum CliCommand {
     Inspect(InspectArgs),
     /// Reserved for the later environment-diagnostic change.
     Doctor(DoctorArgs),
-    /// Reserved for the later transaction-recovery change.
+    /// Reserved for a later operator-facing recovery command.
     Cleanup(CleanupArgs),
 }
 

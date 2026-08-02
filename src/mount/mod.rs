@@ -121,8 +121,8 @@ pub struct PlannedMountAction {
 
 /// A selected Skill that was omitted because an existing entry is preserved.
 ///
-/// Preserved entries are reported but generate no action: the V2 design forbids journaling a
-/// mutation for something that is deliberately left alone.
+/// Preserved entries are reported but generate no action. They are deliberately left alone, so a
+/// transaction cannot claim or journal them as something it owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreservedSkill {
     /// Comparison key of the omitted Skill.

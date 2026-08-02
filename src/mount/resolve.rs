@@ -15,9 +15,9 @@ pub use crate::link::resolve::MAX_LINK_DEPTH;
 /// How an entry appears when it is inspected without implicitly following it.
 ///
 /// Windows junctions and POSIX symbolic links are deliberately not distinguished here. Both are
-/// directory indirections, both are reported by `symlink_metadata` as links, and every rule in
-/// the V2 design that mentions them treats them identically. The link *implementation* only
-/// matters when one is created, which is a later change.
+/// directory indirections, both are reported by `symlink_metadata` as links, and planning applies
+/// the same namespace rules to both. Their implementation difference matters only at the sealed
+/// platform link boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
     /// Nothing exists at the path.
@@ -97,9 +97,9 @@ impl ResolvedEntry {
 /// Classifies an entry and resolves any directory-link chain.
 ///
 /// Broken, cyclic, over-deep, and non-directory layouts are returned as states rather than
-/// errors. The V2 design only mandates failure for the *authoritative* Codex entry and for a
-/// conflicting destination; an unusable ancestor scope has a different consequence. Returning the
-/// state lets each caller apply its own rule instead of forcing one policy into the resolver.
+/// errors. The authoritative Codex entry, an ancestor scope, and a conflicting destination have
+/// different consequences. Returning the state lets each caller apply its own rule instead of
+/// forcing one policy into the resolver.
 ///
 /// # Errors
 ///

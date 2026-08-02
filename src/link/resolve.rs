@@ -19,9 +19,8 @@ use crate::link::{EntryKind, LinkBackend, LinkTarget, PathEntry, PlatformIdentit
 
 /// Maximum number of directory-link hops this walker follows before rejecting an entry.
 ///
-/// The V2 design calls roughly 32 sufficient. The bound is set to the `SKILL.md` chain limit
-/// already used by catalog validation so both layers reject exactly the same pathological
-/// layouts, which keeps a single number to reason about.
+/// The bound matches the `SKILL.md` chain limit used by catalog validation so both layers reject
+/// exactly the same pathological layouts and the crate has one traversal ceiling to reason about.
 ///
 /// It counts the hops this walker *takes*, which are the links occupying the final component of
 /// each path it inspects. A link sitting in an ancestor component — `a/b/c` where `b` is itself a
