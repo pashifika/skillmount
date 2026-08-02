@@ -464,6 +464,28 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn unpaired_surrogates_survive_as_explicit_escapes() {
+        use std::os::windows::ffi::OsStringExt;
+
+        // A lone high surrogate is the Windows counterpart of an invalid UTF-8 byte: the value is
+        // a legal filename that no lossy rendering can round-trip.
+        let value = OsString::from_wide(&[u16::from(b'a'), 0xD800, u16::from(b'b')]);
+
+        assert_eq!(escaped(&value), "a\\uD800b");
+        assert_eq!(
+            os_value(&value, true),
+            "escaped:a\\uD800b",
+            "a value that is not text is marked so a reader knows to decode it"
+        );
+        assert_ne!(
+            os_value(&value, false),
+            os_value(&value, true),
+            "the lossy form is only used when verbose output was not requested"
+        );
+    }
+
     #[test]
     fn shell_metacharacters_are_not_quoted_into_a_command_string() {
         let value = OsString::from("a b\"c'd;e");
