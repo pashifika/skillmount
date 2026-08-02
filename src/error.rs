@@ -213,6 +213,110 @@ impl fmt::Display for PlanError {
 
 impl Error for PlanError {}
 
+/// Platform link-backend failures.
+///
+/// These are separate from [`PlanError`] because they occur *after* planning, against real
+/// filesystem state. An unresolvable chain and an ownership mismatch are deliberately not here:
+/// both are typed outcomes the caller decides about, not failures the backend imposes.
+#[derive(Debug)]
+pub enum LinkError {
+    /// An entry could not be classified without following it.
+    Inspect {
+        /// Entry that could not be inspected.
+        path: PathBuf,
+        /// Operating-system failure.
+        reason: String,
+    },
+    /// A directory link could not be created.
+    Create {
+        /// Path the link was being created at.
+        destination: PathBuf,
+        /// Directory the link was to refer to.
+        source: PathBuf,
+        /// Operating-system or eligibility failure.
+        reason: String,
+    },
+    /// A staged entry could not be placed at its destination.
+    Place {
+        /// Transaction-unique staged entry.
+        staged: PathBuf,
+        /// Final destination the entry was to occupy.
+        destination: PathBuf,
+        /// Operating-system failure.
+        reason: String,
+    },
+    /// A verified link entry could not be removed.
+    Remove {
+        /// Entry that could not be removed.
+        path: PathBuf,
+        /// Operating-system failure.
+        reason: String,
+    },
+    /// The host cannot provide a guarantee the backend refuses to emulate.
+    ///
+    /// Reported instead of a check-then-act sequence. The V2 contract requires atomic no-replace
+    /// placement; emulating it with a separate existence check would reintroduce exactly the race
+    /// the guarantee exists to remove.
+    Unsupported {
+        /// Path the unavailable operation targeted.
+        path: PathBuf,
+        /// Capability the host does not provide.
+        reason: String,
+    },
+    /// A directory link chain could not be resolved to a directory.
+    UnresolvableChain {
+        /// Entry the chain started at.
+        entry: PathBuf,
+        /// Observed chain state.
+        state: &'static str,
+    },
+}
+
+impl fmt::Display for LinkError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inspect { path, reason } => {
+                write!(formatter, "cannot inspect {}: {reason}", path.display())
+            }
+            Self::Create {
+                destination,
+                source,
+                reason,
+            } => write!(
+                formatter,
+                "cannot create a directory link at {} for {}: {reason}",
+                destination.display(),
+                source.display()
+            ),
+            Self::Place {
+                staged,
+                destination,
+                reason,
+            } => write!(
+                formatter,
+                "cannot place {} at {}: {reason}",
+                staged.display(),
+                destination.display()
+            ),
+            Self::Remove { path, reason } => {
+                write!(formatter, "cannot remove {}: {reason}", path.display())
+            }
+            Self::Unsupported { path, reason } => write!(
+                formatter,
+                "the host cannot perform this operation on {} safely: {reason}",
+                path.display()
+            ),
+            Self::UnresolvableChain { entry, state } => write!(
+                formatter,
+                "directory link {} is a {state} and cannot be resolved",
+                entry.display()
+            ),
+        }
+    }
+}
+
+impl Error for LinkError {}
+
 /// An error returned by the shared application boundary.
 #[derive(Debug)]
 pub enum AppError {
@@ -222,6 +326,8 @@ pub enum AppError {
     Catalog(CatalogError),
     /// A resolved catalog cannot be realized against the observed project state.
     Plan(PlanError),
+    /// A platform link backend could not complete an operation.
+    Link(LinkError),
     /// Missing, inaccessible, or wrongly typed input.
     MissingInput {
         /// Input path.
@@ -247,7 +353,7 @@ impl AppError {
             Self::Usage(_) => ExitCategory::Usage,
             Self::Catalog(_) => ExitCategory::Data,
             // A destination conflict is a filesystem-state failure, not a catalog failure.
-            Self::Plan(_) | Self::Filesystem(_) => ExitCategory::Filesystem,
+            Self::Plan(_) | Self::Link(_) | Self::Filesystem(_) => ExitCategory::Filesystem,
             Self::MissingInput { .. } => ExitCategory::MissingInput,
             Self::Internal(_) => ExitCategory::Internal,
             Self::Temporary(_) => ExitCategory::Temporary,
@@ -265,6 +371,7 @@ impl fmt::Display for AppError {
             | Self::Temporary(message) => formatter.write_str(message),
             Self::Catalog(error) => error.fmt(formatter),
             Self::Plan(error) => error.fmt(formatter),
+            Self::Link(error) => error.fmt(formatter),
             Self::MissingInput { path, reason } => {
                 write!(
                     formatter,
@@ -282,6 +389,7 @@ impl Error for AppError {
         match self {
             Self::Catalog(error) => Some(error),
             Self::Plan(error) => Some(error),
+            Self::Link(error) => Some(error),
             _ => None,
         }
     }
@@ -296,5 +404,11 @@ impl From<CatalogError> for AppError {
 impl From<PlanError> for AppError {
     fn from(error: PlanError) -> Self {
         Self::Plan(error)
+    }
+}
+
+impl From<LinkError> for AppError {
+    fn from(error: LinkError) -> Self {
+        Self::Link(error)
     }
 }

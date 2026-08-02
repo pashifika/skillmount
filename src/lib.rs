@@ -16,6 +16,7 @@ mod cli;
 pub mod diagnostic;
 pub mod domain;
 pub mod error;
+pub mod link;
 pub mod lock;
 pub mod mount;
 mod paths;
