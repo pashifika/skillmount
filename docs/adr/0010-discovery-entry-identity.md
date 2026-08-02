@@ -6,9 +6,10 @@
 
 ## Context
 
-Read-only mount planning has to enumerate every Skill an agent can already see, because V2 design
-section 15.7 requires each adapter to preflight the complete discovery namespace rather than only
-the directory SkillMount intends to modify.
+Read-only mount planning has to retain every entry in each scope the adapter inspects rather than
+only entries in the directory SkillMount intends to modify. The input design described those scopes
+as the child's complete discovery namespace; the current architecture baseline deliberately calls
+them the implemented discovery model and requires revalidation before child launch.
 
 The V2 proposed data model types such an entry as:
 
@@ -53,18 +54,16 @@ still resolves through `SkillName`, so no unsafe name is written to a destinatio
 
 ## Alternatives
 
-**Drop entries that fail to parse.** Rejected because it makes conflict detection unsound. Section
-15.6 states that "an exact destination path being absent is insufficient if `A` or another case
-variant already occupies logical key `a`". An entry named `My_Skill` occupies logical key
-`my_skill`. Dropping it means planning reports a clear destination, the transaction creates a link,
-and the child sees two entries under one logical name, resolved by precedence rules the agent does
-not document. Section 15.7 exists to prevent exactly that.
+**Drop entries that fail to parse.** Rejected because it makes conflict detection unsound. An exact
+destination path being absent is insufficient when a case variant already occupies the same
+logical key. An entry named `My_Skill` occupies logical key `my_skill`. Dropping it means planning
+reports a clear destination and the transaction creates a link without proving which same-key
+source the eventual child would select.
 
 **Fail the run when an entry fails to parse.** Rejected because it makes SkillMount reject project
 state it has no authority over. An unrelated directory in the user's own `~/.claude/skills` would
-block every mount, including mounts whose names do not collide with it. This also contradicts
-ADR-005: failing closed applies to conflicts with the requested operation, not to the mere presence
-of unrelated files.
+block every mount, including mounts whose names do not collide with it. Failing closed applies to a
+conflict with the requested operation, not to the mere presence of an unrelated entry.
 
 **Keep both `SkillName` and a separate raw name.** Rejected as a redundant field that is `None` or
 synthetic for exactly the entries that matter, while still requiring every consumer to handle the
@@ -72,8 +71,8 @@ absent case. It adds a field without removing a branch.
 
 ## Consequences
 
-- Conflict detection covers every entry the child can see, not the subset SkillMount could have
-  authored.
+- Conflict detection covers every entry in each inspected discovery scope, not only the subset
+  SkillMount could have authored. Session-adapter work must validate the scope set before launch.
 - `SkillNameKey` holds an `OsString`, so non-UTF-8 entry names participate in comparison. ASCII-only
   case folding is retained deliberately: full Unicode folding is locale-sensitive and would make the
   comparison key depend on the host.

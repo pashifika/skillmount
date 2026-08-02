@@ -112,7 +112,7 @@ impl CreatedLinkKind {
         }
     }
 
-    /// Returns the stable label used in diagnostics and in the future journal.
+    /// Returns the stable label used in diagnostics and in the transaction journal.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -231,13 +231,14 @@ pub struct LinkRequest {
 
 /// Ownership evidence for a link entry this process created.
 ///
-/// A later cleanup removes an entry only when the live entry still matches every field recorded
-/// here. Recording the canonical source *and* the raw target *and* the identity is deliberate. The
-/// raw target still describes the entry after its target has disappeared, which keeps a dangling
-/// link removable; the canonical source is what diagnostics quote. But the identity is the only
-/// field that distinguishes this process's entry from an identical one someone else created, so an
-/// entry recorded without one is never removed and reports
-/// [`OwnershipMismatch::IdentityUnavailable`] instead.
+/// Cleanup requests removal only after the inspected entry matches every field recorded here.
+/// Removal is still path-based, so this evidence does not bind the inspected object across the
+/// remaining verify-act window. Recording the canonical source *and* the raw target *and* the
+/// identity is nevertheless deliberate. The raw target still describes the entry after its target
+/// has disappeared, which keeps a dangling link removable; the canonical source is what diagnostics
+/// quote. But the identity is the only field that distinguishes this process's entry from an
+/// identical one someone else created, so an entry recorded without one is never requested for
+/// removal and reports [`OwnershipMismatch::IdentityUnavailable`] instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedLink {
     /// Path the entry currently occupies: the staged sibling until it is placed.
@@ -367,8 +368,8 @@ pub enum RemoveOutcome {
 /// directory tree, which is what makes "`SkillMount` never deletes your Skills" a property of the
 /// interface rather than a claim about its callers.
 ///
-/// A backend holds no state between calls, so it is `Send + Sync`: the transaction layer applies
-/// independent actions concurrently, and each call already carries everything it needs.
+/// A backend holds no state between calls and is exposed as a process-global instance, so it is
+/// `Send + Sync`; each call already carries everything it needs.
 pub trait LinkBackend: sealed::Sealed + Send + Sync {
     /// Classifies `path` without following it.
     ///
@@ -448,10 +449,11 @@ pub trait LinkBackend: sealed::Sealed + Send + Sync {
         }
     }
 
-    /// Removes exactly the recorded link entry after verifying it is still the recorded one.
+    /// Requests path-based removal after the inspected link matches the recorded evidence.
     ///
     /// Removal unlinks one directory entry. It never descends into the target, and it refuses a
-    /// regular directory outright.
+    /// regular directory outright. Binding inspection and removal to one object across the
+    /// verify-act window remains reserved hardening.
     ///
     /// # Errors
     ///
@@ -459,7 +461,8 @@ pub trait LinkBackend: sealed::Sealed + Send + Sync {
     /// [`LinkError::Remove`] when the verified entry cannot be unlinked.
     fn remove_link_entry(&self, recorded: &CreatedLink) -> Result<RemoveOutcome, LinkError>;
 
-    /// Removes exactly the recorded directory, and only while it is still empty.
+    /// Requests path-based removal after the inspected directory matches, and only while it is
+    /// still empty.
     ///
     /// Emptiness is enforced by the operating system rather than checked first: the removal call
     /// refuses a directory with contents, so there is no window in which something could appear

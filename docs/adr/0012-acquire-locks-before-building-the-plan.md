@@ -32,9 +32,12 @@ table. The design's "preliminary plan" step asks for strictly more than locking 
 
 ## Decision
 
-`app::run_session` runs, in order: mint the transaction identifier, inspect discovery, acquire the
-snapshot's lock set, reconcile incomplete transactions, build the full plan, acquire any lock the
-rebuilt plan added, open the journal, apply, clean up.
+`app::run_session` first performs its fail-closed read-only journal preflight and prepares the
+staging-state base when staging needs one. It then mints the transaction identifier,
+inspects discovery, acquires the snapshot's lock set, reconciles incomplete transactions, builds
+the full plan, acquires any lock the rebuilt plan added, opens the journal, applies, and cleans up.
+This ADR governs the relative discovery, lock, recovery, and plan ordering; the earlier control-state
+steps neither build a plan nor mutate a planned destination.
 
 Incremental acquisition preserves one global order across both observations. A newly observed key
 may be appended only when it sorts after every held key. If it sorts before one, the session drops
@@ -83,8 +86,9 @@ What this commits the project to:
 - Catalog validation failures now surface after locks are taken rather than before. A caller sees
   the same exit code; the only difference is that a lock file may have been created first.
 - `Transaction::open` and `Transaction::adopt` take `&HeldLocks` and refuse when the caller does not
-  hold the plan's locks. The ordering above is therefore enforced at the type-and-runtime boundary,
-  not only by the call site in `run_session`.
+  hold the plan's locks at construction. The application retains that guard through apply and
+  cleanup. `Transaction` does not yet own or borrow the guard, so making the same lifetime guarantee
+  structural for external library callers remains hardening rather than a type-level property.
 - The design's flow sentence stays as written. It is a machine-local input and the historical record
   of what was intended; this ADR is the repository's record of what is true.
 

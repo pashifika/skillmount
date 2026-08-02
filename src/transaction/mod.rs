@@ -1,17 +1,20 @@
 //! The mutating half of a session: apply, roll back, clean up, and recover.
 //!
-//! Everything above this module is read-only. This is where a plan stops describing the filesystem
-//! and starts changing it, and every rule here exists because a session can stop at any instruction.
+//! This module owns planned destination mutation and recovery. The application prepares private
+//! control state and acquires locks before entering it, and every rule here exists because a session
+//! can stop at any instruction.
 //!
 //! Three invariants hold across the whole module:
 //!
-//! - **Nothing is created before it is durable.** A journal describing the mutation reaches the
-//!   disk first, so a crash always leaves a record of what may exist.
+//! - **No planned destination is created before its intent is durable.** A journal describing the
+//!   mutation reaches the disk first, so a crash always leaves a record of what may exist.
 //! - **Nothing is removed without proof.** Every removal compares the live entry against recorded
 //!   evidence, and an entry that cannot be proved to belong to this transaction is retained and
 //!   reported instead. Residue is recoverable; deleting someone's Skills is not.
-//! - **Nothing is touched without the locks.** Apply, cleanup, and recovery all run inside the lock
-//!   set the plan computed, so no two sessions can reach one entry at once.
+//! - **The application keeps every planned destination under its locks.** Apply and ordinary cleanup
+//!   use the discovery-derived keys checked when the transaction opens; recovery also holds every
+//!   key recorded by the journal it adopts. A public caller must currently keep that validated
+//!   `HeldLocks` guard alive because `Transaction` does not retain it structurally.
 
 pub mod apply;
 pub mod cleanup;

@@ -105,7 +105,7 @@ impl CleanupReport {
 }
 
 impl Transaction {
-    /// Removes everything this transaction owns, after the child has finished with it.
+    /// Removes everything this transaction owns when an orderly session releases it.
     ///
     /// `--keep-mounts` short-circuits the whole pass: the journal reaches the terminal `kept` state
     /// and stays on disk, so no later invocation treats the retained entries as stale and removes

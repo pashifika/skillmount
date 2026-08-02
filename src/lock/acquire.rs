@@ -76,7 +76,7 @@ impl LockPolicy {
     }
 }
 
-/// Who took a lock, written into the lock file for diagnostics only.
+/// Who took a lock, written into its owner sidecar for diagnostics only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockOwner {
     /// Transaction the lock belongs to, or a placeholder before one is opened.

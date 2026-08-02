@@ -158,7 +158,8 @@ fn overlay(out: &mut String, report: &ReadOnlyReport<'_>) {
     }
 }
 
-/// Renders every namespace the child will search, which is what makes conflicts explainable.
+/// Renders every namespace in the adapter's current discovery model, which makes conflicts
+/// explainable.
 fn scopes(out: &mut String, report: &ReadOnlyReport<'_>) {
     let _ = writeln!(out, "\nDiscovery scopes:");
     for scope in &report.snapshot.scopes {

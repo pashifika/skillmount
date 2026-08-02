@@ -1,9 +1,10 @@
 //! Catalog, planning, durable mutation, and the shared executable boundary for `SkillMount`.
 //!
 //! The read-only half parses the wrapper contract, preserves platform-native paths, resolves an
-//! ordered Skill catalog, inspects every namespace the child agent would search, and builds one
-//! deterministic mount plan. `inspect` and `--dry-run` create no directory, link, lock, journal,
-//! recovery mutation, or child process, and `tests/read_only.rs` fails if any of them ever does.
+//! ordered Skill catalog, inspects the namespaces in the selected adapter's current discovery
+//! model, and builds one deterministic mount plan. `inspect` and `--dry-run` create no directory,
+//! link, lock, journal, recovery mutation, or child process, and `tests/read_only.rs` fails if any
+//! of them ever does.
 //!
 //! A mutating session acquires the discovery snapshot's resource locks, recovers incomplete
 //! transactions, builds and stabilizes the full plan under those locks, persists a write-ahead
