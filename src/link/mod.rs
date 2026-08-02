@@ -232,10 +232,11 @@ pub struct LinkRequest {
 /// Ownership evidence for a link entry this process created.
 ///
 /// Cleanup requests removal only after the inspected entry matches every field recorded here.
-/// Removal is still path-based, so this evidence does not bind the inspected object across the
-/// remaining verify-act window. Recording the canonical source *and* the raw target *and* the
-/// identity is nevertheless deliberate. The raw target still describes the entry after its target
-/// has disappeared, which keeps a dangling link removable; the canonical source is what diagnostics
+/// Windows retains the no-follow handle that supplied those fields through removal; Unix rechecks
+/// the pathname immediately before unlink under cooperating-session locks, with the residual
+/// non-cooperating race recorded in ADR 0014. Recording the canonical source *and* the raw target
+/// *and* the identity is deliberate. The raw target still describes the entry after its target has
+/// disappeared, which keeps a dangling link removable; the canonical source is what diagnostics
 /// quote. But the identity is the only field that distinguishes this process's entry from an
 /// identical one someone else created, so an entry recorded without one is never requested for
 /// removal and reports [`OwnershipMismatch::IdentityUnavailable`] instead.
@@ -292,23 +293,48 @@ impl OwnedDirectory {
     }
 }
 
-/// The result of placing a staged entry at its destination.
+/// Why placement could not prove that it still addressed the recorded staged entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlacementOutcome {
-    /// The entry now occupies the destination; the value carries the relocated evidence.
-    Placed(CreatedLink),
-    /// A destination appeared after staging. Nothing was replaced and the staged entry is still
-    /// present, so the caller can roll it back with verified removal.
-    DestinationExists,
+pub enum PlacementMismatch {
+    /// The recorded staged entry disappeared before the operation could establish ownership.
+    Missing,
+    /// A live entry exists, but it does not match the recorded evidence.
+    Ownership(OwnershipMismatch),
+    /// The destination could not be inspected after pathname placement completed.
+    InspectionFailed(String),
 }
 
-/// The result of placing a staged path, without regard to what kind of entry it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PathPlacement {
-    /// The entry now occupies the destination.
-    Placed,
-    /// A destination appeared after staging; nothing was replaced.
+impl PlacementMismatch {
+    /// Returns the stable label used in diagnostics.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Missing => "the recorded staged entry is missing",
+            Self::Ownership(mismatch) => mismatch.label(),
+            Self::InspectionFailed(reason) => reason,
+        }
+    }
+}
+
+/// An entry placement left untouched because ownership could not be established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementResidue {
+    /// Path whose current entry was retained.
+    pub path: PathBuf,
+    /// Evidence mismatch that prevented the backend from claiming it.
+    pub mismatch: PlacementMismatch,
+}
+
+/// The result of placing a staged entry at its destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementOutcome<T> {
+    /// The entry now occupies the destination; the value carries the relocated evidence.
+    Placed(T),
+    /// A destination appeared after staging. Nothing was replaced, and the staged pathname remains
+    /// available for ownership-verified rollback.
     DestinationExists,
+    /// The staged or final entry did not match the recorded evidence and was left untouched.
+    OwnershipMismatch(PlacementResidue),
 }
 
 /// Why a recorded entry is no longer this process's to remove.
@@ -417,43 +443,44 @@ pub trait LinkBackend: sealed::Sealed + Send + Sync {
     /// Returns [`LinkError::Create`] when the path is occupied or the host refuses the creation.
     fn create_directory(&self, path: &Path) -> Result<OwnedDirectory, LinkError>;
 
-    /// Atomically moves any staged entry onto `destination` without replacing anything.
+    /// Atomically moves a staged link onto `destination` without replacing anything.
     ///
-    /// This is the single platform primitive both placement paths use, so a link and a directory
-    /// can never end up with different atomicity guarantees.
+    /// The operation consumes recorded ownership evidence, verifies that the staged entry still
+    /// matches it, and returns evidence for the object established at the destination. A backend
+    /// must never expose its raw path-rename primitive through this contract.
     ///
     /// # Errors
     ///
     /// Returns [`LinkError::Place`] when the host reports a failure other than an occupied
     /// destination, and [`LinkError::Unsupported`] when the host cannot guarantee no-replace
     /// semantics. The guarantee is never emulated with a separate existence check.
-    fn place_path_no_replace(
-        &self,
-        staged: &Path,
-        destination: &Path,
-    ) -> Result<PathPlacement, LinkError>;
-
-    /// Atomically moves a staged link onto `destination` without replacing anything.
-    ///
-    /// # Errors
-    ///
-    /// Returns whatever [`LinkBackend::place_path_no_replace`] reports.
     fn place_no_replace(
         &self,
         staged: &CreatedLink,
         destination: &Path,
-    ) -> Result<PlacementOutcome, LinkError> {
-        match self.place_path_no_replace(&staged.path, destination)? {
-            PathPlacement::Placed => Ok(PlacementOutcome::Placed(staged.relocated_to(destination))),
-            PathPlacement::DestinationExists => Ok(PlacementOutcome::DestinationExists),
-        }
-    }
+    ) -> Result<PlacementOutcome<CreatedLink>, LinkError>;
 
-    /// Requests path-based removal after the inspected link matches the recorded evidence.
+    /// Atomically moves a staged directory onto `destination` without replacing anything.
     ///
-    /// Removal unlinks one directory entry. It never descends into the target, and it refuses a
-    /// regular directory outright. Binding inspection and removal to one object across the
-    /// verify-act window remains reserved hardening.
+    /// The operation has the same evidence and no-replace requirements as
+    /// [`LinkBackend::place_no_replace`], but returns relocated directory evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError::Place`] when the host reports a failure other than contention, and
+    /// [`LinkError::Inspect`] when pre-placement ownership cannot be inspected.
+    fn place_directory_no_replace(
+        &self,
+        staged: &OwnedDirectory,
+        destination: &Path,
+    ) -> Result<PlacementOutcome<OwnedDirectory>, LinkError>;
+
+    /// Removes one link entry after it matches the recorded evidence.
+    ///
+    /// Removal never descends into the target and refuses a regular directory outright. Windows
+    /// verifies and disposes the same no-follow handle. Unix performs a final no-follow check and
+    /// pathname unlink while product callers hold cooperative locks; ADR 0014 records the remaining
+    /// race with processes that do not honor those advisory locks.
     ///
     /// # Errors
     ///
@@ -461,14 +488,14 @@ pub trait LinkBackend: sealed::Sealed + Send + Sync {
     /// [`LinkError::Remove`] when the verified entry cannot be unlinked.
     fn remove_link_entry(&self, recorded: &CreatedLink) -> Result<RemoveOutcome, LinkError>;
 
-    /// Requests path-based removal after the inspected directory matches, and only while it is
-    /// still empty.
+    /// Removes the recorded helper directory, and only while it is still empty.
     ///
     /// Emptiness is enforced by the operating system rather than checked first: the removal call
     /// refuses a directory with contents, so there is no window in which something could appear
-    /// between the check and the removal. Together with the identity comparison this is what keeps
-    /// "`SkillMount` never deletes your Skills" true for directories as well as links — there is
-    /// still no recursive removal anywhere on this interface.
+    /// between the check and the removal. Windows binds the check and disposition to one handle;
+    /// Unix rechecks the pathname at its last available boundary. Together with the identity
+    /// comparison this keeps "`SkillMount` never deletes your Skills" true for directories as well
+    /// as links — there is still no recursive removal anywhere on this interface.
     ///
     /// # Errors
     ///
@@ -573,11 +600,37 @@ pub(crate) fn verify_directory_ownership(live: &PathEntry, recorded: &OwnedDirec
     }
 }
 
-/// Shared implementation of [`LinkBackend::create_directory`].
+/// Returns the placement mismatch for a live link entry, or `None` when ownership is proved.
+pub(crate) fn link_placement_mismatch(
+    live: &PathEntry,
+    recorded: &CreatedLink,
+    target_matches: impl FnOnce(&LinkTarget) -> bool,
+) -> Option<PlacementMismatch> {
+    placement_mismatch(verify_ownership(live, recorded, target_matches))
+}
+
+/// Returns the placement mismatch for a live directory, or `None` when ownership is proved.
+pub(crate) fn directory_placement_mismatch(
+    live: &PathEntry,
+    recorded: &OwnedDirectory,
+) -> Option<PlacementMismatch> {
+    placement_mismatch(verify_directory_ownership(live, recorded))
+}
+
+fn placement_mismatch(ownership: Ownership) -> Option<PlacementMismatch> {
+    match ownership {
+        Ownership::Owned => None,
+        Ownership::Absent => Some(PlacementMismatch::Missing),
+        Ownership::Mismatch(mismatch) => Some(PlacementMismatch::Ownership(mismatch)),
+    }
+}
+
+/// Unix implementation of [`LinkBackend::create_directory`].
 ///
 /// `create_dir` fails when the path exists, which is what keeps creation no-replace without a
-/// separate existence check. Both backends share it because the standard library already provides
-/// the exact semantics on each platform.
+/// separate existence check. A failed post-create observation retains the path: Unix cannot bind a
+/// later rollback unlink to the directory that was just created.
+#[cfg(unix)]
 pub(crate) fn create_directory_entry(
     backend: &dyn LinkBackend,
     path: &Path,
@@ -587,16 +640,42 @@ pub(crate) fn create_directory_entry(
         source: path.to_path_buf(),
         reason: error.to_string(),
     })?;
-    let created = backend.inspect_no_follow(path).inspect_err(|_| {
-        let _ = std::fs::remove_dir(path);
-    })?;
+    #[cfg(test)]
+    if let Err(error) = testing::reach_hook(testing::HookPoint::AfterDirectoryCreation, path, None)
+    {
+        return Err(retained_directory_create_error(path, &error.to_string()));
+    }
+    let created = match backend.inspect_no_follow(path) {
+        Ok(created) => created,
+        Err(error) => return Err(retained_directory_create_error(path, &error.to_string())),
+    };
+    if created.kind != EntryKind::Directory || created.identity.is_none() {
+        return Err(retained_directory_create_error(
+            path,
+            "the staged entry could not be proved to be the directory just created",
+        ));
+    }
     Ok(OwnedDirectory {
         path: path.to_path_buf(),
         identity: created.identity,
     })
 }
 
+#[cfg(unix)]
+fn retained_directory_create_error(path: &Path, reason: &str) -> LinkError {
+    LinkError::Create {
+        destination: path.to_path_buf(),
+        source: path.to_path_buf(),
+        reason: format!(
+            "{reason}; no pathname rollback was attempted because ownership could not be proved \
+             across removal; inspect the retained staged path {}",
+            path.display()
+        ),
+    }
+}
+
 /// Shared implementation of [`LinkBackend::remove_empty_directory`].
+#[cfg(unix)]
 pub(crate) fn remove_owned_directory(
     backend: &dyn LinkBackend,
     recorded: &OwnedDirectory,
@@ -605,16 +684,32 @@ pub(crate) fn remove_owned_directory(
     match verify_directory_ownership(&live, recorded) {
         Ownership::Absent => Ok(RemoveOutcome::AlreadyAbsent),
         Ownership::Mismatch(mismatch) => Ok(RemoveOutcome::OwnershipMismatch(mismatch)),
-        Ownership::Owned => match std::fs::remove_dir(&recorded.path) {
-            Ok(()) => Ok(RemoveOutcome::Removed),
-            // The operating system enforces emptiness, so a directory that gained contents between
-            // the identity check and this call is refused here rather than silently emptied.
-            Err(error) if is_not_empty(&error) => Ok(RemoveOutcome::NotEmpty),
-            Err(error) => Err(LinkError::Remove {
-                path: recorded.path.clone(),
-                reason: error.to_string(),
-            }),
-        },
+        Ownership::Owned => {
+            #[cfg(test)]
+            testing::reach_hook(
+                testing::HookPoint::BeforeRemovalMutation,
+                &recorded.path,
+                None,
+            )?;
+            // Recheck at the last boundary available to Unix. Product callers hold cooperative
+            // SkillMount locks here, but a non-cooperating process can still race this pathname
+            // before `remove_dir`; ADR 0014 records that residual limitation.
+            let live = backend.inspect_no_follow(&recorded.path)?;
+            match verify_directory_ownership(&live, recorded) {
+                Ownership::Absent => Ok(RemoveOutcome::AlreadyAbsent),
+                Ownership::Mismatch(mismatch) => Ok(RemoveOutcome::OwnershipMismatch(mismatch)),
+                Ownership::Owned => match std::fs::remove_dir(&recorded.path) {
+                    Ok(()) => Ok(RemoveOutcome::Removed),
+                    // The operating system enforces emptiness, so a directory that gained contents
+                    // between the identity check and this call is refused rather than emptied.
+                    Err(error) if is_not_empty(&error) => Ok(RemoveOutcome::NotEmpty),
+                    Err(error) => Err(LinkError::Remove {
+                        path: recorded.path.clone(),
+                        reason: error.to_string(),
+                    }),
+                },
+            }
+        }
     }
 }
 

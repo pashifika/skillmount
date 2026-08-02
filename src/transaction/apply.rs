@@ -24,7 +24,9 @@ use crate::checkpoint::{Checkpoint, reached};
 use crate::domain::LinkMode;
 use crate::error::{AppError, LinkError, PlanError};
 use crate::journal::{ActionOperation, ActionStatus, RecordedKind, TransactionStatus};
-use crate::link::{EntryKind, LinkRequest, PlacementOutcome};
+use crate::link::{
+    CreatedLink, EntryKind, LinkRequest, OwnedDirectory, PlacementOutcome, PlacementResidue,
+};
 use crate::mount::PathPrecondition;
 
 use super::Transaction;
@@ -186,26 +188,54 @@ impl Transaction {
         // Placement is the point of no return for the destination, and it is the one operation the
         // backend guarantees is atomic and never replaces. A destination that appeared since the
         // precondition check therefore loses the race safely: nothing is overwritten and the staged
-        // entry is still ours to roll back.
+        // pathname remains available for an ownership-verified rollback attempt.
         let placed = match staged {
             Staged::Link(link) => match self.backend.place_no_replace(&link, &final_path)? {
-                PlacementOutcome::Placed(_) => true,
-                PlacementOutcome::DestinationExists => false,
+                PlacementOutcome::Placed(placed) => Placed::Link(placed),
+                PlacementOutcome::DestinationExists => {
+                    return Err(Self::drift(
+                        &final_path,
+                        "another process created the destination after this plan was built",
+                    ));
+                }
+                PlacementOutcome::OwnershipMismatch(residue) => {
+                    return Err(self.placement_failure(index, &residue));
+                }
             },
-            Staged::Directory => matches!(
-                self.backend
-                    .place_path_no_replace(&temporary, &final_path)?,
-                crate::link::PathPlacement::Placed
-            ),
+            Staged::Directory(directory) => {
+                match self
+                    .backend
+                    .place_directory_no_replace(&directory, &final_path)?
+                {
+                    PlacementOutcome::Placed(placed) => Placed::Directory(placed),
+                    PlacementOutcome::DestinationExists => {
+                        return Err(Self::drift(
+                            &final_path,
+                            "another process created the destination after this plan was built",
+                        ));
+                    }
+                    PlacementOutcome::OwnershipMismatch(residue) => {
+                        return Err(self.placement_failure(index, &residue));
+                    }
+                }
+            }
         };
-        if !placed {
-            return Err(Self::drift(
-                &final_path,
-                "another process created the destination after this plan was built",
-            ));
-        }
         reached(Checkpoint::FinalPlaced, sequence);
 
+        match placed {
+            Placed::Link(link) => {
+                self.journal.actions[index]
+                    .identity
+                    .clone_from(&link.identity);
+                self.journal.actions[index].kind = link.kind.into();
+                self.journal.actions[index].link_target = Some(link.target);
+            }
+            Placed::Directory(directory) => {
+                self.journal.actions[index]
+                    .identity
+                    .clone_from(&directory.identity);
+            }
+        }
         self.journal.actions[index].status = ActionStatus::Applied;
         self.persist()?;
         reached(Checkpoint::ActionApplied, sequence);
@@ -221,9 +251,11 @@ impl Transaction {
         match self.journal.actions[index].operation {
             ActionOperation::CreateDirectory => {
                 let created = self.backend.create_directory(temporary)?;
-                self.journal.actions[index].identity = created.identity;
+                self.journal.actions[index]
+                    .identity
+                    .clone_from(&created.identity);
                 self.journal.actions[index].kind = RecordedKind::Directory;
-                Ok(Staged::Directory)
+                Ok(Staged::Directory(created))
             }
             ActionOperation::CreateDirectoryLink => {
                 let source = self.journal.actions[index]
@@ -281,6 +313,23 @@ impl Transaction {
         })
     }
 
+    /// Records a placement result that must be reported but not repaired by this apply attempt.
+    fn placement_failure(&mut self, index: usize, residue: &PlacementResidue) -> AppError {
+        let reason = format!(
+            "placement could not prove ownership: {}; the entry was retained",
+            residue.mismatch.label()
+        );
+        let action_id = self.journal.actions[index].id;
+        self.placement_residue.insert(
+            action_id,
+            super::cleanup::RetainedEntry {
+                path: residue.path.clone(),
+                reason: reason.clone(),
+            },
+        );
+        Self::drift(&residue.path, &reason)
+    }
+
     /// Records a failure that happened before anything could have been created.
     fn fail_without_rollback(cause: AppError) -> Box<ApplyFailure> {
         Box::new(ApplyFailure {
@@ -293,8 +342,14 @@ impl Transaction {
 
 /// What was created at the staged path, carried between staging and placement.
 enum Staged {
-    Link(crate::link::CreatedLink),
-    Directory,
+    Link(CreatedLink),
+    Directory(OwnedDirectory),
+}
+
+/// Verified evidence relocated to an action's final path.
+enum Placed {
+    Link(CreatedLink),
+    Directory(OwnedDirectory),
 }
 
 /// Maps a recorded kind back to the link mode the backend should honour.

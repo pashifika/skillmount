@@ -19,7 +19,9 @@ expose on the supported release targets:
   The specification requires placement to fail instead, and the design states that "a backend that
   cannot guarantee no replacement returns unsupported before plan application; it does not emulate
   the operation with a check-then-rename race". The flags that forbid replacement —
-  `renameatx_np(RENAME_EXCL)` and `MoveFileExW` with no flags — have no safe wrapper.
+  `renameatx_np(RENAME_EXCL)` and handle-bound
+  [`SetFileInformationByHandle(FileRenameInfo)`][set-info] with `ReplaceIfExists = false` — have no
+  safe wrapper.
 - **Junction creation.** `std::os::windows::fs` creates directory symbolic links only. Writing a
   mount-point reparse buffer requires `DeviceIoControl` with `FSCTL_SET_REPARSE_POINT`.
 - **Reparse-tag inspection.** `std::fs::symlink_metadata` reports both a symbolic link and a
@@ -29,6 +31,11 @@ expose on the supported release targets:
 - **Stable file identity.** `MetadataExt::volume_serial_number` and `MetadataExt::file_index` are
   behind the unstable `windows_by_handle` feature. Ownership verification and link-cycle detection
   both want a real identity rather than a path spelling.
+- **Object-bound rename and removal.** A pathname check followed by `MoveFileExW` or
+  `RemoveDirectoryW` can act on a replacement. Windows can instead retain the no-follow handle that
+  supplied attributes, identity, and reparse data. [`FILE_RENAME_INFO`][rename-info] renames that
+  object without replacement, and [`FILE_DISPOSITION_INFO`][disposition-info] deletes that object.
+  The standard library exposes neither handle mutation nor the variable-length rename layout.
 - **Durable journal replacement on Windows.** `std::fs::rename` replaces a journal but exposes no
   write-through option. The journal must not authorize the next filesystem mutation until its
   namespace replacement is durable, so the audited boundary also wraps `MoveFileExW` with
@@ -45,17 +52,21 @@ normative requirement, or move to `deny` and make every exception explicit and r
 `Cargo.toml` sets `unsafe_code = "deny"`. Exactly two modules carry `#![allow(unsafe_code)]`:
 `src/link/unix_ffi.rs` and `src/link/windows_ffi.rs`. No other module may add one.
 
+[set-info]: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileinformationbyhandle
+[rename-info]: https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_rename_info
+[disposition-info]: https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_disposition_info
+
 Both modules follow the same rules, which a reviewer can check by reading the two files:
 
-- one `libc` or Win32 call per function, wrapped so the caller sees `io::Result` and owned Rust
-  values;
+- one focused filesystem operation per wrapper, with every `libc` or Win32 failure converted to
+  `io::Error` before it leaves the boundary and only owned Rust values returned;
 - no `libc` or `windows_sys` type crosses the module boundary;
 - every `unsafe` block carries a `SAFETY` comment naming the invariant that makes it sound;
 - handles are adopted into `std::os::windows::io::OwnedHandle`, so closing them is the standard
   library's responsibility and no `Drop` implementation here can leak or double-close one;
-- raw buffer layout arithmetic lives outside the `unsafe` modules, in `src/link/reparse.rs` and
-  `src/link/winpath.rs`, which are ordinary safe code compiled under `cfg(any(windows, test))` so
-  their bounds checks and rejections are exercised on every host.
+- reparse-buffer codec arithmetic lives in safe `src/link/reparse.rs`; the Win32-required
+  variable-length `FILE_RENAME_INFO` allocation stays inside `src/link/windows_ffi.rs`, uses checked
+  byte arithmetic and aligned owned storage, and has x86/x64 ABI layout tests.
 
 ## Alternatives
 
@@ -102,12 +113,9 @@ allows: it makes new `unsafe` invisible in review anywhere in the crate, while b
   branch uses `renameat2(RENAME_NOREPLACE)`; any other Unix fails closed.
 - `windows-sys` requires Rust 1.71 and `libc` requires 1.65, both below the crate MSRV of 1.85.0, so
   the MSRV is unchanged.
-- Follow-up, deliberately not taken here: `physical_identity` in `src/lock.rs` still falls back to
-  the canonical path on Windows. The volume-serial and file-index pair it wanted is now reachable
-  through `src/link/windows_ffi.rs`, but adopting it means replacing `PhysicalIdentity` with the
-  link layer's `PlatformIdentity` across the public lock-resource contract, which belongs to the
-  locking change rather than to this one. The stale comment in `src/lock.rs` is updated to point
-  here.
+- The later locking change already made `LockResourceIdentity::physical` use the link layer's
+  `PlatformIdentity`. This hardening reuses that contract; it introduces no second identity type,
+  lock-key version, journal migration, dependency, or compatibility-matrix change.
 
 ## Verification
 
@@ -122,6 +130,9 @@ allows: it makes new `unsafe` invisible in review anywhere in the crate, while b
 - `src/link/unix_tests.rs::exactly_one_of_two_racing_placements_wins_the_destination` and its
   Windows counterpart run two real threads through one destination and require exactly one winner.
   A check-then-rename emulation fails these.
+- Windows native tests replace staged and removal pathnames after handle verification and require
+  placement or disposition to affect the verified object while preserving the replacement. The
+  `FILE_RENAME_INFO` layout test runs under both native x86 and x64 jobs.
 - `tests/read_only.rs` continues to snapshot the project, the Skill source, and a redirected home
   directory around every `inspect` and `--dry-run` path, so the new no-follow handle opens cannot
   become writes without a failure.

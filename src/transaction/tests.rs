@@ -13,8 +13,10 @@ use super::{Transaction, recover};
 use crate::app::{ReadOnlyOutcome, plan_read_only};
 use crate::cli::{ParsedCommand, parse_command_from};
 use crate::domain::RunContext;
+use crate::error::LinkError;
 use crate::journal::{ActionStatus, TransactionStatus, store};
-use crate::link::OwnershipMismatch;
+use crate::link::testing::{HookPoint, with_hook};
+use crate::link::{OwnershipMismatch, platform_backend};
 use crate::lock::acquire::{HeldLocks, LockOwner, LockPolicy};
 use crate::paths::resolve_session;
 use crate::state::testing::StateRootGuard;
@@ -318,6 +320,216 @@ fn a_destination_that_appears_after_planning_stops_the_apply_and_rolls_back() {
         failure.into_error().category(),
         crate::error::ExitCategory::Filesystem
     );
+}
+
+#[test]
+fn a_staged_replacement_is_retained_and_never_recorded_as_applied() {
+    let session = Session::codex("txn-staged-replacement", &["alpha"], &[]);
+    let project = session.project();
+    let mounted = project.join(".codex/skills/alpha");
+    let (mut transaction, _locks) = session.open();
+    let hook_destination = mounted.clone();
+
+    let failure = with_hook(
+        move |event| {
+            if event.point == HookPoint::BeforePlacementVerification
+                && event.destination.as_deref() == Some(hook_destination.as_path())
+            {
+                remove_directory_link(&event.path);
+                fs::create_dir_all(event.path.join("their-own-work"))
+                    .expect("the staged replacement is created");
+            }
+            Ok(())
+        },
+        || transaction.apply(),
+    )
+    .expect_err("placement must refuse the replacement");
+
+    let journal = on_disk(&transaction);
+    let action = journal
+        .actions
+        .iter()
+        .find(|action| action.final_path == mounted)
+        .expect("the Skill link action is recorded");
+    let temporary = action
+        .temporary_path
+        .as_ref()
+        .expect("an owned action has a staged path");
+    let replacement = platform_backend()
+        .inspect_no_follow(temporary)
+        .expect("the replacement is inspectable");
+
+    assert_eq!(action.status, ActionStatus::Staged);
+    assert_ne!(
+        action.identity, replacement.identity,
+        "the replacement identity must never become transaction evidence"
+    );
+    assert!(temporary.join("their-own-work").is_dir());
+    assert!(
+        failure
+            .retained
+            .iter()
+            .any(|entry| entry.path == *temporary)
+    );
+    assert_eq!(journal.status, TransactionStatus::Failed);
+}
+
+#[test]
+fn a_destination_created_at_the_placement_boundary_is_preserved() {
+    let session = Session::codex("txn-placement-contention", &["alpha"], &[]);
+    let mounted = session.project().join(".codex/skills/alpha");
+    let (mut transaction, _locks) = session.open();
+    let hook_destination = mounted.clone();
+
+    let failure = with_hook(
+        move |event| {
+            if event.point == HookPoint::BeforePlacementMutation
+                && event.destination.as_deref() == Some(hook_destination.as_path())
+            {
+                fs::create_dir_all(hook_destination.join("their-own-work"))
+                    .expect("the contending destination is created");
+            }
+            Ok(())
+        },
+        || transaction.apply(),
+    )
+    .expect_err("no-replace placement must lose safely");
+
+    assert!(mounted.join("their-own-work").is_dir());
+    assert!(
+        failure
+            .cause
+            .to_string()
+            .contains("another process created the destination"),
+        "{}",
+        failure.cause
+    );
+    let journal = on_disk(&transaction);
+    let action = journal
+        .actions
+        .iter()
+        .find(|action| action.final_path == mounted)
+        .expect("the Skill link action is recorded");
+    assert_eq!(
+        action.status,
+        ActionStatus::RolledBack,
+        "the still-owned staged entry is removed without touching the contender"
+    );
+}
+
+#[test]
+fn an_ambiguous_final_entry_is_retained_by_rollback_and_recovery() {
+    let session = Session::codex("txn-final-residue", &["alpha"], &[]);
+    let mounted = session.project().join(".codex/skills/alpha");
+    let displaced = session.project().join(".codex/skills/displaced-alpha");
+    let (mut transaction, locks) = session.open();
+    let journal_path = transaction.journal_path().to_path_buf();
+    let hook_destination = mounted.clone();
+    let hook_displaced = displaced.clone();
+
+    let failure = with_hook(
+        move |event| {
+            if event.point == HookPoint::AfterPlacementMutation && event.path == hook_destination {
+                fs::rename(&event.path, &hook_displaced)
+                    .expect("the placed entry is moved while its backend handle remains open");
+                fs::create_dir_all(event.path.join("their-own-work"))
+                    .expect("the final replacement is created");
+            }
+            Ok(())
+        },
+        || transaction.apply(),
+    )
+    .expect_err("post-placement ownership must be proved");
+
+    assert!(mounted.join("their-own-work").is_dir());
+    assert!(failure.retained.iter().any(|entry| entry.path == mounted));
+    assert!(journal_path.exists(), "rollback must retain its evidence");
+    drop(failure);
+    drop(transaction);
+    drop(locks);
+
+    let mut recovery_locks = HeldLocks::default();
+    let recovery = recover::recover_stale(&mut recovery_locks).expect("recovery reports residue");
+
+    assert!(mounted.join("their-own-work").is_dir());
+    assert!(
+        recovery
+            .reconciled
+            .iter()
+            .flat_map(|entry| &entry.report.retained)
+            .any(|entry| entry.path == mounted),
+        "{recovery:?}"
+    );
+    assert!(
+        journal_path.exists(),
+        "ambiguous recovery keeps the journal"
+    );
+    assert!(session.source("alpha").join("SKILL.md").is_file());
+    remove_directory_link(&displaced);
+}
+
+#[test]
+fn failed_creation_reports_its_original_cause_and_unproved_staged_residue() {
+    let session = Session::codex("txn-create-residue", &["alpha"], &[]);
+    let (mut transaction, _locks) = session.open();
+    let staged = transaction
+        .journal()
+        .actions
+        .iter()
+        .find(|action| action.operation == crate::journal::ActionOperation::CreateDirectoryLink)
+        .and_then(|action| action.temporary_path.clone())
+        .expect("the link action has a staged path");
+    let hook_staged = staged.clone();
+
+    let failure = with_hook(
+        move |event| {
+            if event.point == HookPoint::AfterLinkCreation && event.path == hook_staged {
+                return Err(LinkError::Inspect {
+                    path: hook_staged.clone(),
+                    reason: "injected post-create inspection failure".to_owned(),
+                });
+            }
+            Ok(())
+        },
+        || transaction.apply(),
+    )
+    .expect_err("unproved creation must stop apply and retain evidence");
+
+    assert!(
+        failure
+            .cause
+            .to_string()
+            .contains("injected post-create inspection failure"),
+        "the original creation cause must survive: {failure}"
+    );
+    assert!(
+        failure.retained.iter().any(|entry| entry.path == staged),
+        "rollback must report the undecided staged path: {:?}",
+        failure.retained
+    );
+    assert!(
+        staged.is_symlink(),
+        "the unproved entry is not path-deleted"
+    );
+    let journal = on_disk(&transaction);
+    assert_eq!(journal.status, TransactionStatus::Failed);
+    assert!(
+        journal
+            .errors
+            .iter()
+            .any(|error| error.contains("injected post-create inspection failure")),
+        "the original cause must be durable: {:?}",
+        journal.errors
+    );
+    assert!(
+        journal.errors.iter().any(
+            |error| error.contains("retained") && error.contains(&staged.display().to_string())
+        ),
+        "the retained path must be durable: {:?}",
+        journal.errors
+    );
+
+    remove_directory_link(&staged);
 }
 
 #[test]

@@ -13,10 +13,12 @@ use crate::domain::LinkMode;
 use crate::error::LinkError;
 use crate::link::resolve::{ChainState, resolve_chain};
 use crate::link::{
-    CreatedLink, CreatedLinkKind, EntryKind, LinkRequest, OwnershipMismatch, PlacementOutcome,
-    RemoveOutcome, platform_backend,
+    CreatedLink, CreatedLinkKind, EntryKind, LinkRequest, OwnershipMismatch, PlacementMismatch,
+    PlacementOutcome, RemoveOutcome, platform_backend,
 };
 use crate::test_support::TestDir;
+
+use super::testing::{HookPoint, with_hook};
 
 /// The file every source directory carries, so a test can prove removal never reached it.
 const SENTINEL: &str = "SKILL.md";
@@ -72,6 +74,13 @@ fn stage(source: &Path, staged: &Path, mode: LinkMode) -> Result<CreatedLink, Li
     })
 }
 
+fn injected_hook_error(path: &Path, boundary: &str) -> LinkError {
+    LinkError::Inspect {
+        path: path.to_path_buf(),
+        reason: format!("injected failure at {boundary}"),
+    }
+}
+
 #[test]
 fn a_staged_link_is_placed_removed_and_leaves_its_source_untouched() {
     let fixture = Fixture::new("unix-lifecycle");
@@ -122,6 +131,60 @@ fn a_staged_link_is_placed_removed_and_leaves_its_source_untouched() {
 }
 
 #[test]
+fn failed_post_create_link_inspection_retains_the_staged_path() {
+    let fixture = Fixture::new("unix-create-residue");
+    let source = fixture.source("source");
+    let staged = fixture.path("staged");
+    let hook_path = staged.clone();
+
+    let error = with_hook(
+        move |event| {
+            if event.point == HookPoint::AfterLinkCreation && event.path == hook_path {
+                return Err(injected_hook_error(&hook_path, "link creation"));
+            }
+            Ok(())
+        },
+        || stage(&source, &staged, LinkMode::Auto),
+    )
+    .expect_err("an unproved created link must not be deleted by pathname");
+
+    assert!(matches!(error, LinkError::Create { .. }));
+    assert!(error.to_string().contains("retained staged path"));
+    assert!(
+        staged.is_symlink(),
+        "the ambiguous staged entry is retained"
+    );
+    fs::remove_file(&staged).expect("the fixture-owned residue is cleaned up");
+    assert_source_intact(&source);
+}
+
+#[test]
+fn failed_post_create_directory_inspection_retains_the_staged_path() {
+    let fixture = Fixture::new("unix-directory-create-residue");
+    let staged = fixture.path("staged");
+    let hook_path = staged.clone();
+
+    let error = with_hook(
+        move |event| {
+            if event.point == HookPoint::AfterDirectoryCreation && event.path == hook_path {
+                return Err(injected_hook_error(&hook_path, "directory creation"));
+            }
+            Ok(())
+        },
+        || platform_backend().create_directory(&staged),
+    )
+    .expect_err("an unproved created directory must not be deleted by pathname");
+
+    assert!(matches!(error, LinkError::Create { .. }));
+    assert!(error.to_string().contains("retained staged path"));
+    assert!(
+        staged.is_dir(),
+        "the ambiguous staged directory is retained"
+    );
+    fs::remove_dir(&staged).expect("the fixture-owned residue is cleaned up");
+}
+
+#[test]
 fn placement_preserves_a_destination_that_appeared_after_staging() {
     let fixture = Fixture::new("unix-placement-conflict");
     let source = fixture.source("skills/rust");
@@ -144,6 +207,131 @@ fn placement_preserves_a_destination_that_appeared_after_staging() {
         "the staged entry stays available for verified rollback"
     );
     assert_source_intact(&source);
+}
+
+#[test]
+fn placement_refuses_a_replacement_visible_before_the_final_rename() {
+    let fixture = Fixture::new("unix-placement-precheck-replacement");
+    let source = fixture.source("source");
+    let replacement_source = fixture.source("replacement-source");
+    let staged = fixture.path("staged");
+    let destination = fixture.path("destination");
+    let created = stage(&source, &staged, LinkMode::Auto).expect("creation succeeds");
+    let hook_staged = staged.clone();
+    let hook_target = replacement_source.clone();
+
+    let outcome = with_hook(
+        move |event| {
+            if event.point == HookPoint::BeforePlacementVerification && event.path == hook_staged {
+                fs::remove_file(&hook_staged).expect("the fixture removes the recorded link");
+                std::os::unix::fs::symlink(&hook_target, &hook_staged)
+                    .expect("a replacement takes the staged pathname");
+            }
+            Ok(())
+        },
+        || platform_backend().place_no_replace(&created, &destination),
+    )
+    .expect("a mismatch is a typed outcome");
+
+    assert!(matches!(
+        outcome,
+        PlacementOutcome::OwnershipMismatch(ref residue)
+            if residue.path == staged
+                && matches!(residue.mismatch, PlacementMismatch::Ownership(_))
+    ));
+    assert!(staged.is_symlink(), "the replacement is left untouched");
+    assert!(
+        !destination.exists(),
+        "placement performs no destination mutation"
+    );
+    fs::remove_file(&staged).expect("the fixture-owned replacement is cleaned up");
+    assert_source_intact(&source);
+    assert_source_intact(&replacement_source);
+}
+
+#[test]
+fn placement_retains_a_final_replacement_crossing_the_pathname_window() {
+    let fixture = Fixture::new("unix-placement-postcheck-replacement");
+    let source = fixture.source("source");
+    let replacement_source = fixture.source("replacement-source");
+    let staged = fixture.path("staged");
+    let destination = fixture.path("destination");
+    let displaced = fixture.path("displaced");
+    let created = stage(&source, &staged, LinkMode::Auto).expect("creation succeeds");
+    let hook_destination = destination.clone();
+    let hook_displaced = displaced.clone();
+    let hook_target = replacement_source.clone();
+
+    let outcome = with_hook(
+        move |event| {
+            if event.point == HookPoint::AfterPlacementMutation && event.path == hook_destination {
+                fs::rename(&hook_destination, &hook_displaced)
+                    .expect("the fixture moves the placed link out of the way");
+                std::os::unix::fs::symlink(&hook_target, &hook_destination)
+                    .expect("a replacement takes the destination pathname");
+            }
+            Ok(())
+        },
+        || platform_backend().place_no_replace(&created, &destination),
+    )
+    .expect("a post-placement mismatch is a typed outcome");
+
+    assert!(matches!(
+        outcome,
+        PlacementOutcome::OwnershipMismatch(ref residue)
+            if residue.path == destination
+                && matches!(residue.mismatch, PlacementMismatch::Ownership(_))
+    ));
+    assert!(
+        destination.is_symlink(),
+        "the final replacement is retained"
+    );
+    assert!(
+        displaced.is_symlink(),
+        "the originally placed link is not lost"
+    );
+    assert_source_intact(&source);
+    assert_source_intact(&replacement_source);
+    fs::remove_file(&destination).expect("the fixture-owned replacement is cleaned up");
+    fs::remove_file(&displaced).expect("the fixture-owned original is cleaned up");
+}
+
+#[test]
+fn helper_directory_postcheck_retains_a_replacement_instead_of_claiming_it() {
+    let fixture = Fixture::new("unix-directory-placement-postcheck");
+    let backend = platform_backend();
+    let staged = fixture.path("staged");
+    let destination = fixture.path("destination");
+    let created = backend
+        .create_directory(&staged)
+        .expect("directory creation succeeds");
+    let hook_destination = destination.clone();
+
+    let outcome = with_hook(
+        move |event| {
+            if event.point == HookPoint::AfterPlacementMutation && event.path == hook_destination {
+                fs::remove_dir(&hook_destination)
+                    .expect("the fixture removes the placed empty directory");
+                fs::create_dir(&hook_destination)
+                    .expect("a replacement directory takes the destination");
+            }
+            Ok(())
+        },
+        || backend.place_directory_no_replace(&created, &destination),
+    )
+    .expect("a post-placement mismatch is a typed outcome");
+
+    assert!(matches!(
+        outcome,
+        PlacementOutcome::OwnershipMismatch(ref residue)
+            if residue.path == destination
+                && matches!(residue.mismatch, PlacementMismatch::Ownership(_))
+    ));
+    assert!(
+        destination.is_dir(),
+        "the replacement directory is retained"
+    );
+    fs::remove_dir(&destination).expect("the fixture-owned replacement is cleaned up");
 }
 
 #[test]
@@ -252,6 +440,41 @@ fn removal_refuses_a_link_that_now_points_somewhere_else() {
     );
     assert!(destination.is_symlink(), "the replacement is left in place");
     assert_source_intact(&elsewhere);
+}
+
+#[test]
+fn removal_rechecks_after_the_test_boundary_and_retains_a_replacement() {
+    let fixture = Fixture::new("unix-removal-final-recheck");
+    let source = fixture.source("source");
+    let replacement_source = fixture.source("replacement-source");
+    let path = fixture.path("mounted");
+    let created = stage(&source, &path, LinkMode::Auto).expect("creation succeeds");
+    let hook_path = path.clone();
+    let hook_target = replacement_source.clone();
+
+    let outcome = with_hook(
+        move |event| {
+            if event.point == HookPoint::BeforeRemovalMutation && event.path == hook_path {
+                fs::remove_file(&hook_path).expect("the fixture removes the verified link");
+                std::os::unix::fs::symlink(&hook_target, &hook_path)
+                    .expect("a replacement takes the pathname before the final recheck");
+            }
+            Ok(())
+        },
+        || platform_backend().remove_link_entry(&created),
+    )
+    .expect("a replacement is reported rather than removed");
+
+    assert!(matches!(
+        outcome,
+        RemoveOutcome::OwnershipMismatch(
+            OwnershipMismatch::TargetChanged | OwnershipMismatch::IdentityChanged
+        )
+    ));
+    assert!(path.is_symlink(), "the replacement remains at the pathname");
+    assert_source_intact(&source);
+    assert_source_intact(&replacement_source);
+    fs::remove_file(&path).expect("the fixture-owned replacement is cleaned up");
 }
 
 #[test]

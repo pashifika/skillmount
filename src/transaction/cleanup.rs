@@ -200,6 +200,10 @@ impl Transaction {
             let Some(index) = self.journal.actions.iter().position(|a| a.id == id) else {
                 continue;
             };
+            if let Some(retained) = self.placement_residue.get(&id) {
+                report.retained.push(retained.clone());
+                continue;
+            }
             let action = self.journal.actions[index].clone();
             let outcome = self.clear_action(&action, sequence, &mut report);
 

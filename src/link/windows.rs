@@ -14,18 +14,22 @@
 use std::fs;
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::os::windows::fs::MetadataExt;
+use std::os::windows::io::OwnedHandle;
 use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD;
-use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+};
 
 use crate::domain::LinkMode;
 use crate::error::LinkError;
 use crate::link::resolve::targets_match;
 use crate::link::{
     CreatedLink, CreatedLinkKind, EntryKind, LinkBackend, LinkRequest, LinkTarget, OwnedDirectory,
-    Ownership, PathEntry, PathPlacement, PlatformIdentity, RemoveOutcome, sealed, verify_ownership,
+    Ownership, PathEntry, PlacementMismatch, PlacementOutcome, PlacementResidue, PlatformIdentity,
+    RemoveOutcome, directory_placement_mismatch, link_placement_mismatch, sealed,
+    verify_directory_ownership, verify_ownership,
 };
 
 use super::reparse::{self, IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK};
@@ -35,75 +39,20 @@ use super::winpath;
 /// The Windows backend.
 pub(super) struct WindowsBackend;
 
+/// One entry observed through the same no-follow handle retained for a possible mutation.
+struct OpenedEntry {
+    handle: OwnedHandle,
+    entry: PathEntry,
+}
+
 impl sealed::Sealed for WindowsBackend {}
 
 impl LinkBackend for WindowsBackend {
     fn inspect_no_follow(&self, path: &Path) -> Result<PathEntry, LinkError> {
-        let metadata = match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(PathEntry::plain(path, EntryKind::Missing));
-            }
-            Err(error) => return Err(inspect_error(path, &error)),
-        };
-
-        // The handle is opened without traversal, so every value read through it describes the
-        // entry itself and never the directory it may point at.
-        //
-        // A failure here is not an inspection failure. `symlink_metadata` already succeeded, so
-        // the entry exists and its attributes are known; another process holding it without
-        // sharing must not turn a classification into an error. What is lost is the identity and,
-        // for a reparse point, the tag — and an entry whose tag cannot be read is reported as
-        // unsupported rather than guessed at, which is the fail-closed answer: it can back no
-        // namespace and can never be mistaken for a link this process owns.
-        let handle = windows_ffi::open_no_follow(path, Access::Inspect).ok();
-        let identity = handle
-            .as_ref()
-            .and_then(|handle| windows_ffi::file_identity(handle).ok())
-            .map(platform_identity);
-
-        let plain = |kind| {
-            Ok(PathEntry {
-                path: path.to_path_buf(),
-                kind,
-                target: None,
-                identity: identity.clone(),
-            })
-        };
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
-            return plain(attribute_kind(&metadata));
-        }
-
-        let decoded = handle
-            .and_then(|handle| windows_ffi::read_reparse_point(&handle).ok())
-            .map(|buffer| reparse::parse(&buffer));
-        let point = match decoded {
-            Some(Ok(point)) => point,
-            // A tag this backend does not own but which is *not* a name surrogate does not
-            // redirect: a cloud placeholder, a deduplication stub, a WIM-backed file. Windows
-            // resolves those as the ordinary directory or file their attributes describe, and so
-            // must this — reporting them as unusable would refuse a Skill store for living in a
-            // synced folder.
-            Some(Err(reparse::ReparseError::UnsupportedTag(tag)))
-                if !reparse::is_name_surrogate(tag) =>
-            {
-                return plain(attribute_kind(&metadata));
-            }
-            // A surrogate tag this backend cannot decode *does* redirect, somewhere it cannot
-            // describe, so it stays unusable. So does a buffer it could not read at all.
-            _ => return plain(EntryKind::Other),
-        };
-        let kind = match point.tag {
-            IO_REPARSE_TAG_MOUNT_POINT => EntryKind::Junction,
-            IO_REPARSE_TAG_SYMLINK => EntryKind::Symlink,
-            _ => EntryKind::Other,
-        };
-        Ok(PathEntry {
-            path: path.to_path_buf(),
-            kind,
-            target: Some(link_target(path, &point.substitute_name)),
-            identity,
-        })
+        Ok(Self::open_entry(path, Access::Inspect)?.map_or_else(
+            || PathEntry::plain(path, EntryKind::Missing),
+            |opened| opened.entry,
+        ))
     }
 
     fn canonical_directory(&self, path: &Path) -> Result<PathBuf, LinkError> {
@@ -130,25 +79,64 @@ impl LinkBackend for WindowsBackend {
 
         if request.mode == LinkMode::Junction {
             check_junction_eligibility(self, request, &source_canonical)?;
-            return self.create_junction(request, &source_canonical);
+            return Self::create_junction(request, &source_canonical);
         }
 
         let error = match std::os::windows::fs::symlink_dir(&source_canonical, &request.staged_path)
         {
             Ok(()) => {
-                // Same rollback as `create_junction`: `RemoveDirectoryW` is also what detaches
-                // a directory symbolic link.
-                let created = self
-                    .inspect_no_follow(&request.staged_path)
-                    .inspect_err(|_| {
-                        let _ = windows_ffi::remove_directory_entry(&request.staged_path);
-                    })?;
+                #[cfg(test)]
+                if let Err(error) = super::testing::reach_hook(
+                    super::testing::HookPoint::AfterLinkCreation,
+                    &request.staged_path,
+                    None,
+                ) {
+                    return Err(retained_create_error(request, &error.to_string()));
+                }
+                let opened = match Self::open_entry(&request.staged_path, Access::Delete) {
+                    Ok(Some(opened)) => opened,
+                    Ok(None) => {
+                        return Err(retained_create_error(
+                            request,
+                            "the created symbolic link disappeared before ownership could be proved",
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(retained_create_error(request, &error.to_string()));
+                    }
+                };
+                let target = match opened.entry.target.as_ref() {
+                    Some(target)
+                        if opened.entry.kind == EntryKind::Symlink
+                            && targets_match(&source_canonical, &target.raw) =>
+                    {
+                        target.raw.clone()
+                    }
+                    _ => {
+                        return Err(retained_create_error(
+                            request,
+                            "the staged entry could not be proved to be the symbolic link just created",
+                        ));
+                    }
+                };
+                #[cfg(test)]
+                if let Err(error) = super::testing::reach_hook(
+                    super::testing::HookPoint::AfterLinkVerification,
+                    &request.staged_path,
+                    None,
+                ) {
+                    return Err(rollback_create_error(
+                        request,
+                        &opened.handle,
+                        &error.to_string(),
+                    ));
+                }
                 return Ok(CreatedLink {
                     path: request.staged_path.clone(),
                     kind: CreatedLinkKind::Symlink,
-                    target: source_canonical.clone(),
+                    target,
                     source_canonical,
-                    identity: created.identity,
+                    identity: opened.entry.identity,
                 });
             }
             Err(error) => error,
@@ -157,7 +145,7 @@ impl LinkBackend for WindowsBackend {
         match classify_symlink_failure(request.mode, &error) {
             SymlinkFailure::FallBackToJunction => {
                 check_junction_eligibility(self, request, &source_canonical)?;
-                self.create_junction(request, &source_canonical)
+                Self::create_junction(request, &source_canonical)
             }
             SymlinkFailure::MissingPrivilege => Err(create_error(
                 request,
@@ -171,117 +159,452 @@ impl LinkBackend for WindowsBackend {
     }
 
     fn create_directory(&self, path: &Path) -> Result<OwnedDirectory, LinkError> {
-        super::create_directory_entry(self, path)
+        fs::create_dir(path).map_err(|error| directory_create_error(path, error.to_string()))?;
+        #[cfg(test)]
+        if let Err(error) = super::testing::reach_hook(
+            super::testing::HookPoint::AfterDirectoryCreation,
+            path,
+            None,
+        ) {
+            return Err(retained_directory_create_error(path, &error.to_string()));
+        }
+        let opened = match Self::open_entry(path, Access::Inspect) {
+            Ok(Some(opened)) => opened,
+            Ok(None) => {
+                return Err(retained_directory_create_error(
+                    path,
+                    "the created directory disappeared before ownership could be proved",
+                ));
+            }
+            Err(error) => {
+                return Err(retained_directory_create_error(path, &error.to_string()));
+            }
+        };
+        if opened.entry.kind != EntryKind::Directory || opened.entry.identity.is_none() {
+            return Err(retained_directory_create_error(
+                path,
+                "the staged entry could not be proved to be the directory just created",
+            ));
+        }
+        Ok(OwnedDirectory {
+            path: path.to_path_buf(),
+            identity: opened.entry.identity,
+        })
     }
 
-    fn place_path_no_replace(
+    fn place_no_replace(
         &self,
-        staged: &Path,
+        staged: &CreatedLink,
         destination: &Path,
-    ) -> Result<PathPlacement, LinkError> {
-        match windows_ffi::rename_no_replace(staged, destination) {
-            Ok(()) => Ok(PathPlacement::Placed),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                Ok(PathPlacement::DestinationExists)
-            }
-            Err(error) => Err(LinkError::Place {
-                staged: staged.to_path_buf(),
-                destination: destination.to_path_buf(),
-                reason: error.to_string(),
-            }),
+    ) -> Result<PlacementOutcome<CreatedLink>, LinkError> {
+        #[cfg(test)]
+        super::testing::reach_hook(
+            super::testing::HookPoint::BeforePlacementVerification,
+            &staged.path,
+            Some(destination),
+        )?;
+        let Some(opened) = Self::open_entry(&staged.path, Access::Delete)? else {
+            return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                path: staged.path.clone(),
+                mismatch: PlacementMismatch::Missing,
+            }));
+        };
+        if let Some(mismatch) = link_placement_mismatch(&opened.entry, staged, |target| {
+            targets_match(&staged.target, &target.raw)
+        }) {
+            return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                path: staged.path.clone(),
+                mismatch,
+            }));
         }
+        #[cfg(test)]
+        super::testing::reach_hook(
+            super::testing::HookPoint::BeforePlacementMutation,
+            &staged.path,
+            Some(destination),
+        )?;
+        if !rename_opened_no_replace(&opened.handle, &staged.path, destination)? {
+            let live = self.inspect_no_follow(&staged.path)?;
+            if let Some(mismatch) = link_placement_mismatch(&live, staged, |target| {
+                targets_match(&staged.target, &target.raw)
+            }) {
+                return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                    path: staged.path.clone(),
+                    mismatch,
+                }));
+            }
+            return Ok(PlacementOutcome::DestinationExists);
+        }
+        #[cfg(test)]
+        super::testing::reach_hook(
+            super::testing::HookPoint::AfterPlacementMutation,
+            destination,
+            None,
+        )?;
+
+        let mut placed = staged.relocated_to(destination);
+        placed.identity.clone_from(&opened.entry.identity);
+        let live = match self.inspect_no_follow(destination) {
+            Ok(live) => live,
+            Err(error) => {
+                return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                    path: destination.to_path_buf(),
+                    mismatch: PlacementMismatch::InspectionFailed(error.to_string()),
+                }));
+            }
+        };
+        if let Some(mismatch) = link_placement_mismatch(&live, &placed, |target| {
+            targets_match(&placed.target, &target.raw)
+        }) {
+            return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                path: destination.to_path_buf(),
+                mismatch,
+            }));
+        }
+        Ok(PlacementOutcome::Placed(placed))
+    }
+
+    fn place_directory_no_replace(
+        &self,
+        staged: &OwnedDirectory,
+        destination: &Path,
+    ) -> Result<PlacementOutcome<OwnedDirectory>, LinkError> {
+        #[cfg(test)]
+        super::testing::reach_hook(
+            super::testing::HookPoint::BeforePlacementVerification,
+            &staged.path,
+            Some(destination),
+        )?;
+        let Some(opened) = Self::open_entry(&staged.path, Access::Delete)? else {
+            return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                path: staged.path.clone(),
+                mismatch: PlacementMismatch::Missing,
+            }));
+        };
+        if let Some(mismatch) = directory_placement_mismatch(&opened.entry, staged) {
+            return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                path: staged.path.clone(),
+                mismatch,
+            }));
+        }
+        #[cfg(test)]
+        super::testing::reach_hook(
+            super::testing::HookPoint::BeforePlacementMutation,
+            &staged.path,
+            Some(destination),
+        )?;
+        if !rename_opened_no_replace(&opened.handle, &staged.path, destination)? {
+            let live = self.inspect_no_follow(&staged.path)?;
+            if let Some(mismatch) = directory_placement_mismatch(&live, staged) {
+                return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                    path: staged.path.clone(),
+                    mismatch,
+                }));
+            }
+            return Ok(PlacementOutcome::DestinationExists);
+        }
+        #[cfg(test)]
+        super::testing::reach_hook(
+            super::testing::HookPoint::AfterPlacementMutation,
+            destination,
+            None,
+        )?;
+
+        let placed = OwnedDirectory {
+            path: destination.to_path_buf(),
+            identity: opened.entry.identity.clone(),
+        };
+        let live = match self.inspect_no_follow(destination) {
+            Ok(live) => live,
+            Err(error) => {
+                return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                    path: destination.to_path_buf(),
+                    mismatch: PlacementMismatch::InspectionFailed(error.to_string()),
+                }));
+            }
+        };
+        if let Some(mismatch) = directory_placement_mismatch(&live, &placed) {
+            return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                path: destination.to_path_buf(),
+                mismatch,
+            }));
+        }
+        Ok(PlacementOutcome::Placed(placed))
     }
 
     fn remove_empty_directory(
         &self,
         recorded: &OwnedDirectory,
     ) -> Result<RemoveOutcome, LinkError> {
-        super::remove_owned_directory(self, recorded)
+        let Some(opened) = Self::open_entry(&recorded.path, Access::Delete)? else {
+            return Ok(RemoveOutcome::AlreadyAbsent);
+        };
+        match verify_directory_ownership(&opened.entry, recorded) {
+            Ownership::Absent => Ok(RemoveOutcome::AlreadyAbsent),
+            Ownership::Mismatch(mismatch) => Ok(RemoveOutcome::OwnershipMismatch(mismatch)),
+            Ownership::Owned => {
+                #[cfg(test)]
+                super::testing::reach_hook(
+                    super::testing::HookPoint::BeforeRemovalMutation,
+                    &recorded.path,
+                    None,
+                )?;
+                match windows_ffi::delete_by_handle(&opened.handle) {
+                    Ok(()) => Ok(RemoveOutcome::Removed),
+                    Err(error) if super::is_not_empty(&error) => Ok(RemoveOutcome::NotEmpty),
+                    Err(error) => Err(LinkError::Remove {
+                        path: recorded.path.clone(),
+                        reason: error.to_string(),
+                    }),
+                }
+            }
+        }
     }
 
     fn remove_link_entry(&self, recorded: &CreatedLink) -> Result<RemoveOutcome, LinkError> {
-        let live = self.inspect_no_follow(&recorded.path)?;
-        match verify_ownership(&live, recorded, |target| {
+        let Some(opened) = Self::open_entry(&recorded.path, Access::Delete)? else {
+            return Ok(RemoveOutcome::AlreadyAbsent);
+        };
+        match verify_ownership(&opened.entry, recorded, |target| {
             targets_match(&recorded.target, &target.raw)
         }) {
             Ownership::Absent => Ok(RemoveOutcome::AlreadyAbsent),
             Ownership::Mismatch(mismatch) => Ok(RemoveOutcome::OwnershipMismatch(mismatch)),
-            // `RemoveDirectoryW` detaches a reparse point. It never descends, which is why no code
-            // path here may reach for a recursive removal.
-            Ownership::Owned => windows_ffi::remove_directory_entry(&recorded.path)
-                .map(|()| RemoveOutcome::Removed)
-                .map_err(|error| LinkError::Remove {
-                    path: recorded.path.clone(),
-                    reason: error.to_string(),
-                }),
+            Ownership::Owned => {
+                #[cfg(test)]
+                super::testing::reach_hook(
+                    super::testing::HookPoint::BeforeRemovalMutation,
+                    &recorded.path,
+                    None,
+                )?;
+                windows_ffi::delete_by_handle(&opened.handle)
+                    .map(|()| RemoveOutcome::Removed)
+                    .map_err(|error| LinkError::Remove {
+                        path: recorded.path.clone(),
+                        reason: error.to_string(),
+                    })
+            }
         }
     }
 }
 
+/// Renames the already-verified open object, returning `false` for destination contention.
+fn rename_opened_no_replace(
+    handle: &OwnedHandle,
+    staged: &Path,
+    destination: &Path,
+) -> Result<bool, LinkError> {
+    match windows_ffi::rename_by_handle_no_replace(handle, destination) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(LinkError::Place {
+            staged: staged.to_path_buf(),
+            destination: destination.to_path_buf(),
+            reason: error.to_string(),
+        }),
+    }
+}
+
 impl WindowsBackend {
+    /// Opens and fully observes one entry without following a reparse point.
+    ///
+    /// Every required value comes from `handle`. The caller may discard it for read-only
+    /// inspection or retain it through a rename/disposition mutation.
+    fn open_entry(path: &Path, access: Access) -> Result<Option<OpenedEntry>, LinkError> {
+        let handle = match windows_ffi::open_no_follow(path, access) {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(inspect_error(path, &error)),
+        };
+        let entry = Self::observe_handle(path, &handle)?;
+        Ok(Some(OpenedEntry { handle, entry }))
+    }
+
+    /// Builds a complete observation from a handle the caller already owns.
+    fn observe_handle(path: &Path, handle: &OwnedHandle) -> Result<PathEntry, LinkError> {
+        let information =
+            windows_ffi::entry_information(handle).map_err(|error| inspect_error(path, &error))?;
+        let identity = Some(platform_identity(information.identity));
+        let plain = |kind| PathEntry {
+            path: path.to_path_buf(),
+            kind,
+            target: None,
+            identity: identity.clone(),
+        };
+
+        let entry = if information.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            plain(attribute_kind(information.attributes))
+        } else {
+            let buffer = windows_ffi::read_reparse_point(handle)
+                .map_err(|error| inspect_error(path, &error))?;
+            match reparse::parse(&buffer) {
+                Ok(point) => {
+                    let kind = match point.tag {
+                        IO_REPARSE_TAG_MOUNT_POINT => EntryKind::Junction,
+                        IO_REPARSE_TAG_SYMLINK => EntryKind::Symlink,
+                        _ => EntryKind::Other,
+                    };
+                    PathEntry {
+                        path: path.to_path_buf(),
+                        kind,
+                        target: Some(link_target(path, &point.substitute_name)),
+                        identity: identity.clone(),
+                    }
+                }
+                // Reparse tags without the name-surrogate bit annotate an ordinary file or
+                // directory rather than redirecting it. Cloud placeholders and deduplication
+                // entries must remain usable as ordinary Skill stores.
+                Err(reparse::ReparseError::UnsupportedTag(tag))
+                    if !reparse::is_name_surrogate(tag) =>
+                {
+                    plain(attribute_kind(information.attributes))
+                }
+                // An unknown name surrogate redirects somewhere this backend cannot describe. It
+                // is an observed but unsupported entry, distinct from an I/O or decoder failure.
+                Err(reparse::ReparseError::UnsupportedTag(_)) => plain(EntryKind::Other),
+                Err(error) => {
+                    return Err(LinkError::Inspect {
+                        path: path.to_path_buf(),
+                        reason: format!("could not decode reparse data: {error}"),
+                    });
+                }
+            }
+        };
+
+        Ok(entry)
+    }
+
     /// Creates a junction and proves the created entry resolves where it was meant to.
     ///
-    /// A junction is an empty directory carrying a mount-point reparse buffer. If anything after
-    /// the directory is created fails, that directory is removed again: `RemoveDirectoryW` on an
-    /// empty directory or a reparse point cannot touch the source.
+    /// A junction is an empty directory carrying a mount-point reparse buffer. Once the new
+    /// directory is opened and identified, the same handle writes, reads back, and if necessary
+    /// rolls back the entry. A failure before that evidence exists leaves the pathname untouched.
     fn create_junction(
-        &self,
         request: &LinkRequest,
         source_canonical: &Path,
     ) -> Result<CreatedLink, LinkError> {
         // `create_dir` fails when the staged path exists, which keeps creation no-replace.
         fs::create_dir(&request.staged_path)
             .map_err(|error| create_error(request, error.to_string()))?;
+        #[cfg(test)]
+        if let Err(error) = super::testing::reach_hook(
+            super::testing::HookPoint::AfterDirectoryCreation,
+            &request.staged_path,
+            None,
+        ) {
+            return Err(retained_create_error(request, &error.to_string()));
+        }
+        let opened = match Self::open_entry(&request.staged_path, Access::WriteReparseData) {
+            Ok(Some(opened)) => opened,
+            Ok(None) => {
+                return Err(retained_create_error(
+                    request,
+                    "the created junction directory disappeared before ownership could be proved",
+                ));
+            }
+            Err(error) => return Err(retained_create_error(request, &error.to_string())),
+        };
+        if opened.entry.kind != EntryKind::Directory || opened.entry.identity.is_none() {
+            return Err(retained_create_error(
+                request,
+                "the staged entry could not be proved to be the junction directory just created",
+            ));
+        }
 
-        self.write_junction_data(request, source_canonical)
-            .inspect_err(|_| {
-                let _ = windows_ffi::remove_directory_entry(&request.staged_path);
-            })
-    }
-
-    fn write_junction_data(
-        &self,
-        request: &LinkRequest,
-        source_canonical: &Path,
-    ) -> Result<CreatedLink, LinkError> {
         let source_wide = to_wide(source_canonical);
         let substitute_name = winpath::to_nt_substitute_name(&source_wide);
-        let buffer = reparse::build_mount_point(&substitute_name, &source_wide)
-            .map_err(|error| create_error(request, error.to_string()))?;
+        let buffer = match reparse::build_mount_point(&substitute_name, &source_wide) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                return Err(rollback_create_error(
+                    request,
+                    &opened.handle,
+                    &error.to_string(),
+                ));
+            }
+        };
+        if let Err(error) = windows_ffi::write_reparse_point(&opened.handle, &buffer) {
+            return Err(rollback_create_error(
+                request,
+                &opened.handle,
+                &error.to_string(),
+            ));
+        }
+        #[cfg(test)]
+        if let Err(error) = super::testing::reach_hook(
+            super::testing::HookPoint::AfterLinkCreation,
+            &request.staged_path,
+            None,
+        ) {
+            return Err(rollback_create_error(
+                request,
+                &opened.handle,
+                &error.to_string(),
+            ));
+        }
 
-        let handle = windows_ffi::open_no_follow(&request.staged_path, Access::WriteReparseData)
-            .map_err(|error| create_error(request, error.to_string()))?;
-        windows_ffi::write_reparse_point(&handle, &buffer)
-            .map_err(|error| create_error(request, error.to_string()))?;
-        drop(handle);
+        Self::finish_junction_creation(request, source_canonical, &opened)
+    }
 
+    /// Reads back and validates the junction through the handle that wrote it.
+    fn finish_junction_creation(
+        request: &LinkRequest,
+        source_canonical: &Path,
+        opened: &OpenedEntry,
+    ) -> Result<CreatedLink, LinkError> {
         // The buffer is written by hand, so the created entry is read back and checked rather than
         // assumed. A junction that decodes to the wrong path would silently mount the wrong Skill.
-        let created = self.inspect_no_follow(&request.staged_path)?;
+        let created = match Self::observe_handle(&request.staged_path, &opened.handle) {
+            Ok(created) => created,
+            Err(error) => {
+                return Err(rollback_create_error(
+                    request,
+                    &opened.handle,
+                    &error.to_string(),
+                ));
+            }
+        };
         if created.kind != EntryKind::Junction {
-            return Err(create_error(
+            return Err(rollback_create_error(
                 request,
-                format!(
+                &opened.handle,
+                &format!(
                     "the created entry is a {} rather than a junction",
                     created.kind.label()
                 ),
             ));
         }
-        let resolves_to_source = created
-            .target
-            .as_ref()
-            .is_some_and(|target| targets_match(source_canonical, &target.resolved));
-        if !resolves_to_source {
-            return Err(create_error(
+        let Some(created_target) = created.target.as_ref() else {
+            return Err(rollback_create_error(
                 request,
-                "the created junction does not resolve to its intended source".to_owned(),
+                &opened.handle,
+                "the created junction has no reparse target",
+            ));
+        };
+        if !targets_match(source_canonical, &created_target.resolved) {
+            return Err(rollback_create_error(
+                request,
+                &opened.handle,
+                "the created junction does not resolve to its intended source",
+            ));
+        }
+        #[cfg(test)]
+        if let Err(error) = super::testing::reach_hook(
+            super::testing::HookPoint::AfterLinkVerification,
+            &request.staged_path,
+            None,
+        ) {
+            return Err(rollback_create_error(
+                request,
+                &opened.handle,
+                &error.to_string(),
             ));
         }
 
         Ok(CreatedLink {
             path: request.staged_path.clone(),
             kind: CreatedLinkKind::Junction,
-            target: from_wide(&substitute_name),
+            target: created_target.raw.clone(),
             source_canonical: source_canonical.to_path_buf(),
             identity: created.identity,
         })
@@ -374,14 +697,12 @@ fn platform_identity(identity: windows_ffi::FileIdentity) -> PlatformIdentity {
     }
 }
 
-/// Classifies an entry from its attributes alone, for everything that does not redirect.
-fn attribute_kind(metadata: &fs::Metadata) -> EntryKind {
-    if metadata.is_dir() {
+/// Classifies an entry from handle attributes, for everything that does not redirect.
+fn attribute_kind(attributes: u32) -> EntryKind {
+    if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
         EntryKind::Directory
-    } else if metadata.is_file() {
-        EntryKind::File
     } else {
-        EntryKind::Other
+        EntryKind::File
     }
 }
 
@@ -421,4 +742,52 @@ fn create_error(request: &LinkRequest, reason: String) -> LinkError {
         source: request.source.clone(),
         reason,
     }
+}
+
+/// Reports a creation failure without issuing a pathname rollback against an unproved entry.
+fn retained_create_error(request: &LinkRequest, reason: &str) -> LinkError {
+    create_error(
+        request,
+        format!(
+            "{reason}; no pathname rollback was attempted because ownership could not be proved; \
+             inspect the retained staged path {}",
+            request.staged_path.display()
+        ),
+    )
+}
+
+/// Rolls back an entry whose ownership is already bound to `handle` and preserves both failures.
+fn rollback_create_error(request: &LinkRequest, handle: &OwnedHandle, reason: &str) -> LinkError {
+    match windows_ffi::delete_by_handle(handle) {
+        Ok(()) => create_error(
+            request,
+            format!("{reason}; the verified staged entry was rolled back through its handle"),
+        ),
+        Err(rollback) => create_error(
+            request,
+            format!(
+                "{reason}; handle-bound rollback failed: {rollback}; retained staged path {}",
+                request.staged_path.display()
+            ),
+        ),
+    }
+}
+
+fn directory_create_error(path: &Path, reason: String) -> LinkError {
+    LinkError::Create {
+        destination: path.to_path_buf(),
+        source: path.to_path_buf(),
+        reason,
+    }
+}
+
+fn retained_directory_create_error(path: &Path, reason: &str) -> LinkError {
+    directory_create_error(
+        path,
+        format!(
+            "{reason}; no pathname rollback was attempted because ownership could not be proved; \
+             inspect the retained staged path {}",
+            path.display()
+        ),
+    )
 }

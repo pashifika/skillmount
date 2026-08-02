@@ -11,8 +11,8 @@ as current only after it exists in the tracked source and can be traced to repos
 
 Status: catalog resolution, discovery inspection, read-only planning, cross-platform link
 primitives, resource locking, durable transactions, cleanup, and stale recovery are implemented.
-Agent child launch, operator commands, release automation, and the ownership-binding hardening
-named under [Reserved work](#reserved-work) are not implemented.
+Agent child launch, operator commands, release automation, and the remaining transaction-lifetime
+hardening named under [Reserved work](#reserved-work) are not implemented.
 
 ## Product definition
 
@@ -203,13 +203,18 @@ visible. The journal distinguishes intent, staged identity, final placement, act
 kept state, and failure. Its path codec round-trips arbitrary Unix bytes and Windows UTF-16,
 including unpaired surrogates, rather than passing ownership evidence through UTF-8.
 
-Apply rechecks every planned precondition and uses atomic same-filesystem no-replace placement.
-Rollback and ordinary cleanup share the same reverse-order removal path. Current cleanup verifies
-kind, target, and available platform identity immediately before path-based removal, but does not
-yet bind verification and removal to one object across the remaining verify-act window. Recovery
-eligibility comes from the held lock set, never a recorded PID: PIDs are reusable and cannot
-authorize cleanup. Unreadable or future-schema journals block new mutation and are retained for
-operator inspection.
+Apply rechecks every planned precondition and uses evidence-bearing, atomic same-filesystem
+no-replace placement. Successful placement returns identity for the object established at the final
+path before the journal advances to `applied`; a visible mismatch remains journal-backed residue.
+Rollback and ordinary cleanup share the same reverse-order removal path. Windows derives
+attributes, strongest identity, and reparse data from one no-follow handle and retains that handle
+through rename or disposition. Unix performs final no-follow verification before pathname mutation
+while the application holds all cooperating-session locks; those advisory state-file locks do not
+exclude another program, so ADR 0014 records the residual final pathname race. A creation whose
+ownership cannot be established is reported and retained rather than removed by an unchecked
+pathname rollback. Recovery eligibility comes from the held lock set, never a recorded PID: PIDs
+are reusable and cannot authorize cleanup. Unreadable or future-schema journals block new mutation
+and are retained for operator inspection.
 
 ## Platform and unsafe boundary
 
@@ -219,10 +224,10 @@ The crate sets `unsafe_code = "deny"`. Exactly two modules may opt in:
 - `src/link/windows_ffi.rs`.
 
 They wrap filesystem operations that have no safe standard-library equivalent, including atomic
-no-replace placement and Windows reparse-point operations. Each unsafe block has a `SAFETY`
-justification, raw platform types do not cross the module boundary, and buffer parsing stays in safe
-Rust. [ADR 0011](adr/0011-scoped-unsafe-for-platform-link-backends.md) records why `deny` with this
-audited scope replaced crate-wide `forbid`.
+no-replace placement and Windows reparse-point observation, handle rename, and handle disposition.
+Each unsafe block has a `SAFETY` justification, raw platform types do not cross the module boundary,
+and reparse decoding stays in safe Rust. [ADR 0011](adr/0011-scoped-unsafe-for-platform-link-backends.md)
+records why `deny` with this audited scope replaced crate-wide `forbid`.
 
 Paths and forwarded arguments remain `PathBuf` and `OsString` through every public seam. They are
 never joined into a shell command or converted lossily for policy, journal, lock, or ownership
@@ -230,8 +235,10 @@ decisions. Diagnostics may render a reversible representation only at the output
 
 macOS uses directory symbolic links and `renameatx_np(RENAME_EXCL)`. Windows prefers a directory
 symbolic link and falls back to a junction only for `ERROR_PRIVILEGE_NOT_HELD` in automatic mode;
-placement uses a non-replacing `MoveFileExW`. The Linux test branch uses
-`renameat2(RENAME_NOREPLACE)` but does not establish Linux product support.
+placement uses `SetFileInformationByHandle(FileRenameInfo)` with replacement disabled, and removal
+uses `FileDispositionInfo` on the verified handle. The variable-length rename layout is compiled and
+tested on both Windows x86 and x64. The Linux test branch uses `renameat2(RENAME_NOREPLACE)` but does
+not establish Linux product support.
 
 ## Cross-module invariants
 
@@ -247,9 +254,9 @@ The following are product rules rather than style preferences:
    mutating plan is accepted.
 6. No planned destination mutation occurs before its durable intent, and apply rechecks persisted
    preconditions.
-7. Cleanup requests path-based removal only after matching kind, target, and available platform
-   identity; uncertainty is retained and reported, while object-bound verify-and-remove remains
-   reserved hardening.
+7. Windows mutation verifies and mutates the same no-follow object handle. Unix pathname mutation
+   performs the last available identity check under cooperating-session locks; visible uncertainty
+   is retained and reported, and advisory locks are never described as excluding other programs.
 8. Link removal never recursively descends into a target directory.
 9. Shared application and transaction code own policy and sequencing; agent adapters inspect and
    plan, while the sealed platform backend executes only the link primitives it is asked for.
@@ -267,7 +274,8 @@ needed to preserve them inside an implementation.
 - Codex and Claude discovery inspection and deterministic read-only planning;
 - `inspect`, `--dry-run`, concise/verbose plan rendering, and read-only regression tests;
 - Unix/macOS symbolic-link and Windows symbolic-link/junction backends;
-- no-follow link-chain resolution, atomic no-replace placement, and ownership-checked removal;
+- no-follow link-chain resolution, evidence-bearing atomic no-replace placement, Windows
+  handle-bound mutation, and Unix ownership-checked pathname mutation under cooperative locks;
 - logical and physical resource locks, versioned journals, write-ahead apply, rollback, cleanup,
   terminal kept state, and stale recovery;
 - crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
@@ -279,7 +287,6 @@ needed to preserve them inside an implementation.
   and argument-contract validation against the supported agent versions;
 - `doctor`, explicit `cleanup`, lock-file reclamation, compatibility evidence, and user recovery
   documentation;
-- binding link verification and mutation to the same object across the remaining verify-act window;
 - binding a public transaction's lifetime to the lock guard validated when it is opened or adopted;
 - rejecting pre-existing links in application-state directory paths before creation or permission changes;
 - versioned release packaging and publication.
