@@ -49,6 +49,11 @@ fn run() -> io::Result<ExitCode> {
             spawn_descendant(&descendant_record, "ignore-all")?;
             wait_for_interrupt(&recorder, None)?;
         }
+        "orphan-descendant-ignore-all" => {
+            let descendant_record = required_path(DESCENDANT_RECORD_ENV)?;
+            spawn_descendant(&descendant_record, "ignore-all")?;
+            recorder.event("ready")?;
+        }
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

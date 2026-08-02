@@ -8,6 +8,8 @@ use std::process::{Child, Command, Stdio};
 use crate::error::ExitCategory;
 use crate::mount::LaunchPlan;
 
+const POST_ROOT_DOMAIN_POLLS: usize = 600;
+
 mod driver;
 mod event;
 
@@ -92,7 +94,7 @@ impl ProcessSupervisor {
     /// is deferred so durable recovery evidence remains intact.
     pub fn supervise<F>(self, request: SupervisionRequest, cleanup: F) -> SupervisionOutcome
     where
-        F: FnOnce() -> CleanupOutcome,
+        F: FnOnce() -> Result<(), CleanupFailure>,
     {
         let Self { _single_use: () } = self;
         let mut cleanup = CleanupGuard::new(cleanup);
@@ -172,25 +174,49 @@ impl ProcessSupervisor {
                 Some(&launch.cwd),
                 &error,
             );
-            let _ = child.kill();
-            let _ = child.wait();
-            let interrupt = prepare_finalization(&mut platform, InterruptPath::None);
-            return defer_cleanup(&mut cleanup, vec![failure], interrupt);
+            let mut backend = NativeBackend::new(&mut child, &mut platform, &launch);
+            return finish_driver_result(
+                &mut cleanup,
+                driver::terminate_after_failure(&mut backend, failure),
+            );
+        }
+        if let Err(error) = platform.activate() {
+            let failure = ProcessFailure::from_io(
+                ProcessStage::InterruptSetup,
+                &launch.executable,
+                Some(&launch.cwd),
+                &error,
+            );
+            let mut backend = NativeBackend::new(&mut child, &mut platform, &launch);
+            return finish_driver_result(
+                &mut cleanup,
+                driver::terminate_after_failure(&mut backend, failure),
+            );
         }
 
         let mut backend = NativeBackend::new(&mut child, &mut platform, &launch);
-        match driver::supervise(&mut backend) {
-            driver::DriverResult::Proven {
-                child,
-                interrupt,
-                failures,
-                permit,
-            } => finish(&mut cleanup, child, interrupt, failures, permit),
-            driver::DriverResult::Uncertain {
-                failures,
-                interrupt,
-            } => defer_cleanup(&mut cleanup, failures, interrupt),
-        }
+        finish_driver_result(&mut cleanup, driver::supervise(&mut backend))
+    }
+}
+
+fn finish_driver_result<F>(
+    cleanup: &mut CleanupGuard<F>,
+    result: driver::DriverResult,
+) -> SupervisionOutcome
+where
+    F: FnOnce() -> Result<(), CleanupFailure>,
+{
+    match result {
+        driver::DriverResult::Proven {
+            child,
+            interrupt,
+            failures,
+            permit,
+        } => finish(cleanup, child, interrupt, failures, permit),
+        driver::DriverResult::Uncertain {
+            failures,
+            interrupt,
+        } => defer_cleanup(cleanup, failures, interrupt),
     }
 }
 
@@ -380,9 +406,10 @@ pub enum InterruptPath {
         first: InterruptKind,
         /// How the first interrupt reached the child boundary.
         delivery: InterruptDelivery,
-        /// Second observed interrupt.
-        second: InterruptKind,
-        /// Result of the force operation.
+        /// Second observed interrupt, or `None` when liveness failure required force after the
+        /// first occurrence.
+        second: Option<InterruptKind>,
+        /// Result of the force operation associated with this path.
         termination: ForceTermination,
     },
 }
@@ -431,6 +458,8 @@ pub enum SupervisionDiagnostic {
     Process(ProcessFailure),
     /// Process liveness remained uncertain without a more specific recorded failure.
     LivenessUncertain,
+    /// Cleanup was marked deferred despite a terminal child outcome.
+    UnexpectedCleanupDeferral,
     /// A Windows child returned a status outside the public wrapper range.
     ExceptionalWindowsStatus {
         /// Original unsigned Windows status.
@@ -490,6 +519,14 @@ pub fn map_exit(outcome: &SupervisionOutcome) -> ExitDecision {
             &mut decision,
             ExitCategory::Filesystem.code(),
             SupervisionDiagnostic::Cleanup(failure.clone()),
+        );
+    } else if matches!(outcome.cleanup, CleanupOutcome::Deferred)
+        && !matches!(outcome.child, ChildOutcome::Uncertain)
+    {
+        add_failure(
+            &mut decision,
+            ExitCategory::Internal.code(),
+            SupervisionDiagnostic::UnexpectedCleanupDeferral,
         );
     }
 
@@ -616,23 +653,7 @@ fn prepare_finalization(
             Ok(()) => return path,
             Err(events) => {
                 for event in events {
-                    let kind = event.kind();
-                    path = match path {
-                        InterruptPath::None => InterruptPath::Graceful {
-                            interrupt: kind,
-                            delivery: InterruptDelivery::ChildAlreadyExited,
-                        },
-                        InterruptPath::Graceful {
-                            interrupt: first,
-                            delivery,
-                        } => InterruptPath::Forced {
-                            first,
-                            delivery,
-                            second: kind,
-                            termination: ForceTermination::ChildAlreadyExited,
-                        },
-                        forced @ InterruptPath::Forced { .. } => forced,
-                    };
+                    path = driver::record_already_exited(path, event.kind());
                 }
             }
         }
@@ -647,7 +668,7 @@ fn finish<F>(
     permit: driver::CleanupPermit,
 ) -> SupervisionOutcome
 where
-    F: FnOnce() -> CleanupOutcome,
+    F: FnOnce() -> Result<(), CleanupFailure>,
 {
     SupervisionOutcome {
         child,
@@ -663,7 +684,7 @@ fn defer_cleanup<F>(
     interrupt: InterruptPath,
 ) -> SupervisionOutcome
 where
-    F: FnOnce() -> CleanupOutcome,
+    F: FnOnce() -> Result<(), CleanupFailure>,
 {
     SupervisionOutcome {
         child: ChildOutcome::Uncertain,
@@ -679,6 +700,7 @@ struct NativeBackend<'a> {
     executable: &'a Path,
     cwd: &'a Path,
     root_status: Option<ChildStatus>,
+    post_root_domain_polls: usize,
     armed: bool,
 }
 
@@ -694,6 +716,7 @@ impl<'a> NativeBackend<'a> {
             executable: &launch.executable,
             cwd: &launch.cwd,
             root_status: None,
+            post_root_domain_polls: 0,
             armed: true,
         }
     }
@@ -731,7 +754,23 @@ impl driver::Backend for NativeBackend<'_> {
                 self.root_status
                     .expect("a domain probe requires a reaped root child"),
             ),
-            Ok(false) => driver::Probe::Running,
+            Ok(false) => {
+                if !self.platform.post_root_containment_is_stable() {
+                    self.post_root_domain_polls += 1;
+                    if self.post_root_domain_polls >= POST_ROOT_DOMAIN_POLLS {
+                        return driver::Probe::Uncertain(ProcessFailure::from_io(
+                            ProcessStage::ContainmentProbe,
+                            self.executable,
+                            Some(self.cwd),
+                            &io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "the reaped Unix root left a nonempty numeric process group whose identity cannot be safely retained",
+                            ),
+                        ));
+                    }
+                }
+                driver::Probe::Running
+            }
             Err(error) => driver::Probe::Uncertain(ProcessFailure::from_io(
                 ProcessStage::ContainmentProbe,
                 self.executable,
@@ -742,12 +781,22 @@ impl driver::Backend for NativeBackend<'_> {
     }
 
     fn deliver_first(&mut self, event: Self::Event) -> InterruptDelivery {
-        self.platform
-            .forward_first(self.child, event, self.executable)
+        self.platform.forward_first(
+            self.child,
+            event,
+            self.executable,
+            self.cwd,
+            self.root_status.is_some(),
+        )
     }
 
     fn force(&mut self) -> ForceTermination {
-        self.platform.force(self.child, self.executable)
+        self.platform.force(
+            self.child,
+            self.executable,
+            self.cwd,
+            self.root_status.is_some(),
+        )
     }
 
     fn begin_finalization(&mut self) -> Result<(), Vec<Self::Event>> {
@@ -776,10 +825,13 @@ impl Drop for NativeBackend<'_> {
         if !self.armed {
             return;
         }
-        let termination = self.platform.force(self.child, self.executable);
-        if !matches!(termination, ForceTermination::Failed(_)) {
-            let _ = self.child.wait();
-        }
+        let _termination = self.platform.force(
+            self.child,
+            self.executable,
+            self.cwd,
+            self.root_status.is_some(),
+        );
+        let _ = self.child.try_wait();
     }
 }
 
@@ -789,7 +841,7 @@ struct CleanupGuard<F> {
 
 impl<F> CleanupGuard<F>
 where
-    F: FnOnce() -> CleanupOutcome,
+    F: FnOnce() -> Result<(), CleanupFailure>,
 {
     const fn new(action: F) -> Self {
         Self {
@@ -802,7 +854,10 @@ where
             .action
             .take()
             .expect("cleanup guard may be consumed only once");
-        action()
+        match action() {
+            Ok(()) => CleanupOutcome::Succeeded,
+            Err(failure) => CleanupOutcome::Failed(failure),
+        }
     }
 
     fn defer(&mut self) -> CleanupOutcome {
@@ -1040,7 +1095,7 @@ mod tests {
                     interrupt: InterruptPath::Forced {
                         first: InterruptKind::Interrupt,
                         delivery: InterruptDelivery::Failed(forward_failure.clone()),
-                        second: InterruptKind::Interrupt,
+                        second: Some(InterruptKind::Interrupt),
                         termination: ForceTermination::Terminated,
                     },
                     cleanup: CleanupOutcome::Failed(cleanup.clone()),
@@ -1052,6 +1107,18 @@ mod tests {
                     vec![SupervisionDiagnostic::Cleanup(cleanup)],
                 ),
             },
+            Case {
+                name: "a fabricated cleanup deferral cannot report session success",
+                outcome: outcome(
+                    ChildOutcome::Exited(ChildStatus::Exited(0)),
+                    CleanupOutcome::Deferred,
+                ),
+                expected: decision(
+                    70,
+                    Some(SupervisionDiagnostic::UnexpectedCleanupDeferral),
+                    vec![],
+                ),
+            },
         ]);
     }
 
@@ -1060,7 +1127,7 @@ mod tests {
         let cleanup_called = Cell::new(false);
         let mut cleanup = CleanupGuard::new(|| {
             cleanup_called.set(true);
-            CleanupOutcome::Succeeded
+            Ok(())
         });
         let wait = failure(ProcessStage::Wait, io::ErrorKind::Other);
 

@@ -68,6 +68,10 @@ impl Platform {
         Ok(())
     }
 
+    pub(super) fn activate(&mut self) -> io::Result<()> {
+        self.events.activate()
+    }
+
     pub(super) fn pending_interrupts(&mut self) -> Vec<Interrupt> {
         self.events
             .pending()
@@ -92,33 +96,38 @@ impl Platform {
         _child: &mut Child,
         _interrupt: Interrupt,
         _executable: &Path,
+        _cwd: &Path,
+        _root_reaped: bool,
     ) -> InterruptDelivery {
         InterruptDelivery::DeliveredByPlatform
     }
 
-    pub(super) fn force(&self, child: &mut Child, executable: &Path) -> ForceTermination {
-        let result = if self.attached {
+    pub(super) fn force(
+        &self,
+        child: &mut Child,
+        executable: &Path,
+        cwd: &Path,
+        _root_reaped: bool,
+    ) -> ForceTermination {
+        if self.attached {
             let Some(job) = &self.job else {
                 return ForceTermination::Failed(ProcessFailure::from_io(
                     ProcessStage::ForceTermination,
                     executable,
-                    None,
+                    Some(cwd),
                     &io::Error::new(
                         io::ErrorKind::NotFound,
                         "the attached Windows Job Object is unavailable",
                     ),
                 ));
             };
-            match job.active_processes() {
-                Ok(0) => return ForceTermination::ChildAlreadyExited,
-                Ok(_) => job.terminate(1),
-                Err(error) => Err(error),
-            }
-        } else if child_has_exited(child) {
+            return force_attached_job(job, executable, cwd);
+        }
+        if child_has_exited(child) {
             return ForceTermination::ChildAlreadyExited;
-        } else {
-            child.kill()
-        };
+        }
+
+        let result = child.kill();
 
         match result {
             Ok(()) => ForceTermination::Terminated,
@@ -126,7 +135,7 @@ impl Platform {
             Err(error) => ForceTermination::Failed(ProcessFailure::from_io(
                 ProcessStage::ForceTermination,
                 executable,
-                None,
+                Some(cwd),
                 &error,
             )),
         }
@@ -144,6 +153,38 @@ impl Platform {
             .ok_or_else(|| io::Error::other("the attached Windows Job Object is unavailable"))?
             .active_processes()
             .map(|count| count == 0)
+    }
+
+    pub(super) const fn post_root_containment_is_stable(&self) -> bool {
+        self.attached
+    }
+}
+
+fn force_attached_job(job: &JobObject, executable: &Path, cwd: &Path) -> ForceTermination {
+    let result = job.active_processes().and_then(|count| {
+        if count == 0 {
+            Ok(false)
+        } else {
+            job.terminate(1).map(|()| true)
+        }
+    });
+    attached_force_result(result, executable, cwd)
+}
+
+fn attached_force_result(
+    result: io::Result<bool>,
+    executable: &Path,
+    cwd: &Path,
+) -> ForceTermination {
+    match result {
+        Ok(true) => ForceTermination::Terminated,
+        Ok(false) => ForceTermination::ChildAlreadyExited,
+        Err(error) => ForceTermination::Failed(ProcessFailure::from_io(
+            ProcessStage::ForceTermination,
+            executable,
+            Some(cwd),
+            &error,
+        )),
     }
 }
 
@@ -207,5 +248,19 @@ mod tests {
             child_status(ExitStatus::from_raw(raw_status)),
             ChildStatus::ExceptionalWindows { raw_status }
         );
+    }
+
+    #[test]
+    fn attached_job_failure_is_not_downgraded_by_root_process_state() {
+        let termination = attached_force_result(
+            Err(io::Error::other("fixture Job Object failure")),
+            Path::new("test executable"),
+            Path::new("test cwd"),
+        );
+
+        let ForceTermination::Failed(failure) = termination else {
+            panic!("the Job Object failure must remain observable");
+        };
+        assert_eq!(failure.cwd(), Some(Path::new("test cwd")));
     }
 }

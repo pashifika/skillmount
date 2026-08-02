@@ -26,7 +26,7 @@ path = "tests/fixtures/supervisor_harness.rs"
 required-features = ["test-fixtures"]
 
 [features]
-test-fixtures = ["dep:ctrlc"]
+test-fixtures = ["dep:ctrlc", "signal-hook/iterator"]
 
 [profile.release]
 codegen-units = 1
@@ -48,8 +48,8 @@ pedantic = "deny"
 clap = { version = "=4.6.5", features = ["derive"] }
 # Real operating-system advisory locks. `flock` and `LockFileEx` are the liveness signal the
 # transaction layer needs, and neither is reachable from the standard library. `fs4` wraps exactly
-# those two calls, keeps the crate's `unsafe` boundary at the two audited link FFI modules
-# (ADR 0011), and already resolves to the `windows-sys` version pinned below.
+# those two calls, keeps locking-related unsafe within the two audited link FFI modules (ADR 0011),
+# and already resolves to the `windows-sys` version pinned below.
 fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
 serde_yaml_ng = "=0.10.0"
 # Lock filenames are SHA-256 digests of tagged identity bytes, so two spellings of one resource
@@ -61,9 +61,9 @@ sha2 = { version = "=0.11.0", default-features = false }
 # `renameat2(RENAME_NOREPLACE)`, both only through libc.
 [target."cfg(unix)".dependencies]
 libc = "=0.2.189"
-# Signal hooks write only to their internal self-pipe in the handler. The process module consumes
-# origin data and performs all forwarding, waiting, and cleanup in ordinary Rust control flow.
-signal-hook = { version = "=0.4.4", default-features = false, features = ["extended-siginfo"] }
+# Product handlers record event identity directly in an atomic ledger through the audited Unix FFI
+# boundary. Only the feature-gated fake agent uses signal-hook's iterator support.
+signal-hook = { version = "=0.4.4", default-features = false }
 # `kill`/`killpg` are exposed through a maintained safe API, keeping raw Unix process FFI out of
 # the process supervisor.
 nix = { version = "=0.31.3", default-features = false, features = ["signal"] }

@@ -12,9 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use skillmount::mount::LaunchPlan;
-use skillmount::process::{
-    CleanupFailure, CleanupOutcome, ProcessSupervisor, SupervisionRequest, map_exit,
-};
+use skillmount::process::{CleanupFailure, ProcessSupervisor, SupervisionRequest, map_exit};
 
 const EXECUTABLE_ENV: &str = "SKILLMOUNT_HARNESS_EXECUTABLE";
 const CWD_ENV: &str = "SKILLMOUNT_HARNESS_CWD";
@@ -139,7 +137,7 @@ fn run_cleanup(
     counter: Option<&std::path::Path>,
     configured_failure: bool,
     cwd: &std::path::Path,
-) -> CleanupOutcome {
+) -> Result<(), CleanupFailure> {
     if let Some(path) = counter {
         let result = OpenOptions::new()
             .create(true)
@@ -147,7 +145,10 @@ fn run_cleanup(
             .open(path)
             .and_then(|mut file| file.write_all(b"cleanup\n"));
         if let Err(error) = result {
-            return cleanup_failure(cwd, format!("could not record cleanup: {error}"));
+            return Err(cleanup_failure(
+                cwd,
+                format!("could not record cleanup: {error}"),
+            ));
         }
     }
     if let Some(delay) = env::var_os(CLEANUP_DELAY_ENV) {
@@ -157,23 +158,26 @@ fn run_cleanup(
             .and_then(|value| value.parse::<u64>().map_err(|_| "invalid cleanup delay"));
         match delay {
             Ok(delay) => std::thread::sleep(std::time::Duration::from_millis(delay)),
-            Err(reason) => return cleanup_failure(cwd, reason.to_owned()),
+            Err(reason) => return Err(cleanup_failure(cwd, reason.to_owned())),
         }
     }
     if configured_failure {
-        cleanup_failure(cwd, "configured cleanup failure".to_owned())
+        Err(cleanup_failure(
+            cwd,
+            "configured cleanup failure".to_owned(),
+        ))
     } else {
-        CleanupOutcome::Succeeded
+        Ok(())
     }
 }
 
-fn cleanup_failure(cwd: &std::path::Path, reason: String) -> CleanupOutcome {
-    CleanupOutcome::Failed(CleanupFailure {
+fn cleanup_failure(cwd: &std::path::Path, reason: String) -> CleanupFailure {
+    CleanupFailure {
         reason,
         failed_paths: vec![cwd.join("retained-mount")],
         retained_journal: Some(cwd.join("retained-journal")),
         recovery_command: vec![OsString::from("asm"), OsString::from("cleanup")],
-    })
+    }
 }
 
 fn required_os(name: &str) -> io::Result<OsString> {

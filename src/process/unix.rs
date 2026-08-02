@@ -36,12 +36,15 @@ pub(super) struct Platform {
 impl Platform {
     pub(super) fn install() -> io::Result<Self> {
         unix_ffi::install()?;
-        let events = EVENTS.acquire()?;
         let grouping = if io::stdin().is_terminal() {
             Grouping::SharedForeground
         } else {
             Grouping::Dedicated
         };
+        let mut events = EVENTS.acquire()?;
+        if grouping == Grouping::Dedicated {
+            events.activate()?;
+        }
         Ok(Self { events, grouping })
     }
 
@@ -61,6 +64,10 @@ impl Platform {
     #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     pub(super) fn attach(&mut self, _child: &Child) -> io::Result<()> {
         Ok(())
+    }
+
+    pub(super) fn activate(&mut self) -> io::Result<()> {
+        self.events.activate()
     }
 
     pub(super) fn pending_interrupts(&mut self) -> Vec<Interrupt> {
@@ -85,9 +92,18 @@ impl Platform {
         child: &mut Child,
         interrupt: Interrupt,
         executable: &Path,
+        cwd: &Path,
+        root_reaped: bool,
     ) -> InterruptDelivery {
         if interrupt.delivered_by_platform {
             return InterruptDelivery::DeliveredByPlatform;
+        }
+        if !group_identity_is_safe(self.grouping, root_reaped) {
+            return InterruptDelivery::Failed(group_identity_failure(
+                ProcessStage::ForwardInterrupt,
+                executable,
+                cwd,
+            ));
         }
         if self.grouping == Grouping::SharedForeground && child_has_exited(child) {
             return InterruptDelivery::ChildAlreadyExited;
@@ -99,7 +115,7 @@ impl Platform {
                 return InterruptDelivery::Failed(ProcessFailure::from_io(
                     ProcessStage::ForwardInterrupt,
                     executable,
-                    None,
+                    Some(cwd),
                     &io::Error::new(io::ErrorKind::InvalidInput, error.to_string()),
                 ));
             }
@@ -113,10 +129,23 @@ impl Platform {
             }
         };
 
-        delivery_result(result, executable)
+        delivery_result(result, executable, cwd)
     }
 
-    pub(super) fn force(&self, child: &mut Child, executable: &Path) -> ForceTermination {
+    pub(super) fn force(
+        &self,
+        child: &mut Child,
+        executable: &Path,
+        cwd: &Path,
+        root_reaped: bool,
+    ) -> ForceTermination {
+        if !group_identity_is_safe(self.grouping, root_reaped) {
+            return ForceTermination::Failed(group_identity_failure(
+                ProcessStage::ForceTermination,
+                executable,
+                cwd,
+            ));
+        }
         if self.grouping == Grouping::SharedForeground && child_has_exited(child) {
             return ForceTermination::ChildAlreadyExited;
         }
@@ -136,7 +165,7 @@ impl Platform {
             Err(error) => ForceTermination::Failed(ProcessFailure::from_io(
                 ProcessStage::ForceTermination,
                 executable,
-                None,
+                Some(cwd),
                 &error,
             )),
         }
@@ -153,6 +182,10 @@ impl Platform {
             Err(Errno::ESRCH) => Ok(true),
             Err(error) => Err(errno_to_io(error)),
         }
+    }
+
+    pub(super) const fn post_root_containment_is_stable(&self) -> bool {
+        matches!(self.grouping, Grouping::SharedForeground)
     }
 
     fn interrupt(&self, kind: InterruptKind) -> Option<Interrupt> {
@@ -214,7 +247,11 @@ fn child_has_exited(child: &mut Child) -> bool {
     matches!(child.try_wait(), Ok(Some(_)))
 }
 
-fn delivery_result(result: io::Result<()>, executable: &Path) -> InterruptDelivery {
+const fn group_identity_is_safe(grouping: Grouping, root_reaped: bool) -> bool {
+    matches!(grouping, Grouping::SharedForeground) || !root_reaped
+}
+
+fn delivery_result(result: io::Result<()>, executable: &Path, cwd: &Path) -> InterruptDelivery {
     match result {
         Ok(()) => InterruptDelivery::Forwarded,
         Err(error) if error.raw_os_error() == Some(Errno::ESRCH as i32) => {
@@ -223,10 +260,21 @@ fn delivery_result(result: io::Result<()>, executable: &Path) -> InterruptDelive
         Err(error) => InterruptDelivery::Failed(ProcessFailure::from_io(
             ProcessStage::ForwardInterrupt,
             executable,
-            None,
+            Some(cwd),
             &error,
         )),
     }
+}
+
+fn group_identity_failure(stage: ProcessStage, executable: &Path, cwd: &Path) -> ProcessFailure {
+    ProcessFailure::from_io(
+        stage,
+        executable,
+        Some(cwd),
+        &io::Error::other(
+            "the Unix process-group leader was reaped, so the numeric group identity is no longer safe to signal",
+        ),
+    )
 }
 
 fn errno_to_io(error: Errno) -> io::Error {
@@ -260,8 +308,17 @@ mod tests {
                 delivered_by_platform: false,
             },
             Path::new("test executable"),
+            Path::new("test cwd"),
+            false,
         );
 
         assert_eq!(delivery, InterruptDelivery::ChildAlreadyExited);
+    }
+
+    #[test]
+    fn dedicated_group_identity_is_not_safe_after_its_leader_is_reaped() {
+        assert!(!group_identity_is_safe(Grouping::Dedicated, true));
+        assert!(group_identity_is_safe(Grouping::Dedicated, false));
+        assert!(group_identity_is_safe(Grouping::SharedForeground, true));
     }
 }

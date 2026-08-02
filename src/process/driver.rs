@@ -94,6 +94,23 @@ pub(super) fn supervise<B: Backend>(backend: &mut B) -> DriverResult {
     }
 }
 
+pub(super) fn terminate_after_failure<B: Backend>(
+    backend: &mut B,
+    failure: ProcessFailure,
+) -> DriverResult {
+    let primary = failure.clone();
+    let forced = force_and_confirm(backend, vec![failure]);
+    match forced.status {
+        Some(_status) => proven(
+            backend,
+            ChildOutcome::Failed(primary),
+            InterruptPath::None,
+            forced.failures,
+        ),
+        None => uncertain(backend, InterruptPath::None, forced.failures),
+    }
+}
+
 enum EventResult {
     Continue(InterruptPath),
     Complete(DriverResult),
@@ -120,7 +137,7 @@ fn handle_event<B: Backend>(backend: &mut B, event: B::Event, path: InterruptPat
         Probe::Uncertain(failure) => {
             let delivery_failure = failure.clone();
             let forced = force_and_confirm(backend, vec![failure]);
-            let path = record_force(
+            let path = record_event_force(
                 path,
                 kind,
                 forced.termination.clone(),
@@ -157,6 +174,7 @@ fn handle_event<B: Backend>(backend: &mut B, event: B::Event, path: InterruptPat
                         Probe::Running => EventResult::Continue(path),
                         Probe::Uncertain(probe_failure) => {
                             let forced = force_and_confirm(backend, vec![failure, probe_failure]);
+                            let path = record_failure_force(path, forced.termination.clone());
                             match forced.status {
                                 Some(status) => EventResult::Complete(proven(
                                     backend,
@@ -176,7 +194,7 @@ fn handle_event<B: Backend>(backend: &mut B, event: B::Event, path: InterruptPat
             }
             InterruptPath::Graceful { .. } | InterruptPath::Forced { .. } => {
                 let forced = force_and_confirm(backend, Vec::new());
-                let path = record_force(path, kind, forced.termination.clone(), None);
+                let path = record_event_force(path, kind, forced.termination.clone(), None);
                 match forced.status {
                     Some(status) => EventResult::Complete(proven(
                         backend,
@@ -301,28 +319,33 @@ fn uncertain<B: Backend>(
                 };
             }
             Err(events) => {
+                let mut proven_status = None;
                 for event in events {
                     let kind = backend.event_kind(event);
+                    if proven_status.is_some() {
+                        interrupt = record_already_exited(interrupt, kind);
+                        continue;
+                    }
                     let initial_failure = failures.first().cloned();
                     let forced = force_and_confirm(backend, failures);
-                    interrupt =
-                        record_force(interrupt, kind, forced.termination.clone(), initial_failure);
-                    if let Some(status) = forced.status {
-                        return proven(
-                            backend,
-                            ChildOutcome::Exited(status),
-                            interrupt,
-                            forced.failures,
-                        );
-                    }
+                    interrupt = record_event_force(
+                        interrupt,
+                        kind,
+                        forced.termination.clone(),
+                        initial_failure,
+                    );
+                    proven_status = forced.status;
                     failures = forced.failures;
+                }
+                if let Some(status) = proven_status {
+                    return proven(backend, ChildOutcome::Exited(status), interrupt, failures);
                 }
             }
         }
     }
 }
 
-fn record_already_exited(path: InterruptPath, kind: InterruptKind) -> InterruptPath {
+pub(super) fn record_already_exited(path: InterruptPath, kind: InterruptKind) -> InterruptPath {
     match path {
         InterruptPath::None => InterruptPath::Graceful {
             interrupt: kind,
@@ -334,14 +357,27 @@ fn record_already_exited(path: InterruptPath, kind: InterruptKind) -> InterruptP
         } => InterruptPath::Forced {
             first,
             delivery,
-            second: kind,
+            second: Some(kind),
             termination: ForceTermination::ChildAlreadyExited,
         },
-        forced @ InterruptPath::Forced { .. } => forced,
+        InterruptPath::Forced {
+            first,
+            delivery,
+            second: None,
+            termination,
+        } => InterruptPath::Forced {
+            first,
+            delivery,
+            second: Some(kind),
+            termination,
+        },
+        forced @ InterruptPath::Forced {
+            second: Some(_), ..
+        } => forced,
     }
 }
 
-fn record_force(
+fn record_event_force(
     path: InterruptPath,
     kind: InterruptKind,
     termination: ForceTermination,
@@ -356,7 +392,7 @@ fn record_force(
                     _ => unreachable!("forcing without a first event requires failure context"),
                 },
             )),
-            second: kind,
+            second: None,
             termination,
         },
         InterruptPath::Graceful {
@@ -365,7 +401,32 @@ fn record_force(
         } => InterruptPath::Forced {
             first,
             delivery,
-            second: kind,
+            second: Some(kind),
+            termination,
+        },
+        InterruptPath::Forced {
+            first,
+            delivery,
+            second,
+            ..
+        } => InterruptPath::Forced {
+            first,
+            delivery,
+            second: second.or(Some(kind)),
+            termination,
+        },
+    }
+}
+
+fn record_failure_force(path: InterruptPath, termination: ForceTermination) -> InterruptPath {
+    match path {
+        InterruptPath::Graceful {
+            interrupt: first,
+            delivery,
+        } => InterruptPath::Forced {
+            first,
+            delivery,
+            second: None,
             termination,
         },
         InterruptPath::Forced {
@@ -379,6 +440,9 @@ fn record_force(
             second,
             termination,
         },
+        InterruptPath::None => {
+            unreachable!("failure-triggered force requires an observed first interrupt")
+        }
     }
 }
 
@@ -506,9 +570,40 @@ mod tests {
             panic!("post-force death proof should permit orderly finalization");
         };
         assert_eq!(failures, [wait]);
-        assert!(matches!(interrupt, InterruptPath::Forced { .. }));
+        assert!(matches!(
+            interrupt,
+            InterruptPath::Forced { second: None, .. }
+        ));
         assert!(backend.finalized);
         assert!(backend.disarmed);
+    }
+
+    #[test]
+    fn spawned_failure_uses_bounded_force_and_never_invents_cleanup_permission() {
+        let attach = failure(ProcessStage::ContainmentSetup);
+        let force_one = failure(ProcessStage::ForceTermination);
+        let force_two = failure(ProcessStage::ForceTermination);
+        let mut backend = ScriptedBackend {
+            events: VecDeque::new(),
+            probes: VecDeque::from([Probe::Running, Probe::Running]),
+            force: VecDeque::from([
+                ForceTermination::Failed(force_one.clone()),
+                ForceTermination::Failed(force_two.clone()),
+            ]),
+            delivery: InterruptDelivery::DeliveredByPlatform,
+            finalization_events: VecDeque::new(),
+            finalized: false,
+            disarmed: false,
+        };
+
+        let result = terminate_after_failure(&mut backend, attach.clone());
+
+        let DriverResult::Uncertain { failures, .. } = result else {
+            panic!("an unproven spawned failure must defer cleanup");
+        };
+        assert_eq!(failures, [attach, force_one, force_two]);
+        assert!(backend.finalized);
+        assert!(!backend.disarmed);
     }
 
     #[test]
@@ -556,7 +651,10 @@ mod tests {
                 ForceTermination::Terminated,
             ]),
             delivery: InterruptDelivery::DeliveredByPlatform,
-            finalization_events: VecDeque::from([vec![InterruptKind::Interrupt], Vec::new()]),
+            finalization_events: VecDeque::from([
+                vec![InterruptKind::Interrupt, InterruptKind::Terminate],
+                Vec::new(),
+            ]),
             finalized: false,
             disarmed: false,
         };
@@ -577,7 +675,7 @@ mod tests {
             InterruptPath::Forced {
                 first: InterruptKind::Interrupt,
                 delivery: InterruptDelivery::Failed(wait),
-                second: InterruptKind::Interrupt,
+                second: Some(InterruptKind::Terminate),
                 termination: ForceTermination::Terminated,
             }
         );

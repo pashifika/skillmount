@@ -455,6 +455,43 @@ fn first_interrupt_reaches_a_child_process_group_descendant() {
     assert_eq!(cleanup_count(&cleanup), 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn reaped_group_leader_with_live_descendant_defers_cleanup_within_bound() {
+    let root = TestDir::new("orphan-descendant");
+    let record = root.0.join("parent-record.txt");
+    let descendant = root.0.join("descendant-record.txt");
+    let cleanup = root.0.join("cleanup.txt");
+    let outcome = root.0.join("outcome.txt");
+    let mut command = waiting_harness(
+        &root.0,
+        &record,
+        &cleanup,
+        &outcome,
+        "orphan-descendant-ignore-all",
+    );
+    command.env("SKILLMOUNT_FAKE_DESCENDANT_RECORD", &descendant);
+    let mut child = command.spawn().expect("spawn orphan-descendant harness");
+    wait_for_event_count(&descendant, 1);
+    let descendant_pid = read_record(&descendant)
+        .pid
+        .expect("fake descendant records its PID");
+    let descendant = UnixProcessGuard(descendant_pid);
+
+    let started = Instant::now();
+    let status = wait_for_exit(&mut child);
+
+    assert_eq!(status.code(), Some(70), "{status:?}");
+    assert!(started.elapsed() < TIMEOUT);
+    assert!(!cleanup.exists(), "cleanup ran before process-domain proof");
+    assert!(unix_process_is_running(descendant.0));
+    let outcome = fs::read_to_string(outcome).expect("read orphan-descendant outcome");
+    assert!(outcome.contains("Uncertain"), "{outcome}");
+    assert!(outcome.contains("Deferred"), "{outcome}");
+    assert!(outcome.contains("ContainmentProbe"), "{outcome}");
+    assert!(outcome.contains("TimedOut"), "{outcome}");
+}
+
 #[cfg(windows)]
 #[test]
 fn second_interrupt_terminates_the_windows_job_descendant_before_cleanup() {
@@ -712,6 +749,34 @@ fn send_termination(process_group_leader: u32) {
 
     let pid = i32::try_from(process_group_leader).expect("Unix PID fits i32");
     kill(Pid::from_raw(pid), Signal::SIGTERM).expect("send SIGTERM to harness");
+}
+
+#[cfg(unix)]
+struct UnixProcessGuard(u32);
+
+#[cfg(unix)]
+impl Drop for UnixProcessGuard {
+    fn drop(&mut self) {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+
+        let pid = i32::try_from(self.0).expect("Unix PID fits i32");
+        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+}
+
+#[cfg(unix)]
+fn unix_process_is_running(process_id: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let pid = i32::try_from(process_id).expect("Unix PID fits i32");
+    match kill(Pid::from_raw(pid), None) {
+        Ok(()) | Err(Errno::EPERM) => true,
+        Err(Errno::ESRCH) => false,
+        Err(error) => panic!("query descendant {process_id} liveness: {error}"),
+    }
 }
 
 #[cfg(windows)]
