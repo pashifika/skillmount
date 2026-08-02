@@ -546,10 +546,5 @@ fn os_from_bytes(value: &[u8]) -> OsString {
 fn non_unicode_argument() -> OsString {
     use std::os::windows::ffi::OsStringExt;
 
-    OsString::from_wide(&[
-        u16::from(b'n'),
-        u16::from(b'o'),
-        u16::from(b'n'),
-        0xd800,
-    ])
+    OsString::from_wide(&[u16::from(b'n'), u16::from(b'o'), u16::from(b'n'), 0xd800])
 }
