@@ -77,6 +77,7 @@ impl Project {
             launch_cwd: self.root.clone(),
             project_root: self.root.clone(),
             skill_sources: Vec::new(),
+            session_id: None,
             agent_bin: PathBuf::from(agent.executable_name()),
             passthrough_args: Vec::new(),
             options: RunOptions {
@@ -839,7 +840,7 @@ fn every_staging_lock_resource_keeps_a_logical_key_before_the_root_exists() {
     assert_eq!(snapshot.lock_resources.len(), 2);
     for resource in &snapshot.lock_resources {
         assert!(
-            !resource.identity.logical_key().as_os_str().is_empty(),
+            !resource.identity.logical_path().as_os_str().is_empty(),
             "a resource that does not exist yet still needs a lock key"
         );
         assert!(

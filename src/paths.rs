@@ -43,6 +43,7 @@ pub(crate) fn resolve_session(
         launch_cwd,
         project_root,
         skill_sources,
+        session_id: None,
         agent_bin,
         passthrough_args: input.passthrough_args,
         options: input.options,
@@ -67,6 +68,7 @@ pub(crate) fn resolve_inspection(
         skill_sources: resolve_source_occurrences(skills_dirs, &invocation_cwd)?,
         invocation_cwd,
         project_root,
+        session_id: None,
         agent_bin: PathBuf::from(agent.executable_name()),
         passthrough_args: Vec::new(),
         options: crate::domain::RunOptions {

@@ -18,8 +18,8 @@ use crate::domain::LinkMode;
 use crate::error::LinkError;
 use crate::link::resolve::targets_match;
 use crate::link::{
-    CreatedLink, CreatedLinkKind, EntryKind, LinkBackend, LinkRequest, LinkTarget, Ownership,
-    PathEntry, PlacementOutcome, PlatformIdentity, RemoveOutcome, sealed, verify_ownership,
+    CreatedLink, CreatedLinkKind, EntryKind, LinkBackend, LinkRequest, LinkTarget, OwnedDirectory,
+    Ownership, PathEntry, PathPlacement, PlatformIdentity, RemoveOutcome, sealed, verify_ownership,
 };
 use crate::paths::lexical_normalize;
 
@@ -265,25 +265,69 @@ impl LinkBackend for RecordingBackend {
         })
     }
 
-    fn place_no_replace(
+    fn create_directory(&self, path: &Path) -> Result<OwnedDirectory, LinkError> {
+        self.record(Call::Create(path.to_path_buf()));
+        if self.lookup(path).is_some() {
+            return Err(LinkError::Create {
+                destination: path.to_path_buf(),
+                source: path.to_path_buf(),
+                reason: "the staged path is already occupied".to_owned(),
+            });
+        }
+        let identity = self.take_identity();
+        self.entries
+            .locked()
+            .insert(key(path), (Entry::Directory, identity));
+        Ok(OwnedDirectory {
+            path: path.to_path_buf(),
+            identity: Some(PlatformIdentity::from_pair("model", 0, identity)),
+        })
+    }
+
+    fn place_path_no_replace(
         &self,
-        staged: &CreatedLink,
+        staged: &Path,
         destination: &Path,
-    ) -> Result<PlacementOutcome, LinkError> {
-        self.record(Call::Place(staged.path.clone(), destination.to_path_buf()));
+    ) -> Result<PathPlacement, LinkError> {
+        self.record(Call::Place(staged.to_path_buf(), destination.to_path_buf()));
         if self.lookup(destination).is_some() {
-            return Ok(PlacementOutcome::DestinationExists);
+            return Ok(PathPlacement::DestinationExists);
         }
         let mut entries = self.entries.locked();
-        let Some(entry) = entries.remove(&key(&staged.path)) else {
+        let Some(entry) = entries.remove(&key(staged)) else {
             return Err(LinkError::Place {
-                staged: staged.path.clone(),
+                staged: staged.to_path_buf(),
                 destination: destination.to_path_buf(),
                 reason: "the staged entry no longer exists".to_owned(),
             });
         };
         entries.insert(key(destination), entry);
-        Ok(PlacementOutcome::Placed(staged.relocated_to(destination)))
+        Ok(PathPlacement::Placed)
+    }
+
+    fn remove_empty_directory(
+        &self,
+        recorded: &OwnedDirectory,
+    ) -> Result<RemoveOutcome, LinkError> {
+        self.record(Call::Remove(recorded.path.clone()));
+        let live = self.inspect_no_follow(&recorded.path)?;
+        match crate::link::verify_directory_ownership(&live, recorded) {
+            Ownership::Absent => Ok(RemoveOutcome::AlreadyAbsent),
+            Ownership::Mismatch(mismatch) => Ok(RemoveOutcome::OwnershipMismatch(mismatch)),
+            Ownership::Owned => {
+                let prefix = key(&recorded.path);
+                let occupied = self
+                    .entries
+                    .locked()
+                    .keys()
+                    .any(|candidate| candidate != &prefix && candidate.starts_with(&prefix));
+                if occupied {
+                    return Ok(RemoveOutcome::NotEmpty);
+                }
+                self.entries.locked().remove(&prefix);
+                Ok(RemoveOutcome::Removed)
+            }
+        }
     }
 
     fn remove_link_entry(&self, recorded: &CreatedLink) -> Result<RemoveOutcome, LinkError> {

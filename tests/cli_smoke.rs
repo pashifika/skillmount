@@ -1,7 +1,7 @@
 //! Cross-process smoke tests for the two installed executable names.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,6 +11,25 @@ const SKILLMOUNT: &str = env!("CARGO_BIN_EXE_skillmount");
 fn run(executable: &str, arguments: &[&str]) -> Output {
     Command::new(executable)
         .args(arguments)
+        .output()
+        .expect("smoke-test executable should run")
+}
+
+/// Runs a mutating session against a throwaway project and a throwaway state root.
+///
+/// Both redirections are mandatory. Without `--project-root` the session would resolve the project
+/// from the test harness's own working directory and mount into this repository, and without
+/// `SKILLMOUNT_STATE_DIR` it would write journals and locks into the developer's real
+/// application-support directory.
+fn run_session(executable: &str, project: &Path, state: &Path, arguments: &[&str]) -> Output {
+    Command::new(executable)
+        .args(arguments)
+        .arg("--project-root")
+        .arg(project)
+        .arg("--cwd")
+        .arg(project)
+        .env("SKILLMOUNT_STATE_DIR", state)
+        .current_dir(project)
         .output()
         .expect("smoke-test executable should run")
 }
@@ -135,17 +154,45 @@ fn inspect_resolves_without_crossing_the_unimplemented_mount_boundary() {
         "a dry run creates nothing"
     );
 
+    let project = fixture.join("project");
+    fs::create_dir(&project).expect("project fixture");
+    let state = fixture.join("state");
     let session_arguments = ["codex", "--skills-dir", &skill.to_string_lossy()];
-    let session = run(ASM, &session_arguments);
-    let fallback_session = run(SKILLMOUNT, &session_arguments);
+    let session = run_session(ASM, &project, &state, &session_arguments);
+    let fallback_session = run_session(SKILLMOUNT, &project, &state, &session_arguments);
+
     assert_eq!(session.status.code(), Some(70));
     assert_eq!(session.status, fallback_session.status);
     assert_eq!(session.stdout, fallback_session.stdout);
     assert_eq!(session.stderr, fallback_session.stderr);
     assert!(
-        String::from_utf8_lossy(&session.stderr).contains("reserved for later changes"),
-        "a normal session still stops at the mutation boundary"
+        String::from_utf8_lossy(&session.stderr).contains("launching the agent is"),
+        "a normal session now completes the transaction and stops at the launch boundary: {}",
+        String::from_utf8_lossy(&session.stderr)
+    );
+    assert!(
+        !project.join(".agents").exists() && !project.join(".codex").exists(),
+        "a session that cannot launch a child releases everything it applied"
+    );
+    assert!(
+        journal_count(&state) == 0,
+        "a completed transaction leaves no journal behind"
     );
 
     fs::remove_dir_all(fixture).expect("fixture cleanup");
+}
+
+/// Counts journals left in a redirected state root.
+fn journal_count(state: &Path) -> usize {
+    fs::read_dir(state.join("transactions")).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "journal")
+            })
+            .count()
+    })
 }

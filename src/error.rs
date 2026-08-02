@@ -317,6 +317,122 @@ impl fmt::Display for LinkError {
 
 impl Error for LinkError {}
 
+/// Transaction-journal failures.
+///
+/// Every variant retains the journal path. A journal names the entries a transaction owns, so a
+/// journal that cannot be read is the one situation where `SkillMount` knows something of its own
+/// may be on disk and cannot prove which entry it is. Deleting the file to make the error go away
+/// would discard that record permanently, so the file is always kept and the path is always
+/// reported.
+#[derive(Debug)]
+pub enum JournalError {
+    /// The journal exists but the host refused to read it.
+    Unreadable {
+        /// Journal path.
+        path: PathBuf,
+        /// Operating-system failure.
+        reason: String,
+    },
+    /// The journal is truncated, is not a journal, or failed validation.
+    Corrupt {
+        /// Journal path.
+        path: PathBuf,
+        /// Why it cannot be acted on.
+        reason: String,
+    },
+    /// The journal was written against a schema this build does not implement.
+    UnsupportedVersion {
+        /// Journal path.
+        path: PathBuf,
+        /// Version found in the header.
+        found: String,
+        /// Version this build writes.
+        supported: u32,
+    },
+    /// The journal could not be made durable.
+    Write {
+        /// Journal path.
+        path: PathBuf,
+        /// Operating-system failure.
+        reason: String,
+    },
+}
+
+impl JournalError {
+    /// Returns the journal path, which is retained in every case.
+    #[must_use]
+    pub fn path(&self) -> &PathBuf {
+        match self {
+            Self::Unreadable { path, .. }
+            | Self::Corrupt { path, .. }
+            | Self::UnsupportedVersion { path, .. }
+            | Self::Write { path, .. } => path,
+        }
+    }
+
+    /// Returns the operator-facing explanation without the path prefix.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Unreadable { reason, .. }
+            | Self::Corrupt { reason, .. }
+            | Self::Write { reason, .. } => reason.clone(),
+            Self::UnsupportedVersion {
+                found, supported, ..
+            } => format!(
+                "schema version {found} is not supported by this build (writes {supported})"
+            ),
+        }
+    }
+
+    /// Returns whether the failure blocks recovery rather than the current write.
+    ///
+    /// A journal this build cannot interpret is a *temporary* condition: a build that understands
+    /// it, or an operator who removes it deliberately, resolves the situation. Reporting it as a
+    /// filesystem failure would suggest the destination is at fault and invite a retry that behaves
+    /// identically.
+    #[must_use]
+    pub const fn blocks_recovery(&self) -> bool {
+        matches!(
+            self,
+            Self::Unreadable { .. } | Self::Corrupt { .. } | Self::UnsupportedVersion { .. }
+        )
+    }
+}
+
+impl fmt::Display for JournalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unreadable { path, reason } => write!(
+                formatter,
+                "cannot read transaction journal {}: {reason}; it is retained",
+                path.display()
+            ),
+            Self::Corrupt { path, reason } => write!(
+                formatter,
+                "transaction journal {} cannot be acted on: {reason}; it is retained for manual review",
+                path.display()
+            ),
+            Self::UnsupportedVersion {
+                path,
+                found,
+                supported,
+            } => write!(
+                formatter,
+                "transaction journal {} uses schema version {found} and this build writes {supported}; it is retained and nothing was removed",
+                path.display()
+            ),
+            Self::Write { path, reason } => write!(
+                formatter,
+                "cannot make transaction journal {} durable: {reason}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl Error for JournalError {}
+
 /// An error returned by the shared application boundary.
 #[derive(Debug)]
 pub enum AppError {
@@ -328,6 +444,8 @@ pub enum AppError {
     Plan(PlanError),
     /// A platform link backend could not complete an operation.
     Link(LinkError),
+    /// A transaction journal could not be written, read, or interpreted.
+    Journal(JournalError),
     /// Missing, inaccessible, or wrongly typed input.
     MissingInput {
         /// Input path.
@@ -354,6 +472,13 @@ impl AppError {
             Self::Catalog(_) => ExitCategory::Data,
             // A destination conflict is a filesystem-state failure, not a catalog failure.
             Self::Plan(_) | Self::Link(_) | Self::Filesystem(_) => ExitCategory::Filesystem,
+            Self::Journal(error) => {
+                if error.blocks_recovery() {
+                    ExitCategory::Temporary
+                } else {
+                    ExitCategory::Filesystem
+                }
+            }
             Self::MissingInput { .. } => ExitCategory::MissingInput,
             Self::Internal(_) => ExitCategory::Internal,
             Self::Temporary(_) => ExitCategory::Temporary,
@@ -372,6 +497,7 @@ impl fmt::Display for AppError {
             Self::Catalog(error) => error.fmt(formatter),
             Self::Plan(error) => error.fmt(formatter),
             Self::Link(error) => error.fmt(formatter),
+            Self::Journal(error) => error.fmt(formatter),
             Self::MissingInput { path, reason } => {
                 write!(
                     formatter,
@@ -390,6 +516,7 @@ impl Error for AppError {
             Self::Catalog(error) => Some(error),
             Self::Plan(error) => Some(error),
             Self::Link(error) => Some(error),
+            Self::Journal(error) => Some(error),
             _ => None,
         }
     }
@@ -410,5 +537,11 @@ impl From<PlanError> for AppError {
 impl From<LinkError> for AppError {
     fn from(error: LinkError) -> Self {
         Self::Link(error)
+    }
+}
+
+impl From<JournalError> for AppError {
+    fn from(error: JournalError) -> Self {
+        Self::Journal(error)
     }
 }
