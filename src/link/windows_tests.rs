@@ -444,12 +444,19 @@ fn spaces_japanese_characters_and_long_paths_address_the_intended_entries() {
     );
     assert_source_intact(&source);
 
-    // A path past the 260-character limit, which only resolves because every system call goes out
-    // in the extended `\\?\` form.
-    let deep = fixture.source(&["長い名前"; 24].join("/"));
+    // A path past the legacy 260-character limit, which only resolves because every system call
+    // goes out in the extended `\\?\` form.
+    //
+    // The component count is derived from the fixture root rather than fixed, because that root
+    // carries the runner's user name, the process id, and a nanosecond nonce. A fixed count that
+    // clears the limit on one runner falls short on another, which is what happened here.
+    let component = "長い名前";
+    let per_component = component.chars().count() + 1;
+    let needed = 320_usize.saturating_sub(wide(&fixture.root).len()) / per_component + 1;
+    let deep = fixture.source(&(0..needed).map(|_| component).collect::<Vec<_>>().join("/"));
     assert!(
         wide(&deep).len() > 260,
-        "the long-path case must actually be long: {} units",
+        "the long-path case must actually be long: {} units over {needed} components",
         wide(&deep).len()
     );
     let long_link = stage(&deep, &fixture.path("long"), LinkMode::Junction)
