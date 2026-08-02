@@ -207,10 +207,12 @@ impl Transaction {
         &mut self.journal
     }
 
-    /// Writes the current journal state to disk.
+    /// Writes the current journal state to the file this transaction owns.
+    ///
+    /// The path is fixed when the transaction is created or adopted and never recomputed, so a
+    /// journal read from disk keeps being written back to the file it came from.
     fn persist(&mut self) -> Result<(), AppError> {
-        self.path = store::persist(&self.journal)?;
-        Ok(())
+        store::persist(&self.journal, &self.path)
     }
 
     /// Advances the transaction status and makes it durable.

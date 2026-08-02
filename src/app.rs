@@ -129,8 +129,11 @@ pub(crate) struct ReadOnlyOutcome {
 fn run_session(context: &RunContext) -> Result<(), AppError> {
     // SkillMount's own storage is created here rather than planned as a transaction action. Every
     // session shares it, so an action that created it would make two concurrent runs contend on a
-    // directory neither of them owns.
-    crate::state::ensure_private_directory(&crate::state::session_root_base()?)?;
+    // directory neither of them owns. Only a staging session needs it, and creating it anyway
+    // would leave a Codex-only state root looking as though it had once staged something.
+    if context.options.mount_mode == MountMode::Staging {
+        crate::state::ensure_private_directory(&crate::state::session_root_base()?)?;
+    }
 
     // The identifier is minted before anything is observed, and used for both the staging root and
     // the journal name. Minting it this early is what keeps two concurrent Claude sessions apart:

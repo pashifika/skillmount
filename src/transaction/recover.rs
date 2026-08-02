@@ -111,22 +111,23 @@ pub fn recover_stale(already_held: &mut HeldLocks) -> Result<RecoveryReport, App
         ..RecoveryReport::default()
     };
 
-    for journal in scan.incomplete() {
-        let resources = journal.lock_resources();
+    for scanned in scan.incomplete() {
+        let resources = scanned.journal.lock_resources();
         let Some(taken) = claim(&resources, already_held)? else {
-            report
-                .active
-                .push(store::journal_path(&journal.transaction_id)?);
+            report.active.push(scanned.path.clone());
             continue;
         };
         already_held.absorb(taken);
 
-        let path = store::journal_path(&journal.transaction_id)?;
-        let mut transaction = Transaction::adopt(journal.clone(), path.clone(), already_held)?;
+        // The file the journal was read from, never a path re-derived from its recorded id. The
+        // two agree for every journal this crate wrote; reconciling the derived one instead would
+        // leave a mismatched file behind to be recovered again on every later run.
+        let mut transaction =
+            Transaction::adopt(scanned.journal.clone(), scanned.path.clone(), already_held)?;
         let outcome = transaction.cleanup_recovered()?;
         report.reconciled.push(ReconciledTransaction {
-            transaction: journal.transaction_id.to_string(),
-            journal: path,
+            transaction: scanned.journal.transaction_id.to_string(),
+            journal: scanned.path.clone(),
             report: outcome,
         });
     }
@@ -144,7 +145,7 @@ pub fn recover_stale(already_held: &mut HeldLocks) -> Result<RecoveryReport, App
 /// # Errors
 ///
 /// Returns [`AppError::Journal`] when the journal directory cannot be enumerated.
-pub fn blocking_state(already_held: &mut HeldLocks) -> Result<Vec<String>, AppError> {
+pub fn blocking_state(already_held: &HeldLocks) -> Result<Vec<String>, AppError> {
     let scan = store::scan()?;
     let mut blocking = scan
         .rejected
@@ -158,16 +159,16 @@ pub fn blocking_state(already_held: &mut HeldLocks) -> Result<Vec<String>, AppEr
         })
         .collect::<Vec<_>>();
 
-    for journal in scan.incomplete() {
-        let resources = journal.lock_resources();
+    for scanned in scan.incomplete() {
+        let resources = scanned.journal.lock_resources();
         // A transaction whose locks are held is somebody else's live session, not unrecovered
         // state. It is not this run's business and does not block it; the ordinary lock wait will
         // report it if the two sessions actually contend.
         if claim(&resources, already_held)?.is_some() {
             blocking.push(format!(
                 "transaction {} is incomplete ({}) and --no-recover forbids reconciling it",
-                journal.transaction_id,
-                journal.status.label()
+                scanned.journal.transaction_id,
+                scanned.journal.status.label()
             ));
         }
     }

@@ -254,14 +254,10 @@ fn persistence_is_atomic_and_leaves_no_temporary_file() {
     let _guard = StateRootGuard::set(fixture.path());
     let journal = sample(TransactionStatus::Planned);
 
-    let path = store::persist(&journal).expect("the state directory is writable");
+    let path = store::journal_path(&journal.transaction_id).unwrap();
+    store::persist(&journal, &path).expect("the state directory is writable");
 
     assert_eq!(store::load(&path).expect("the journal reloads"), journal);
-    assert_eq!(
-        store::journal_path(&journal.transaction_id).unwrap(),
-        path,
-        "the derived path and the written path must agree so recovery finds the file"
-    );
     let leftovers = std::fs::read_dir(path.parent().unwrap())
         .unwrap()
         .filter_map(Result::ok)
@@ -276,16 +272,42 @@ fn a_status_advance_replaces_the_same_file() {
     let _guard = StateRootGuard::set(fixture.path());
     let mut journal = sample(TransactionStatus::Planned);
 
-    let first = store::persist(&journal).expect("the state directory is writable");
+    let path = store::journal_path(&journal.transaction_id).unwrap();
+    store::persist(&journal, &path).expect("the state directory is writable");
     journal.status = TransactionStatus::Active;
-    let second = store::persist(&journal).expect("advancing a status rewrites the journal");
+    store::persist(&journal, &path).expect("advancing a status rewrites the journal");
 
-    assert_eq!(first, second);
     assert_eq!(
-        store::load(&second).unwrap().status,
+        store::load(&path).unwrap().status,
         TransactionStatus::Active
     );
     assert_eq!(store::scan().unwrap().journals.len(), 1);
+}
+
+#[test]
+fn a_scanned_journal_carries_the_file_it_came_from() {
+    let fixture = TestDir::new("journal-scan-path");
+    let _guard = StateRootGuard::set(fixture.path());
+    let journal = sample(TransactionStatus::Active);
+    // A journal whose filename does not match its recorded id, which a manual copy or a partially
+    // restored backup produces. Reconciling it against a path re-derived from the id would write
+    // and remove a second file on every run while this one stayed incomplete forever.
+    let directory = crate::state::transaction_base().unwrap();
+    crate::state::ensure_private_directory(&directory).unwrap();
+    let misnamed = directory.join("renamed-by-hand.journal");
+    store::persist(&journal, &misnamed).expect("the state directory is writable");
+
+    let scan = store::scan().expect("the directory is readable");
+
+    assert_eq!(scan.journals.len(), 1);
+    assert_eq!(
+        scan.journals[0].path, misnamed,
+        "reconciling must target the file that was read, not one derived from the recorded id"
+    );
+    assert_ne!(
+        scan.journals[0].path,
+        store::journal_path(&journal.transaction_id).unwrap()
+    );
 }
 
 #[test]
@@ -293,7 +315,8 @@ fn a_scan_separates_healthy_journals_from_refused_ones() {
     let fixture = TestDir::new("journal-scan");
     let _guard = StateRootGuard::set(fixture.path());
     let healthy = sample(TransactionStatus::Active);
-    store::persist(&healthy).expect("the state directory is writable");
+    let healthy_path = store::journal_path(&healthy.transaction_id).unwrap();
+    store::persist(&healthy, &healthy_path).expect("the state directory is writable");
 
     let directory = crate::state::transaction_base().unwrap();
     std::fs::write(directory.join("garbage.journal"), b"not a journal at all\n")
@@ -303,7 +326,9 @@ fn a_scan_separates_healthy_journals_from_refused_ones() {
 
     let scan: JournalScan = store::scan().expect("one bad journal must not hide the good ones");
 
-    assert_eq!(scan.journals, vec![healthy]);
+    assert_eq!(scan.journals.len(), 1);
+    assert_eq!(scan.journals[0].journal, healthy);
+    assert_eq!(scan.journals[0].path, healthy_path);
     assert_eq!(scan.rejected.len(), 1);
     assert_eq!(
         scan.rejected[0].path,

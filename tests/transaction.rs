@@ -595,6 +595,54 @@ fn a_claude_session_stages_under_its_own_identifier() {
     );
 }
 
+#[test]
+fn a_claude_session_removes_its_whole_staging_root_at_cleanup() {
+    let fixture = Fixture::new("claude-cleanup");
+    fixture.skill("alpha").skill("beta");
+
+    let output = fixture.run("claude", &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(70),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Claude staging creates a four-deep chain — `<id>`, `<id>/root`, `<id>/root/.claude`,
+    // `<id>/root/.claude/skills` — so reverse-order removal carries more weight here than in the
+    // Codex layout every other cleanup test covers. Its lock resources are unanchored too, which
+    // is a different derivation from the anchored Codex ones.
+    let staged = fs::read_dir(fixture.state.join("sessions"))
+        .expect("the shared sessions directory survives")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert!(
+        staged.is_empty(),
+        "every directory the session created must be gone: {staged:?}"
+    );
+    assert!(
+        fixture.state.join("sessions").is_dir(),
+        "the shared parent is not the session's to remove"
+    );
+    assert!(
+        fixture.journals().is_empty(),
+        "a completed transaction leaves no journal: {:?}",
+        fixture.journals()
+    );
+    assert!(
+        fixture.project_tree().is_empty(),
+        "staging never touches the project: {:?}",
+        fixture.project_tree()
+    );
+    for name in ["alpha", "beta"] {
+        assert!(
+            exists(&fixture.sources.join(name).join("SKILL.md")),
+            "removing a staged link must never reach the source it pointed at"
+        );
+    }
+}
+
 /// Waits up to two seconds for `condition`, so a spawned session is observably underway.
 fn wait_for(condition: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(2);

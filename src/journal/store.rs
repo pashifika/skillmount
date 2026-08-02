@@ -35,35 +35,53 @@ pub struct RejectedJournal {
     pub reason: String,
 }
 
+/// One journal together with the file it was read from.
+///
+/// The pair is kept rather than the journal alone, because the filename and the recorded
+/// transaction id are two sources of truth for one fact. Re-deriving the path from the id would
+/// make a journal whose name does not match — a manual copy, a partially restored backup — be
+/// reconciled against a *different* file: the derived name would be written and removed on every
+/// run while the original stayed incomplete forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedJournal {
+    /// File the journal was read from, which is the file reconciling it must write and remove.
+    pub path: PathBuf,
+    /// The decoded journal.
+    pub journal: TransactionJournal,
+}
+
 /// Everything found in the journal directory during one scan.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JournalScan {
-    /// Journals that decoded and validated.
-    pub journals: Vec<TransactionJournal>,
+    /// Journals that decoded and validated, each with the file it came from.
+    pub journals: Vec<ScannedJournal>,
     /// Journals that exist but were refused.
     pub rejected: Vec<RejectedJournal>,
 }
 
 impl JournalScan {
     /// Returns the journals a later invocation must reconcile.
-    pub fn incomplete(&self) -> impl Iterator<Item = &TransactionJournal> {
+    pub fn incomplete(&self) -> impl Iterator<Item = &ScannedJournal> {
         self.journals
             .iter()
-            .filter(|journal| journal.status.is_incomplete())
+            .filter(|scanned| scanned.journal.status.is_incomplete())
     }
 }
 
-/// Writes `journal` durably, replacing any earlier version of the same transaction.
+/// Writes `journal` durably to `path`, replacing any earlier version of the same transaction.
+///
+/// The destination is supplied rather than derived from the journal's own id. A transaction that
+/// was read from disk must keep writing to the file it was read from, so that one journal is never
+/// described by two files.
 ///
 /// # Errors
 ///
 /// Returns [`AppError::Journal`] when the state directory, the temporary file, the flush, or the
 /// rename fails. A failure here is reported before the mutation it was about to describe, so the
 /// caller has not yet changed anything.
-pub fn persist(journal: &TransactionJournal) -> Result<PathBuf, AppError> {
-    let directory = state::transaction_base()?;
-    state::ensure_private_directory(&directory)?;
-    let final_path = directory.join(journal.file_name());
+pub fn persist(journal: &TransactionJournal, path: &Path) -> Result<(), AppError> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    state::ensure_private_directory(directory)?;
     let document = codec::render_document(&journal.to_lines());
 
     // The temporary name carries the transaction id, so two concurrent transactions never collide
@@ -82,15 +100,15 @@ pub fn persist(journal: &TransactionJournal) -> Result<PathBuf, AppError> {
     // A journal is replaced in place as its status advances, so this rename must replace. That is
     // the opposite of link placement, which must never replace: there the destination belongs to
     // the project, while here it belongs to this transaction and no other writer exists.
-    fs::rename(&temporary, &final_path).map_err(|error| {
+    fs::rename(&temporary, path).map_err(|error| {
         let _ = fs::remove_file(&temporary);
         AppError::Journal(JournalError::Write {
-            path: final_path.clone(),
+            path: path.to_path_buf(),
             reason: error.to_string(),
         })
     })?;
-    flush_directory(&directory);
-    Ok(final_path)
+    flush_directory(directory);
+    Ok(())
 }
 
 /// Reads and validates one journal file.
@@ -184,7 +202,7 @@ pub fn scan() -> Result<JournalScan, AppError> {
 
     for path in paths {
         match load(&path) {
-            Ok(journal) => scan.journals.push(journal),
+            Ok(journal) => scan.journals.push(ScannedJournal { path, journal }),
             Err(AppError::Journal(error)) => scan.rejected.push(RejectedJournal {
                 path,
                 reason: error.reason().clone(),

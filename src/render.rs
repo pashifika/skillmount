@@ -13,7 +13,6 @@ use crate::diagnostic::Diagnostic;
 use crate::domain::{RunContext, ShadowReason, SkillCatalog};
 use crate::lock::LockResource;
 use crate::mount::{MountAction, MountPlan};
-use crate::state::transaction_base;
 
 /// Everything a read-only command has observed, ready to render.
 pub(crate) struct ReadOnlyReport<'a> {
@@ -287,9 +286,6 @@ fn verbose_lock_identity(out: &mut String, resource: &LockResource) {
 /// promise that a listed transaction is actually stale — eligibility needs the locks, and taking
 /// them is a side effect. It reports what it can see and what it would examine.
 fn recovery(out: &mut String) {
-    let Ok(base) = transaction_base() else {
-        return;
-    };
     let Ok(scan) = crate::journal::store::scan() else {
         return;
     };
@@ -298,9 +294,8 @@ fn recovery(out: &mut String) {
     }
 
     let _ = writeln!(out, "\nRecovery:");
-    for journal in &scan.journals {
-        let record = base.join(journal.file_name());
-        let verb = if journal.status.is_terminal() {
+    for scanned in &scan.journals {
+        let verb = if scanned.journal.status.is_terminal() {
             "WOULD KEEP    "
         } else {
             "WOULD RECOVER"
@@ -308,9 +303,9 @@ fn recovery(out: &mut String) {
         let _ = writeln!(
             out,
             "  {verb}  {}  ({}, {} owned action(s))",
-            path_value(&record, false),
-            journal.status.label(),
-            journal.reversible_actions().count()
+            path_value(&scanned.path, false),
+            scanned.journal.status.label(),
+            scanned.journal.reversible_actions().count()
         );
     }
     for rejected in &scan.rejected {
