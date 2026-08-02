@@ -65,14 +65,28 @@ pub(crate) fn try_symlink_dir(target: &Path, link: &Path) -> io::Result<()> {
     }
 }
 
+/// Environment variable that turns a skipped link fixture into a failure.
+///
+/// CI sets it so link coverage cannot silently disappear. A skipped test still reports success,
+/// and its output is captured unless it fails, so without this guard a run where every link
+/// fixture was skipped is indistinguishable from a run where all of them worked.
+const REQUIRE_LINKS: &str = "SKILLMOUNT_REQUIRE_LINKS";
+
 /// Creates a directory link and panics on any failure other than missing privilege.
 ///
-/// Returns `false` when the host cannot create links, which lets a test return early.
+/// Returns `false` when the host cannot create links, which lets a test return early. Windows
+/// needs Developer Mode or an elevated process, so a contributor without either still gets a
+/// usable suite locally while CI proves the link paths actually ran.
 #[must_use]
 pub(crate) fn symlink_dir_or_skip(target: &Path, link: &Path) -> bool {
     match try_symlink_dir(target, link) {
         Ok(()) => true,
         Err(error) if skip_unprivileged(&error) => {
+            assert!(
+                std::env::var_os(REQUIRE_LINKS).is_none(),
+                "{REQUIRE_LINKS} is set, so a link fixture may not be skipped: creating {} failed: {error}",
+                link.display()
+            );
             eprintln!("skipping link fixture at {}: {error}", link.display());
             false
         }

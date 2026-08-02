@@ -22,6 +22,10 @@ env:
   CARGO_DENY_VERSION: "0.20.2"
   MSRV: "1.85.0"
   RUST_TOOLCHAIN: "1.97.1"
+  # Link fixtures may be skipped on a developer machine without the privilege to create a
+  # directory symbolic link, but never here: a skipped test still reports success, so without
+  # this the link paths could stop running and no job would notice.
+  SKILLMOUNT_REQUIRE_LINKS: "1"
 
 jobs:
   branch-policy:
