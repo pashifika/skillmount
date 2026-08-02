@@ -328,14 +328,24 @@ fn a_staged_replacement_is_retained_and_never_recorded_as_applied() {
     let project = session.project();
     let mounted = project.join(".codex/skills/alpha");
     let (mut transaction, _locks) = session.open();
+    let staged = transaction
+        .journal()
+        .actions
+        .iter()
+        .find(|action| action.final_path == mounted)
+        .and_then(|action| action.temporary_path.clone())
+        .expect("the Skill link action has a staged path");
+    let displaced = staged.with_extension("displaced");
     let hook_destination = mounted.clone();
+    let hook_displaced = displaced.clone();
 
     let failure = with_hook(
         move |event| {
             if event.point == HookPoint::BeforePlacementVerification
                 && event.destination.as_deref() == Some(hook_destination.as_path())
             {
-                remove_directory_link(&event.path);
+                fs::rename(&event.path, &hook_displaced)
+                    .expect("the recorded staged entry is moved out of the way");
                 fs::create_dir_all(event.path.join("their-own-work"))
                     .expect("the staged replacement is created");
             }
@@ -355,6 +365,7 @@ fn a_staged_replacement_is_retained_and_never_recorded_as_applied() {
         .temporary_path
         .as_ref()
         .expect("an owned action has a staged path");
+    assert_eq!(temporary, &staged);
     let replacement = platform_backend()
         .inspect_no_follow(temporary)
         .expect("the replacement is inspectable");
@@ -372,6 +383,7 @@ fn a_staged_replacement_is_retained_and_never_recorded_as_applied() {
             .any(|entry| entry.path == *temporary)
     );
     assert_eq!(journal.status, TransactionStatus::Failed);
+    remove_directory_link(&displaced);
 }
 
 #[test]

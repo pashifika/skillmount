@@ -198,7 +198,7 @@ fn a_non_privilege_failure_keeps_its_own_error_and_creates_nothing() {
 }
 
 #[test]
-fn inspection_preserves_a_required_handle_open_failure() {
+fn handle_bound_removal_preserves_a_required_open_failure() {
     let fixture = Fixture::new("windows-inspect-sharing-failure");
     let path = fixture.path("locked-entry");
     fs::write(&path, "locked").expect("the fixture file is written");
@@ -207,10 +207,17 @@ fn inspection_preserves_a_required_handle_open_failure() {
         .share_mode(0)
         .open(&path)
         .expect("the test owns an exclusive handle");
+    let recorded = CreatedLink {
+        path: path.clone(),
+        kind: CreatedLinkKind::Symlink,
+        target: PathBuf::from("unused-target"),
+        source_canonical: PathBuf::from("unused-source"),
+        identity: None,
+    };
 
     let error = platform_backend()
-        .inspect_no_follow(&path)
-        .expect_err("a required no-follow handle cannot be silently discarded");
+        .remove_link_entry(&recorded)
+        .expect_err("a required DELETE handle cannot be silently discarded");
     let LinkError::Inspect { reason, .. } = error else {
         panic!("an open failure must remain an inspection error: {error}");
     };
