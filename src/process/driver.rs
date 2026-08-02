@@ -313,7 +313,9 @@ fn force_and_confirm<B: Backend>(
             if let Some(failed) = failed {
                 failures.push(failed);
             } else if matches!(termination, ForceTermination::Terminated) {
-                failures.push(backend.timeout_failure());
+                let timeout = backend.timeout_failure();
+                proven_child.record_failure(&timeout);
+                failures.push(timeout);
             }
         }
     }
@@ -901,6 +903,42 @@ mod tests {
         };
         assert_eq!(child, ChildOutcome::Failed(wait.clone()));
         assert_eq!(failures, [wait]);
+    }
+
+    #[test]
+    fn force_timeout_remains_primary_after_later_finalization_proof() {
+        let timeout = failure(ProcessStage::Wait);
+        let mut probes = VecDeque::from([Probe::Running, Probe::Running]);
+        probes.extend((0..FORCE_CONFIRM_POLLS * FORCE_ATTEMPTS).map(|_| Probe::Running));
+        probes.push_back(Probe::ProvenDead(ChildStatus::Exited(9)));
+        let mut backend = ScriptedBackend {
+            events: VecDeque::from([vec![InterruptKind::Interrupt, InterruptKind::Terminate]]),
+            probes,
+            force: VecDeque::from([
+                ForceTermination::Terminated,
+                ForceTermination::Terminated,
+                ForceTermination::Terminated,
+            ]),
+            delivery: InterruptDelivery::Forwarded,
+            post_proof_delivery: InterruptDelivery::ChildAlreadyExited,
+            delivery_calls: 0,
+            finalization_events: VecDeque::from([vec![InterruptKind::Break], Vec::new()]),
+            finalized: false,
+            disarmed: false,
+        };
+
+        let result = supervise(&mut backend);
+
+        let DriverResult::Proven {
+            child, failures, ..
+        } = result
+        else {
+            panic!("a finalization event should trigger a later death proof");
+        };
+        assert_eq!(child, ChildOutcome::Failed(timeout.clone()));
+        assert_eq!(failures, [timeout.clone(), timeout]);
+        assert!(backend.finalized);
+        assert!(backend.disarmed);
     }
 
     #[test]
