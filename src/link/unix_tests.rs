@@ -319,17 +319,20 @@ fn helper_directory_postcheck_retains_a_replacement_instead_of_claiming_it() {
     let backend = platform_backend();
     let staged = fixture.path("staged");
     let destination = fixture.path("destination");
+    let replacement = fixture.path("replacement");
     let created = backend
         .create_directory(&staged)
         .expect("directory creation succeeds");
+    fs::create_dir(&replacement).expect("create replacement directory before placement");
     let hook_destination = destination.clone();
+    let hook_replacement = replacement.clone();
 
     let outcome = with_hook(
         move |event| {
             if event.point == HookPoint::AfterPlacementMutation && event.path == hook_destination {
                 fs::remove_dir(&hook_destination)
                     .expect("the fixture removes the placed empty directory");
-                fs::create_dir(&hook_destination)
+                fs::rename(&hook_replacement, &hook_destination)
                     .expect("a replacement directory takes the destination");
             }
             Ok(())

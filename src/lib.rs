@@ -8,8 +8,9 @@
 //!
 //! A mutating session acquires the discovery snapshot's resource locks, recovers incomplete
 //! transactions, builds and stabilizes the full plan under those locks, persists a write-ahead
-//! journal, applies, and cleans up. Agent child launch is the remaining reserved boundary; see
-//! `docs/architecture.md` for current status and the cross-module ordering rules.
+//! journal, applies, and cleans up. The generic process supervisor can directly launch a completed
+//! plan and coordinate cleanup, while agent-specific selection and composition into the mutating
+//! application flow remain reserved; see `docs/architecture.md` for the current boundaries.
 
 pub mod agent;
 mod app;
@@ -25,6 +26,7 @@ pub mod lock;
 pub mod mount;
 mod native;
 mod paths;
+pub mod process;
 mod render;
 pub mod state;
 #[cfg(test)]

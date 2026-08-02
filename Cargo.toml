@@ -15,6 +15,19 @@ path = "src/bin/asm.rs"
 name = "skillmount"
 path = "src/bin/skillmount.rs"
 
+[[bin]]
+name = "skillmount-fake-agent"
+path = "tests/fixtures/fake_agent.rs"
+required-features = ["test-fixtures"]
+
+[[bin]]
+name = "skillmount-supervisor-harness"
+path = "tests/fixtures/supervisor_harness.rs"
+required-features = ["test-fixtures"]
+
+[features]
+test-fixtures = ["dep:ctrlc", "signal-hook/iterator"]
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
@@ -22,9 +35,9 @@ strip = "symbols"
 
 [lints.rust]
 missing_docs = "deny"
-# `deny` rather than `forbid`: the platform link backends need raw filesystem calls that no safe
-# API exposes, and `forbid` cannot be lifted anywhere. Every `allow` is a whole module that exists
-# only to wrap those calls, and no other module may opt in. See docs/adr/0011.
+# `deny` rather than `forbid`: the platform link backends and native process dispatch/containment
+# need narrow raw calls that no safe API exposes, and `forbid` cannot be lifted anywhere. Every
+# `allow` is a whole audited FFI module, and no other module may opt in. See ADR 0011 and ADR 0019.
 unsafe_code = "deny"
 
 [lints.clippy]
@@ -35,8 +48,8 @@ pedantic = "deny"
 clap = { version = "=4.6.5", features = ["derive"] }
 # Real operating-system advisory locks. `flock` and `LockFileEx` are the liveness signal the
 # transaction layer needs, and neither is reachable from the standard library. `fs4` wraps exactly
-# those two calls, keeps the crate's `unsafe` boundary at the two audited link FFI modules
-# (ADR 0011), and already resolves to the `windows-sys` version pinned below.
+# those two calls, keeps locking-related unsafe within the two audited link FFI modules (ADR 0011),
+# and already resolves to the `windows-sys` version pinned below.
 fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
 serde_yaml_ng = "=0.10.0"
 # Lock filenames are SHA-256 digests of tagged identity bytes, so two spellings of one resource
@@ -48,15 +61,27 @@ sha2 = { version = "=0.11.0", default-features = false }
 # `renameat2(RENAME_NOREPLACE)`, both only through libc.
 [target."cfg(unix)".dependencies]
 libc = "=0.2.189"
+# Product handlers record event identity directly in an atomic ledger through the audited Unix FFI
+# boundary. Only the feature-gated fake agent uses signal-hook's iterator support.
+signal-hook = { version = "=0.4.4", default-features = false }
+# `kill`/`killpg` are exposed through a maintained safe API, keeping raw Unix process FFI out of
+# the process supervisor.
+nix = { version = "=0.31.3", default-features = false, features = ["signal"] }
 
 # Junctions are reparse points. Creating, reading, and identifying one needs `DeviceIoControl`,
 # `CreateFileW`, and `GetFileInformationByHandle`, none of which the standard library exposes.
 [target."cfg(windows)".dependencies]
+# The fake-agent fixture uses `ctrlc` to observe its inherited console events. Product supervision
+# preserves the raw event type through the audited process FFI module instead.
+ctrlc = { version = "=3.5.2", optional = true }
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_JobObjects",
     "Win32_System_SystemServices",
+    "Win32_System_Threading",
 ] }
