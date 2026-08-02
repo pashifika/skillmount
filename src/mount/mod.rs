@@ -40,6 +40,16 @@ impl PathPrecondition {
             Self::ExistingLinkToSource => "existing_link_to_source",
         }
     }
+
+    /// Parses a label a journal recorded earlier.
+    #[must_use]
+    pub fn parse(label: &str) -> Option<Self> {
+        match label {
+            "missing" => Some(Self::Missing),
+            "existing_link_to_source" => Some(Self::ExistingLinkToSource),
+            _ => None,
+        }
+    }
 }
 
 /// One filesystem operation a later transaction would perform.

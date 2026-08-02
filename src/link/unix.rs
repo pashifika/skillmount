@@ -17,8 +17,8 @@ use crate::domain::LinkMode;
 use crate::error::LinkError;
 use crate::link::resolve::targets_match;
 use crate::link::{
-    CreatedLink, CreatedLinkKind, EntryKind, LinkBackend, LinkRequest, LinkTarget, Ownership,
-    PathEntry, PlacementOutcome, PlatformIdentity, RemoveOutcome, sealed, verify_ownership,
+    CreatedLink, CreatedLinkKind, EntryKind, LinkBackend, LinkRequest, LinkTarget, OwnedDirectory,
+    Ownership, PathEntry, PathPlacement, PlatformIdentity, RemoveOutcome, sealed, verify_ownership,
 };
 
 /// The macOS backend.
@@ -119,15 +119,19 @@ impl LinkBackend for UnixBackend {
         })
     }
 
-    fn place_no_replace(
+    fn create_directory(&self, path: &Path) -> Result<OwnedDirectory, LinkError> {
+        super::create_directory_entry(self, path)
+    }
+
+    fn place_path_no_replace(
         &self,
-        staged: &CreatedLink,
+        staged: &Path,
         destination: &Path,
-    ) -> Result<PlacementOutcome, LinkError> {
-        match super::unix_ffi::rename_no_replace(&staged.path, destination) {
-            Ok(()) => Ok(PlacementOutcome::Placed(staged.relocated_to(destination))),
+    ) -> Result<PathPlacement, LinkError> {
+        match super::unix_ffi::rename_no_replace(staged, destination) {
+            Ok(()) => Ok(PathPlacement::Placed),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                Ok(PlacementOutcome::DestinationExists)
+                Ok(PathPlacement::DestinationExists)
             }
             Err(error) if error.kind() == io::ErrorKind::Unsupported => {
                 Err(LinkError::Unsupported {
@@ -136,11 +140,18 @@ impl LinkBackend for UnixBackend {
                 })
             }
             Err(error) => Err(LinkError::Place {
-                staged: staged.path.clone(),
+                staged: staged.to_path_buf(),
                 destination: destination.to_path_buf(),
                 reason: error.to_string(),
             }),
         }
+    }
+
+    fn remove_empty_directory(
+        &self,
+        recorded: &OwnedDirectory,
+    ) -> Result<RemoveOutcome, LinkError> {
+        super::remove_owned_directory(self, recorded)
     }
 
     fn remove_link_entry(&self, recorded: &CreatedLink) -> Result<RemoveOutcome, LinkError> {

@@ -25,6 +25,25 @@ impl AgentId {
             Self::Claude => OsStr::new("claude"),
         }
     }
+
+    /// Returns the stable label used in output and in the transaction journal.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+
+    /// Parses a label a journal recorded earlier.
+    #[must_use]
+    pub fn parse(label: &str) -> Option<Self> {
+        match label {
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            _ => None,
+        }
+    }
 }
 
 /// The requested link implementation.
@@ -125,6 +144,14 @@ pub struct RunContext {
     pub project_root: PathBuf,
     /// Ordered source occurrences.
     pub skill_sources: Vec<SourceOccurrence>,
+    /// Identifier for a mutating session, or `None` while planning is still preliminary.
+    ///
+    /// A staging layout is addressed by this value, so it cannot be invented during planning: two
+    /// identical `--dry-run` invocations would then print different output. A preliminary plan uses
+    /// [`crate::state::PENDING_SESSION`] instead, and a mutating run mints the identifier once and
+    /// replans with it before anything is created — which is also what keeps two concurrent Claude
+    /// sessions in separate staging roots.
+    pub session_id: Option<crate::journal::TransactionId>,
     /// Explicit resolved agent path, or the bare executable name for `PATH` lookup.
     pub agent_bin: PathBuf,
     /// Opaque arguments following the standalone `--`.

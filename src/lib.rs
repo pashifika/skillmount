@@ -12,18 +12,22 @@
 pub mod agent;
 mod app;
 pub mod catalog;
+pub mod checkpoint;
 mod cli;
 pub mod diagnostic;
 pub mod domain;
 pub mod error;
+pub mod journal;
 pub mod link;
 pub mod lock;
 pub mod mount;
+mod native;
 mod paths;
 mod render;
 pub mod state;
 #[cfg(test)]
 mod test_support;
+pub mod transaction;
 
 use std::ffi::OsString;
 use std::process::ExitCode;

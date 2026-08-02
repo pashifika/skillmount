@@ -43,13 +43,22 @@ pub(crate) struct StagingLayout {
 }
 
 impl StagingLayout {
-    /// Computes the layout for a session that has not been created yet.
+    /// Computes the layout a session would stage into.
+    ///
+    /// A run that has not minted an identifier yet uses [`PENDING_SESSION`], which is deliberately
+    /// unusable as a real directory name on Windows: a preliminary plan must be recognisable as
+    /// one, and never accidentally applied. A mutating run replans with its real identifier before
+    /// anything is created, which is also what puts two concurrent sessions in separate roots.
     ///
     /// # Errors
     ///
     /// Returns [`AppError::MissingInput`] when the platform state location cannot be resolved.
-    pub(crate) fn pending() -> Result<Self, AppError> {
-        let session = session_root_base()?.join(PENDING_SESSION);
+    pub(crate) fn for_context(context: &RunContext) -> Result<Self, AppError> {
+        let component = context
+            .session_id
+            .as_ref()
+            .map_or_else(|| PENDING_SESSION.to_owned(), ToString::to_string);
+        let session = session_root_base()?.join(component);
         let add_dir_root = session.join("root");
         let skills = add_dir_root.join(SKILLS_SUFFIX);
         Ok(Self {
@@ -60,11 +69,20 @@ impl StagingLayout {
     }
 }
 
-/// Returns every ancestor of `leaf` that does not exist yet, parents before children.
-fn missing_directory_chain(leaf: &Path) -> Vec<PathBuf> {
+/// Returns every ancestor of `leaf` beneath `boundary` that does not exist yet, parents first.
+///
+/// The boundary is load-bearing, not a tidiness measure. Everything at or above it is shared by
+/// every session — the state root and its `sessions` directory, or the project root — and a shared
+/// directory must never become a transaction action. Two concurrent sessions would then each plan
+/// to create it, the second would find it occupied, and a precondition check would fail a run that
+/// is doing nothing wrong. Shared storage is created idempotently outside the transaction instead;
+/// the journal and lock directories are handled the same way.
+fn missing_directory_chain(leaf: &Path, boundary: &Path) -> Vec<PathBuf> {
     let mut missing = leaf
         .ancestors()
-        .take_while(|ancestor| !ancestor.as_os_str().is_empty() && !ancestor.exists())
+        .take_while(|ancestor| {
+            !ancestor.as_os_str().is_empty() && *ancestor != boundary && !ancestor.exists()
+        })
         .map(Path::to_path_buf)
         .collect::<Vec<_>>();
     missing.reverse();
@@ -133,7 +151,7 @@ impl ClaudeAdapter {
     ) -> Result<(PathBuf, PathBuf, Option<StagingLayout>), AppError> {
         match context.options.mount_mode {
             MountMode::Staging => {
-                let layout = StagingLayout::pending()?;
+                let layout = StagingLayout::for_context(context)?;
                 Ok((
                     layout.add_dir_root.clone(),
                     layout.skills.clone(),
@@ -248,8 +266,13 @@ impl AgentAdapter for ClaudeAdapter {
         catalog: &SkillCatalog,
         discovery: &DiscoverySnapshot,
     ) -> Result<MountPlan, AppError> {
+        // Directories at or above this boundary belong to every session, so they are never planned.
+        let boundary = match context.options.mount_mode {
+            MountMode::Staging => session_root_base()?,
+            MountMode::Project => context.project_root.clone(),
+        };
         let mut actions = ActionSequence::default();
-        for directory in missing_directory_chain(&discovery.backing_store) {
+        for directory in missing_directory_chain(&discovery.backing_store, &boundary) {
             actions.push(
                 MountAction::CreateDirectory { path: directory },
                 PathPrecondition::Missing,
@@ -336,7 +359,7 @@ mod tests {
         let existing = std::env::temp_dir();
         let leaf = existing.join("skillmount-absent-a/b/c");
 
-        let chain = missing_directory_chain(&leaf);
+        let chain = missing_directory_chain(&leaf, &existing);
 
         assert_eq!(
             chain,
@@ -347,6 +370,28 @@ mod tests {
             ],
             "parents must precede children so the chain applies in order"
         );
-        assert!(missing_directory_chain(&existing).is_empty());
+        assert!(missing_directory_chain(&existing, &existing).is_empty());
+    }
+
+    #[test]
+    fn nothing_at_or_above_the_shared_boundary_is_ever_planned() {
+        // A staging root whose shared parents do not exist yet. Planning them would make two
+        // concurrent sessions each claim the same `sessions` directory, and the loser would fail a
+        // precondition check for doing nothing wrong.
+        let base = std::env::temp_dir().join("skillmount-shared-base/sessions");
+        let leaf = base.join("session-id/root/.claude/skills");
+
+        let chain = missing_directory_chain(&leaf, &base);
+
+        assert_eq!(
+            chain,
+            [
+                base.join("session-id"),
+                base.join("session-id/root"),
+                base.join("session-id/root/.claude"),
+                leaf
+            ],
+            "only directories inside this session's own root may be planned"
+        );
     }
 }

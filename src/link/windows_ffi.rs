@@ -6,9 +6,10 @@
 //! `windows_sys` type crosses back out of it, so a reviewer auditing the raw-pointer surface reads
 //! this file and nothing else.
 //!
-//! Four things the standard library cannot do bring us here: opening a directory without following
-//! its reparse point, reading and writing a reparse buffer, reading a stable file identity, and
-//! renaming without replacement. Everything else in the Windows backend uses safe `std::fs`.
+//! Five things the standard library cannot do bring us here: opening a directory without following
+//! its reparse point, reading and writing a reparse buffer, reading a stable file identity,
+//! renaming without replacement, and replacing a durable journal with write-through semantics.
+//! Everything else in the Windows backend uses safe `std::fs`.
 //!
 //! Handles are wrapped in [`std::os::windows::io::OwnedHandle`] at the boundary, so closing them is
 //! std's responsibility and no `Drop` implementation here can leak or double-close one.
@@ -26,7 +27,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, MoveFileExW, OPEN_EXISTING, RemoveDirectoryW,
+    GetFileInformationByHandleEx, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    OPEN_EXISTING, RemoveDirectoryW,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
@@ -284,6 +286,35 @@ pub(super) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     // SAFETY: both buffers are NUL-terminated and outlive the call. Passing no flags is what makes
     // the operation refuse to replace an existing destination.
     let succeeded = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Atomically replaces `to` with `from` and waits for the move to reach the disk.
+///
+/// Microsoft documents `MOVEFILE_WRITE_THROUGH` as not returning until the file is actually moved
+/// on disk. Pairing it with `MOVEFILE_REPLACE_EXISTING` supplies the journal semantics that
+/// `std::fs::rename` lacks on Windows: replacement plus a durable namespace update before success.
+/// No cross-volume copy fallback is enabled; the journal temporary is always a sibling of `to`.
+///
+/// # Errors
+///
+/// Returns the operating-system error when replacement or its write-through completion fails.
+pub(super) fn replace_file_write_through(from: &Path, to: &Path) -> io::Result<()> {
+    let from = to_wide(from)?;
+    let to = to_wide(to)?;
+    // SAFETY: both buffers are NUL-terminated and outlive the call. The source and destination are
+    // siblings, so no copy-across-volumes flag is needed. `MOVEFILE_WRITE_THROUGH` makes successful
+    // return the durability boundary instead of merely queueing the namespace update.
+    let succeeded = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
     if succeeded == 0 {
         return Err(io::Error::last_os_error());
     }

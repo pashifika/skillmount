@@ -84,11 +84,23 @@ impl Fixture {
         ]
     }
 
+    /// Roots holding data that belongs to the operator rather than to `SkillMount`.
+    ///
+    /// A mutating session legitimately creates `SkillMount`'s own state directories — journals and
+    /// lock files — before it can decide whether it may proceed. Those are not the operator's data,
+    /// so a test about a failing session watches only the project and the Skill sources.
+    fn user_data(&self) -> Vec<PathBuf> {
+        vec![self.project.clone(), self.sources.clone()]
+    }
+
     fn assert_unchanged(&self, arguments: &[&str]) -> Output {
-        let before = self
-            .watched()
-            .into_iter()
-            .map(|root| (root.clone(), snapshot(&root)))
+        self.assert_roots_unchanged(&self.watched(), arguments)
+    }
+
+    fn assert_roots_unchanged(&self, roots: &[PathBuf], arguments: &[&str]) -> Output {
+        let before = roots
+            .iter()
+            .map(|root| (root.clone(), snapshot(root)))
             .collect::<Vec<_>>();
 
         let output = self.run(arguments);
@@ -315,17 +327,24 @@ fn a_skill_disabling_claude_argument_is_rejected_before_planning() {
 }
 
 #[test]
-fn a_normal_session_stops_at_the_mutation_boundary_without_launching() {
+fn a_session_that_fails_before_the_mutation_boundary_changes_nothing() {
     let fixture = Fixture::new("mutation-boundary");
     fixture.skill("alpha");
+    // A destination the plan cannot resolve, so the run fails while it is still read-only. A
+    // session that gets past planning is no longer a read-only path and belongs to
+    // `tests/transaction.rs`; what this suite still owns is the guarantee that a failure on the
+    // way there costs nothing.
+    fs::create_dir_all(fixture.project.join(".codex/skills/alpha")).expect("conflicting entry");
     let sources = fixture.sources.to_string_lossy().into_owned();
     let agent_bin = fixture.agent_bin.to_string_lossy().into_owned();
 
-    let output =
-        fixture.assert_unchanged(&["codex", "--skills-dir", &sources, "--agent-bin", &agent_bin]);
+    let output = fixture.assert_roots_unchanged(
+        &fixture.user_data(),
+        &["codex", "--skills-dir", &sources, "--agent-bin", &agent_bin],
+    );
 
-    assert_eq!(output.status.code(), Some(70));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("reserved for later changes"));
+    assert_eq!(output.status.code(), Some(73));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("conflicts with"));
 }
 
 #[test]
@@ -385,21 +404,22 @@ fn an_existing_transaction_record_is_reported_and_left_alone() {
             .join("Library/Application Support/skillmount/transactions")
     };
     fs::create_dir_all(&transactions).expect("transaction directory");
-    let record = transactions.join("01JEXAMPLE.json");
-    fs::write(&record, "{}").expect("transaction record");
+    let record = transactions.join("01JEXAMPLE.journal");
+    fs::write(&record, "not a journal this build wrote\n").expect("transaction record");
     let sources = fixture.sources.to_string_lossy().into_owned();
 
     let output = fixture.assert_unchanged(&["codex", "--skills-dir", &sources, "--dry-run"]);
 
     assert!(output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("WOULD RECOVER"),
-        "an observable transaction record must be reported"
+        String::from_utf8_lossy(&output.stdout).contains("WOULD RETAIN"),
+        "a journal this build cannot interpret must be reported rather than ignored: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
     assert_eq!(
         fs::read_to_string(&record).expect("record still readable"),
-        "{}",
-        "a dry run must not recover or rewrite a transaction"
+        "not a journal this build wrote\n",
+        "a dry run must not recover, rewrite, or remove a transaction journal"
     );
 }
 

@@ -13,7 +13,6 @@ use crate::diagnostic::Diagnostic;
 use crate::domain::{RunContext, ShadowReason, SkillCatalog};
 use crate::lock::LockResource;
 use crate::mount::{MountAction, MountPlan};
-use crate::state::transaction_base;
 
 /// Everything a read-only command has observed, ready to render.
 pub(crate) struct ReadOnlyReport<'a> {
@@ -280,29 +279,42 @@ fn verbose_lock_identity(out: &mut String, resource: &LockResource) {
     }
 }
 
-/// Reports transaction records that a normal run would examine.
+/// Reports the transaction journals a normal run would reconcile.
 ///
-/// Journal parsing arrives with the transaction change, so a record is reported by presence alone
-/// and deliberately over-reports rather than claiming a state it cannot read. Nothing here opens,
-/// modifies, or removes a record.
+/// Reading is the only thing that happens here: nothing is locked, recovered, rewritten, or
+/// removed, which is what keeps `--dry-run` and `inspect` read-only. A dry run therefore cannot
+/// promise that a listed transaction is actually stale — eligibility needs the locks, and taking
+/// them is a side effect. It reports what it can see and what it would examine.
 fn recovery(out: &mut String) {
-    let Ok(base) = transaction_base() else {
+    let Ok(scan) = crate::journal::store::scan() else {
         return;
     };
-    let Ok(entries) = std::fs::read_dir(&base) else {
-        return;
-    };
-    let mut records = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    if records.is_empty() {
+    if scan.journals.is_empty() && scan.rejected.is_empty() {
         return;
     }
-    records.sort();
+
     let _ = writeln!(out, "\nRecovery:");
-    for record in records {
-        let _ = writeln!(out, "  WOULD RECOVER  {}", path_value(&record, false));
+    for scanned in &scan.journals {
+        let verb = if scanned.journal.status.is_terminal() {
+            "WOULD KEEP    "
+        } else {
+            "WOULD RECOVER"
+        };
+        let _ = writeln!(
+            out,
+            "  {verb}  {}  ({}, {} owned action(s))",
+            path_value(&scanned.path, false),
+            scanned.journal.status.label(),
+            scanned.journal.reversible_actions().count()
+        );
+    }
+    for rejected in &scan.rejected {
+        let _ = writeln!(
+            out,
+            "  WOULD RETAIN   {}  (unreadable: {})",
+            path_value(&rejected.path, false),
+            rejected.reason
+        );
     }
 }
 

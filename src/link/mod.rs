@@ -47,6 +47,15 @@ mod sealed {
     pub trait Sealed {}
 }
 
+/// Replaces one file and waits for the Windows namespace update to reach disk.
+///
+/// Kept as a crate-only wrapper so the raw Win32 call stays inside the audited FFI module while
+/// the journal store can use its durability guarantee.
+#[cfg(windows)]
+pub(crate) fn replace_file_write_through(from: &Path, to: &Path) -> std::io::Result<()> {
+    windows_ffi::replace_file_write_through(from, to)
+}
+
 /// How an entry appears when it is inspected without following it.
 ///
 /// A symbolic link and a Windows junction are distinguished here, unlike in
@@ -161,6 +170,20 @@ impl PlatformIdentity {
     pub(crate) fn from_pair(derivation: &str, volume: u64, index: u64) -> Self {
         Self::new(derivation, volume, &index.to_be_bytes())
     }
+
+    /// Rebuilds an identity from a value a journal recorded earlier.
+    ///
+    /// The rendering is opaque and is never interpreted, only compared, so a value written by an
+    /// older run of the same platform stays usable without a migration. A value produced by a
+    /// different derivation simply never compares equal, which is the conservative outcome.
+    pub(crate) fn from_recorded(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+
+    /// Returns the stable rendering, for hashing into a lock key or writing to a journal.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Display for PlatformIdentity {
@@ -243,6 +266,31 @@ impl CreatedLink {
     }
 }
 
+/// Ownership evidence for a directory this process created.
+///
+/// A helper directory gets the same treatment as a link, and for the same reason: "it is empty" is
+/// not proof that it is *this* transaction's directory. A user who removed the mounts by hand and
+/// left the store behind would otherwise have their directory deleted by a cleanup that only
+/// checked emptiness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedDirectory {
+    /// Path the directory currently occupies.
+    pub path: PathBuf,
+    /// Platform identity captured at creation, when the host reports one.
+    pub identity: Option<PlatformIdentity>,
+}
+
+impl OwnedDirectory {
+    /// Returns the same evidence recorded against `path`.
+    #[must_use]
+    pub fn relocated_to(&self, path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            identity: self.identity.clone(),
+        }
+    }
+}
+
 /// The result of placing a staged entry at its destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlacementOutcome {
@@ -253,6 +301,15 @@ pub enum PlacementOutcome {
     DestinationExists,
 }
 
+/// The result of placing a staged path, without regard to what kind of entry it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathPlacement {
+    /// The entry now occupies the destination.
+    Placed,
+    /// A destination appeared after staging; nothing was replaced.
+    DestinationExists,
+}
+
 /// Why a recorded entry is no longer this process's to remove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnershipMismatch {
@@ -260,6 +317,8 @@ pub enum OwnershipMismatch {
     RegularDirectory,
     /// The path now holds something that is not a directory link.
     NotALink,
+    /// The path no longer holds a regular directory.
+    NotADirectory,
     /// The link implementation differs from the recorded one.
     KindChanged,
     /// The link points somewhere other than the recorded target.
@@ -277,6 +336,7 @@ impl OwnershipMismatch {
         match self {
             Self::RegularDirectory => "a regular directory replaced the entry",
             Self::NotALink => "the entry is no longer a directory link",
+            Self::NotADirectory => "the entry is no longer a regular directory",
             Self::KindChanged => "the link implementation changed",
             Self::TargetChanged => "the link points somewhere else",
             Self::IdentityChanged => "the entry was replaced by a different one",
@@ -294,6 +354,11 @@ pub enum RemoveOutcome {
     AlreadyAbsent,
     /// The live entry does not match the recorded evidence and was left exactly as it is.
     OwnershipMismatch(OwnershipMismatch),
+    /// The verified directory holds entries this transaction did not put there.
+    ///
+    /// Distinct from an ownership mismatch: the directory *is* the recorded one, and it is still
+    /// not removable, because removing it would take the contents with it.
+    NotEmpty,
 }
 
 /// The narrow filesystem contract the transaction layer builds on.
@@ -341,18 +406,47 @@ pub trait LinkBackend: sealed::Sealed + Send + Sync {
     /// does not exist on this platform.
     fn create_directory_link(&self, request: &LinkRequest) -> Result<CreatedLink, LinkError>;
 
-    /// Atomically moves a staged entry onto `destination` without replacing anything.
+    /// Creates one empty directory at `path`, which must not already exist.
+    ///
+    /// The created entry is inspected before it is returned, so the caller receives the platform
+    /// identity that later proves the directory is still the one this transaction made.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError::Create`] when the path is occupied or the host refuses the creation.
+    fn create_directory(&self, path: &Path) -> Result<OwnedDirectory, LinkError>;
+
+    /// Atomically moves any staged entry onto `destination` without replacing anything.
+    ///
+    /// This is the single platform primitive both placement paths use, so a link and a directory
+    /// can never end up with different atomicity guarantees.
     ///
     /// # Errors
     ///
     /// Returns [`LinkError::Place`] when the host reports a failure other than an occupied
     /// destination, and [`LinkError::Unsupported`] when the host cannot guarantee no-replace
     /// semantics. The guarantee is never emulated with a separate existence check.
+    fn place_path_no_replace(
+        &self,
+        staged: &Path,
+        destination: &Path,
+    ) -> Result<PathPlacement, LinkError>;
+
+    /// Atomically moves a staged link onto `destination` without replacing anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`LinkBackend::place_path_no_replace`] reports.
     fn place_no_replace(
         &self,
         staged: &CreatedLink,
         destination: &Path,
-    ) -> Result<PlacementOutcome, LinkError>;
+    ) -> Result<PlacementOutcome, LinkError> {
+        match self.place_path_no_replace(&staged.path, destination)? {
+            PathPlacement::Placed => Ok(PlacementOutcome::Placed(staged.relocated_to(destination))),
+            PathPlacement::DestinationExists => Ok(PlacementOutcome::DestinationExists),
+        }
+    }
 
     /// Removes exactly the recorded link entry after verifying it is still the recorded one.
     ///
@@ -364,6 +458,22 @@ pub trait LinkBackend: sealed::Sealed + Send + Sync {
     /// Returns [`LinkError::Inspect`] when the entry cannot be classified and
     /// [`LinkError::Remove`] when the verified entry cannot be unlinked.
     fn remove_link_entry(&self, recorded: &CreatedLink) -> Result<RemoveOutcome, LinkError>;
+
+    /// Removes exactly the recorded directory, and only while it is still empty.
+    ///
+    /// Emptiness is enforced by the operating system rather than checked first: the removal call
+    /// refuses a directory with contents, so there is no window in which something could appear
+    /// between the check and the removal. Together with the identity comparison this is what keeps
+    /// "`SkillMount` never deletes your Skills" true for directories as well as links — there is
+    /// still no recursive removal anywhere on this interface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkError::Inspect`] when the entry cannot be classified and
+    /// [`LinkError::Remove`] when the verified directory cannot be removed for a reason other than
+    /// holding entries.
+    fn remove_empty_directory(&self, recorded: &OwnedDirectory)
+    -> Result<RemoveOutcome, LinkError>;
 }
 
 /// Returns the backend for the host platform.
@@ -432,4 +542,91 @@ pub(crate) fn verify_ownership(
             }
         }
     }
+}
+
+/// Decides whether a live entry is still the directory this transaction created.
+///
+/// The identity rule is the same one links use and is here for the same reason: a directory that
+/// someone recreated at the same path with the same name is a different directory, and only the
+/// identity distinguishes them. A missing identity on either side therefore refuses, which leaves
+/// harmless residue instead of removing a directory this process cannot prove it made.
+pub(crate) fn verify_directory_ownership(live: &PathEntry, recorded: &OwnedDirectory) -> Ownership {
+    match live.kind {
+        EntryKind::Missing => Ownership::Absent,
+        EntryKind::Symlink | EntryKind::Junction => {
+            Ownership::Mismatch(OwnershipMismatch::KindChanged)
+        }
+        EntryKind::File | EntryKind::Other => Ownership::Mismatch(OwnershipMismatch::NotADirectory),
+        EntryKind::Directory => match (live.identity.as_ref(), recorded.identity.as_ref()) {
+            (Some(live_identity), Some(recorded_identity)) => {
+                if live_identity == recorded_identity {
+                    Ownership::Owned
+                } else {
+                    Ownership::Mismatch(OwnershipMismatch::IdentityChanged)
+                }
+            }
+            _ => Ownership::Mismatch(OwnershipMismatch::IdentityUnavailable),
+        },
+    }
+}
+
+/// Shared implementation of [`LinkBackend::create_directory`].
+///
+/// `create_dir` fails when the path exists, which is what keeps creation no-replace without a
+/// separate existence check. Both backends share it because the standard library already provides
+/// the exact semantics on each platform.
+pub(crate) fn create_directory_entry(
+    backend: &dyn LinkBackend,
+    path: &Path,
+) -> Result<OwnedDirectory, LinkError> {
+    std::fs::create_dir(path).map_err(|error| LinkError::Create {
+        destination: path.to_path_buf(),
+        source: path.to_path_buf(),
+        reason: error.to_string(),
+    })?;
+    let created = backend.inspect_no_follow(path).inspect_err(|_| {
+        let _ = std::fs::remove_dir(path);
+    })?;
+    Ok(OwnedDirectory {
+        path: path.to_path_buf(),
+        identity: created.identity,
+    })
+}
+
+/// Shared implementation of [`LinkBackend::remove_empty_directory`].
+pub(crate) fn remove_owned_directory(
+    backend: &dyn LinkBackend,
+    recorded: &OwnedDirectory,
+) -> Result<RemoveOutcome, LinkError> {
+    let live = backend.inspect_no_follow(&recorded.path)?;
+    match verify_directory_ownership(&live, recorded) {
+        Ownership::Absent => Ok(RemoveOutcome::AlreadyAbsent),
+        Ownership::Mismatch(mismatch) => Ok(RemoveOutcome::OwnershipMismatch(mismatch)),
+        Ownership::Owned => match std::fs::remove_dir(&recorded.path) {
+            Ok(()) => Ok(RemoveOutcome::Removed),
+            // The operating system enforces emptiness, so a directory that gained contents between
+            // the identity check and this call is refused here rather than silently emptied.
+            Err(error) if is_not_empty(&error) => Ok(RemoveOutcome::NotEmpty),
+            Err(error) => Err(LinkError::Remove {
+                path: recorded.path.clone(),
+                reason: error.to_string(),
+            }),
+        },
+    }
+}
+
+/// Returns whether a removal failed because the directory still holds entries.
+///
+/// `ErrorKind::DirectoryNotEmpty` is newer than the crate's minimum supported Rust version, so the
+/// raw code is matched instead. Both codes come from the platform crate rather than a literal:
+/// `ENOTEMPTY` is 66 on macOS and 39 on Linux, and hard-coding either would misclassify a real
+/// failure as a harmless one on the other host.
+fn is_not_empty(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    let not_empty = libc::ENOTEMPTY;
+    #[cfg(windows)]
+    let not_empty = i32::try_from(windows_sys::Win32::Foundation::ERROR_DIR_NOT_EMPTY)
+        .expect("the error code fits in an i32");
+
+    error.raw_os_error() == Some(not_empty)
 }
