@@ -17,7 +17,7 @@ pub enum ExitCategory {
     MissingInput = 66,
     /// Internal invariant or unsupported application boundary.
     Internal = 70,
-    /// Filesystem mutation or cleanup failure.
+    /// Link creation or removal, cleanup, permission, or destination-conflict failure.
     Filesystem = 73,
     /// Temporary lock or stale-transaction failure.
     Temporary = 75,
@@ -147,6 +147,72 @@ impl fmt::Display for CatalogError {
 
 impl Error for CatalogError {}
 
+/// Planning failures that must stop a run while it is still read-only.
+///
+/// These report [`ExitCategory::Filesystem`], not the catalog category: the selected catalog is
+/// valid and the obstruction is destination state the operator owns. Exit code 73 is the
+/// destination-conflict code, so a caller can distinguish "your Skills are wrong" from "your
+/// project already has something there" without parsing text.
+#[derive(Debug)]
+pub enum PlanError {
+    /// A discovery entry is broken, cyclic, over-deep, or not a directory.
+    AmbiguousDiscoveryEntry {
+        /// Discovery entry that could not be resolved.
+        path: PathBuf,
+        /// Observed classification.
+        state: &'static str,
+    },
+    /// A selected Skill collides with an entry the agent can already see.
+    DestinationConflict {
+        /// Logical Skill name.
+        name: OsString,
+        /// Scope in which the collision was observed.
+        scope: &'static str,
+        /// Existing entry that occupies the name.
+        existing: PathBuf,
+        /// Observed classification of the existing entry.
+        existing_state: &'static str,
+        /// Canonical source of the selected Skill.
+        selected: PathBuf,
+    },
+    /// The observed layout is one that planning refuses to interpret.
+    UnsupportedLayout {
+        /// Path the layout was observed at.
+        path: PathBuf,
+        /// Why the layout cannot be planned.
+        reason: String,
+    },
+}
+
+impl fmt::Display for PlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AmbiguousDiscoveryEntry { path, state } => write!(
+                formatter,
+                "discovery entry {} is a {state} and cannot be planned",
+                path.display()
+            ),
+            Self::DestinationConflict {
+                name,
+                scope,
+                existing,
+                existing_state,
+                selected,
+            } => write!(
+                formatter,
+                "Skill {name:?} from {} conflicts with the {existing_state} {} already visible in the {scope} scope",
+                selected.display(),
+                existing.display()
+            ),
+            Self::UnsupportedLayout { path, reason } => {
+                write!(formatter, "cannot plan {}: {reason}", path.display())
+            }
+        }
+    }
+}
+
+impl Error for PlanError {}
+
 /// An error returned by the shared application boundary.
 #[derive(Debug)]
 pub enum AppError {
@@ -154,6 +220,8 @@ pub enum AppError {
     Usage(String),
     /// Invalid catalog data.
     Catalog(CatalogError),
+    /// A resolved catalog cannot be realized against the observed project state.
+    Plan(PlanError),
     /// Missing, inaccessible, or wrongly typed input.
     MissingInput {
         /// Input path.
@@ -178,9 +246,10 @@ impl AppError {
         match self {
             Self::Usage(_) => ExitCategory::Usage,
             Self::Catalog(_) => ExitCategory::Data,
+            // A destination conflict is a filesystem-state failure, not a catalog failure.
+            Self::Plan(_) | Self::Filesystem(_) => ExitCategory::Filesystem,
             Self::MissingInput { .. } => ExitCategory::MissingInput,
             Self::Internal(_) => ExitCategory::Internal,
-            Self::Filesystem(_) => ExitCategory::Filesystem,
             Self::Temporary(_) => ExitCategory::Temporary,
             Self::Interrupted => ExitCategory::Interrupted,
         }
@@ -195,6 +264,7 @@ impl fmt::Display for AppError {
             | Self::Filesystem(message)
             | Self::Temporary(message) => formatter.write_str(message),
             Self::Catalog(error) => error.fmt(formatter),
+            Self::Plan(error) => error.fmt(formatter),
             Self::MissingInput { path, reason } => {
                 write!(
                     formatter,
@@ -211,6 +281,7 @@ impl Error for AppError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Catalog(error) => Some(error),
+            Self::Plan(error) => Some(error),
             _ => None,
         }
     }
@@ -219,5 +290,11 @@ impl Error for AppError {
 impl From<CatalogError> for AppError {
     fn from(error: CatalogError) -> Self {
         Self::Catalog(error)
+    }
+}
+
+impl From<PlanError> for AppError {
+    fn from(error: PlanError) -> Self {
+        Self::Plan(error)
     }
 }

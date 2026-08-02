@@ -112,7 +112,28 @@ fn inspect_resolves_without_crossing_the_unimplemented_mount_boundary() {
 
     let inspect = run(ASM, &["inspect", "--skills-dir", &skill.to_string_lossy()]);
     assert!(inspect.status.success());
-    assert!(String::from_utf8_lossy(&inspect.stdout).contains("Resolved 1 Skill"));
+    let inspected = String::from_utf8_lossy(&inspect.stdout);
+    assert!(inspected.contains("Overlay: 1 Skill(s), 0 source override(s)"));
+    assert!(
+        inspected.contains("Agent:          codex") && inspected.contains("Agent:          claude"),
+        "the default inspection covers every agent: {inspected}"
+    );
+    assert!(inspected.contains("Effective argv:"));
+
+    let dry_run_arguments = [
+        "codex",
+        "--skills-dir",
+        &skill.to_string_lossy(),
+        "--dry-run",
+    ];
+    let dry_run = run(ASM, &dry_run_arguments);
+    assert!(dry_run.status.success(), "a dry run completes normally");
+    let planned = String::from_utf8_lossy(&dry_run.stdout);
+    assert!(planned.contains("LINK"), "the plan is rendered: {planned}");
+    assert!(
+        !fixture.join(".codex").exists() && !fixture.join(".agents").exists(),
+        "a dry run creates nothing"
+    );
 
     let session_arguments = ["codex", "--skills-dir", &skill.to_string_lossy()];
     let session = run(ASM, &session_arguments);
@@ -121,7 +142,10 @@ fn inspect_resolves_without_crossing_the_unimplemented_mount_boundary() {
     assert_eq!(session.status, fallback_session.status);
     assert_eq!(session.stdout, fallback_session.stdout);
     assert_eq!(session.stderr, fallback_session.stderr);
-    assert!(String::from_utf8_lossy(&session.stderr).contains("catalog resolved 1 Skill"));
+    assert!(
+        String::from_utf8_lossy(&session.stderr).contains("reserved for later changes"),
+        "a normal session still stops at the mutation boundary"
+    );
 
     fs::remove_dir_all(fixture).expect("fixture cleanup");
 }

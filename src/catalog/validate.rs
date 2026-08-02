@@ -7,7 +7,7 @@ use crate::catalog::{CatalogRequest, RawCandidate};
 use crate::diagnostic::Diagnostic;
 use crate::domain::{AgentId, Skill, SkillMetadata, SkillName, ValidationLevel};
 use crate::error::{AppError, CatalogError};
-use crate::paths::lexical_normalize;
+use crate::paths::{canonical_anchor, lexical_normalize};
 
 const MAX_LINK_DEPTH: usize = 40;
 
@@ -139,7 +139,7 @@ fn validate_destination_cycles(
     destinations: &[PathBuf],
 ) -> Result<(), AppError> {
     for destination in destinations {
-        let destination = canonicalize_with_missing_tail(destination);
+        let destination = canonical_anchor(destination);
         for source in [input_source, selected_source] {
             if destination.starts_with(source) || source.starts_with(&destination) {
                 return Err(CatalogError::SourceDestinationCycle {
@@ -151,27 +151,6 @@ fn validate_destination_cycles(
         }
     }
     Ok(())
-}
-
-fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
-    let mut cursor = path;
-    let mut tail = Vec::new();
-    loop {
-        if let Ok(mut canonical) = fs::canonicalize(cursor) {
-            for component in tail.iter().rev() {
-                canonical.push(component);
-            }
-            return lexical_normalize(&canonical);
-        }
-        let Some(name) = cursor.file_name() else {
-            return lexical_normalize(path);
-        };
-        tail.push(name.to_os_string());
-        let Some(parent) = cursor.parent() else {
-            return lexical_normalize(path);
-        };
-        cursor = parent;
-    }
 }
 
 fn validate_metadata(
