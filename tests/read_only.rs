@@ -404,6 +404,45 @@ fn an_existing_transaction_record_is_reported_and_left_alone() {
 }
 
 #[test]
+fn passthrough_values_with_shell_metacharacters_stay_separate_indexed_values() {
+    let fixture = Fixture::new("metacharacters");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let awkward = ["--flag", "a b\"c'd;e", "$(id)", "x && y", "back\\slash"];
+
+    let mut arguments = vec![
+        "codex",
+        "--skills-dir",
+        &sources,
+        "--dry-run",
+        "--verbose",
+        "--",
+    ];
+    arguments.extend(awkward);
+    let output = fixture.assert_unchanged(&arguments);
+
+    assert!(output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    for (index, value) in awkward.iter().enumerate() {
+        assert!(
+            rendered.contains(&format!("[{index}] {value}")),
+            "forwarded value {index} must appear verbatim on its own line: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("argv[{}] = {value}", index + 1)),
+            "effective argv must index the same value: {rendered}"
+        );
+    }
+    assert!(
+        !rendered
+            .lines()
+            .any(|line| line.contains(awkward[0]) && line.contains(awkward[1])),
+        "two forwarded values must never share a line, which is what a joined command string \
+         would produce: {rendered}"
+    );
+}
+
+#[test]
 fn read_only_output_is_identical_across_runs() {
     let fixture = Fixture::new("deterministic");
     fixture.skill("gamma");

@@ -435,23 +435,46 @@ fn an_entry_that_is_not_a_portable_name_still_occupies_its_logical_key() {
 
 #[test]
 fn scope_enumeration_is_independent_of_host_ordering() {
+    // Two stores hold the same logical entries created in opposite order. Creation order is the
+    // lever a caller has over what `read_dir` returns, so building both and comparing is what
+    // actually demonstrates the result does not depend on it. Reading one store twice would only
+    // show that the host is self-consistent.
     let project = Project::new("scope-deterministic");
-    let store = project.make_dir(COMPATIBILITY);
-    for name in ["zeta", "alpha", "Middle"] {
-        std::fs::create_dir_all(store.join(name)).expect("entry");
+    let forward = project.make_dir(".codex/forward");
+    let reverse = project.make_dir(".codex/reverse");
+    let names = ["zeta", "alpha", "Middle", "beta"];
+    for name in names {
+        std::fs::create_dir_all(forward.join(name)).expect("entry");
+    }
+    for name in names.iter().rev() {
+        std::fs::create_dir_all(reverse.join(name)).expect("entry");
     }
 
-    let first = inspect_scope(ScopeKind::CodexCompatibility, &store).unwrap();
-    let second = inspect_scope(ScopeKind::CodexCompatibility, &store).unwrap();
+    let first = inspect_scope(ScopeKind::CodexCompatibility, &forward).unwrap();
+    let second = inspect_scope(ScopeKind::CodexCompatibility, &reverse).unwrap();
 
-    assert_eq!(first, second);
-    assert_eq!(
-        first
+    let keys = |scope: &super::DiscoveryScope| {
+        scope
             .existing_skills
             .keys()
             .map(ToString::to_string)
-            .collect::<Vec<_>>(),
-        ["alpha", "middle", "zeta"]
+            .collect::<Vec<_>>()
+    };
+    let raw_names = |scope: &super::DiscoveryScope| {
+        scope
+            .existing_skills
+            .values()
+            .map(|existing| existing.raw_name.clone())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(keys(&first), ["alpha", "beta", "middle", "zeta"]);
+    assert_eq!(keys(&first), keys(&second));
+    assert_eq!(raw_names(&first), raw_names(&second));
+    assert_eq!(
+        inspect_scope(ScopeKind::CodexCompatibility, &forward).unwrap(),
+        first,
+        "repeating one inspection must also be stable"
     );
 }
 
