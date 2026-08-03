@@ -266,6 +266,7 @@ fn codex_rejects_every_plugin_namespace_spelling_above_a_selected_source() {
         fs::create_dir_all(manifest.parent().expect("manifest parent"))
             .expect("manifest directory");
         fs::write(&manifest, r#"{"name":"fixture-plugin"}"#).expect("plugin manifest");
+        let canonical_manifest = fs::canonicalize(&manifest).expect("canonical plugin manifest");
         let sources = fixture.sources.to_string_lossy().into_owned();
 
         let output = fixture.assert_unchanged(&[
@@ -286,7 +287,7 @@ fn codex_rejects_every_plugin_namespace_spelling_above_a_selected_source() {
         );
         assert!(stderr.contains("namespace-qualify"), "{stderr}");
         assert!(
-            stderr.contains(manifest.to_string_lossy().as_ref()),
+            stderr.contains(canonical_manifest.to_string_lossy().as_ref()),
             "{stderr}"
         );
     }
