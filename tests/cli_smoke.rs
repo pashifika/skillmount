@@ -9,8 +9,21 @@ const ASM: &str = env!("CARGO_BIN_EXE_asm");
 const SKILLMOUNT: &str = env!("CARGO_BIN_EXE_skillmount");
 
 fn run(executable: &str, arguments: &[&str]) -> Output {
+    let home =
+        std::env::temp_dir().join(format!("skillmount-cli-smoke-home-{}", std::process::id()));
+    fs::create_dir_all(home.join("codex-home")).expect("smoke-test Codex home");
     Command::new(executable)
         .args(arguments)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("SKILLMOUNT_TEST_CODEX_USER_HOME", &home)
+        .env("SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG", "absent")
+        .env("LOCALAPPDATA", home.join("AppData/Local"))
+        .env("CODEX_HOME", home.join("codex-home"))
+        .env(
+            "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
+            home.join("admin-skills"),
+        )
         .output()
         .expect("smoke-test executable should run")
 }
@@ -22,6 +35,8 @@ fn run(executable: &str, arguments: &[&str]) -> Output {
 /// `SKILLMOUNT_STATE_DIR` it would write journals and locks into the developer's real
 /// application-support directory.
 fn run_session(executable: &str, project: &Path, state: &Path, arguments: &[&str]) -> Output {
+    let home = state.join("home");
+    fs::create_dir_all(home.join("codex-home")).expect("session Codex home");
     Command::new(executable)
         .args(arguments)
         .arg("--project-root")
@@ -31,7 +46,19 @@ fn run_session(executable: &str, project: &Path, state: &Path, arguments: &[&str
         .arg("--agent-bin")
         .arg(ASM)
         .arg("--")
-        .arg("--help")
+        .arg("exec")
+        .arg("fixture")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("SKILLMOUNT_TEST_CODEX_USER_HOME", &home)
+        .env("SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG", "absent")
+        .env("LOCALAPPDATA", home.join("AppData/Local"))
+        .env("CODEX_HOME", home.join("codex-home"))
+        .env("SKILLMOUNT_TEST_CODEX_VERSION", "codex-cli 0.146.0")
+        .env(
+            "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
+            home.join("admin-skills"),
+        )
         .env("SKILLMOUNT_STATE_DIR", state)
         .current_dir(project)
         .output()
@@ -175,6 +202,9 @@ fn inspect_and_codex_session_preserve_binary_parity() {
         "--skills-dir",
         &skill.to_string_lossy(),
         "--dry-run",
+        "--",
+        "exec",
+        "fixture",
     ];
     let dry_run = run(ASM, &dry_run_arguments);
     assert!(dry_run.status.success(), "a dry run completes normally");
@@ -192,14 +222,14 @@ fn inspect_and_codex_session_preserve_binary_parity() {
     let session = run_session(ASM, &project, &state, &session_arguments);
     let fallback_session = run_session(SKILLMOUNT, &project, &state, &session_arguments);
 
-    assert_eq!(session.status.code(), Some(0));
+    assert_eq!(session.status.code(), Some(64));
     assert_eq!(session.status, fallback_session.status);
     assert_eq!(session.stdout, fallback_session.stdout);
     assert_eq!(session.stderr, fallback_session.stderr);
     assert!(
         String::from_utf8_lossy(&session.stderr)
             .contains("discovery does not grant sandbox access"),
-        "a normal Codex session launches and reports permission separation: {}",
+        "the Codex session launches the parity fixture and reports permission separation: {}",
         String::from_utf8_lossy(&session.stderr)
     );
     assert!(

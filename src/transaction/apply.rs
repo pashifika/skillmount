@@ -144,16 +144,18 @@ impl Transaction {
         let path = action.final_path.clone();
 
         let live = self.backend.inspect_no_follow(&path)?;
-        let reaches_source = matches!(live.kind, EntryKind::Symlink | EntryKind::Junction)
-            && self
-                .backend
-                .canonical_directory(&path)
-                .is_ok_and(|canonical| canonical == expected_source);
+        let reaches_source = matches!(
+            live.kind,
+            EntryKind::Directory | EntryKind::Symlink | EntryKind::Junction
+        ) && self
+            .backend
+            .canonical_directory(&path)
+            .is_ok_and(|canonical| canonical == expected_source);
         if !reaches_source {
             return Err(Self::drift(
                 &path,
                 &format!(
-                    "the entry planned for reuse is now a {} rather than a link to {}",
+                    "the entry planned for reuse is now a {} rather than a directory resolving to {}",
                     live.kind.label(),
                     expected_source.display()
                 ),

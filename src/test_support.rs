@@ -65,6 +65,18 @@ pub(crate) fn try_symlink_dir(target: &Path, link: &Path) -> io::Result<()> {
     }
 }
 
+/// Creates a file link, or returns the operating-system failure.
+pub(crate) fn try_symlink_file(target: &Path, link: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
 /// Environment variable that turns a skipped link fixture into a failure.
 ///
 /// CI sets it so link coverage cannot silently disappear. A skipped test still reports success,
@@ -80,6 +92,24 @@ const REQUIRE_LINKS: &str = "SKILLMOUNT_REQUIRE_LINKS";
 #[must_use]
 pub(crate) fn symlink_dir_or_skip(target: &Path, link: &Path) -> bool {
     match try_symlink_dir(target, link) {
+        Ok(()) => true,
+        Err(error) if skip_unprivileged(&error) => {
+            assert!(
+                std::env::var_os(REQUIRE_LINKS).is_none(),
+                "{REQUIRE_LINKS} is set, so a link fixture may not be skipped: creating {} failed: {error}",
+                link.display()
+            );
+            eprintln!("skipping link fixture at {}: {error}", link.display());
+            false
+        }
+        Err(error) => panic!("link fixture at {} failed: {error}", link.display()),
+    }
+}
+
+/// Creates a file link and applies the same CI skip guard as directory-link fixtures.
+#[must_use]
+pub(crate) fn symlink_file_or_skip(target: &Path, link: &Path) -> bool {
+    match try_symlink_file(target, link) {
         Ok(()) => true,
         Err(error) if skip_unprivileged(&error) => {
             assert!(

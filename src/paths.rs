@@ -8,6 +8,9 @@ use crate::cli::SessionInput;
 use crate::domain::{AgentId, RunContext, SourceOccurrence};
 use crate::error::AppError;
 
+#[cfg(windows)]
+mod windows_ffi;
+
 pub(crate) fn resolve_session(
     input: SessionInput,
     invocation_cwd: &Path,
@@ -18,9 +21,11 @@ pub(crate) fn resolve_session(
         None => invocation_cwd.clone(),
     };
 
+    let inferred_project_root =
+        nearest_git_root(&launch_cwd)?.unwrap_or_else(|| launch_cwd.clone());
     let project_root = match input.project_root.as_deref() {
         Some(path) => canonical_directory(&absolute_from(&invocation_cwd, path)?)?,
-        None => nearest_git_root(&launch_cwd)?.unwrap_or_else(|| launch_cwd.clone()),
+        None => inferred_project_root.clone(),
     };
 
     if input.agent == AgentId::Codex && !launch_cwd.starts_with(&project_root) {
@@ -30,6 +35,21 @@ pub(crate) fn resolve_session(
             launch_cwd.display()
         )));
     }
+    if input.agent == AgentId::Codex && project_root != inferred_project_root {
+        return Err(AppError::Usage(format!(
+            "Codex project root {} does not match the default root {} inferred from launch CWD {}; --project-root cannot change the root used by the child",
+            project_root.display(),
+            inferred_project_root.display(),
+            launch_cwd.display()
+        )));
+    }
+
+    let user_home = agent_user_home(input.agent)?;
+    let (codex_home, codex_home_override) = if input.agent == AgentId::Codex {
+        codex_home(&user_home, &invocation_cwd)?
+    } else {
+        (user_home.join(".codex"), None)
+    };
 
     let skill_sources = resolve_source_occurrences(&input.skills_dirs, &invocation_cwd)?;
     let resolve_codex_executable = input.agent == AgentId::Codex && !input.options.dry_run;
@@ -53,6 +73,10 @@ pub(crate) fn resolve_session(
         invocation_cwd,
         launch_cwd,
         project_root,
+        user_home,
+        codex_home,
+        codex_home_override,
+        codex_admin_skills: codex_admin_skills(),
         skill_sources,
         session_id: None,
         agent_bin,
@@ -62,12 +86,13 @@ pub(crate) fn resolve_session(
 }
 
 fn validate_explicit_executable(path: &Path) -> Result<PathBuf, AppError> {
-    reject_implicit_shell(path)?;
-    validate_runnable(path)?;
-    fs::canonicalize(path).map_err(|error| AppError::MissingInput {
+    let canonical = fs::canonicalize(path).map_err(|error| AppError::MissingInput {
         path: path.to_path_buf(),
         reason: format!("cannot resolve agent executable: {error}"),
-    })
+    })?;
+    reject_implicit_shell(&canonical)?;
+    validate_runnable(&canonical)?;
+    Ok(canonical)
 }
 
 fn resolve_path_executable(name: &OsStr, invocation_cwd: &Path) -> Result<PathBuf, AppError> {
@@ -86,11 +111,11 @@ fn resolve_path_executable(name: &OsStr, invocation_cwd: &Path) -> Result<PathBu
         };
         for candidate_name in executable_names(name) {
             let candidate = directory.join(candidate_name);
-            if reject_implicit_shell(&candidate).is_ok() && validate_runnable(&candidate).is_ok() {
-                return fs::canonicalize(&candidate).map_err(|error| AppError::MissingInput {
-                    path: candidate,
-                    reason: format!("cannot resolve agent executable: {error}"),
-                });
+            let Ok(canonical) = fs::canonicalize(&candidate) else {
+                continue;
+            };
+            if reject_implicit_shell(&canonical).is_ok() && validate_runnable(&canonical).is_ok() {
+                return Ok(canonical);
             }
         }
     }
@@ -113,14 +138,13 @@ fn executable_names(name: &OsStr) -> Vec<OsString> {
     }
     let mut exe = name.to_os_string();
     exe.push(".exe");
-    let mut com = name.to_os_string();
-    com.push(".com");
-    vec![name.to_os_string(), exe, com]
+    vec![exe]
 }
 
 #[cfg(unix)]
 fn validate_runnable(path: &Path) -> Result<(), AppError> {
-    use std::os::unix::fs::PermissionsExt;
+    use nix::fcntl::{AT_FDCWD, AtFlags};
+    use nix::unistd::{AccessFlags, faccessat};
 
     let metadata = fs::metadata(path).map_err(|error| AppError::MissingInput {
         path: path.to_path_buf(),
@@ -132,10 +156,10 @@ fn validate_runnable(path: &Path) -> Result<(), AppError> {
             reason: "agent executable is not a regular file".to_owned(),
         });
     }
-    if metadata.permissions().mode() & 0o111 == 0 {
+    if faccessat(AT_FDCWD, path, AccessFlags::X_OK, AtFlags::AT_EACCESS).is_err() {
         return Err(AppError::MissingInput {
             path: path.to_path_buf(),
-            reason: "agent executable has no execute permission".to_owned(),
+            reason: "agent executable is not executable by the current effective user".to_owned(),
         });
     }
     Ok(())
@@ -192,12 +216,22 @@ pub(crate) fn resolve_inspection(
 ) -> Result<RunContext, AppError> {
     let invocation_cwd = canonical_directory(invocation_cwd)?;
     let project_root = nearest_git_root(&invocation_cwd)?.unwrap_or_else(|| invocation_cwd.clone());
+    let user_home = agent_user_home(agent)?;
+    let (codex_home, codex_home_override) = if agent == AgentId::Codex {
+        codex_home(&user_home, &invocation_cwd)?
+    } else {
+        (user_home.join(".codex"), None)
+    };
     Ok(RunContext {
         agent,
         launch_cwd: invocation_cwd.clone(),
         skill_sources: resolve_source_occurrences(skills_dirs, &invocation_cwd)?,
         invocation_cwd,
         project_root,
+        user_home,
+        codex_home,
+        codex_home_override,
+        codex_admin_skills: codex_admin_skills(),
         session_id: None,
         agent_bin: PathBuf::from(agent.executable_name()),
         passthrough_args: Vec::new(),
@@ -215,6 +249,136 @@ pub(crate) fn resolve_inspection(
             verbosity: 0,
         },
     })
+}
+
+fn agent_user_home(agent: AgentId) -> Result<PathBuf, AppError> {
+    match agent {
+        AgentId::Codex => codex_user_home(),
+        AgentId::Claude => crate::state::user_home(),
+    }
+}
+
+/// Mirrors the home resolver used by Codex's user-wide `.agents/skills` root.
+fn codex_user_home() -> Result<PathBuf, AppError> {
+    // Native integration tests must not inspect the developer's actual user root on Windows,
+    // where Codex uses FOLDERID_Profile instead of the overridden USERPROFILE value.
+    // The test-only override is absent from release builds, like failure checkpoints.
+    #[cfg(debug_assertions)]
+    if let Some(path) =
+        std::env::var_os("SKILLMOUNT_TEST_CODEX_USER_HOME").filter(|value| !value.is_empty())
+    {
+        return absolute_codex_user_home(Some(PathBuf::from(path)));
+    }
+
+    absolute_codex_user_home(platform_codex_user_home())
+}
+
+fn platform_codex_user_home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        windows_ffi::profile_directory()
+    }
+    #[cfg(unix)]
+    {
+        std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                nix::unistd::User::from_uid(nix::unistd::Uid::current())
+                    .ok()
+                    .flatten()
+                    .map(|user| user.dir)
+            })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+fn absolute_codex_user_home(home: Option<PathBuf>) -> Result<PathBuf, AppError> {
+    let Some(home) = home.filter(|path| path.is_absolute()) else {
+        return Err(AppError::MissingInput {
+            path: PathBuf::from("<Codex user home>"),
+            reason: "Codex could not resolve an absolute user home directory".to_owned(),
+        });
+    };
+    Ok(home)
+}
+
+/// Mirrors Codex's configuration-home resolution and retains an explicit child override.
+fn codex_home(
+    user_home: &Path,
+    invocation_cwd: &Path,
+) -> Result<(PathBuf, Option<PathBuf>), AppError> {
+    let value = unicode_codex_home(std::env::var("CODEX_HOME"));
+    codex_home_from_value(user_home, invocation_cwd, value.as_deref())
+}
+
+fn codex_home_from_value(
+    user_home: &Path,
+    invocation_cwd: &Path,
+    value: Option<&str>,
+) -> Result<(PathBuf, Option<PathBuf>), AppError> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok((user_home.join(".codex"), None));
+    };
+    let supplied = PathBuf::from(value);
+    let resolved = if supplied.is_absolute() {
+        supplied.clone()
+    } else {
+        invocation_cwd.join(&supplied)
+    };
+    let metadata = fs::metadata(&resolved).map_err(|error| AppError::MissingInput {
+        path: supplied.clone(),
+        reason: format!("CODEX_HOME does not name an existing directory: {error}"),
+    })?;
+    if !metadata.is_dir() {
+        return Err(AppError::MissingInput {
+            path: supplied,
+            reason: "CODEX_HOME is not a directory".to_owned(),
+        });
+    }
+    let canonical = fs::canonicalize(&resolved).map_err(|error| AppError::MissingInput {
+        path: resolved,
+        reason: format!("cannot canonicalize CODEX_HOME: {error}"),
+    })?;
+    if canonical.to_str().is_none() {
+        return Err(AppError::MissingInput {
+            path: canonical,
+            reason: "canonical CODEX_HOME is not Unicode and cannot be propagated to Codex"
+                .to_owned(),
+        });
+    }
+    Ok((canonical.clone(), Some(canonical)))
+}
+
+fn unicode_codex_home(value: Result<String, std::env::VarError>) -> Option<String> {
+    value.ok().filter(|value| !value.is_empty())
+}
+
+/// Returns the host-wide Codex Skill root supported by the current loader.
+#[allow(clippy::unnecessary_wraps)]
+fn codex_admin_skills() -> Option<PathBuf> {
+    // Integration tests need to isolate discovery from the developer host just as they isolate
+    // HOME and CODEX_HOME. The override is absent from release builds, like failure checkpoints.
+    #[cfg(debug_assertions)]
+    if let Some(path) =
+        std::env::var_os("SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR").filter(|value| !value.is_empty())
+    {
+        return Some(PathBuf::from(path));
+    }
+
+    #[cfg(unix)]
+    {
+        Some(PathBuf::from("/etc/codex/skills"))
+    }
+    #[cfg(windows)]
+    {
+        let program_data = windows_ffi::program_data_directory()
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        Some(program_data.join("OpenAI/Codex/skills"))
+    }
 }
 
 pub(crate) fn resolve_source_occurrences(
@@ -325,11 +489,10 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, AppError> {
 fn nearest_git_root(start: &Path) -> Result<Option<PathBuf>, AppError> {
     for ancestor in start.ancestors() {
         let marker = ancestor.join(OsStr::new(".git"));
-        match fs::symlink_metadata(&marker) {
-            Ok(metadata) if metadata.is_dir() || metadata.is_file() => {
+        match fs::metadata(&marker) {
+            Ok(_) => {
                 return Ok(Some(ancestor.to_path_buf()));
             }
-            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(AppError::MissingInput {
@@ -344,7 +507,16 @@ fn nearest_git_root(start: &Path) -> Result<Option<PathBuf>, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{absolute_from, nearest_git_root, resolve_session};
+    #[cfg(unix)]
+    use super::unicode_codex_home;
+    #[cfg(unix)]
+    use super::validate_runnable;
+    use super::{
+        absolute_codex_user_home, absolute_from, codex_home_from_value, nearest_git_root,
+        resolve_session,
+    };
+    #[cfg(windows)]
+    use super::{codex_admin_skills, executable_names, validate_explicit_executable};
     use crate::cli::{ParsedCommand, parse_command_from};
     use crate::error::ExitCategory;
     use std::ffi::OsString;
@@ -380,6 +552,33 @@ mod tests {
             panic!("expected session");
         };
         input
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_codex_admin_root_uses_program_data_layout() {
+        let root = codex_admin_skills().expect("Windows Codex has an administrator Skill root");
+        assert!(root.is_absolute());
+        assert!(root.ends_with(Path::new("OpenAI/Codex/skills")));
+    }
+
+    #[cfg(unix)]
+    fn create_directory_link(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).expect("directory-link fixture");
+        true
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => true,
+            Err(error) => {
+                if std::env::var_os("SKILLMOUNT_REQUIRE_LINKS").is_some() {
+                    panic!("directory-link fixture is required: {error}");
+                }
+                false
+            }
+        }
     }
 
     #[test]
@@ -454,6 +653,73 @@ mod tests {
     }
 
     #[test]
+    fn linked_git_marker_is_a_project_root() {
+        let fixture = TestDir::new("git-link");
+        let target = fixture.0.join("git-target");
+        fs::create_dir(&target).expect("Git marker target");
+        if !create_directory_link(&target, &fixture.0.join(".git")) {
+            return;
+        }
+        let nested = fixture.0.join("a/b");
+        fs::create_dir_all(&nested).expect("nested fixture");
+
+        assert_eq!(nearest_git_root(&nested).unwrap(), Some(fixture.0.clone()));
+    }
+
+    #[test]
+    fn explicit_relative_codex_home_is_canonicalized_for_the_child() {
+        let fixture = TestDir::new("relative-codex-home");
+        let user_home = fixture.0.join("home");
+        let configured = fixture.0.join("configured");
+        fs::create_dir(&configured).expect("Codex home fixture");
+
+        let (effective, child_override) =
+            codex_home_from_value(&user_home, &fixture.0, Some("configured"))
+                .expect("existing relative CODEX_HOME");
+        let expected = fs::canonicalize(configured).expect("canonical fixture");
+
+        assert_eq!(effective, expected);
+        assert_eq!(child_override, Some(expected));
+    }
+
+    #[test]
+    fn codex_user_home_must_be_absolute_like_the_supported_loader_requires() {
+        assert_eq!(
+            absolute_codex_user_home(Some(PathBuf::from("relative-home")))
+                .expect_err("a relative home is not a Codex discovery root")
+                .category(),
+            ExitCategory::MissingInput
+        );
+        assert_eq!(
+            absolute_codex_user_home(None)
+                .expect_err("an absent home is not a Codex discovery root")
+                .category(),
+            ExitCategory::MissingInput
+        );
+    }
+
+    #[test]
+    fn missing_explicit_codex_home_is_rejected() {
+        let fixture = TestDir::new("missing-codex-home");
+        let error = codex_home_from_value(&fixture.0, &fixture.0, Some("missing"))
+            .expect_err("Codex rejects a configured home that does not exist");
+
+        assert_eq!(error.category(), ExitCategory::MissingInput);
+        assert!(error.to_string().contains("CODEX_HOME"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_codex_home_is_ignored_like_codex() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let value = Err(std::env::VarError::NotUnicode(OsString::from_vec(vec![
+            0xff,
+        ])));
+        assert_eq!(unicode_codex_home(value), None);
+    }
+
+    #[test]
     fn launch_cwd_is_the_fallback_without_git() {
         let fixture = TestDir::new("no-git");
         let input = parsed_session(&["claude", "--skills-dir=skills"]);
@@ -477,6 +743,29 @@ mod tests {
     }
 
     #[test]
+    fn codex_explicit_project_root_must_match_the_default_discovered_root() {
+        let fixture = TestDir::new("codex-project-root-match");
+        fs::create_dir(fixture.0.join(".git")).expect("Git root marker");
+        fs::create_dir_all(fixture.0.join("nested/deep")).expect("nested fixture");
+        let input = parsed_session(&[
+            "codex",
+            "--skills-dir=skills",
+            "--cwd=nested/deep",
+            "--project-root=nested",
+        ]);
+
+        let error = resolve_session(input, &fixture.0)
+            .expect_err("the wrapper and child must use the same project root");
+
+        assert_eq!(error.category(), ExitCategory::Usage);
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the default root")
+        );
+    }
+
+    #[test]
     fn a_missing_explicit_agent_fails_before_a_mutating_session_can_plan() {
         let fixture = TestDir::new("missing-agent");
         let input = parsed_session(&["codex", "--skills-dir=skills", "--agent-bin=missing-codex"]);
@@ -485,6 +774,24 @@ mod tests {
             .expect_err("an explicit missing executable must fail during context resolution");
 
         assert_eq!(error.category(), ExitCategory::MissingInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_permission_is_checked_for_the_effective_user_not_any_mode_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = TestDir::new("effective-execute-access");
+        let executable = fixture.0.join("owner-cannot-execute");
+        fs::write(&executable, "#!/bin/sh\nexit 0\n").expect("executable fixture");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o010))
+            .expect("group-only execute mode");
+
+        let error = validate_runnable(&executable)
+            .expect_err("an owner cannot use the group's execute bit on their own file");
+
+        assert_eq!(error.category(), ExitCategory::MissingInput);
+        assert!(error.to_string().contains("effective user"));
     }
 
     #[cfg(windows)]
@@ -499,6 +806,36 @@ mod tests {
 
         assert_eq!(error.category(), ExitCategory::Usage);
         assert!(error.to_string().contains("implicit cmd.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_exe_named_symlink_to_a_batch_file_is_rejected_after_canonicalization() {
+        let fixture = TestDir::new("batch-agent-alias");
+        let batch = fixture.0.join("codex.cmd");
+        let alias = fixture.0.join("codex.exe");
+        fs::write(&batch, "@exit /b 0\r\n").expect("batch fixture");
+        if let Err(error) = std::os::windows::fs::symlink_file(&batch, &alias) {
+            if std::env::var_os("SKILLMOUNT_REQUIRE_LINKS").is_some() {
+                panic!("file-link fixture is required: {error}");
+            }
+            return;
+        }
+
+        let error = validate_explicit_executable(&alias)
+            .expect_err("canonical batch targets still require an implicit shell");
+
+        assert_eq!(error.category(), ExitCategory::Usage);
+        assert!(error.to_string().contains("implicit cmd.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_resolution_uses_the_native_exe_candidate_only() {
+        assert_eq!(
+            executable_names(std::ffi::OsStr::new("codex")),
+            [OsString::from("codex.exe")]
+        );
     }
 
     #[cfg(windows)]

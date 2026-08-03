@@ -91,7 +91,7 @@ pub struct JournalScan {
 }
 
 impl JournalScan {
-    /// Returns the journals a later invocation must reconcile.
+    /// Returns the non-terminal journals a later invocation must recover, quarantine, or report.
     pub fn incomplete(&self) -> impl Iterator<Item = &ScannedJournal> {
         self.journals
             .iter()

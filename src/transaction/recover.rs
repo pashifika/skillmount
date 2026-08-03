@@ -1,15 +1,16 @@
 //! Reconciling transactions that no process is still driving.
 //!
-//! The hard question is not what to remove; it is how to know nobody else is using it. The answer
-//! is the lock set, and only the lock set. A journal's owner process id is recorded, but it is
-//! never consulted: the operating system reuses process ids, so "that pid is gone" and "that pid
-//! belongs to something unrelated now" look identical, and either reading can authorize deleting a
-//! live session's mounts.
+//! The hard question is not what to remove; it is how to know nobody else is using it. Before child
+//! exposure the answer is the lock set. A journal's owner process id is recorded but never
+//! consulted: the operating system reuses process ids, so "that pid is gone" and "that pid belongs
+//! to something unrelated now" look identical. After child exposure no durable automatic proof is
+//! available, so recovery retains rather than guesses.
 //!
-//! So eligibility is decided by trying to take every lock the journal says its transaction held. If
-//! all of them are free, no process is between apply and cleanup for that transaction and it can be
-//! reconciled. If even one is held, the transaction is alive and is left completely alone — not
-//! inspected, not reported as stale, not touched.
+//! Before child exposure, eligibility is decided by trying to take every lock the journal says its
+//! transaction held. If all are free, no wrapper is between apply and cleanup and the transaction
+//! can be reconciled. After `supervising` is durable, free wrapper locks no longer prove the child
+//! domain empty; that state is quarantined. If any lock is held, the transaction is actively driven
+//! and is left completely alone.
 //!
 //! Recovery then reuses the ordinary rollback path, so there is exactly one implementation of
 //! "prove ownership, then remove", and it is the one that has to be right.
@@ -31,6 +32,8 @@ pub struct RecoveryReport {
     pub reconciled: Vec<ReconciledTransaction>,
     /// Transactions whose locks are still held, so a process is still driving them.
     pub active: Vec<PathBuf>,
+    /// Journals whose locks are free but whose child-domain liveness was never proved.
+    pub quarantined: Vec<PathBuf>,
     /// Journals that exist but cannot be interpreted, and are therefore retained untouched.
     pub unreadable: Vec<RejectedJournal>,
 }
@@ -40,6 +43,7 @@ impl RecoveryReport {
     #[must_use]
     pub fn needs_attention(&self) -> bool {
         !self.unreadable.is_empty()
+            || !self.quarantined.is_empty()
             || self
                 .reconciled
                 .iter()
@@ -70,6 +74,12 @@ impl RecoveryReport {
                 path.display()
             ));
         }
+        for path in &self.quarantined {
+            lines.push(format!(
+                "transaction journal {} may still belong to a live child process domain and was quarantined without cleanup",
+                path.display()
+            ));
+        }
         for rejected in &self.unreadable {
             lines.push(format!(
                 "transaction journal {} cannot be interpreted ({}), so it is retained and nothing beneath it was removed",
@@ -92,7 +102,8 @@ pub struct ReconciledTransaction {
     pub report: CleanupReport,
 }
 
-/// Reconciles every incomplete transaction whose locks are all free.
+/// Reconciles automatically recoverable transactions whose locks are free and quarantines
+/// post-launch uncertainty.
 ///
 /// `already_held` is the current session's lock set. Locks taken during recovery are absorbed into
 /// it rather than released, so a transaction that was just reconciled cannot be resurrected by a
@@ -115,7 +126,29 @@ pub fn recover_stale(already_held: &mut HeldLocks) -> Result<RecoveryReport, App
         return Ok(report);
     }
 
-    for scanned in scan.incomplete() {
+    // Quarantined liveness is a global fail-closed condition, like an unreadable journal. Detect
+    // every free one before reconciling a healthy neighbor so no path is removed first merely
+    // because its journal sorted earlier.
+    for scanned in scan
+        .incomplete()
+        .filter(|scanned| !scanned.journal.status.is_automatically_recoverable())
+    {
+        let resources = scanned.journal.lock_resources();
+        let Some(taken) = claim(&resources, already_held)? else {
+            report.active.push(scanned.path.clone());
+            continue;
+        };
+        already_held.absorb(taken);
+        report.quarantined.push(scanned.path.clone());
+    }
+    if !report.quarantined.is_empty() {
+        return Ok(report);
+    }
+
+    for scanned in scan
+        .incomplete()
+        .filter(|scanned| scanned.journal.status.is_automatically_recoverable())
+    {
         let resources = scanned.journal.lock_resources();
         let Some(taken) = claim(&resources, already_held)? else {
             report.active.push(scanned.path.clone());
@@ -170,7 +203,7 @@ pub fn blocking_state(already_held: &HeldLocks) -> Result<Vec<String>, AppError>
         // report it if the two sessions actually contend.
         if claim(&resources, already_held)?.is_some() {
             blocking.push(format!(
-                "transaction {} is incomplete ({}) and --no-recover forbids reconciling it",
+                "transaction {} is incomplete ({}) and --no-recover forbids handling it",
                 scanned.journal.transaction_id,
                 scanned.journal.status.label()
             ));
@@ -206,8 +239,9 @@ impl Transaction {
         // `keep_mounts` becomes terminal only through the orderly cleanup entry in `cleanup`.
         // Reaching recovery proves the earlier process did not durably finish that boundary, so a
         // planned, applying, active, cleaning, or failed transaction must be reconciled exactly
-        // like any other incomplete transaction. Persisting `cleaning` below also clears the flag,
-        // so a second crash cannot later reinterpret the same partial apply as requested retention.
+        // like any other automatically recoverable transaction. `supervising` never reaches this
+        // function. Persisting `cleaning` below also clears the flag, so a second crash cannot later
+        // reinterpret the same partial apply as requested retention.
         self.journal.keep_mounts = false;
         self.cleanup()
     }

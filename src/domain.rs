@@ -142,6 +142,17 @@ pub struct RunContext {
     pub launch_cwd: PathBuf,
     /// Project root used for discovery.
     pub project_root: PathBuf,
+    /// User home used by agent-level discovery roots.
+    pub user_home: PathBuf,
+    /// Codex configuration home, including deprecated and bundled Skill roots.
+    pub codex_home: PathBuf,
+    /// Canonical `CODEX_HOME` value that must be propagated to a Codex child.
+    ///
+    /// `None` means Codex ignored an absent, empty, or non-Unicode override and derived its
+    /// default from the user home instead.
+    pub codex_home_override: Option<PathBuf>,
+    /// Host-wide Codex Skill root when the platform exposes one.
+    pub codex_admin_skills: Option<PathBuf>,
     /// Ordered source occurrences.
     pub skill_sources: Vec<SourceOccurrence>,
     /// Identifier for a mutating session, or `None` while planning is still preliminary.

@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 
-use crate::agent::{DiscoveryScope, DiscoverySnapshot, ExistingSkill};
+use crate::agent::{DiscoverySnapshot, ExistingSkill, ScopeKind};
 use crate::domain::{ConflictPolicy, RunContext, SkillCatalog};
 use crate::error::{AppError, PlanError};
 use crate::mount::resolve::PathKind;
@@ -11,7 +11,7 @@ use crate::mount::{ActionSequence, MountAction, PathPrecondition, PreservedSkill
 /// How an already-visible entry relates to the Skill that wants its logical name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Occupancy {
-    /// A directory link that already points at the selected canonical source.
+    /// A directory or directory link that resolves to the selected canonical source.
     SameSource,
     /// A directory link pointing somewhere else.
     DifferentSource,
@@ -48,7 +48,7 @@ pub(crate) fn apply_conflict_policy(
     preserved: &mut Vec<PreservedSkill>,
 ) -> Result<(), AppError> {
     let policy = context.options.conflict;
-    let mount_scope = discovery.mount_scope();
+    let mount_scope = discovery.mount_scope().map(|scope| scope.kind);
 
     for resolution in &catalog.resolutions {
         let skill = &resolution.selected;
@@ -68,8 +68,11 @@ pub(crate) fn apply_conflict_policy(
         }
 
         let direct = mount_scope.and_then(|scope| {
-            most_restrictive(scope.direct_occupants(&key), source)
-                .map(|(existing, occupancy)| (scope, existing, occupancy))
+            most_restrictive(
+                discovery.mount_entries.get(&key).map_or(&[], Vec::as_slice),
+                source,
+            )
+            .map(|(existing, occupancy)| (scope, existing, occupancy))
         });
         if let Some((scope, existing, other)) =
             direct.filter(|(_, _, occupancy)| *occupancy != Occupancy::SameSource)
@@ -112,10 +115,12 @@ pub(crate) fn apply_conflict_policy(
 
 /// Classifies an existing entry against the canonical source that wants its name.
 fn occupancy(existing: &ExistingSkill, source: &std::path::Path) -> Occupancy {
+    if matches!(existing.kind, PathKind::Directory | PathKind::DirectoryLink)
+        && existing.source_canonical.as_deref() == Some(source)
+    {
+        return Occupancy::SameSource;
+    }
     match existing.kind {
-        PathKind::DirectoryLink if existing.source_canonical.as_deref() == Some(source) => {
-            Occupancy::SameSource
-        }
         PathKind::DirectoryLink => Occupancy::DifferentSource,
         PathKind::Directory => Occupancy::ProjectDirectory,
         _ => Occupancy::Unsupported,
@@ -131,18 +136,30 @@ fn visible_occupant<'a>(
     discovery: &'a DiscoverySnapshot,
     key: &crate::domain::SkillNameKey,
     source: &std::path::Path,
-) -> Option<(&'a DiscoveryScope, &'a ExistingSkill, Occupancy)> {
+) -> Option<(ScopeKind, &'a ExistingSkill, Occupancy)> {
     let mut matching = None;
-    for scope in &discovery.scopes {
-        if let Some((existing, occupancy)) = most_restrictive(scope.occupants(key), source) {
-            if occupancy == Occupancy::SameSource {
-                matching.get_or_insert((scope, existing, occupancy));
-            } else {
-                return Some((scope, existing, occupancy));
-            }
+    let mut skippable = None;
+    for visible in discovery
+        .visible_skills
+        .get(key)
+        .map_or(&[][..], Vec::as_slice)
+    {
+        let mut occupancy = occupancy(&visible.skill, source);
+        // Codex owns and may delete or replace the bundled cache before loading Skills. No
+        // observed cache entry is stable reuse or skip evidence for the child, even when its
+        // canonical source currently matches.
+        if visible.scope == ScopeKind::CodexSystem {
+            occupancy = Occupancy::Unsupported;
+        }
+        if occupancy == Occupancy::SameSource {
+            matching.get_or_insert((visible.scope, &visible.skill, occupancy));
+        } else if occupancy == Occupancy::Unsupported {
+            return Some((visible.scope, &visible.skill, occupancy));
+        } else {
+            skippable.get_or_insert((visible.scope, &visible.skill, occupancy));
         }
     }
-    matching
+    skippable.or(matching)
 }
 
 fn most_restrictive<'a>(
@@ -167,7 +184,7 @@ fn most_restrictive<'a>(
 }
 
 fn preserve(
-    scope: &DiscoveryScope,
+    scope: ScopeKind,
     existing: &ExistingSkill,
     source: &std::path::Path,
 ) -> PreservedSkill {
@@ -175,20 +192,20 @@ fn preserve(
         comparison_key: existing.comparison_key.clone(),
         existing: existing.entry.clone(),
         existing_kind: existing.kind,
-        scope: scope.kind,
+        scope,
         omitted_source: source.to_path_buf(),
     }
 }
 
 fn conflict(
-    scope: &DiscoveryScope,
+    scope: ScopeKind,
     existing: &ExistingSkill,
     skill: &crate::domain::Skill,
     source: &std::path::Path,
 ) -> PlanError {
     PlanError::DestinationConflict {
         name: OsString::from(skill.mount_name.as_str()),
-        scope: scope.kind.label(),
+        scope: scope.label(),
         existing: existing.entry.clone(),
         existing_state: existing.kind.label(),
         selected: source.to_path_buf(),

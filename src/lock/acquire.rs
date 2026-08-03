@@ -241,8 +241,9 @@ impl HeldLocks {
     /// Takes every lock in `resources` only if all of them are free right now.
     ///
     /// Returns the contention that stopped it, without holding any of the locks it managed to take.
-    /// This is the eligibility test recovery uses: a transaction whose locks are all free has no
-    /// live owner, and one whose locks are not is still running.
+    /// This is the lock-availability part of recovery eligibility: free locks prove there is no
+    /// live wrapper owner. Journal status separately decides whether child-domain uncertainty still
+    /// requires quarantine.
     ///
     /// # Errors
     ///

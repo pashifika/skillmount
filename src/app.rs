@@ -86,7 +86,7 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError
                     input.validation,
                     invocation_cwd,
                 )?;
-                let report = plan_read_only(&context)?;
+                let report = plan_inspection(&context)?;
                 if !rendered.is_empty() {
                     rendered.push('\n');
                 }
@@ -135,6 +135,14 @@ pub(crate) struct ReadOnlyOutcome {
 /// journal untouched for recovery. `--keep-mounts` reaches the transaction's terminal kept state
 /// through that same callback.
 fn run_session(context: &RunContext) -> Result<u8, AppError> {
+    // Root-changing arguments and an incompatible Codex binary are rejected before reading or
+    // creating SkillMount state. The later locked replan repeats the pure argument check, but it
+    // must not be the first time a mutating invocation learns that its launch contract is unsafe.
+    adapter_for(context.agent).validate_passthrough_args(&context.passthrough_args)?;
+    if context.agent == AgentId::Codex {
+        crate::agent::codex::verify_supported_launch(context)?;
+    }
+
     // Unknown ownership state is checked before creating even SkillMount's own staging or lock
     // directories. Recovery scans again after locks are held, so a journal appearing between this
     // read-only preflight and acquisition still fails closed rather than entering a new plan.
@@ -164,6 +172,7 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     let policy = LockPolicy::from_env();
 
     let preliminary = adapter_for(context.agent).inspect_discovery(&context)?;
+    crate::checkpoint::reached(crate::checkpoint::Checkpoint::DiscoveryInspected, 1);
     let mut required_resources = preliminary.lock_resources;
     let mut locks = HeldLocks::acquire(&required_resources, policy, &owner)?;
 
@@ -201,6 +210,13 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
         ))
     })?;
 
+    // Lock acquisition may wait behind a long-running session while the installed Codex is
+    // upgraded. Re-probe after the lock set stabilizes so a plan is never persisted or applied
+    // using only compatibility evidence captured before that wait.
+    if context.agent == AgentId::Codex {
+        crate::agent::codex::verify_supported_launch(&context)?;
+    }
+
     warn(&render::render_warnings(
         &rebuilt.catalog,
         &rebuilt.snapshot,
@@ -233,6 +249,20 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
         )));
     }
 
+    // Apply can itself take time and runs after the last version probe. Check once more at the
+    // child boundary. If an updater replaced Codex, no child is spawned and the active
+    // transaction is released through the normal evidence-checked cleanup path.
+    verify_codex_spawn_boundary(&context, &rebuilt.catalog, &mut transaction)?;
+
+    if let Err(error) = transaction.begin_supervision() {
+        match transaction.cleanup_required() {
+            Ok(report) => warn(&report.describe()),
+            Err(cleanup_error) => warn(&[format!(
+                "recording Codex supervision intent failed and cleanup also failed: {cleanup_error}"
+            )]),
+        }
+        return Err(error);
+    }
     let journal_path = transaction.journal_path().to_path_buf();
     let request = SupervisionRequest::new(rebuilt.plan.launch.clone());
     let outcome = ProcessSupervisor::new().supervise(request, move || {
@@ -245,6 +275,25 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     let decision = map_exit(&outcome);
     report_supervision_diagnostics(&decision);
     Ok(decision.code)
+}
+
+fn verify_codex_spawn_boundary(
+    context: &RunContext,
+    catalog: &SkillCatalog,
+    transaction: &mut Transaction,
+) -> Result<(), AppError> {
+    let compatibility = crate::agent::codex::verify_supported_launch(context)
+        .and_then(|()| crate::agent::codex::verify_selected_plugin_namespaces(catalog));
+    if let Err(error) = compatibility {
+        match transaction.cleanup_required() {
+            Ok(report) => warn(&report.describe()),
+            Err(cleanup_error) => warn(&[format!(
+                "Codex compatibility changed before launch and cleanup also failed: {cleanup_error}"
+            )]),
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn cleanup_for_supervisor(
@@ -376,6 +425,17 @@ fn reconcile_incomplete_transactions(
     if !report.unreadable.is_empty() {
         return Err(unreadable_journals_error(&report.unreadable));
     }
+    if !report.quarantined.is_empty() {
+        return Err(AppError::Temporary(format!(
+            "cannot start a mutating session because process-domain death was never proved for:\n{}\nthese journals and their mounts were retained; verify that every related process has exited, then use the future explicit cleanup command or account for the recorded paths manually",
+            report
+                .quarantined
+                .iter()
+                .map(|path| format!("transaction journal {}", path.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )));
+    }
     warn(&report.describe());
     Ok(())
 }
@@ -419,8 +479,22 @@ fn extend_resources(
 /// `inspect` command and `--dry-run` stop here. A normal session calls the same pure pipeline under
 /// its locks after recovery and before applying any planned destination mutation.
 pub(crate) fn plan_read_only(context: &RunContext) -> Result<ReadOnlyOutcome, AppError> {
+    build_read_only(context, true)
+}
+
+/// Builds an inspection report without certifying a child command that will never be launched.
+fn plan_inspection(context: &RunContext) -> Result<ReadOnlyOutcome, AppError> {
+    build_read_only(context, false)
+}
+
+fn build_read_only(
+    context: &RunContext,
+    validate_launch_command: bool,
+) -> Result<ReadOnlyOutcome, AppError> {
     let adapter = adapter_for(context.agent);
-    adapter.validate_passthrough_args(&context.passthrough_args)?;
+    if validate_launch_command {
+        adapter.validate_passthrough_args(&context.passthrough_args)?;
+    }
 
     let destination_stores = destination_stores(context);
     let catalog = resolve_catalog(
@@ -432,10 +506,10 @@ pub(crate) fn plan_read_only(context: &RunContext) -> Result<ReadOnlyOutcome, Ap
         },
     )?;
     let mut snapshot = adapter.inspect_discovery(context)?;
+    let plan = adapter.build_mount_plan(context, &catalog, &snapshot)?;
     snapshot
         .warnings
-        .extend(adapter.catalog_diagnostics(context, &catalog));
-    let plan = adapter.build_mount_plan(context, &catalog, &snapshot)?;
+        .extend(adapter.catalog_diagnostics(context, &catalog, &plan));
     Ok(ReadOnlyOutcome {
         catalog,
         snapshot,
@@ -477,10 +551,7 @@ fn warn(messages: &[String]) {
 
 fn destination_stores(context: &crate::domain::RunContext) -> Vec<PathBuf> {
     match (context.agent, context.options.mount_mode) {
-        (AgentId::Codex, _) => vec![
-            context.project_root.join(".agents/skills"),
-            context.project_root.join(".codex/skills"),
-        ],
+        (AgentId::Codex, _) => vec![context.project_root.join(".agents/skills")],
         (AgentId::Claude, MountMode::Project) => {
             vec![context.project_root.join(".claude/skills")]
         }

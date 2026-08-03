@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::claude::ClaudeAdapter;
-use super::codex::{CodexAdapter, resolve_backing};
+use super::codex::{CodexAdapter, resolve_destination};
 use super::{AgentAdapter, ScopeKind, inspect_scope};
 use crate::catalog::{CatalogRequest, resolve_catalog};
 use crate::diagnostic::DiagnosticKind;
@@ -15,10 +15,11 @@ use crate::mount::resolve::{PathKind, classify};
 use crate::mount::{MountAction, MountPlan};
 use crate::test_support::{
     TestDir, assert_no_side_effects, remove_directory_link, symlink_dir_or_skip,
+    symlink_file_or_skip,
 };
 
-const AUTHORITATIVE: &str = ".agents/skills";
-const COMPATIBILITY: &str = ".codex/skills";
+const PREFERRED: &str = ".agents/skills";
+const LEGACY: &str = ".codex/skills";
 
 /// A project fixture whose paths are all canonical, so anchors and scopes compare correctly.
 struct Project {
@@ -40,12 +41,12 @@ impl Project {
         }
     }
 
-    fn authoritative(&self) -> PathBuf {
-        self.root.join(AUTHORITATIVE)
+    fn preferred(&self) -> PathBuf {
+        self.root.join(PREFERRED)
     }
 
-    fn compatibility(&self) -> PathBuf {
-        self.root.join(COMPATIBILITY)
+    fn legacy(&self) -> PathBuf {
+        self.root.join(LEGACY)
     }
 
     fn make_dir(&self, relative: &str) -> PathBuf {
@@ -77,6 +78,10 @@ impl Project {
             invocation_cwd: self.root.clone(),
             launch_cwd: self.root.clone(),
             project_root: self.root.clone(),
+            user_home: self.root.join("home"),
+            codex_home: self.root.join("codex-home"),
+            codex_home_override: None,
+            codex_admin_skills: Some(self.root.join("admin/skills")),
             skill_sources: Vec::new(),
             session_id: None,
             agent_bin: PathBuf::from(agent.executable_name()),
@@ -132,7 +137,11 @@ fn codex_permission_diagnostics_are_typed_and_only_cover_external_skills() {
     let context = project.codex_context(ConflictPolicy::Error);
     assert!(
         CodexAdapter
-            .catalog_diagnostics(&context, &project.catalog(AgentId::Codex))
+            .catalog_diagnostics(
+                &context,
+                &project.catalog(AgentId::Codex),
+                &plan_codex(&project, &context).expect("permission fixture plan"),
+            )
             .is_empty(),
         "project-contained Skills need no permission-separation warning"
     );
@@ -159,7 +168,13 @@ fn codex_permission_diagnostics_are_typed_and_only_cover_external_skills() {
     )
     .expect("external catalog");
 
-    let diagnostics = CodexAdapter.catalog_diagnostics(&context, &catalog);
+    let snapshot = CodexAdapter
+        .inspect_discovery(&context)
+        .expect("permission snapshot");
+    let plan = CodexAdapter
+        .build_mount_plan(&context, &catalog, &snapshot)
+        .expect("permission fixture plan");
+    let diagnostics = CodexAdapter.catalog_diagnostics(&context, &catalog, &plan);
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(
         diagnostics[0].kind,
@@ -173,33 +188,62 @@ fn codex_permission_diagnostics_are_typed_and_only_cover_external_skills() {
     );
 }
 
-/// Returns only the per-Skill links, excluding the authoritative discovery link.
+#[test]
+fn a_skipped_external_skill_does_not_claim_that_codex_will_follow_a_new_link() {
+    let project = Project::new("codex-permission-skipped");
+    let existing = project.make_dir(".agents/skills/outside");
+    std::fs::write(
+        existing.join("SKILL.md"),
+        "---\nname: outside\ndescription: project fixture\n---\n",
+    )
+    .expect("project Skill metadata");
+    let external = TestDir::new("codex-permission-skipped-source");
+    let source_root = external.dir("source");
+    let source = external.dir("source/outside");
+    std::fs::write(
+        source.join("SKILL.md"),
+        "---\nname: outside\ndescription: external fixture\n---\n",
+    )
+    .expect("external Skill metadata");
+    let catalog = resolve_catalog(
+        &[SourceOccurrence {
+            ordinal: 0,
+            input_path: source_root.clone(),
+            resolved_path: source_root,
+        }],
+        &CatalogRequest {
+            agent: AgentId::Codex,
+            validation: ValidationLevel::Basic,
+            destination_stores: &[],
+        },
+    )
+    .expect("external catalog");
+    let context = project.codex_context(ConflictPolicy::Skip);
+    let snapshot = CodexAdapter
+        .inspect_discovery(&context)
+        .expect("permission snapshot");
+    let plan = CodexAdapter
+        .build_mount_plan(&context, &catalog, &snapshot)
+        .expect("skip preserves the project Skill");
+
+    assert_eq!(plan.preserved.len(), 1);
+    assert!(
+        CodexAdapter
+            .catalog_diagnostics(&context, &catalog, &plan)
+            .is_empty(),
+        "no new external link is planned, so no sandbox-access warning applies"
+    );
+}
+
+/// Returns the per-Skill links in a mount plan.
 fn link_destinations(plan: &MountPlan) -> Vec<&Path> {
     plan.actions
         .iter()
         .filter_map(|action| match &action.operation {
-            MountAction::CreateDirectoryLink { destination, .. }
-                if destination != &plan.discovery.entry =>
-            {
-                Some(destination.as_path())
-            }
+            MountAction::CreateDirectoryLink { destination, .. } => Some(destination.as_path()),
             _ => None,
         })
         .collect()
-}
-
-/// Returns the target of the authoritative discovery link, when the plan creates one.
-fn authoritative_link_target(plan: &MountPlan) -> Option<&Path> {
-    plan.actions
-        .iter()
-        .find_map(|action| match &action.operation {
-            MountAction::CreateDirectoryLink {
-                source,
-                destination,
-                ..
-            } if destination == &plan.discovery.entry => Some(source.as_path()),
-            _ => None,
-        })
 }
 
 fn reuse_destinations(plan: &MountPlan) -> Vec<&Path> {
@@ -223,258 +267,120 @@ fn created_directories(plan: &MountPlan) -> Vec<&Path> {
 }
 
 // ---------------------------------------------------------------------------
-// Section 14.2 state table: every row of the Codex discovery-entry resolution.
+// Preferred `.agents/skills` placement, independent from legacy discovery.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn agents_links_to_codex_store_is_the_expected_layout() {
-    let project = Project::new("codex-row-link-to-c");
-    let store = project.make_dir(COMPATIBILITY);
-    project.make_dir(".agents");
-    if !symlink_dir_or_skip(&store, &project.authoritative()) {
-        return;
-    }
-
-    let backing = resolve_backing(
-        &project.root,
-        &classify(&project.authoritative()).unwrap(),
-        &classify(&project.compatibility()).unwrap(),
-    )
-    .expect("the expected layout resolves");
-
-    assert_eq!(backing.store, project.compatibility());
-    assert!(
-        backing.authoritative_link_target.is_none(),
-        "an existing authoritative entry is never rewritten"
-    );
-    assert!(backing.create_directories.is_empty());
-    assert!(backing.warnings.is_empty());
-}
-
-#[test]
-fn agents_linking_elsewhere_wins_over_the_compatibility_store_and_warns() {
-    let project = Project::new("codex-row-link-elsewhere");
-    project.make_dir(COMPATIBILITY);
-    let elsewhere = project.make_dir("shared-store");
-    project.make_dir(".agents");
-    if !symlink_dir_or_skip(&elsewhere, &project.authoritative()) {
-        return;
-    }
-
-    let backing = resolve_backing(
-        &project.root,
-        &classify(&project.authoritative()).unwrap(),
-        &classify(&project.compatibility()).unwrap(),
-    )
-    .expect("an authoritative link elsewhere still resolves");
-
-    assert_eq!(backing.store, project.authoritative());
-    assert!(backing.authoritative_link_target.is_none());
-    assert_eq!(backing.warnings.len(), 1, "the divergence must be reported");
-}
-
-#[test]
-fn a_regular_agents_directory_is_authoritative_over_every_compatibility_state() {
-    let project = Project::new("codex-row-regular-a");
-    let authoritative = project.make_dir(AUTHORITATIVE);
-
-    // C missing.
-    let backing = resolve_backing(
-        &project.root,
-        &classify(&authoritative).unwrap(),
-        &classify(&project.compatibility()).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(backing.store, authoritative);
-    assert!(backing.warnings.is_empty());
-
-    // C a separate regular directory: never merged, and reported.
-    project.make_dir(COMPATIBILITY);
-    let backing = resolve_backing(
-        &project.root,
-        &classify(&authoritative).unwrap(),
-        &classify(&project.compatibility()).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(backing.store, authoritative);
-    assert_eq!(backing.warnings.len(), 1);
-    assert!(backing.create_directories.is_empty());
-}
-
-#[test]
-fn a_compatibility_link_back_to_agents_selects_agents_without_warning() {
-    let project = Project::new("codex-row-c-links-a");
-    let authoritative = project.make_dir(AUTHORITATIVE);
-    project.make_dir(".codex");
-    if !symlink_dir_or_skip(&authoritative, &project.compatibility()) {
-        return;
-    }
-
-    let backing = resolve_backing(
-        &project.root,
-        &classify(&authoritative).unwrap(),
-        &classify(&project.compatibility()).unwrap(),
-    )
-    .unwrap();
-
-    assert_eq!(backing.store, authoritative);
-    assert!(
-        backing.warnings.is_empty(),
-        "both entries already name one directory, so there is nothing to report"
-    );
-}
-
-#[test]
-fn a_separate_compatibility_link_remains_visible_and_warns() {
-    let project = Project::new("codex-row-c-links-elsewhere");
-    let authoritative = project.make_dir(AUTHORITATIVE);
-    let legacy = project.make_dir("legacy-store");
-    project.make_dir(".codex");
-    if !symlink_dir_or_skip(&legacy, &project.compatibility()) {
-        return;
-    }
-
-    let backing = resolve_backing(
-        &project.root,
-        &classify(&authoritative).unwrap(),
-        &classify(&project.compatibility()).unwrap(),
-    )
-    .expect("the authoritative regular directory remains the mount store");
-
-    assert_eq!(backing.store, authoritative);
-    assert_eq!(backing.warnings.len(), 1);
-}
-
-#[test]
-fn a_missing_agents_entry_is_planned_against_an_existing_codex_store() {
-    let project = Project::new("codex-row-missing-a");
-    let store = project.make_dir(COMPATIBILITY);
-
-    let backing = resolve_backing(
-        &project.root,
-        &classify(&project.authoritative()).unwrap(),
-        &classify(&store).unwrap(),
-    )
-    .unwrap();
-
-    assert_eq!(backing.store, store);
-    assert_eq!(backing.authoritative_link_target, Some(store));
-    assert_eq!(
-        backing.create_directories,
-        [project.root.join(".agents")],
-        "only the missing parent of the authoritative entry is created"
-    );
-}
-
-#[test]
-fn a_missing_agents_entry_links_past_a_compatibility_link_to_its_terminal() {
-    let project = Project::new("codex-row-missing-a-linked-c");
+fn an_existing_agents_link_is_respected_as_the_logical_destination() {
+    let project = Project::new("codex-agents-link");
     let terminal = project.make_dir("shared-store");
-    project.make_dir(".codex");
-    if !symlink_dir_or_skip(&terminal, &project.compatibility()) {
+    project.make_dir(".agents");
+    if !symlink_dir_or_skip(&terminal, &project.preferred()) {
         return;
     }
 
-    let backing = resolve_backing(
-        &project.root,
-        &classify(&project.authoritative()).unwrap(),
-        &classify(&project.compatibility()).unwrap(),
-    )
-    .unwrap();
+    let destination = resolve_destination(&project.root, &classify(&project.preferred()).unwrap())
+        .expect("an existing preferred link resolves");
 
-    assert_eq!(backing.store, project.compatibility());
+    assert_eq!(destination.entry, project.preferred());
+    assert_eq!(destination.entry_state, PathKind::DirectoryLink);
+    assert!(destination.create_directories.is_empty());
+}
+
+#[test]
+fn a_regular_agents_directory_needs_no_helper_action() {
+    let project = Project::new("codex-agents-directory");
+    let preferred = project.make_dir(PREFERRED);
+
+    let destination = resolve_destination(&project.root, &classify(&preferred).unwrap()).unwrap();
+
+    assert_eq!(destination.entry, preferred);
+    assert_eq!(destination.entry_state, PathKind::Directory);
+    assert!(destination.create_directories.is_empty());
+}
+
+#[test]
+fn a_missing_agents_entry_creates_only_the_preferred_regular_directory_chain() {
+    let project = Project::new("codex-agents-missing");
+    project.make_dir(LEGACY);
+
+    let destination =
+        resolve_destination(&project.root, &classify(&project.preferred()).unwrap()).unwrap();
+
+    assert_eq!(destination.entry, project.preferred());
     assert_eq!(
-        backing.authoritative_link_target,
-        Some(terminal),
-        "the new link points at the terminal directory so the chain stays one hop deep"
+        destination.create_directories,
+        [project.root.join(".agents"), project.preferred()],
+        "the legacy root is visible but never selected as a destination"
     );
 }
 
 #[test]
-fn both_entries_missing_plans_the_full_helper_chain_in_dependency_order() {
-    let project = Project::new("codex-row-both-missing");
+fn an_existing_agents_parent_only_adds_its_skills_child() {
+    let project = Project::new("codex-agents-parent");
+    project.make_dir(".agents");
 
-    let backing = resolve_backing(
-        &project.root,
-        &classify(&project.authoritative()).unwrap(),
-        &classify(&project.compatibility()).unwrap(),
-    )
-    .unwrap();
+    let destination =
+        resolve_destination(&project.root, &classify(&project.preferred()).unwrap()).unwrap();
 
-    assert_eq!(backing.store, project.compatibility());
-    assert_eq!(
-        backing.create_directories,
-        [
-            project.root.join(".codex"),
-            project.compatibility(),
-            project.root.join(".agents"),
-        ],
-        "a parent is always created before the entry beneath it"
-    );
-    assert_eq!(
-        backing.authoritative_link_target,
-        Some(project.compatibility())
-    );
+    assert_eq!(destination.create_directories, [project.preferred()]);
 }
 
 #[test]
-fn an_unresolvable_authoritative_entry_fails_before_any_action_exists() {
+fn a_linked_agents_parent_can_receive_the_regular_skills_child() {
+    let project = Project::new("codex-linked-agents-parent");
+    let terminal = project.make_dir("shared-agents");
+    if !symlink_dir_or_skip(&terminal, &project.root.join(".agents")) {
+        return;
+    }
+
+    let destination =
+        resolve_destination(&project.root, &classify(&project.preferred()).unwrap()).unwrap();
+
+    assert_eq!(destination.create_directories, [project.preferred()]);
+}
+
+#[test]
+fn an_unresolvable_preferred_entry_fails_before_any_action_exists() {
     let project = Project::new("codex-row-unresolvable");
     project.make_dir(".agents");
 
     // Broken link.
-    if !symlink_dir_or_skip(&project.root.join("absent"), &project.authoritative()) {
+    if !symlink_dir_or_skip(&project.root.join("absent"), &project.preferred()) {
         return;
     }
-    let error = resolve_backing(
-        &project.root,
-        &classify(&project.authoritative()).unwrap(),
-        &classify(&project.compatibility()).unwrap(),
-    )
-    .expect_err("a broken authoritative entry has no safe destination");
+    let error = resolve_destination(&project.root, &classify(&project.preferred()).unwrap())
+        .expect_err("a broken preferred entry has no safe destination");
     assert_eq!(error.category(), ExitCategory::Filesystem);
-    remove_directory_link(&project.authoritative());
+    remove_directory_link(&project.preferred());
 
     // Non-directory.
-    std::fs::write(project.authoritative(), "not a namespace").expect("file fixture");
-    let error = resolve_backing(
-        &project.root,
-        &classify(&project.authoritative()).unwrap(),
-        &classify(&project.compatibility()).unwrap(),
-    )
-    .expect_err("a file cannot hold Skills");
+    std::fs::write(project.preferred(), "not a namespace").expect("file fixture");
+    let error = resolve_destination(&project.root, &classify(&project.preferred()).unwrap())
+        .expect_err("a file cannot hold Skills");
     assert_eq!(error.category(), ExitCategory::Filesystem);
-    std::fs::remove_file(project.authoritative()).expect("reset fixture");
+    std::fs::remove_file(project.preferred()).expect("reset fixture");
 
     // Link cycle.
     let other = project.root.join(".agents/other");
-    assert!(symlink_dir_or_skip(&other, &project.authoritative()));
-    assert!(symlink_dir_or_skip(&project.authoritative(), &other));
-    let resolved = classify(&project.authoritative()).unwrap();
+    assert!(symlink_dir_or_skip(&other, &project.preferred()));
+    assert!(symlink_dir_or_skip(&project.preferred(), &other));
+    let resolved = classify(&project.preferred()).unwrap();
     assert_eq!(resolved.kind, PathKind::CyclicLink);
-    let error = resolve_backing(
-        &project.root,
-        &resolved,
-        &classify(&project.compatibility()).unwrap(),
-    )
-    .expect_err("a cycle has no terminal directory");
+    let error = resolve_destination(&project.root, &resolved)
+        .expect_err("a cycle has no terminal directory");
     assert_eq!(error.category(), ExitCategory::Filesystem);
 }
 
 #[test]
-fn a_missing_authoritative_entry_over_a_broken_store_fails_closed() {
-    let project = Project::new("codex-row-broken-c");
-    project.make_dir(".codex");
-    if !symlink_dir_or_skip(&project.root.join("absent"), &project.compatibility()) {
+fn a_missing_preferred_entry_beneath_a_broken_parent_fails_closed() {
+    let project = Project::new("codex-broken-agents-parent");
+    if !symlink_dir_or_skip(&project.root.join("absent"), &project.root.join(".agents")) {
         return;
     }
 
-    let error = resolve_backing(
-        &project.root,
-        &classify(&project.authoritative()).unwrap(),
-        &classify(&project.compatibility()).unwrap(),
-    )
-    .expect_err("a broken compatibility store cannot back a new authoritative link");
+    let error = resolve_destination(&project.root, &classify(&project.preferred()).unwrap())
+        .expect_err("a broken parent cannot hold the preferred regular directory");
 
     assert_eq!(error.category(), ExitCategory::Filesystem);
 }
@@ -486,11 +392,11 @@ fn a_missing_authoritative_entry_over_a_broken_store_fails_closed() {
 #[test]
 fn an_entry_that_is_not_a_portable_name_still_occupies_its_logical_key() {
     let project = Project::new("scope-non-portable");
-    let store = project.make_dir(COMPATIBILITY);
+    let store = project.make_dir(LEGACY);
     std::fs::create_dir_all(store.join("My_Skill")).expect("uppercase entry");
     std::fs::create_dir_all(store.join("rust--review")).expect("double-hyphen entry");
 
-    let scope = inspect_scope(ScopeKind::CodexCompatibility, &store).unwrap();
+    let scope = inspect_scope(ScopeKind::CodexProjectLegacy, &store).unwrap();
 
     let occupant = scope
         .occupant(&SkillNameKey::new(std::ffi::OsStr::new("my_skill")))
@@ -521,8 +427,8 @@ fn scope_enumeration_is_independent_of_host_ordering() {
         std::fs::create_dir_all(reverse.join(name)).expect("entry");
     }
 
-    let first = inspect_scope(ScopeKind::CodexCompatibility, &forward).unwrap();
-    let second = inspect_scope(ScopeKind::CodexCompatibility, &reverse).unwrap();
+    let first = inspect_scope(ScopeKind::CodexProjectLegacy, &forward).unwrap();
+    let second = inspect_scope(ScopeKind::CodexProjectLegacy, &reverse).unwrap();
 
     let keys = |scope: &super::DiscoveryScope| {
         scope
@@ -544,7 +450,7 @@ fn scope_enumeration_is_independent_of_host_ordering() {
     assert_eq!(keys(&first), keys(&second));
     assert_eq!(raw_names(&first), raw_names(&second));
     assert_eq!(
-        inspect_scope(ScopeKind::CodexCompatibility, &forward).unwrap(),
+        inspect_scope(ScopeKind::CodexProjectLegacy, &forward).unwrap(),
         first,
         "repeating one inspection must also be stable"
     );
@@ -554,10 +460,40 @@ fn scope_enumeration_is_independent_of_host_ordering() {
 fn a_missing_scope_reports_no_occupants_instead_of_failing() {
     let project = Project::new("scope-missing");
 
-    let scope = inspect_scope(ScopeKind::CodexAuthoritative, &project.authoritative()).unwrap();
+    let scope = inspect_scope(ScopeKind::CodexProjectAgents, &project.preferred()).unwrap();
 
     assert_eq!(scope.state.kind, PathKind::Missing);
     assert!(scope.existing_skills.is_empty());
+}
+
+#[test]
+fn a_file_link_named_skill_md_is_not_a_visible_codex_skill() {
+    let project = Project::new("codex-file-linked-metadata");
+    let skill = project.make_dir(".agents/skills/linked-metadata");
+    let metadata = skill.join("metadata.md");
+    std::fs::write(
+        &metadata,
+        "---\nname: linked-metadata\ndescription: linked fixture\n---\n",
+    )
+    .expect("metadata fixture");
+    if !symlink_file_or_skip(&metadata, &skill.join("SKILL.md")) {
+        return;
+    }
+
+    let snapshot = CodexAdapter
+        .inspect_discovery(&project.codex_context(ConflictPolicy::Error))
+        .expect("file-linked metadata is ignored, not followed");
+
+    assert!(
+        !snapshot
+            .visible_skills
+            .contains_key(&SkillNameKey::new(std::ffi::OsStr::new("linked-metadata")))
+    );
+    assert!(snapshot.warnings.iter().any(|warning| {
+        warning
+            .message
+            .contains("directory entry is not a regular file")
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -569,28 +505,19 @@ fn a_missing_destination_plans_a_link_under_both_policies() {
     for policy in [ConflictPolicy::Error, ConflictPolicy::Skip] {
         let project = Project::new("conflict-missing");
         let source = project.source_skill("alpha");
-        project.make_dir(COMPATIBILITY);
+        project.make_dir(LEGACY);
 
         let plan = plan_codex(&project, &project.codex_context(policy)).expect("plan builds");
 
         assert_eq!(
             link_destinations(&plan),
-            [project.compatibility().join("alpha")]
-        );
-        assert_eq!(
-            authoritative_link_target(&plan),
-            Some(project.compatibility().as_path()),
-            "a missing .agents/skills is linked at the existing store"
+            [project.preferred().join("alpha")]
         );
         assert_eq!(
             plan.actions
                 .iter()
                 .filter_map(|action| match &action.operation {
-                    MountAction::CreateDirectoryLink {
-                        source,
-                        destination,
-                        ..
-                    } if destination != &plan.discovery.entry => Some(source.as_path()),
+                    MountAction::CreateDirectoryLink { source, .. } => Some(source.as_path()),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -603,7 +530,7 @@ fn a_missing_destination_plans_a_link_under_both_policies() {
 fn a_link_to_the_selected_source_is_reused_and_never_owned() {
     let project = Project::new("conflict-same-source");
     let source = project.source_skill("alpha");
-    let store = project.make_dir(COMPATIBILITY);
+    let store = project.make_dir(LEGACY);
     if !symlink_dir_or_skip(&source, &store.join("alpha")) {
         return;
     }
@@ -632,7 +559,7 @@ fn a_link_to_a_different_source_fails_under_error_and_is_preserved_under_skip() 
     let project = Project::new("conflict-different-source");
     project.source_skill("alpha");
     let other = project.make_dir("other-alpha");
-    let store = project.make_dir(COMPATIBILITY);
+    let store = project.make_dir(PREFERRED);
     if !symlink_dir_or_skip(&other, &store.join("alpha")) {
         return;
     }
@@ -652,7 +579,7 @@ fn a_link_to_a_different_source_fails_under_error_and_is_preserved_under_skip() 
 fn a_regular_project_directory_is_never_replaced() {
     let project = Project::new("conflict-project-directory");
     project.source_skill("alpha");
-    let store = project.make_dir(COMPATIBILITY);
+    let store = project.make_dir(PREFERRED);
     std::fs::create_dir_all(store.join("alpha")).expect("project-owned skill");
 
     let error = plan_codex(&project, &project.codex_context(ConflictPolicy::Error))
@@ -669,7 +596,7 @@ fn a_regular_project_directory_is_never_replaced() {
 fn an_unsupported_destination_fails_under_both_policies() {
     let project = Project::new("conflict-unsupported");
     project.source_skill("alpha");
-    let store = project.make_dir(COMPATIBILITY);
+    let store = project.make_dir(PREFERRED);
     if !symlink_dir_or_skip(&project.root.join("absent"), &store.join("alpha")) {
         return;
     }
@@ -686,7 +613,7 @@ fn an_unsupported_destination_fails_under_both_policies() {
 fn a_case_variant_destination_is_detected_even_though_the_exact_path_is_absent() {
     let project = Project::new("conflict-case-variant");
     project.source_skill("alpha");
-    let store = project.make_dir(COMPATIBILITY);
+    let store = project.make_dir(PREFERRED);
     std::fs::create_dir_all(store.join("Alpha")).expect("case-variant entry");
 
     let error = plan_codex(&project, &project.codex_context(ConflictPolicy::Error))
@@ -709,7 +636,7 @@ fn skipping_a_winner_never_reveals_a_shadowed_source() {
         )
         .expect("SKILL.md");
     }
-    let store = project.make_dir(COMPATIBILITY);
+    let store = project.make_dir(PREFERRED);
     std::fs::create_dir_all(store.join("alpha")).expect("project-owned skill");
 
     let occurrences = [&first, &second]
@@ -754,7 +681,7 @@ fn skipping_a_winner_never_reveals_a_shadowed_source() {
 fn a_same_key_skill_in_an_ancestor_scope_blocks_a_mount_whose_destination_is_free() {
     let project = Project::new("cross-scope-ancestor");
     project.source_skill("alpha");
-    project.make_dir(COMPATIBILITY);
+    project.make_dir(LEGACY);
     let nested = project.make_dir("nested");
     let ancestor_store = project.make_dir("nested/.agents/skills");
     let ancestor_skill = ancestor_store.join("alpha");
@@ -778,7 +705,7 @@ fn a_same_key_skill_in_an_ancestor_scope_blocks_a_mount_whose_destination_is_fre
 fn a_same_key_skill_in_an_ancestor_codex_scope_blocks_a_mount() {
     let project = Project::new("cross-scope-ancestor-codex");
     project.source_skill("alpha");
-    project.make_dir(COMPATIBILITY);
+    project.make_dir(LEGACY);
     let nested = project.make_dir("nested");
     let existing = project.make_dir("nested/.codex/skills/alpha");
     std::fs::write(
@@ -814,10 +741,144 @@ fn a_recursive_frontmatter_name_conflicts_when_directory_names_differ() {
 }
 
 #[test]
+fn codex_directory_name_fallback_is_included_in_the_conflict_index() {
+    let project = Project::new("cross-scope-frontmatter-name-fallback");
+    project.source_skill("alpha");
+    let existing = project.make_dir(".agents/skills/group/alpha");
+    std::fs::write(
+        existing.join("SKILL.md"),
+        "---\ndescription: fallback alpha\n---\n",
+    )
+    .expect("existing Skill metadata");
+
+    let error = plan_codex(&project, &project.codex_context(ConflictPolicy::Error))
+        .expect_err("Codex falls back to the containing directory when name is absent");
+
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn codex_directory_name_fallback_uses_a_link_targets_directory_name() {
+    let project = Project::new("cross-scope-frontmatter-linked-name-fallback");
+    project.source_skill("canonical-alpha");
+    let store = project.make_dir(PREFERRED);
+    let existing = project.make_dir("foreign/canonical-alpha");
+    std::fs::write(
+        existing.join("SKILL.md"),
+        "---\ndescription: linked fallback alpha\n---\n",
+    )
+    .expect("existing Skill metadata");
+    if !symlink_dir_or_skip(&existing, &store.join("alias-alpha")) {
+        return;
+    }
+
+    let error = plan_codex(&project, &project.codex_context(ConflictPolicy::Error))
+        .expect_err("Codex canonicalizes the Skill before applying its directory-name fallback");
+
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn codex_scalar_repair_keeps_a_real_existing_skill_in_the_conflict_index() {
+    let project = Project::new("cross-scope-frontmatter-scalar-repair");
+    project.source_skill("alpha");
+    let existing = project.make_dir(".agents/skills/foreign");
+    std::fs::write(
+        existing.join("SKILL.md"),
+        "---\nname: alpha\ndescription: Build for AWS: ECS and Lambda\n---\n",
+    )
+    .expect("existing Skill metadata");
+
+    let error = plan_codex(&project, &project.codex_context(ConflictPolicy::Error))
+        .expect_err("the pinned Codex loader repairs this unquoted prose");
+
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn codex_existing_discovery_ignores_a_wrong_case_skill_filename() {
+    let project = Project::new("cross-scope-exact-skill-filename");
+    project.source_skill("alpha");
+    let existing = project.make_dir(".agents/skills/foreign");
+    std::fs::write(
+        existing.join("skill.md"),
+        "---\nname: alpha\ndescription: wrong-case filename\n---\n",
+    )
+    .expect("wrong-case Skill metadata");
+
+    let plan = plan_codex(&project, &project.codex_context(ConflictPolicy::Error))
+        .expect("the pinned loader does not treat skill.md as SKILL.md");
+
+    assert_eq!(
+        link_destinations(&plan),
+        [project.preferred().join("alpha")]
+    );
+}
+
+#[test]
+fn recursive_discovery_includes_depth_six_but_does_not_descend_beyond_it() {
+    let project = Project::new("recursive-discovery-depth-boundary");
+    let store = project.make_dir(PREFERRED);
+    let mut directory = store;
+    for component in ["one", "two", "three", "four", "five", "six"] {
+        directory = directory.join(component);
+        std::fs::create_dir(&directory).expect("nested discovery directory");
+    }
+    std::fs::write(
+        directory.join("SKILL.md"),
+        "---\nname: at-boundary\ndescription: depth-six fixture\n---\n",
+    )
+    .expect("depth-six Skill metadata");
+    let beyond = directory.join("seven");
+    std::fs::create_dir(&beyond).expect("beyond-boundary directory");
+    std::fs::write(
+        beyond.join("SKILL.md"),
+        "---\nname: beyond-boundary\ndescription: depth-seven fixture\n---\n",
+    )
+    .expect("depth-seven Skill metadata");
+
+    let snapshot = CodexAdapter
+        .inspect_discovery(&project.codex_context(ConflictPolicy::Error))
+        .expect("bounded recursive discovery");
+
+    assert!(
+        snapshot
+            .visible_skills
+            .contains_key(&SkillNameKey::new(std::ffi::OsStr::new("at-boundary")))
+    );
+    assert!(
+        !snapshot
+            .visible_skills
+            .contains_key(&SkillNameKey::new(std::ffi::OsStr::new("beyond-boundary")))
+    );
+}
+
+#[test]
+fn recursive_discovery_does_not_descend_into_hidden_collections() {
+    let project = Project::new("recursive-discovery-hidden-collection");
+    let hidden = project.make_dir(".agents/skills/.hidden/foreign");
+    std::fs::write(
+        hidden.join("SKILL.md"),
+        "---\nname: hidden-skill\ndescription: hidden fixture\n---\n",
+    )
+    .expect("hidden Skill metadata");
+
+    let snapshot = CodexAdapter
+        .inspect_discovery(&project.codex_context(ConflictPolicy::Error))
+        .expect("hidden collection discovery");
+
+    assert!(
+        !snapshot
+            .visible_skills
+            .contains_key(&SkillNameKey::new(std::ffi::OsStr::new("hidden-skill")))
+    );
+}
+
+#[test]
 fn a_symlinked_collection_is_discovered_once_even_when_it_links_back() {
     let project = Project::new("cross-scope-symlinked-collection");
     project.source_skill("alpha");
-    let store = project.make_dir(AUTHORITATIVE);
+    let store = project.make_dir(PREFERRED);
     let collection = project.make_dir("collection/deep/foreign");
     std::fs::write(
         collection.join("SKILL.md"),
@@ -841,7 +902,7 @@ fn a_symlinked_collection_is_discovered_once_even_when_it_links_back() {
 fn duplicate_frontmatter_names_retain_a_foreign_conflict() {
     let project = Project::new("cross-scope-duplicate-frontmatter");
     let source = project.source_skill("alpha");
-    let store = project.make_dir(AUTHORITATIVE);
+    let store = project.make_dir(PREFERRED);
     if !symlink_dir_or_skip(&source, &store.join("one")) {
         return;
     }
@@ -858,12 +919,255 @@ fn duplicate_frontmatter_names_retain_a_foreign_conflict() {
     assert_eq!(error.category(), ExitCategory::Filesystem);
 }
 
+#[test]
+fn agents_and_legacy_names_are_merged_without_dropping_a_foreign_duplicate() {
+    let project = Project::new("cross-scope-agents-legacy-merge");
+    let source = project.source_skill("alpha");
+    let agents = project.make_dir(PREFERRED);
+    if !symlink_dir_or_skip(&source, &agents.join("matching")) {
+        return;
+    }
+    let foreign = project.make_dir(".codex/skills/foreign");
+    std::fs::write(
+        foreign.join("SKILL.md"),
+        "---\nname: alpha\ndescription: foreign legacy alpha\n---\n",
+    )
+    .expect("foreign legacy Skill metadata");
+
+    let context = project.codex_context(ConflictPolicy::Error);
+    let snapshot = CodexAdapter
+        .inspect_discovery(&context)
+        .expect("merged discovery snapshot");
+    let visible = snapshot
+        .visible_skills
+        .get(&SkillNameKey::new(std::ffi::OsStr::new("alpha")))
+        .expect("both alpha declarations remain indexed");
+
+    assert_eq!(visible.len(), 2);
+    assert!(
+        visible
+            .iter()
+            .any(|entry| entry.scope == ScopeKind::CodexProjectAgents)
+    );
+    assert!(
+        visible
+            .iter()
+            .any(|entry| entry.scope == ScopeKind::CodexProjectLegacy)
+    );
+    let error = CodexAdapter
+        .build_mount_plan(&context, &project.catalog(AgentId::Codex), &snapshot)
+        .expect_err("a matching declaration must not hide the legacy foreign duplicate");
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn every_global_codex_scope_participates_in_the_merged_conflict_index() {
+    for (label, relative, expected_scope) in [
+        (
+            "user-agents",
+            "home/.agents/skills/foreign",
+            ScopeKind::CodexUserAgents,
+        ),
+        (
+            "user-legacy",
+            "codex-home/skills/foreign",
+            ScopeKind::CodexUserLegacy,
+        ),
+        (
+            "bundled-system",
+            "codex-home/skills/.system/foreign",
+            ScopeKind::CodexSystem,
+        ),
+        (
+            "administrator",
+            "admin/skills/foreign",
+            ScopeKind::CodexAdmin,
+        ),
+    ] {
+        let project = Project::new(&format!("cross-scope-global-{label}"));
+        project.source_skill("alpha");
+        let existing = project.make_dir(relative);
+        std::fs::write(
+            existing.join("SKILL.md"),
+            "---\nname: alpha\ndescription: global alpha\n---\n",
+        )
+        .expect("global Skill metadata");
+        let context = project.codex_context(ConflictPolicy::Error);
+        let snapshot = CodexAdapter
+            .inspect_discovery(&context)
+            .expect("global discovery snapshot");
+        let visible = snapshot
+            .visible_skills
+            .get(&SkillNameKey::new(std::ffi::OsStr::new("alpha")))
+            .expect("global alpha is indexed");
+
+        assert!(
+            visible.iter().any(|entry| entry.scope == expected_scope),
+            "{label} was absent from {visible:?}"
+        );
+        let error = CodexAdapter
+            .build_mount_plan(&context, &project.catalog(AgentId::Codex), &snapshot)
+            .expect_err("a global duplicate must block a new mount");
+        assert_eq!(error.category(), ExitCategory::Filesystem, "{label}");
+    }
+}
+
+#[test]
+fn embedded_system_names_are_reserved_before_codex_installs_its_cache() {
+    for name in [
+        "imagegen",
+        "openai-docs",
+        "plugin-creator",
+        "review-agent",
+        "skill-creator",
+        "skill-installer",
+    ] {
+        for policy in [ConflictPolicy::Error, ConflictPolicy::Skip] {
+            let project = Project::new(&format!(
+                "cross-scope-system-cache-install-{name}-{policy:?}"
+            ));
+            project.source_skill(name);
+
+            let error = plan_codex(&project, &project.codex_context(policy))
+                .expect_err("Codex owns the embedded cache across discovery and launch");
+
+            assert_eq!(error.category(), ExitCategory::Filesystem, "{name}");
+            assert!(error.to_string().contains("codex system"), "{name}");
+        }
+    }
+}
+
+#[test]
+fn system_and_admin_scopes_sharing_a_terminal_keep_their_traversal_policies() {
+    let project = Project::new("cross-scope-system-admin-shared-terminal");
+    project.source_skill("alpha");
+    let system = project.make_dir("codex-home/skills/.system");
+    let foreign = project.make_dir("foreign-admin-skill");
+    std::fs::write(
+        foreign.join("SKILL.md"),
+        "---\nname: alpha\ndescription: linked administrator alpha\n---\n",
+    )
+    .expect("linked Skill metadata");
+    if !symlink_dir_or_skip(&foreign, &system.join("linked")) {
+        return;
+    }
+    let mut context = project.codex_context(ConflictPolicy::Error);
+    context.codex_admin_skills = Some(system);
+
+    let snapshot = CodexAdapter
+        .inspect_discovery(&context)
+        .expect("shared-terminal discovery");
+    let visible = snapshot
+        .visible_skills
+        .get(&SkillNameKey::new(std::ffi::OsStr::new("alpha")))
+        .expect("administrator traversal retains the linked Skill");
+    assert!(
+        visible
+            .iter()
+            .any(|entry| entry.scope == ScopeKind::CodexAdmin)
+    );
+
+    let error = CodexAdapter
+        .build_mount_plan(&context, &project.catalog(AgentId::Codex), &snapshot)
+        .expect_err("system's no-link scan must not erase the administrator result");
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn bundled_cache_entries_are_never_reused_as_stable_selected_sources() {
+    let project = Project::new("codex-system-cache-reuse");
+    let source = project.make_dir("codex-home/skills/.system/alpha");
+    std::fs::write(
+        source.join("SKILL.md"),
+        "---\nname: alpha\ndescription: bundled cache fixture\n---\n",
+    )
+    .expect("system Skill metadata");
+    let occurrences = vec![SourceOccurrence {
+        ordinal: 0,
+        input_path: source.clone(),
+        resolved_path: source,
+    }];
+    let catalog = resolve_catalog(
+        &occurrences,
+        &CatalogRequest {
+            agent: AgentId::Codex,
+            validation: ValidationLevel::Basic,
+            destination_stores: &[],
+        },
+    )
+    .expect("system source catalog");
+
+    let error_context = project.codex_context(ConflictPolicy::Error);
+    let snapshot = CodexAdapter
+        .inspect_discovery(&error_context)
+        .expect("system cache discovery");
+    let error = CodexAdapter
+        .build_mount_plan(&error_context, &catalog, &snapshot)
+        .expect_err("Codex may delete or replace an exact-source cache entry before loading it");
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+
+    let skip_context = project.codex_context(ConflictPolicy::Skip);
+    let error = CodexAdapter
+        .build_mount_plan(&skip_context, &catalog, &snapshot)
+        .expect_err("skip cannot promise that Codex will preserve its mutable cache entry");
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn bundled_system_discovery_does_not_follow_nested_directory_links() {
+    let project = Project::new("cross-scope-system-link-policy");
+    project.source_skill("alpha");
+    let system = project.make_dir("codex-home/skills/.system");
+    let foreign = project.make_dir("foreign-system-skill");
+    std::fs::write(
+        foreign.join("SKILL.md"),
+        "---\nname: alpha\ndescription: linked system alpha\n---\n",
+    )
+    .expect("linked system Skill metadata");
+    if !symlink_dir_or_skip(&foreign, &system.join("linked")) {
+        return;
+    }
+
+    let plan = plan_codex(&project, &project.codex_context(ConflictPolicy::Error))
+        .expect("Codex ignores nested links in its bundled system root");
+
+    assert_eq!(
+        link_destinations(&plan),
+        [project.preferred().join("alpha")]
+    );
+}
+
+#[test]
+fn bundled_system_discovery_follows_a_linked_root_before_applying_its_link_policy() {
+    let project = Project::new("cross-scope-system-root-link-policy");
+    project.source_skill("alpha");
+    project.make_dir("codex-home/skills");
+    let foreign_root = project.make_dir("foreign-system-root");
+    let foreign = project.make_dir("foreign-system-root/foreign");
+    std::fs::write(
+        foreign.join("SKILL.md"),
+        "---\nname: alpha\ndescription: linked system root alpha\n---\n",
+    )
+    .expect("linked system Skill metadata");
+    if !symlink_dir_or_skip(
+        &foreign_root,
+        &project.root.join("codex-home/skills/.system"),
+    ) {
+        return;
+    }
+
+    let error = plan_codex(&project, &project.codex_context(ConflictPolicy::Error))
+        .expect_err("Codex canonicalizes the bundled-system root before walking it");
+
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn an_unsupported_case_variant_outranks_a_skippable_destination() {
     let project = Project::new("cross-scope-duplicate-unsupported");
     project.source_skill("alpha");
-    let store = project.make_dir(AUTHORITATIVE);
+    let store = project.make_dir(PREFERRED);
     std::fs::create_dir(store.join("ALPHA")).expect("skippable case-variant directory");
     if !symlink_dir_or_skip(Path::new("missing-target"), &store.join("alpha")) {
         return;
@@ -879,7 +1183,7 @@ fn an_unsupported_case_variant_outranks_a_skippable_destination() {
 fn every_codex_discovery_root_and_backing_store_is_locked() {
     let project = Project::new("codex-complete-lock-set");
     project.source_skill("alpha");
-    project.make_dir(COMPATIBILITY);
+    project.make_dir(LEGACY);
     let nested = project.make_dir("nested");
     project.make_dir("nested/.agents/skills");
     project.make_dir("nested/.codex/skills");
@@ -898,23 +1202,39 @@ fn every_codex_discovery_root_and_backing_store_is_locked() {
     let expected = [
         (
             crate::lock::LockResourceKind::DiscoveryEntry,
-            project.authoritative(),
+            project.preferred(),
         ),
         (
             crate::lock::LockResourceKind::DiscoveryEntry,
-            project.compatibility(),
+            project.legacy(),
         ),
         (
             crate::lock::LockResourceKind::BackingStore,
-            project.compatibility(),
+            project.preferred(),
         ),
         (
             crate::lock::LockResourceKind::DiscoveryEntry,
-            nested.join(AUTHORITATIVE),
+            nested.join(PREFERRED),
         ),
         (
             crate::lock::LockResourceKind::DiscoveryEntry,
-            nested.join(COMPATIBILITY),
+            nested.join(LEGACY),
+        ),
+        (
+            crate::lock::LockResourceKind::DiscoveryEntry,
+            project.root.join("home/.agents/skills"),
+        ),
+        (
+            crate::lock::LockResourceKind::DiscoveryEntry,
+            project.root.join("codex-home/skills"),
+        ),
+        (
+            crate::lock::LockResourceKind::DiscoveryEntry,
+            project.root.join("codex-home/skills/.system"),
+        ),
+        (
+            crate::lock::LockResourceKind::DiscoveryEntry,
+            project.root.join("admin/skills"),
         ),
     ]
     .into_iter()
@@ -927,7 +1247,7 @@ fn every_codex_discovery_root_and_backing_store_is_locked() {
 fn the_same_source_already_visible_elsewhere_is_reused_rather_than_duplicated() {
     let project = Project::new("cross-scope-same-source");
     let source = project.source_skill("alpha");
-    project.make_dir(COMPATIBILITY);
+    project.make_dir(LEGACY);
     let nested = project.make_dir("nested");
     let ancestor_store = project.make_dir("nested/.agents/skills");
     if !symlink_dir_or_skip(&source, &ancestor_store.join("alpha")) {
@@ -944,12 +1264,32 @@ fn the_same_source_already_visible_elsewhere_is_reused_rather_than_duplicated() 
 }
 
 #[test]
+fn the_same_source_reached_as_a_regular_child_of_a_linked_collection_is_reused() {
+    let project = Project::new("cross-scope-linked-collection-same-source");
+    let source = project.source_skill("alpha");
+    let store = project.make_dir(PREFERRED);
+    if !symlink_dir_or_skip(&project.sources, &store.join("collection")) {
+        return;
+    }
+
+    let plan = plan_codex(&project, &project.codex_context(ConflictPolicy::Error))
+        .expect("canonical source identity makes the nested regular directory reusable");
+
+    assert!(link_destinations(&plan).is_empty());
+    assert_eq!(reuse_destinations(&plan), [store.join("collection/alpha")]);
+    assert_eq!(
+        std::fs::canonicalize(store.join("collection/alpha")).unwrap(),
+        source
+    );
+}
+
+#[test]
 fn the_expected_layout_does_not_turn_ordinary_mounts_into_reuse() {
     let project = Project::new("cross-scope-dedupe");
     project.source_skill("alpha");
-    let store = project.make_dir(COMPATIBILITY);
+    let store = project.make_dir(LEGACY);
     project.make_dir(".agents");
-    if !symlink_dir_or_skip(&store, &project.authoritative()) {
+    if !symlink_dir_or_skip(&store, &project.preferred()) {
         return;
     }
     std::fs::create_dir_all(store.join("existing")).expect("unrelated entry");
@@ -959,7 +1299,7 @@ fn the_expected_layout_does_not_turn_ordinary_mounts_into_reuse() {
 
     assert_eq!(
         link_destinations(&plan),
-        [store.join("alpha")],
+        [project.preferred().join("alpha")],
         "the store reached through .agents/skills must not look like a foreign scope"
     );
     assert!(reuse_destinations(&plan).is_empty());
@@ -1094,9 +1434,8 @@ fn codex_planning_creates_nothing_even_when_the_whole_layout_is_missing() {
     assert_eq!(
         created_directories(&plan),
         [
-            project.root.join(".codex").as_path(),
-            project.compatibility().as_path(),
             project.root.join(".agents").as_path(),
+            project.preferred().as_path(),
         ]
     );
     for directory in created_directories(&plan) {
@@ -1112,11 +1451,35 @@ fn codex_planning_creates_nothing_even_when_the_whole_layout_is_missing() {
 }
 
 #[test]
+fn codex_launch_pins_the_inspected_cwd_and_discovery_configuration() {
+    let project = Project::new("codex-pinned-session");
+    project.source_skill("alpha");
+    project.source_skill("beta");
+    let context = project.codex_context(ConflictPolicy::Error);
+
+    let plan = plan_codex(&project, &context).expect("pinned launch plan");
+
+    assert_eq!(
+        plan.launch.injected_args,
+        vec![
+            OsString::from("-C"),
+            project.root.as_os_str().to_os_string(),
+            OsString::from("-c"),
+            OsString::from("project_root_markers=[\".git\"]"),
+            OsString::from("-c"),
+            OsString::from(
+                "skills.config=[{name=\"alpha\",enabled=true},{name=\"beta\",enabled=true}]"
+            ),
+        ]
+    );
+}
+
+#[test]
 fn a_late_conflict_leaves_earlier_candidates_unapplied() {
     let project = Project::new("read-only-late-conflict");
     project.source_skill("alpha");
     project.source_skill("zeta");
-    let store = project.make_dir(COMPATIBILITY);
+    let store = project.make_dir(PREFERRED);
     std::fs::create_dir_all(store.join("zeta")).expect("conflicting entry");
 
     let context = project.codex_context(ConflictPolicy::Error);
@@ -1154,8 +1517,8 @@ fn action_ids_follow_the_order_actions_apply_in() {
         .collect::<Vec<_>>();
     assert_eq!(
         verbs,
-        ["MKDIR", "MKDIR", "MKDIR", "LINK", "LINK", "LINK"],
-        "helper directories precede the authoritative link, which precedes Skills"
+        ["MKDIR", "MKDIR", "LINK", "LINK"],
+        "the preferred directory chain precedes Skill links"
     );
     assert!(
         plan.actions

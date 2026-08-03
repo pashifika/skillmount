@@ -97,7 +97,7 @@ impl ResolvedEntry {
 /// Classifies an entry and resolves any directory-link chain.
 ///
 /// Broken, cyclic, over-deep, and non-directory layouts are returned as states rather than
-/// errors. The authoritative Codex entry, an ancestor scope, and a conflicting destination have
+/// errors. The preferred Codex entry, an ancestor scope, and a conflicting destination have
 /// different consequences. Returning the state lets each caller apply its own rule instead of
 /// forcing one policy into the resolver.
 ///

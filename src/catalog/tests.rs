@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::{CatalogRequest, resolve_catalog};
 use crate::domain::{AgentId, ShadowReason, SourceOccurrence, ValidationLevel};
 use crate::error::{AppError, CatalogError, ExitCategory};
+use crate::test_support::symlink_file_or_skip as guarded_symlink_file;
 
 struct TestDir(PathBuf);
 
@@ -319,10 +320,23 @@ fn validation_levels_follow_adapter_metadata_rules() {
         .is_err()
     );
 
-    let none = resolve(&[claude_only], AgentId::Codex, ValidationLevel::None)
-        .expect("none should skip metadata");
-    assert_eq!(none.warnings.len(), 1);
-    assert_eq!(none.resolutions[0].selected.metadata.name, None);
+    assert!(
+        resolve(
+            std::slice::from_ref(&claude_only),
+            AgentId::Codex,
+            ValidationLevel::None,
+        )
+        .is_err(),
+        "Codex's injected name-enable rules require an adapter-proved metadata name even when optional validation is disabled"
+    );
+    let valid_codex = valid_skill(&fixture.0, "codex");
+    let none = resolve(&[valid_codex], AgentId::Codex, ValidationLevel::None)
+        .expect("Codex keeps its adapter-required metadata boundary");
+    assert!(none.warnings.is_empty());
+    assert_eq!(
+        none.resolutions[0].selected.metadata.name.as_deref(),
+        Some("codex")
+    );
 }
 
 #[test]
@@ -344,6 +358,26 @@ fn metadata_none_never_disables_safe_name_or_regular_skill_checks() {
     assert!(matches!(
         error,
         AppError::Catalog(CatalogError::InvalidSelectedSkill { .. })
+    ));
+}
+
+#[test]
+fn codex_source_discovery_requires_the_exact_skill_filename() {
+    let fixture = TestDir::new("codex-exact-skill-filename");
+    let skill = fixture.0.join("demo");
+    fs::create_dir(&skill).expect("Skill directory");
+    fs::write(
+        skill.join("skill.md"),
+        "---\nname: demo\ndescription: wrong-case filename\n---\n",
+    )
+    .expect("wrong-case Skill metadata");
+
+    let error = resolve(&[skill], AgentId::Codex, ValidationLevel::Basic)
+        .expect_err("Codex compares the discovered directory-entry basename exactly");
+
+    assert!(matches!(
+        error,
+        AppError::Catalog(CatalogError::EmptyCatalog { .. })
     ));
 }
 
@@ -459,6 +493,34 @@ fn whitespace_only_required_metadata_is_empty() {
     let error = resolve(&[blank], AgentId::Codex, ValidationLevel::Basic)
         .expect_err("blank description should fail");
     assert!(error.to_string().contains("description"));
+}
+
+#[test]
+fn codex_rejects_a_file_link_named_skill_md_that_claude_can_read() {
+    let fixture = TestDir::new("codex-file-linked-skill-md");
+    let catalog = fixture.0.join("catalog");
+    let skill = catalog.join("demo");
+    fs::create_dir_all(&skill).expect("Skill fixture");
+    let metadata = skill.join("metadata.md");
+    fs::write(
+        &metadata,
+        "---\nname: demo\ndescription: linked metadata fixture\n---\n",
+    )
+    .expect("metadata fixture");
+    if !guarded_symlink_file(&metadata, &skill.join("SKILL.md")) {
+        return;
+    }
+
+    resolve(
+        std::slice::from_ref(&catalog),
+        AgentId::Claude,
+        ValidationLevel::Basic,
+    )
+    .expect("Claude catalog validation may follow a contained metadata link");
+    let error = resolve(&[catalog], AgentId::Codex, ValidationLevel::Basic)
+        .expect_err("Codex's discovery walk skips file-linked SKILL.md entries");
+
+    assert!(error.to_string().contains("only regular SKILL.md entries"));
 }
 
 #[test]

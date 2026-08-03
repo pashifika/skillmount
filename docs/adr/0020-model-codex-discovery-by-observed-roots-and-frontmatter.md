@@ -1,6 +1,6 @@
 # ADR 0020: Model Codex Discovery by Observed Roots and Frontmatter
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR 0021
 - **Date:** 2026-08-03
 - **Supersedes:** ADR 0010 for Codex discovery identity only
 

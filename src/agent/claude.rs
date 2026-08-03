@@ -4,7 +4,8 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::agent::{
-    AgentAdapter, DiscoverySnapshot, ScopeKind, dedupe_scopes_by_terminal, inspect_scope,
+    AgentAdapter, DiscoverySnapshot, ScopeKind, dedupe_scopes_by_terminal, discovery_indexes,
+    inspect_scope,
 };
 use crate::diagnostic::Diagnostic;
 use crate::domain::{AgentId, MountMode, RunContext, SkillCatalog};
@@ -15,7 +16,7 @@ use crate::mount::resolve::classify;
 use crate::mount::{
     ActionSequence, DiscoveryPlan, LaunchPlan, MountAction, MountPlan, PathPrecondition,
 };
-use crate::state::{PENDING_SESSION, session_root_base, user_home};
+use crate::state::{PENDING_SESSION, session_root_base};
 
 /// Namespace Claude Code searches inside any directory it is given.
 const SKILLS_SUFFIX: &str = ".claude/skills";
@@ -207,7 +208,7 @@ impl AgentAdapter for ClaudeAdapter {
         }
         scopes.push(inspect_scope(
             ScopeKind::ClaudeUser,
-            &user_home()?.join(SKILLS_SUFFIX),
+            &context.user_home.join(SKILLS_SUFFIX),
         )?);
         for directory in parse_add_dirs(&context.passthrough_args) {
             scopes.push(inspect_scope(
@@ -249,10 +250,13 @@ impl AgentAdapter for ClaudeAdapter {
         for scope in &scopes {
             warnings.extend(scope.warnings.iter().cloned());
         }
+        let (visible_skills, mount_entries) = discovery_indexes(&scopes, &backing_store);
 
         Ok(DiscoverySnapshot {
             agent: AgentId::Claude,
             scopes,
+            visible_skills,
+            mount_entries,
             discovery_entry,
             backing_store,
             backing_store_state: backing_state.kind,
@@ -304,6 +308,7 @@ impl AgentAdapter for ClaudeAdapter {
                 cwd: context.launch_cwd.clone(),
                 injected_args,
                 passthrough_args: context.passthrough_args.clone(),
+                environment_overrides: Vec::new(),
             },
         })
     }

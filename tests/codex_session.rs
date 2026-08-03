@@ -6,6 +6,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use skillmount::domain::LinkMode;
@@ -20,6 +22,7 @@ struct Fixture {
     sources: PathBuf,
     state: PathBuf,
     record: PathBuf,
+    version_record: PathBuf,
 }
 
 impl Fixture {
@@ -37,10 +40,12 @@ impl Fixture {
             sources: root.join("sources"),
             state: root.join("state"),
             record: root.join("fake-codex.record"),
+            version_record: root.join("fake-codex-version.record"),
             root,
         };
         fs::create_dir_all(&fixture.project).expect("project fixture");
         fs::create_dir_all(&fixture.sources).expect("source fixture");
+        fs::create_dir_all(fixture.root.join("codex-home")).expect("Codex home fixture");
         fixture
     }
 
@@ -56,10 +61,18 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
-        self.command_with_agent(Some(Path::new(FAKE_CODEX)))
+        self.command_with_options(&[])
+    }
+
+    fn command_with_options(&self, options: &[&str]) -> Command {
+        self.command_with_agent_and_options(Some(Path::new(FAKE_CODEX)), options)
     }
 
     fn command_with_agent(&self, agent: Option<&Path>) -> Command {
+        self.command_with_agent_and_options(agent, &[])
+    }
+
+    fn command_with_agent_and_options(&self, agent: Option<&Path>, options: &[&str]) -> Command {
         let mut command = Command::new(ASM);
         command
             .arg("codex")
@@ -73,11 +86,25 @@ impl Fixture {
             command.arg("--agent-bin").arg(agent);
         }
         command
+            .args(options)
             .arg("--")
+            .arg("exec")
             .arg("--literal")
             .arg("value with spaces")
+            .env("HOME", self.root.join("home"))
+            .env("USERPROFILE", self.root.join("home"))
+            .env("SKILLMOUNT_TEST_CODEX_USER_HOME", self.root.join("home"))
+            .env("SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG", "absent")
+            .env("LOCALAPPDATA", self.root.join("home/AppData/Local"))
+            .env("CODEX_HOME", self.root.join("codex-home"))
+            .env(
+                "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
+                self.root.join("admin-skills"),
+            )
             .env("SKILLMOUNT_STATE_DIR", &self.state)
             .env("SKILLMOUNT_FAKE_RECORD", &self.record)
+            .env("SKILLMOUNT_FAKE_VERSION_RECORD", &self.version_record)
+            .env("SKILLMOUNT_FAKE_RECORD_CODEX_HOME", "1")
             .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
             .current_dir(&self.project);
         command
@@ -121,6 +148,34 @@ impl Drop for Fixture {
 
 fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
+}
+
+#[cfg(unix)]
+struct UnixProcessGuard(nix::unistd::Pid);
+
+#[cfg(unix)]
+impl UnixProcessGuard {
+    fn from_record(path: &Path) -> Self {
+        let record = fs::read_to_string(path).expect("fake descendant record");
+        let pid = record
+            .lines()
+            .find_map(|line| line.strip_prefix("pid="))
+            .expect("fake descendant records its PID")
+            .parse::<i32>()
+            .expect("fake descendant PID is numeric");
+        Self(nix::unistd::Pid::from_raw(pid))
+    }
+
+    fn is_running(&self) -> bool {
+        nix::sys::signal::kill(self.0, None).is_ok()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixProcessGuard {
+    fn drop(&mut self) {
+        let _ = nix::sys::signal::kill(self.0, nix::sys::signal::Signal::SIGKILL);
+    }
 }
 
 #[cfg(unix)]
@@ -200,7 +255,7 @@ fn selected_skills_stay_mounted_while_fake_codex_runs_then_cleanup_succeeds() {
     let fixture = Fixture::new("happy-path");
     fixture.skill("alpha");
 
-    let mounted = fixture.project.join(".codex/skills/alpha");
+    let mounted = fixture.project.join(".agents/skills/alpha");
     let expected_paths = std::env::join_paths([&mounted]).expect("fixture path list");
     let output = fixture
         .command()
@@ -230,12 +285,44 @@ fn selected_skills_stay_mounted_while_fake_codex_runs_then_cleanup_succeeds() {
         "arg",
         OsStr::new("value with spaces")
     ));
-    assert!(!record_contains_os(&record, "arg", OsStr::new("-C")));
+    assert!(record_contains_os(&record, "arg", OsStr::new("-C")));
+    assert!(record_contains_os(
+        &record,
+        "arg",
+        fs::canonicalize(&fixture.project)
+            .expect("canonical project fixture")
+            .as_os_str()
+    ));
+    assert!(record_contains_os(
+        &record,
+        "arg",
+        OsStr::new("project_root_markers=[\".git\"]")
+    ));
+    assert!(record_contains_os(
+        &record,
+        "arg",
+        OsStr::new("skills.config=[{name=\"alpha\",enabled=true}]")
+    ));
     assert!(!record_contains_os(&record, "arg", OsStr::new("--add-dir")));
     assert!(record_contains_os(&record, "visible", mounted.as_os_str()));
+    assert!(record_contains_os(
+        &record,
+        "env:CODEX_HOME",
+        fs::canonicalize(fixture.root.join("codex-home"))
+            .expect("canonical Codex home")
+            .as_os_str()
+    ));
     assert!(fixture.sources.join("alpha/SKILL.md").is_file());
     assert!(!exists(&fixture.project.join(".agents")));
     assert!(!exists(&fixture.project.join(".codex")));
+    assert_eq!(
+        fs::read_to_string(&fixture.version_record)
+            .expect("version probe record")
+            .lines()
+            .count(),
+        3,
+        "compatibility is re-probed before apply and again before spawn"
+    );
 }
 
 #[test]
@@ -254,7 +341,7 @@ fn current_discovery_link_and_project_owned_skill_are_preserved() {
     let discovery_before = backend
         .inspect_no_follow(&discovery)
         .expect("inspect fixture discovery link");
-    let mounted = fixture.project.join(".codex/skills/alpha");
+    let mounted = fixture.project.join(".agents/skills/alpha");
     let expected_paths =
         std::env::join_paths([&project_skill, &mounted]).expect("fixture path list");
 
@@ -298,6 +385,98 @@ fn a_missing_explicit_codex_fails_with_66_before_mutation() {
     assert!(!exists(&fixture.project.join(".codex")));
     assert!(!exists(&fixture.state));
     assert!(!exists(&fixture.record));
+}
+
+#[test]
+fn an_unsupported_codex_version_fails_before_skillmount_state_or_mounts() {
+    let fixture = Fixture::new("unsupported-version");
+    fixture.skill("alpha");
+
+    let output = fixture
+        .command_with_agent(Some(Path::new(ASM)))
+        .output()
+        .expect("asm should reject its own non-Codex version output");
+
+    assert_eq!(output.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("0.146.0"));
+    assert!(!exists(&fixture.project.join(".agents")));
+    assert!(!exists(&fixture.project.join(".codex")));
+    assert!(!exists(&fixture.state));
+    assert!(!exists(&fixture.record));
+}
+
+#[test]
+fn a_codex_upgrade_after_apply_overrides_keep_and_cleans_mounts() {
+    let fixture = Fixture::new("upgrade-after-apply");
+    fixture.skill("alpha");
+
+    let output = fixture
+        .command_with_options(&["--keep-mounts"])
+        .env("SKILLMOUNT_FAKE_UNSUPPORTED_VERSION_AT", "3")
+        .output()
+        .expect("asm should reject a child that changes release at the spawn boundary");
+
+    assert_eq!(output.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("0.146.0"));
+    assert_eq!(
+        fs::read_to_string(&fixture.version_record)
+            .expect("version probe record")
+            .lines()
+            .count(),
+        3
+    );
+    assert!(
+        !exists(&fixture.record),
+        "the incompatible child must not start"
+    );
+    assert!(!exists(&fixture.project.join(".agents")));
+    assert!(!exists(&fixture.project.join(".codex")));
+}
+
+#[test]
+fn a_plugin_namespace_appearing_after_apply_overrides_keep_and_cleans_mounts() {
+    let fixture = Fixture::new("plugin-after-apply");
+    fixture.skill("alpha");
+    let manifest = fixture.sources.join(".codex-plugin/plugin.json");
+
+    let output = fixture
+        .command_with_options(&["--keep-mounts"])
+        .env("SKILLMOUNT_FAKE_CREATE_PLUGIN_MANIFEST_AT", "3")
+        .env("SKILLMOUNT_FAKE_PLUGIN_MANIFEST_PATH", &manifest)
+        .output()
+        .expect("asm should reject namespace qualification at the spawn boundary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(73), "{stderr}");
+    assert!(stderr.contains("namespace-qualify"), "{stderr}");
+    assert!(
+        manifest.is_file(),
+        "the third version probe created the race fixture"
+    );
+    assert!(!exists(&fixture.record), "the child must not start");
+    assert!(!exists(&fixture.project.join(".agents")));
+    assert!(!exists(&fixture.project.join(".codex")));
+}
+
+#[test]
+fn supervision_journal_failure_overrides_keep_and_cleans_mounts_before_returning() {
+    let fixture = Fixture::new("supervision-journal-failure");
+    fixture.skill("alpha");
+
+    let output = fixture
+        .command_with_options(&["--keep-mounts"])
+        .env("SKILLMOUNT_TEST_FAIL_BEGIN_SUPERVISION", "1")
+        .output()
+        .expect("asm should report the durable supervision failure");
+
+    assert_eq!(output.status.code(), Some(73));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("injected begin-supervision persistence failure")
+    );
+    assert!(!exists(&fixture.record), "the child must not start");
+    assert!(!exists(&fixture.project.join(".agents")));
+    assert!(!exists(&fixture.project.join(".codex")));
 }
 
 #[test]
@@ -372,7 +551,7 @@ fn child_nonzero_status_is_preserved_after_successful_cleanup() {
 fn cleanup_failure_replaces_child_success_and_preserves_user_content() {
     let fixture = Fixture::new("cleanup-failure");
     fixture.skill("alpha");
-    let user_file = fixture.project.join(".codex/skills/user-note.txt");
+    let user_file = fixture.project.join(".agents/skills/user-note.txt");
 
     let output = fixture
         .command()
@@ -385,8 +564,8 @@ fn cleanup_failure_replaces_child_success_and_preserves_user_content() {
         fs::read_to_string(&user_file).expect("user file must survive cleanup"),
         "created by fake agent\n"
     );
-    assert!(!exists(&fixture.project.join(".codex/skills/alpha")));
-    assert!(!exists(&fixture.project.join(".agents")));
+    assert!(!exists(&fixture.project.join(".agents/skills/alpha")));
+    assert!(fixture.project.join(".agents/skills").is_dir());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("session cleanup failed"), "{stderr}");
     assert!(stderr.contains("journal retained at"), "{stderr}");
@@ -396,7 +575,7 @@ fn cleanup_failure_replaces_child_success_and_preserves_user_content() {
 fn child_failure_remains_primary_when_cleanup_also_fails() {
     let fixture = Fixture::new("child-and-cleanup-failure");
     fixture.skill("alpha");
-    let user_file = fixture.project.join(".codex/skills/user-note.txt");
+    let user_file = fixture.project.join(".agents/skills/user-note.txt");
 
     let output = fixture
         .command()
@@ -415,5 +594,67 @@ fn child_failure_remains_primary_when_cleanup_also_fails() {
     assert!(
         !stderr.contains("error: session cleanup failed"),
         "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_supervising_journal_is_quarantined_while_an_orphan_descendant_remains_alive() {
+    let fixture = Fixture::new("supervising-quarantine");
+    fixture.skill("alpha");
+    let descendant_record = fixture.root.join("fake-descendant.record");
+
+    let first = fixture
+        .command()
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "orphan-descendant-ignore-all")
+        .env("SKILLMOUNT_FAKE_DESCENDANT_RECORD", &descendant_record)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("the uncertain session should return within the supervision bound");
+    let descendant = UnixProcessGuard::from_record(&descendant_record);
+    let mounted = fixture.project.join(".agents/skills/alpha");
+
+    assert_eq!(first.code(), Some(70));
+    assert!(descendant.is_running(), "the descendant must still be live");
+    assert!(
+        exists(&mounted),
+        "cleanup must be deferred while liveness is unknown"
+    );
+
+    let second = fixture
+        .command()
+        .output()
+        .expect("a later session should fail closed on the supervising journal");
+    let stderr = String::from_utf8_lossy(&second.stderr);
+
+    assert_eq!(second.status.code(), Some(75), "{stderr}");
+    assert!(
+        stderr.contains("process-domain death was never proved"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("journals and their mounts were retained"),
+        "{stderr}"
+    );
+    assert!(
+        exists(&mounted),
+        "automatic recovery must not remove the live mount"
+    );
+    assert!(
+        descendant.is_running(),
+        "recovery must not affect the live child domain"
+    );
+    assert_eq!(
+        fs::read_dir(fixture.state.join("transactions"))
+            .expect("retained transaction directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "journal"))
+            .count(),
+        1,
+        "the quarantined ownership evidence must remain durable"
     );
 }

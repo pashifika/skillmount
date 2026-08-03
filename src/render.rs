@@ -11,6 +11,7 @@ use std::path::Path;
 use crate::agent::DiscoverySnapshot;
 use crate::diagnostic::Diagnostic;
 use crate::domain::{RunContext, ShadowReason, SkillCatalog};
+use crate::journal::TransactionStatus;
 use crate::lock::LockResource;
 use crate::mount::{MountAction, MountPlan};
 
@@ -296,10 +297,10 @@ fn recovery(out: &mut String) {
 
     let _ = writeln!(out, "\nRecovery:");
     for scanned in &scan.journals {
-        let verb = if scanned.journal.status.is_terminal() {
-            "WOULD KEEP    "
-        } else {
-            "WOULD RECOVER"
+        let verb = match scanned.journal.status {
+            TransactionStatus::Supervising => "WOULD QUARANTINE",
+            status if status.is_terminal() => "WOULD KEEP      ",
+            _ => "WOULD RECOVER   ",
         };
         let _ = writeln!(
             out,
@@ -339,6 +340,20 @@ fn arguments(out: &mut String, report: &ReadOnlyReport<'_>) {
     };
     layer(out, "Injected args", &launch.injected_args);
     layer(out, "Forwarded args", &launch.passthrough_args);
+
+    let _ = writeln!(out, "Environment overrides:");
+    if launch.environment_overrides.is_empty() {
+        let _ = writeln!(out, "  (none)");
+    } else {
+        for (name, value) in &launch.environment_overrides {
+            let _ = writeln!(
+                out,
+                "  {} = {}",
+                os_value(name, verbose),
+                os_value(value, verbose)
+            );
+        }
+    }
 
     let _ = writeln!(out, "Effective argv:");
     for (index, value) in launch.effective_argv().iter().enumerate() {
