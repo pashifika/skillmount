@@ -42,7 +42,7 @@ impl Fixture {
             fs::create_dir_all(path).expect("fixture directory");
         }
         let launch_sentinel = root.join("agent-was-launched");
-        let agent_bin = write_fake_agent(&root, &launch_sentinel);
+        let agent_bin = fake_agent_executable(&root, &launch_sentinel);
         Self {
             root,
             project,
@@ -129,8 +129,8 @@ impl Drop for Fixture {
     }
 }
 
-/// Writes an executable that records the fact it ran, so a launch cannot pass unnoticed.
-fn write_fake_agent(root: &Path, sentinel: &Path) -> PathBuf {
+/// Provides a native executable for the mutation-boundary launch sentinel.
+fn fake_agent_executable(root: &Path, sentinel: &Path) -> PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -142,13 +142,10 @@ fn write_fake_agent(root: &Path, sentinel: &Path) -> PathBuf {
     }
     #[cfg(windows)]
     {
-        let path = root.join("fake-agent.cmd");
-        fs::write(
-            &path,
-            format!("@echo off\r\ntype nul > \"{}\"\r\n", sentinel.display()),
-        )
-        .expect("fake agent");
-        path
+        let _ = (root, sentinel);
+        std::env::var_os("COMSPEC")
+            .map(PathBuf::from)
+            .expect("Windows provides a native command interpreter")
     }
 }
 
@@ -338,10 +335,16 @@ fn a_session_that_fails_before_the_mutation_boundary_changes_nothing() {
     let sources = fixture.sources.to_string_lossy().into_owned();
     let agent_bin = fixture.agent_bin.to_string_lossy().into_owned();
 
-    let output = fixture.assert_roots_unchanged(
-        &fixture.user_data(),
-        &["codex", "--skills-dir", &sources, "--agent-bin", &agent_bin],
-    );
+    let mut arguments = vec!["codex", "--skills-dir", &sources, "--agent-bin", &agent_bin];
+    #[cfg(windows)]
+    let sentinel_command = format!("type nul > \"{}\"", fixture.launch_sentinel.display());
+    #[cfg(windows)]
+    let agent_arguments = ["--", "/d", "/c", sentinel_command.as_str()];
+    #[cfg(not(windows))]
+    let agent_arguments: [&str; 0] = [];
+    arguments.extend(agent_arguments);
+
+    let output = fixture.assert_roots_unchanged(&fixture.user_data(), &arguments);
 
     assert_eq!(output.status.code(), Some(73));
     assert!(String::from_utf8_lossy(&output.stderr).contains("conflicts with"));
