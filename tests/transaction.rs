@@ -168,6 +168,7 @@ impl Fixture {
                 home.join("claude-managed/skills"),
             )
             .env_remove("CLAUDE_CODE_SAFE_MODE")
+            .env_remove("CLAUDE_CODE_SIMPLE")
             .env(
                 "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
                 home.join("admin-skills"),

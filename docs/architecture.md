@@ -290,16 +290,23 @@ settings, and configuration-directory documentation, the changelog, and native b
 The platform managed root, project direct-entry scopes from the launch CWD through the project
 root, user Skills below the effective `CLAUDE_CONFIG_DIR`, the proposed staging root, and every
 user-added directory participate in one conflict index. Relative configuration and `--add-dir`
-values resolve from the child launch CWD. A foreign managed collision fails under both conflict
-policies; an exact-source managed entry can be reused. Bundled names are not conflicts because the
-pinned release gives custom standalone Skills precedence.
+values resolve from the child launch CWD, while drive-relative Windows `CLAUDE_CONFIG_DIR` values
+fail as ambiguous. A foreign managed collision fails under both conflict policies; an exact-source
+managed entry can be reused. Terminal aliases never erase the managed classification during
+physical-scope deduplication. Bundled names are not conflicts because the pinned release gives
+custom standalone Skills precedence.
 
 Exact `--bare`, `--safe-mode`, and `--disable-slash-commands` tokens in option position, a truthy
-inherited `CLAUDE_CODE_SAFE_MODE`, and user `--settings` or `--managed-settings` passthrough fail
-before state access. The bounded parser distinguishes values and stops at standalone `--`. The
-default launch prepends one `--add-dir <session>/root` pair, and every launch injects a temporary
-`skillOverrides` map that enables each selected catalog name before preserving validated user
-passthrough. It edits no persistent setting or permission mode.
+inherited `CLAUDE_CODE_SAFE_MODE` or `CLAUDE_CODE_SIMPLE`, and user `--settings`,
+`--managed-settings`, or `--setting-sources` passthrough fail before state access. Background,
+worktree, and tmux controls also fail because they detach the logical child or relocate discovery
+outside the supervised and inspected session. Every pinned service/operator subcommand also fails:
+the first unconsumed positional token selects a command even after standalone `--`, and those
+commands do not share the certified foreground lifecycle. The bounded parser distinguishes option
+values, the first command position, and later prompt text. The default launch prepends one
+`--add-dir <session>/root` pair, and every launch injects a temporary `skillOverrides` map that
+enables each selected catalog name before preserving validated user passthrough. It edits no
+persistent setting or permission mode.
 [ADR 0024](adr/0024-pin-the-claude-session-discovery-contract.md) records the corrected scope and
 launch contract. Enterprise managed settings can intentionally suppress all non-plugin Skills,
 outrank command-line settings, arrive asynchronously, and refresh during a child session.

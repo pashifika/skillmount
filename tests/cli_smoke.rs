@@ -39,6 +39,7 @@ fn run(executable: &str, arguments: &[&str]) -> Output {
             home.join("claude-managed/skills"),
         )
         .env_remove("CLAUDE_CODE_SAFE_MODE")
+        .env_remove("CLAUDE_CODE_SIMPLE")
         .env(
             "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
             home.join("admin-skills"),
@@ -86,6 +87,7 @@ fn run_session(
             home.join("claude-managed/skills"),
         )
         .env_remove("CLAUDE_CODE_SAFE_MODE")
+        .env_remove("CLAUDE_CODE_SIMPLE")
         .env("SKILLMOUNT_FAKE_RECORD", state.join(record_name))
         .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
         .env(

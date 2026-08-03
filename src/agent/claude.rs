@@ -36,7 +36,32 @@ const VERSION_OUTPUT_LIMIT: usize = 1024;
 const SKILL_DISABLING_ARGS: [&str; 3] = ["--bare", "--safe-mode", "--disable-slash-commands"];
 
 /// Passthrough settings inputs that could undo `SkillMount`'s session visibility override.
-const SKILL_VISIBILITY_ARGS: [&str; 2] = ["--managed-settings", "--settings"];
+const SKILL_VISIBILITY_ARGS: [&str; 3] = ["--managed-settings", "--setting-sources", "--settings"];
+
+/// Passthrough controls that detach the logical session or relocate its discovery root.
+const SESSION_BOUNDARY_ARGS: [&str; 5] = ["--background", "--bg", "--tmux", "--worktree", "-w"];
+
+/// Pinned 2.1.220 commands that do not start a supervised foreground session.
+///
+/// Claude selects a command from the first unconsumed positional argument, including after a
+/// standalone `--`. Forwarding one of these commands would hand the staged root to an operator or
+/// service process whose lifetime and discovery behavior are outside this adapter's contract.
+const NON_SESSION_SUBCOMMANDS: [&str; 14] = [
+    "agents",
+    "auth",
+    "auto-mode",
+    "doctor",
+    "gateway",
+    "install",
+    "mcp",
+    "plugin",
+    "plugins",
+    "project",
+    "setup-token",
+    "ultrareview",
+    "update",
+    "upgrade",
+];
 
 /// Pinned 2.1.220 options that consume exactly one following value.
 ///
@@ -172,15 +197,23 @@ struct PassthroughScan {
     add_dirs: Vec<PathBuf>,
     disabling_arg: Option<&'static str>,
     visibility_arg: Option<&'static str>,
+    session_boundary_arg: Option<&'static str>,
+    non_session_subcommand: Option<&'static str>,
 }
 
 fn scan_passthrough(args: &[OsString]) -> Result<PassthroughScan, AppError> {
     let mut scan = PassthroughScan::default();
     let mut directories = Vec::new();
     let mut index = 0;
+    let mut command_position_open = true;
     while index < args.len() {
         let argument = args[index].as_os_str();
         if argument == OsStr::new("--") {
+            if command_position_open {
+                scan.non_session_subcommand = args
+                    .get(index + 1)
+                    .and_then(|argument| non_session_subcommand(argument));
+            }
             break;
         }
         if let Some(rejected) = SKILL_DISABLING_ARGS
@@ -195,6 +228,10 @@ fn scan_passthrough(args: &[OsString]) -> Result<PassthroughScan, AppError> {
                 || strip_prefix(argument, &format!("{candidate}=")).is_some()
         }) {
             scan.visibility_arg = Some(rejected);
+            break;
+        }
+        if let Some(rejected) = session_boundary_arg(argument) {
+            scan.session_boundary_arg = Some(rejected);
             break;
         }
         if let Some(value) = strip_prefix(argument, "--add-dir=") {
@@ -219,6 +256,13 @@ fn scan_passthrough(args: &[OsString]) -> Result<PassthroughScan, AppError> {
             continue;
         }
         if !contains_os(&VARIADIC_VALUE_ARGS, argument) {
+            if command_position_open && !is_option(argument) {
+                if let Some(rejected) = non_session_subcommand(argument) {
+                    scan.non_session_subcommand = Some(rejected);
+                    break;
+                }
+                command_position_open = false;
+            }
             index += 1;
             continue;
         }
@@ -242,6 +286,27 @@ fn scan_passthrough(args: &[OsString]) -> Result<PassthroughScan, AppError> {
 
 fn contains_os(values: &[&str], candidate: &OsStr) -> bool {
     values.iter().any(|value| candidate == OsStr::new(value))
+}
+
+fn session_boundary_arg(argument: &OsStr) -> Option<&'static str> {
+    SESSION_BOUNDARY_ARGS
+        .iter()
+        .find(|candidate| argument == OsStr::new(candidate))
+        .copied()
+        .or_else(|| strip_prefix(argument, "--worktree=").map(|_| "--worktree"))
+        .or_else(|| strip_prefix(argument, "--tmux=").map(|_| "--tmux"))
+        .or_else(|| {
+            strip_prefix(argument, "-w")
+                .filter(|value| !value.is_empty())
+                .map(|_| "-w")
+        })
+}
+
+fn non_session_subcommand(argument: &OsStr) -> Option<&'static str> {
+    NON_SESSION_SUBCOMMANDS
+        .iter()
+        .find(|candidate| argument == OsStr::new(candidate))
+        .copied()
 }
 
 fn is_option(value: &OsStr) -> bool {
@@ -335,6 +400,12 @@ pub(crate) fn verify_supported_launch(context: &RunContext) -> Result<(), AppErr
                 .to_owned(),
         ));
     }
+    if env_flag_enabled(std::env::var_os("CLAUDE_CODE_SIMPLE").as_deref()) {
+        return Err(AppError::Usage(
+            "CLAUDE_CODE_SIMPLE enables Claude Code's bare mode and disables normal Skill discovery; unset it or run the agent directly"
+                .to_owned(),
+        ));
+    }
 
     // Native integration suites use the shared fake-agent executable. The override is absent from
     // release builds, like failure checkpoints and other deterministic platform fixtures.
@@ -407,6 +478,16 @@ impl AgentAdapter for ClaudeAdapter {
         if let Some(rejected) = scan.visibility_arg {
             return Err(AppError::Usage(format!(
                 "{rejected} can override selected Skill visibility after SkillMount plans the session; remove it or run the agent directly"
+            )));
+        }
+        if let Some(rejected) = scan.session_boundary_arg {
+            return Err(AppError::Usage(format!(
+                "{rejected} detaches Claude Code or relocates its discovery root outside SkillMount's supervised session contract; remove it or run the agent directly"
+            )));
+        }
+        if let Some(rejected) = scan.non_session_subcommand {
+            return Err(AppError::Usage(format!(
+                "Claude Code subcommand {rejected:?} does not start a supervised foreground session; run that subcommand directly"
             )));
         }
         Ok(Vec::new())
@@ -606,12 +687,65 @@ mod tests {
     }
 
     #[test]
+    fn session_detaching_or_root_relocating_arguments_fail_before_planning() {
+        for rejected in [
+            "--bg",
+            "--background",
+            "--worktree",
+            "--worktree=review",
+            "-w",
+            "-wreview",
+            "--tmux",
+            "--tmux=classic",
+        ] {
+            let error = ClaudeAdapter
+                .validate_passthrough_args(&args(&[rejected]))
+                .expect_err("session detachment and root relocation must be rejected");
+            assert_eq!(error.category(), crate::error::ExitCategory::Usage);
+        }
+    }
+
+    #[test]
+    fn non_session_subcommands_fail_before_planning() {
+        for rejected in [
+            "agents",
+            "auth",
+            "auto-mode",
+            "doctor",
+            "gateway",
+            "install",
+            "mcp",
+            "plugin",
+            "plugins",
+            "project",
+            "setup-token",
+            "ultrareview",
+            "update",
+            "upgrade",
+        ] {
+            for passthrough in [args(&[rejected]), args(&["--verbose", rejected])] {
+                let error = ClaudeAdapter
+                    .validate_passthrough_args(&passthrough)
+                    .expect_err("non-session Claude subcommands must be rejected");
+                assert_eq!(error.category(), crate::error::ExitCategory::Usage);
+            }
+        }
+
+        let error = ClaudeAdapter
+            .validate_passthrough_args(&args(&["--", "agents", "list"]))
+            .expect_err("the separator does not prevent Claude subcommand dispatch");
+        assert_eq!(error.category(), crate::error::ExitCategory::Usage);
+    }
+
+    #[test]
     fn passthrough_settings_that_can_hide_selected_skills_are_rejected() {
         for rejected in [
             args(&["--settings", "settings.json"]),
             args(&["--settings={\"skillOverrides\":{}}"]),
             args(&["--managed-settings", "{}"]),
             args(&["--managed-settings={}"]),
+            args(&["--setting-sources", "user"]),
+            args(&["--setting-sources=project"]),
         ] {
             let error = ClaudeAdapter
                 .validate_passthrough_args(&rejected)
@@ -630,7 +764,17 @@ mod tests {
 
     #[test]
     fn standalone_separator_keeps_flag_shaped_prompt_text_opaque() {
-        let passthrough = args(&["--", "--bare", "--add-dir", "/not-a-scope"]);
+        let passthrough = args(&[
+            "--",
+            "--bare",
+            "--setting-sources",
+            "project",
+            "--background",
+            "--worktree=review",
+            "--tmux",
+            "--add-dir",
+            "/not-a-scope",
+        ]);
 
         let diagnostics = ClaudeAdapter
             .validate_passthrough_args(&passthrough)
@@ -649,12 +793,24 @@ mod tests {
         for passthrough in [
             args(&["--model", "--bare", "prompt"]),
             args(&["--model", "--settings", "prompt"]),
+            args(&["--model", "--setting-sources", "prompt"]),
+            args(&["--model", "--background", "prompt"]),
+            args(&["--model", "--worktree=review", "prompt"]),
+            args(&["--model", "--tmux", "prompt"]),
+            args(&["--model", "agents", "prompt"]),
             args(&["--system-prompt", "--disable-slash-commands", "prompt"]),
         ] {
             ClaudeAdapter
                 .validate_passthrough_args(&passthrough)
                 .expect("a flag-shaped value belongs to the preceding pinned option");
         }
+    }
+
+    #[test]
+    fn a_subcommand_name_after_the_prompt_position_is_opaque() {
+        ClaudeAdapter
+            .validate_passthrough_args(&args(&["review", "agents"]))
+            .expect("only Claude's first positional argument selects a subcommand");
     }
 
     #[test]

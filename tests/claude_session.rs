@@ -101,6 +101,7 @@ impl Fixture {
                 self.root.join("claude-managed/skills"),
             )
             .env_remove("CLAUDE_CODE_SAFE_MODE")
+            .env_remove("CLAUDE_CODE_SIMPLE")
             .env("LOCALAPPDATA", self.home.join("AppData/Local"))
             .env("SKILLMOUNT_STATE_DIR", &self.state)
             .env("SKILLMOUNT_FAKE_RECORD", &self.record)
@@ -254,14 +255,46 @@ fn disabling_flags_and_unsupported_versions_fail_before_state_or_child_launch() 
         assert!(!fixture.record.exists());
     }
 
-    for rejected in ["--settings", "--managed-settings"] {
+    for (index, (rejected, expected_name)) in [
+        ("--bg", "--bg"),
+        ("--background", "--background"),
+        ("--worktree", "--worktree"),
+        ("--worktree=review", "--worktree"),
+        ("-w", "-w"),
+        ("-wreview", "-w"),
+        ("--tmux", "--tmux"),
+        ("--tmux=classic", "--tmux"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = Fixture::new(&format!("unsupported-lifecycle-{index}"));
+        fixture.skill(&fixture.left, "alpha", "fixture");
+        let output = fixture
+            .command()
+            .arg("--")
+            .arg(rejected)
+            .output()
+            .expect("asm should reject detached or root-relocating sessions");
+
+        assert_eq!(output.status.code(), Some(64));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected_name));
+        assert!(!fixture.state.exists());
+        assert!(!fixture.record.exists());
+    }
+
+    for (rejected, value) in [
+        ("--settings", "{}"),
+        ("--managed-settings", "{}"),
+        ("--setting-sources", "user"),
+    ] {
         let fixture = Fixture::new(rejected.trim_start_matches('-'));
         fixture.skill(&fixture.left, "alpha", "fixture");
         let output = fixture
             .command()
             .arg("--")
             .arg(rejected)
-            .arg("{}")
+            .arg(value)
             .output()
             .expect("asm should reject passthrough visibility settings");
 
@@ -286,6 +319,21 @@ fn disabling_flags_and_unsupported_versions_fail_before_state_or_child_launch() 
     assert!(!fixture.state.exists());
     assert!(!fixture.record.exists());
 
+    let fixture = Fixture::new("simple-mode-environment");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+    let output = fixture
+        .command()
+        .arg("--")
+        .arg("prompt")
+        .env("CLAUDE_CODE_SIMPLE", "1")
+        .output()
+        .expect("asm should reject inherited bare mode");
+
+    assert_eq!(output.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CLAUDE_CODE_SIMPLE"));
+    assert!(!fixture.state.exists());
+    assert!(!fixture.record.exists());
+
     let fixture = Fixture::new("unsupported-version");
     fixture.skill(&fixture.left, "alpha", "fixture");
     let output = fixture
@@ -300,6 +348,58 @@ fn disabling_flags_and_unsupported_versions_fail_before_state_or_child_launch() 
     assert!(String::from_utf8_lossy(&output.stderr).contains("2.1.220"));
     assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
     assert_eq!(fixture.journal_count(), 0);
+    assert!(!fixture.record.exists());
+}
+
+#[test]
+fn non_session_subcommands_fail_before_state_or_child_launch() {
+    for (index, rejected) in [
+        "agents",
+        "auth",
+        "auto-mode",
+        "doctor",
+        "gateway",
+        "install",
+        "mcp",
+        "plugin",
+        "plugins",
+        "project",
+        "setup-token",
+        "ultrareview",
+        "update",
+        "upgrade",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = Fixture::new(&format!("unsupported-subcommand-{index}"));
+        fixture.skill(&fixture.left, "alpha", "fixture");
+        let output = fixture
+            .command()
+            .arg("--")
+            .arg(rejected)
+            .output()
+            .expect("asm should reject a non-session Claude subcommand");
+
+        assert_eq!(output.status.code(), Some(64));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(rejected));
+        assert!(!fixture.state.exists());
+        assert!(!fixture.record.exists());
+    }
+
+    let fixture = Fixture::new("unsupported-subcommand-after-separator");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+    let output = fixture
+        .command()
+        .arg("--")
+        .arg("--")
+        .arg("agents")
+        .output()
+        .expect("asm should reject Claude subcommand dispatch after its separator");
+
+    assert_eq!(output.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("agents"));
+    assert!(!fixture.state.exists());
     assert!(!fixture.record.exists());
 }
 

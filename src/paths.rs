@@ -52,7 +52,7 @@ pub(crate) fn resolve_session(
     } else {
         (user_home.join(".codex"), None)
     };
-    let claude_config_dir = claude_config_dir(&user_home, &launch_cwd);
+    let claude_config_dir = claude_config_dir(&user_home, &launch_cwd)?;
 
     let skill_sources = resolve_source_occurrences(&input.skills_dirs, &invocation_cwd)?;
     let resolve_agent_executable = !input.options.dry_run;
@@ -234,7 +234,7 @@ pub(crate) fn resolve_inspection(
     } else {
         (user_home.join(".codex"), None)
     };
-    let claude_config_dir = claude_config_dir(&user_home, &invocation_cwd);
+    let claude_config_dir = claude_config_dir(&user_home, &invocation_cwd)?;
     Ok(RunContext {
         agent,
         launch_cwd: invocation_cwd.clone(),
@@ -373,7 +373,7 @@ fn unicode_codex_home(value: Result<String, std::env::VarError>) -> Option<Strin
 }
 
 /// Mirrors Claude Code's relocation of every user `~/.claude` path.
-fn claude_config_dir(user_home: &Path, launch_cwd: &Path) -> PathBuf {
+fn claude_config_dir(user_home: &Path, launch_cwd: &Path) -> Result<PathBuf, AppError> {
     claude_config_dir_from_value(user_home, launch_cwd, std::env::var_os("CLAUDE_CONFIG_DIR"))
 }
 
@@ -381,16 +381,11 @@ fn claude_config_dir_from_value(
     user_home: &Path,
     launch_cwd: &Path,
     value: Option<OsString>,
-) -> PathBuf {
+) -> Result<PathBuf, AppError> {
     let Some(configured) = value.filter(|value| !value.is_empty()) else {
-        return user_home.join(".claude");
+        return Ok(user_home.join(".claude"));
     };
-    let configured = PathBuf::from(configured);
-    if configured.is_absolute() {
-        configured
-    } else {
-        launch_cwd.join(configured)
-    }
+    absolute_from(launch_cwd, Path::new(&configured))
 }
 
 /// Returns the host-wide enterprise Claude Code Skill root supported by 2.1.220.
@@ -751,11 +746,13 @@ mod tests {
                 &user_home,
                 &launch_cwd,
                 Some(OsString::from("custom-claude")),
-            ),
+            )
+            .expect("relative Claude config directory"),
             launch_cwd.join("custom-claude")
         );
         assert_eq!(
-            claude_config_dir_from_value(&user_home, &launch_cwd, None),
+            claude_config_dir_from_value(&user_home, &launch_cwd, None)
+                .expect("default Claude config directory"),
             user_home.join(".claude")
         );
     }
@@ -939,6 +936,15 @@ mod tests {
     #[test]
     fn drive_relative_wrapper_paths_are_rejected_as_ambiguous() {
         let fixture = TestDir::new("drive-relative");
+        let error = claude_config_dir_from_value(
+            &fixture.0.join("home"),
+            &fixture.0,
+            Some(OsString::from("C:config")),
+        )
+        .expect_err("drive-relative CLAUDE_CONFIG_DIR must fail closed");
+        assert_eq!(error.category(), ExitCategory::Usage);
+        assert!(error.to_string().contains("drive-relative Windows path"));
+
         for arguments in [
             &["claude", "--skills-dir=skills", "--cwd=C:launch"][..],
             &["claude", "--skills-dir=skills", "--project-root=C:project"][..],

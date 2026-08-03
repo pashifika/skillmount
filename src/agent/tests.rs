@@ -1516,6 +1516,69 @@ fn a_foreign_managed_claude_skill_cannot_be_skipped() {
 }
 
 #[test]
+fn a_project_alias_to_managed_claude_skills_keeps_managed_precedence() {
+    for policy in [ConflictPolicy::Error, ConflictPolicy::Skip] {
+        let project = Project::new(&format!("claude-managed-alias-{policy:?}"));
+        project.source_skill("alpha");
+        let managed_skill = project.make_dir("claude-managed/skills/alpha");
+        std::fs::write(
+            managed_skill.join("SKILL.md"),
+            "---\nname: alpha\ndescription: managed alias fixture\n---\n",
+        )
+        .expect("managed alias Skill metadata");
+        project.make_dir(".claude");
+        if !symlink_dir_or_skip(
+            &project.root.join("claude-managed/skills"),
+            &project.root.join(".claude/skills"),
+        ) {
+            return;
+        }
+        let context = project.context(AgentId::Claude, MountMode::Staging, policy);
+
+        let error = plan_claude(&project, &context)
+            .expect_err("a project alias cannot downgrade enterprise precedence");
+
+        assert_eq!(error.category(), ExitCategory::Filesystem, "{policy:?}");
+        assert!(error.to_string().contains("claude managed"), "{policy:?}");
+    }
+}
+
+#[test]
+fn a_same_source_managed_alias_is_reused_without_losing_scope_evidence() {
+    let project = Project::new("claude-managed-alias-same-source");
+    let source = project.source_skill("alpha");
+    let managed = project.make_dir("claude-managed/skills");
+    if !symlink_dir_or_skip(&source, &managed.join("alpha")) {
+        return;
+    }
+    project.make_dir(".claude");
+    if !symlink_dir_or_skip(&managed, &project.root.join(".claude/skills")) {
+        return;
+    }
+    let context = project.context(AgentId::Claude, MountMode::Staging, ConflictPolicy::Error);
+
+    let snapshot = ClaudeAdapter
+        .inspect_discovery(&context)
+        .expect("managed alias discovery");
+    assert!(
+        snapshot
+            .scopes
+            .iter()
+            .any(|scope| scope.kind == ScopeKind::ClaudeManaged),
+        "terminal deduplication must retain managed policy evidence"
+    );
+    let plan = ClaudeAdapter
+        .build_mount_plan(&context, &project.catalog(AgentId::Claude), &snapshot)
+        .expect("the exact managed source remains reusable through an alias");
+
+    assert_eq!(
+        reuse_destinations(&plan),
+        [project.root.join(".claude/skills/alpha")]
+    );
+    assert!(link_destinations(&plan).is_empty());
+}
+
+#[test]
 fn an_exact_source_managed_claude_skill_is_reused() {
     let project = Project::new("claude-managed-same-source");
     let source = project.source_skill("alpha");

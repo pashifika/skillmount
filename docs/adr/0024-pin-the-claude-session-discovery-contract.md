@@ -31,6 +31,20 @@ added directory remained selected over Claude's bundled `debug`, so bundled name
 synthetic conflict inventory in this pinned release. User `skillOverrides.debug = "off"` removed
 that Skill from the model attachment, while a command-line `--settings` override restored it.
 
+Adversarial review exposed five more counterexamples to the first implementation. A project entry
+can be a terminal alias of the managed Skill root, but physical deduplication must not erase the
+managed root's semantic precedence. `--setting-sources` can exclude the user or project source
+whose existing Skill was accepted during planning, and inherited `CLAUDE_CODE_SIMPLE` selects the
+same minimal mode as `--bare`. Finally, background execution returns before the logical child
+session ends, while worktree and tmux launch controls can move discovery or relaunch outside the
+inspected CWD and supervised process domain. Those controls invalidate cleanup and visibility
+proofs rather than merely changing presentation.
+
+The fifth counterexample is command dispatch. In 2.1.220, the first unconsumed positional token can
+select a service or operator subcommand such as `agents`; a standalone `--` does not suppress that
+dispatch. Such a command does not provide the foreground session lifecycle or discovery behavior
+the adapter certified.
+
 Enterprise policy is different. Both the official
 [settings hierarchy](https://code.claude.com/docs/en/settings) and a local
 `--managed-settings '{"strictPluginOnlyCustomization":["skills"]}'` probe show that managed
@@ -53,7 +67,14 @@ Skill entries in:
 
 An explicit wrapper project root SHALL equal the root inferred from that same CWD. A foreign
 managed Skill collision SHALL fail under both conflict policies because enterprise precedence means
-`skip` cannot expose the selected source; an exact-source managed entry may be reused.
+`skip` cannot expose the selected source; an exact-source managed entry may be reused. Terminal
+deduplication SHALL preserve the `ClaudeManaged` classification when a lower-precedence scope aliases
+the same physical directory.
+
+The effective `CLAUDE_CONFIG_DIR` SHALL pass through the shared fallible native path resolver.
+Absolute and ordinary relative values retain Claude's launch-CWD semantics; drive-relative Windows
+forms such as `C:config` SHALL fail with a usage error because their resolution depends on hidden
+per-drive process state.
 
 On Windows, `src/paths/windows_ffi.rs` MAY additionally resolve `FOLDERID_ProgramFiles` through its
 existing audited `SHGetKnownFolderPath` boundary, copy the UTF-16 path into a safe `PathBuf`, and
@@ -62,11 +83,22 @@ documented `C:\Program Files` fallback. This supersedes only ADR 0023's requirem
 resolve exactly `FOLDERID_Profile` and `FOLDERID_ProgramData`; ADR 0023's unsafe-module allowlist,
 allocation, type-boundary, and other Codex decisions remain in force.
 
-The passthrough scan SHALL preserve platform-native arguments, consume only the pinned option
-shapes needed to locate discovery controls, and stop at standalone `--`. It SHALL reject exact
+The passthrough scan SHALL preserve platform-native arguments and consume only the pinned option
+shapes needed to locate discovery controls. Option recognition SHALL stop at standalone `--`, but
+the first unconsumed positional token on either side of that separator SHALL still be checked
+against the pinned non-session subcommand set. The scan SHALL reject exact
 `--bare`, `--safe-mode`, or `--disable-slash-commands` tokens in option position, a truthy inherited
-`CLAUDE_CODE_SAFE_MODE`, and user `--settings` or `--managed-settings` arguments before state
-creation. The latter two could replace the selected-name visibility contract after planning.
+`CLAUDE_CODE_SAFE_MODE` or `CLAUDE_CODE_SIMPLE`, and user `--settings`, `--managed-settings`, or
+`--setting-sources` arguments before state creation. Settings controls could replace or exclude the
+selected-name visibility contract after planning.
+
+The scan SHALL also reject `--bg`, `--background`, `--worktree`, `-w`, and `--tmux`, including
+supported attached-value forms, in option position. SkillMount does not claim staging lifetime,
+root, or process-domain guarantees for a detached or relocated Claude session. Flag-shaped values
+consumed by another pinned option remain opaque. Once a non-subcommand prompt occupies the first
+positional slot, later positional tokens remain opaque. Every pinned service/operator subcommand
+(`agents`, `auth`, `auto-mode`, `doctor`, `gateway`, `install`, `mcp`, `plugin`/`plugins`,
+`project`, `setup-token`, `ultrareview`, and `update`/`upgrade`) SHALL fail before state access.
 
 The launch plan SHALL prepend one native `--add-dir <session>/root` pair. It SHALL also pass a
 session-only `--settings` JSON object that sets every selected logical Skill name to `on`, so
@@ -111,9 +143,12 @@ override it; detection of asynchronously delivered server policy remains release
   `<session>/root/.claude/skills` tree and grants only its enclosing root as an added directory.
 - SkillMount changes no persistent Claude setting or permission mode. The generated
   `skillOverrides` object exists only in child argv and only names the selected catalog keys.
-- Forwarded arguments remain native-value equivalent, but `--settings` and `--managed-settings`
-  passthrough are now rejected because their effects cannot coexist with the mounted visibility
-  guarantee.
+- Forwarded arguments remain native-value equivalent, but `--settings`, `--managed-settings`,
+  `--setting-sources`, detached launch, worktree, tmux controls, and non-session subcommands are now
+  rejected because their effects cannot coexist with the mounted visibility and lifetime
+  guarantees.
+- Enabled inherited `CLAUDE_CODE_SIMPLE` is rejected with the same pre-state behavior as safe mode,
+  and drive-relative Windows `CLAUDE_CONFIG_DIR` values are rejected as ambiguous.
 - Three version probes reduce executable-replacement races but do not bind the executable pathname
   atomically to spawn. Real Claude link loading, Windows junction loading, and asynchronous managed
   settings remain release-hardening evidence.
@@ -126,15 +161,19 @@ override it; detection of asynchronously delivered server policy remains release
   `CLAUDE_CONFIG_DIR`, the macOS managed path, bundled-name shadowing, ordinary
   `skillOverrides` restoration, `CLAUDE_CODE_SAFE_MODE`, and managed
   `strictPluginOnlyCustomization` suppression.
-- `src/agent/claude.rs` unit tests cover exact disabling and settings flags, environment-flag
-  semantics, option-value disambiguation, standalone `--`, attached and variadic add-dir forms,
-  Unicode-independent native values, and the exact release label.
+- `src/agent/claude.rs` unit tests cover exact disabling, settings-source, detachment, worktree,
+  tmux, and non-session command controls; environment-flag semantics; option-value and command-slot
+  disambiguation across standalone `--`; attached and variadic add-dir forms;
+  Unicode-independent native values; and the exact release label.
 - `src/agent/tests.rs` covers ancestor, relocated user, relative add-dir, and managed-scope
-  conflicts; managed exact-source reuse; user-scope error/skip behavior; case variants;
-  deterministic staging; and selected-name settings injection.
+  conflicts; managed aliases with foreign and exact-source entries; user-scope error/skip behavior;
+  case variants; deterministic staging; and selected-name settings injection.
 - `tests/claude_session.rs` proves three probes, rightmost winners, effective argv/CWD/streams,
-  active link visibility, pre-state rejection, child/cleanup precedence, project/user preservation,
-  binary parity, and two overlapping children with distinct roots.
+  active link visibility, pre-state rejection of discovery and lifecycle controls, child/cleanup
+  precedence, project/user preservation, binary parity, and two overlapping children with distinct
+  roots.
+- Windows-target path tests reject drive-relative `CLAUDE_CONFIG_DIR` through the same native path
+  boundary as wrapper arguments.
 - `tests/transaction.rs` injects a conflict after preliminary discovery, exercises every durable
   recoverable boundary against Claude staging, and retains replaced or unprovable objects.
 - Native macOS and Windows CI provide the supported link and path implementations. Authenticated

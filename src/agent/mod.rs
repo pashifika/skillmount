@@ -363,10 +363,12 @@ pub(crate) fn dedupe_scopes_by_terminal(
 /// Returns whether two roots are guaranteed to produce the same recursive inventory.
 ///
 /// Bundled-system discovery deliberately refuses directory links, while every other supported
-/// Codex root follows them. Folding those scopes merely because their roots share a terminal would
-/// discard Skills that the non-system scope can still reach.
+/// Codex root follows them. Claude's managed scope follows links like the other Claude scopes but
+/// carries higher-precedence conflict semantics that cannot be discarded during a fold. Those two
+/// scope kinds therefore only fold with another scope of the same semantic class.
 const fn compatible_traversal(left: ScopeKind, right: ScopeKind) -> bool {
     matches!(left, ScopeKind::CodexSystem) == matches!(right, ScopeKind::CodexSystem)
+        && matches!(left, ScopeKind::ClaudeManaged) == matches!(right, ScopeKind::ClaudeManaged)
 }
 
 /// Builds the merged visible-name index and the separate destination-occupancy map.
