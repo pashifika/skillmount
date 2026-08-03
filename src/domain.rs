@@ -153,6 +153,10 @@ pub struct RunContext {
     pub codex_home_override: Option<PathBuf>,
     /// Host-wide Codex Skill root when the platform exposes one.
     pub codex_admin_skills: Option<PathBuf>,
+    /// Claude Code user configuration directory, after applying `CLAUDE_CONFIG_DIR`.
+    pub claude_config_dir: PathBuf,
+    /// Host-wide enterprise Claude Code Skill root.
+    pub claude_managed_skills: PathBuf,
     /// Ordered source occurrences.
     pub skill_sources: Vec<SourceOccurrence>,
     /// Identifier for a mutating session, or `None` while planning is still preliminary.

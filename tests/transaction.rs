@@ -148,10 +148,9 @@ impl Fixture {
             .arg("--agent-bin")
             .arg(ASM)
             .args(extra)
-            // Reuse the already-built cross-platform `asm` executable as a harmless Codex child.
-            // The static `exec` shape passes the Codex adapter boundary; `asm` then rejects the
-            // injected Codex-native prefix with usage 64. Claude remains at its pre-launch
-            // apply-and-release boundary and returns the existing internal-error code.
+            // Reuse the already-built cross-platform `asm` executable as a harmless agent child.
+            // The static `exec` shape passes the Codex adapter boundary; the child then rejects
+            // either adapter's injected native prefix with usage 64.
             .arg("--")
             .arg("exec")
             .arg("fixture")
@@ -162,6 +161,13 @@ impl Fixture {
             .env("LOCALAPPDATA", home.join("AppData/Local"))
             .env("CODEX_HOME", home.join("codex-home"))
             .env("SKILLMOUNT_TEST_CODEX_VERSION", "codex-cli 0.146.0")
+            .env("SKILLMOUNT_TEST_CLAUDE_VERSION", "2.1.220 (Claude Code)")
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env(
+                "SKILLMOUNT_CLAUDE_MANAGED_SKILLS_DIR",
+                home.join("claude-managed/skills"),
+            )
+            .env_remove("CLAUDE_CODE_SAFE_MODE")
             .env(
                 "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
                 home.join("admin-skills"),
@@ -213,6 +219,14 @@ impl Fixture {
     fn project_tree(&self) -> Vec<String> {
         let mut entries = Vec::new();
         collect(&self.project, &self.project, &mut entries);
+        entries.sort();
+        entries
+    }
+
+    fn session_tree(&self) -> Vec<String> {
+        let root = self.state.join("sessions");
+        let mut entries = Vec::new();
+        collect(&root, &root, &mut entries);
         entries.sort();
         entries
     }
@@ -323,6 +337,58 @@ fn a_second_invocation_recovers_every_boundary_and_leaves_the_project_clean() {
             assert!(
                 fixture.journals().is_empty(),
                 "recovery plus a completed session must leave no journal at {boundary}: {:?}",
+                fixture.journals()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_second_claude_invocation_recovers_every_staging_boundary() {
+    for boundary in BOUNDARIES {
+        let fixture = Fixture::new(&format!("recover-claude-{boundary}"));
+        fixture.skill("alpha");
+
+        let stopped = fixture.run_stopping_at("claude", boundary, &[]);
+        assert!(
+            !stopped.status.success(),
+            "{boundary} must stop the session"
+        );
+        let recovered = fixture.run("claude", &[]);
+        let stderr = String::from_utf8_lossy(&recovered.stderr);
+
+        assert_eq!(
+            recovered.status.code(),
+            Some(FIXTURE_CHILD_STATUS),
+            "Claude recovery must reach its fixture child at {boundary}: {stderr}"
+        );
+        assert!(
+            fixture.project_tree().is_empty(),
+            "Claude recovery must not touch the project at {boundary}: {:?}",
+            fixture.project_tree()
+        );
+        assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+
+        if boundary == "temporary-created" {
+            assert!(
+                fixture
+                    .session_tree()
+                    .iter()
+                    .any(|entry| entry.contains(".skillmount-")),
+                "unrecorded staging identity is retained at {boundary}: {:?}",
+                fixture.session_tree()
+            );
+            assert!(stderr.contains("retained"), "{stderr}");
+            assert_eq!(fixture.journals().len(), 1);
+        } else {
+            assert!(
+                fixture.session_tree().is_empty(),
+                "owned Claude staging residue remains at {boundary}: {:?}",
+                fixture.session_tree()
+            );
+            assert!(
+                fixture.journals().is_empty(),
+                "completed Claude recovery retains a journal at {boundary}: {:?}",
                 fixture.journals()
             );
         }
@@ -525,6 +591,71 @@ fn recovery_never_removes_an_entry_a_user_replaced_after_the_crash() {
         "the mismatch must be reported: {}",
         String::from_utf8_lossy(&recovered.stderr)
     );
+}
+
+#[test]
+fn claude_recovery_never_removes_a_replaced_staging_entry() {
+    let fixture = Fixture::new("claude-replaced-after-crash");
+    fixture.skill("alpha");
+    fixture.run_stopping_at("claude", "journal-active", &[]);
+
+    let sessions = fs::read_dir(fixture.state.join("sessions"))
+        .expect("crashed Claude session root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(sessions.len(), 1, "the stopped run owns one staging root");
+    let mounted = sessions[0].join("root/.claude/skills/alpha");
+    if cfg!(windows) {
+        fs::remove_dir(&mounted)
+    } else {
+        fs::remove_file(&mounted)
+    }
+    .expect("replace the crashed session's mount");
+    fs::create_dir(&mounted).expect("replacement Skill directory");
+    fs::write(mounted.join("operator-owned.txt"), "mine\n").expect("replacement content");
+
+    let recovered = fixture.run("claude", &[]);
+    let stderr = String::from_utf8_lossy(&recovered.stderr);
+
+    assert!(mounted.join("operator-owned.txt").is_file());
+    assert!(stderr.contains("retained"), "{stderr}");
+    assert!(
+        !fixture.journals().is_empty(),
+        "mismatched ownership evidence must remain durable"
+    );
+    assert!(fixture.project_tree().is_empty());
+}
+
+#[test]
+fn claude_recovery_retains_a_replaced_session_root() {
+    let fixture = Fixture::new("claude-replaced-session-root");
+    fixture.skill("alpha");
+    fixture.run_stopping_at("claude", "journal-active", &[]);
+
+    let sessions = fs::read_dir(fixture.state.join("sessions"))
+        .expect("crashed Claude session root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    let moved = fixture.root.join("operator-moved-session");
+    fs::rename(session, &moved).expect("move the owned root away from its recorded path");
+    fs::create_dir(session).expect("create a replacement session root");
+    fs::write(session.join("operator-owned.txt"), "mine\n").expect("replacement content");
+
+    let recovered = fixture.run("claude", &[]);
+    let stderr = String::from_utf8_lossy(&recovered.stderr);
+
+    assert!(session.join("operator-owned.txt").is_file());
+    assert!(moved.join("root/.claude/skills/alpha").is_dir());
+    assert!(stderr.contains("retained"), "{stderr}");
+    assert!(
+        !fixture.journals().is_empty(),
+        "root identity mismatch must retain its ownership journal"
+    );
+    assert!(fixture.project_tree().is_empty());
 }
 
 #[test]
@@ -834,6 +965,38 @@ fn a_conflict_introduced_after_preliminary_discovery_is_seen_under_lock() {
 }
 
 #[test]
+fn a_claude_conflict_introduced_after_preliminary_discovery_is_seen_under_lock() {
+    let fixture = Fixture::new("claude-conflict-after-discovery");
+    fixture.skill("alpha");
+
+    let mut session = fixture
+        .command("claude", &[])
+        .env("SKILLMOUNT_HOLD_AT", "discovery-inspected")
+        .env("SKILLMOUNT_HOLD_MS", "4000")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the Claude session should reach preliminary discovery");
+    let mut diagnostics = wait_for_hold(&mut session, "discovery-inspected");
+
+    let obstruction = fixture.project.join(".claude/skills/alpha/operator-owned");
+    fs::create_dir_all(&obstruction).expect("late project-owned Claude Skill");
+
+    let status = session.wait().expect("the held session remains waitable");
+    let mut remaining = String::new();
+    diagnostics
+        .read_to_string(&mut remaining)
+        .expect("the held session diagnostics remain readable");
+
+    assert_eq!(status.code(), Some(73), "{remaining}");
+    assert!(obstruction.is_dir());
+    assert!(
+        fixture.journals().is_empty(),
+        "the locked rebuild rejects the conflict before opening a transaction"
+    );
+    assert!(fixture.session_tree().is_empty());
+}
+
+#[test]
 fn a_cleanup_that_cannot_finish_keeps_its_journal_and_its_evidence() {
     let fixture = Fixture::new("cleanup-blocked");
     fixture.skill("alpha");
@@ -1002,7 +1165,7 @@ fn two_isolated_claude_sessions_do_not_serialize() {
 
     assert_eq!(
         concurrent.status.code(),
-        Some(70),
+        Some(FIXTURE_CHILD_STATUS),
         "two Claude sessions with separate staging roots share no mutable resource: {}",
         String::from_utf8_lossy(&concurrent.stderr)
     );
@@ -1021,7 +1184,7 @@ fn a_claude_session_stages_under_its_own_identifier() {
 
     assert_eq!(
         output.status.code(),
-        Some(70),
+        Some(FIXTURE_CHILD_STATUS),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1056,7 +1219,7 @@ fn a_claude_session_removes_its_whole_staging_root_at_cleanup() {
 
     assert_eq!(
         output.status.code(),
-        Some(70),
+        Some(FIXTURE_CHILD_STATUS),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );

@@ -11,8 +11,8 @@ as current only after it exists in the tracked source and can be traced to repos
 
 Status: catalog resolution, discovery inspection, read-only planning, cross-platform link
 primitives, resource locking, durable transactions, cleanup, stale recovery, the generic child
-process supervisor, and the Codex session adapter are implemented. Claude launch integration,
-operator commands, release automation, live-agent compatibility certification, and the remaining
+process supervisor, and the Codex and Claude session adapters are implemented. Operator commands,
+release automation, live-agent compatibility certification, and the remaining
 transaction-lifetime hardening named under [Reserved work](#reserved-work) are not implemented.
 
 ## Product definition
@@ -66,20 +66,18 @@ behavior.
 | `asm claude --dry-run` | Produces the isolated Claude staging plan under the same read-only contract. |
 | `asm claude --mount-mode=project` | Uses the project's `.claude/skills` namespace instead of isolated staging; `--dry-run` keeps that plan read-only. |
 | `asm codex -- exec ...` or `-- review ...` without `--dry-run` | Resolves a shell-free executable, locks, recovers, replans, journals, applies, launches the bounded Codex command with the requested CWD and passthrough, then cleans up after the managed process domain is dead. Interactive TUI passthrough fails before state access. |
-| `asm claude` without `--dry-run` | Locks, recovers, replans, journals, applies, cleans up, and returns internal exit category 70 at the reserved Claude launch boundary. |
+| `asm claude` without `--dry-run` | Requires exactly Claude Code 2.1.220, stages under a unique state-owned root, locks, recovers, replans, journals, applies, injects that root through one `--add-dir` pair, supervises the shell-free child, and cleans up after proven process-domain death. |
 | Session with `--keep-mounts` | After a child reaches the supervision boundary, records terminal kept state instead of removing owned entries. A pre-spawn compatibility or supervision-intent failure overrides the request and removes every verified owned entry. |
 | Session with `--no-recover` | Refuses when incomplete state requires reconciliation; otherwise continues through the normal mutating path. |
 | Session encountering a free `supervising` journal | Refuses with category 75 and retains every recorded mount because wrapper-lock release does not prove child-domain death. |
 | `doctor`, `cleanup` | Parsed but rejected as reserved and unimplemented. |
 
-A mutating Codex invocation returns the child's ordinary status after successful cleanup. A spawn
+A mutating agent invocation returns the child's ordinary status after successful cleanup. A spawn
 or supervision failure uses the shared typed exit mapping. Cleanup failure replaces child success
 with category 73 and remains secondary evidence behind a failed child. Ordinary cleanup attempts
 to release every owned entry, while `--keep-mounts` retains them intentionally after the child
 boundary. A compatibility or supervision-intent failure before spawn forces verified cleanup;
-anything cleanup cannot prove safe to remove remains reported and journal-backed. Claude still
-returns category 70 after applying and releasing its plan because its launch contract has not been
-validated.
+anything cleanup cannot prove safe to remove remains reported and journal-backed.
 
 ## Execution architecture
 
@@ -113,8 +111,7 @@ read-only journal preflight
   -> persist planned journal
   -> write-ahead apply
   -> journal active
-  -> Codex: persist supervising intent, then shell-free child supervision
-     Claude: [child-launch composition reserved]
+  -> persist supervising intent, then shell-free child supervision
   -> after proven process-domain death: one reverse-order cleanup operation or terminal kept state
      after uncertain liveness: retain the supervising journal and every mount
 ```
@@ -160,8 +157,7 @@ up. There is no recursive removal operation in the link contract.
 
 The process layer consumes a completed `LaunchPlan` and a single-use cleanup operation. It does not
 select an agent executable, inject agent-specific arguments, apply a mount transaction, or decide
-retention policy. `src/app.rs` composes that boundary for Codex only. Claude continues to clean up
-at the reserved launch boundary until a separate change revalidates and composes its contract.
+retention policy. `src/app.rs` composes that boundary for both implemented session adapters.
 
 `src/link/` therefore serves two callers without owning their policy:
 
@@ -198,11 +194,11 @@ unsound; [ADR 0010](adr/0010-discovery-entry-identity.md) records this decision.
 
 | Concern | Codex | Claude Code |
 |---|---|---|
-| Current modeled discovery | Codex 0.146.0 recursive regular-file `SKILL.md` discovery under project and ancestor `.agents/skills` and `.codex/skills`, `$HOME/.agents/skills`, deprecated `$CODEX_HOME/skills`, bundled `$CODEX_HOME/skills/.system`, and the platform administrator root; file links are ignored, logical identity uses the supported frontmatter parser and directory-name fallback, and all same-name declarations are retained | Selected destination, project and user `.claude/skills`, plus user-supplied `--add-dir` scopes |
+| Current modeled discovery | Codex 0.146.0 recursive regular-file `SKILL.md` discovery under project and ancestor `.agents/skills` and `.codex/skills`, `$HOME/.agents/skills`, deprecated `$CODEX_HOME/skills`, bundled `$CODEX_HOME/skills/.system`, and the platform administrator root; file links are ignored, logical identity uses the supported frontmatter parser and directory-name fallback, and all same-name declarations are retained | Claude Code 2.1.220 direct-entry discovery in the platform managed Skill root, project `.claude/skills` from launch CWD through project root, the effective `CLAUDE_CONFIG_DIR/skills` user scope, the selected destination, and user-supplied `--add-dir` scopes; descendant collisions below launch CWD are namespace-qualified and custom standalone Skills override bundled names |
 | Compatibility | `.codex/skills` is a visible legacy conflict scope but never a placement candidate; an existing `.agents/skills -> .codex/skills` link is respected as operator configuration | No project compatibility store is created |
 | Planned destination | Always `<project>/.agents/skills`; a missing path is planned as a regular directory chain | Default: unique state-root staging tree at `<session>/root/.claude/skills`; project mode: `<project>/.claude/skills` |
 | Project mutation | Transaction-owned Skill links may be added only through `.agents/skills` | Project mode may add transaction-owned entries; default staging does not modify the project namespace |
-| Launch integration | Implemented for bounded `exec` and `review` launches on exactly `codex-cli 0.146.0`, re-probed before state, after lock stabilization, and at the spawn boundary; interactive TUI is rejected because it can reload higher-precedence managed configuration after spawn; child `current_dir`, canonical explicit `CODEX_HOME`, injected native `-C` and session discovery overrides, validated passthrough, and no `--add-dir` | Reserved; the current default-staging plan includes `<session>/root` via `--add-dir`, while the project-mode plan adds no argument |
+| Launch integration | Implemented for bounded `exec` and `review` launches on exactly `codex-cli 0.146.0`, re-probed before state, after lock stabilization, and at the spawn boundary; interactive TUI is rejected because it can reload higher-precedence managed configuration after spawn; child `current_dir`, canonical explicit `CODEX_HOME`, injected native `-C` and session discovery overrides, validated passthrough, and no `--add-dir` | Implemented on exactly `2.1.220 (Claude Code)`, re-probed at the same three boundaries; default staging injects one `--add-dir <session>/root` pair and every mode injects a session-only selected-name `skillOverrides` object before unchanged validated passthrough |
 
 Scopes that resolve to one terminal directory and use the same traversal policy are folded for
 conflict evaluation while their visible aliases remain available for diagnostics. A bundled-system
@@ -249,8 +245,7 @@ mounted Skill. Each potential manifest is reopened with a post-open regular-file
 instead of being mistaken for Codex's malformed-first-file suppression. Existing namespaced Skills
 remain conservatively indexed by their unqualified
 frontmatter name. That can add a false conflict, but a colon-qualified Codex name cannot equal a
-portable selected name, so it cannot hide one. Claude remains a planning-only adapter and must be
-revalidated before its child boundary is enabled.
+portable selected name, so it cannot hide one.
 
 SkillMount injects native `-C <launch-cwd>`, `project_root_markers=[".git"]`, and one name-enable
 rule for every selected, non-skipped Skill in a bounded `exec` or `review` launch. It does not edit
@@ -267,13 +262,14 @@ rejected because a later option can end its values and expose a nested command; 
 `-iVALUE`/`--image=VALUE` remains classifiable. Command-free `inspect` remains an inventory
 operation and does not certify a launch command.
 An explicit SkillMount
-`--project-root` is accepted for Codex only when it equals the root inferred from the launch CWD by
-the supported default marker model; any successfully followed `.git` entry is a marker, matching
-Codex's metadata probe. Normal system, cloud-managed, user, and profile layers cannot replace the
-injected marker value. A higher-precedence legacy managed file, or the corresponding macOS MDM
-preference, is conservatively rejected before state access and rechecked at both later compatibility
-boundaries. Full plugin-qualified display and duplicate modeling remains uncertified; the selected
-source gate above prevents that deferred modeling from changing a launched Skill's effective name.
+`--project-root` is accepted for either launched agent only when it equals the root inferred from
+the launch CWD by the supported default marker model; any successfully followed `.git` entry is a
+marker, matching both pinned loaders. For Codex, normal system, cloud-managed, user, and profile
+layers cannot replace the injected marker value. A higher-precedence legacy managed file, or the
+corresponding macOS MDM preference, is conservatively rejected before state access and rechecked at
+both later compatibility boundaries. Full plugin-qualified display and duplicate modeling remains
+uncertified; the selected source gate above prevents that deferred modeling from changing a
+launched Skill's effective name.
 
 Codex reads `CODEX_HOME` only when it is non-empty Unicode. An explicit value must already name a
 directory and is canonicalized relative to SkillMount's invocation CWD; the canonical Unicode path
@@ -289,10 +285,26 @@ adapter-required frontmatter name and description checks when optional metadata 
 to `none`, because the injected name-enable rules must address the same logical names the child
 loads.
 
-Claude `--add-dir` values are preserved for forwarding. Absolute values identify the same scope for
-planning and a future child; relative values are currently inspected relative to SkillMount's own
-process directory rather than the resolved launch CWD. Aligning those path semantics is part of the
-reserved argument-contract work.
+The Claude model was revalidated on 2026-08-03 against Claude Code 2.1.220, its official Skills,
+settings, and configuration-directory documentation, the changelog, and native black-box probes.
+The platform managed root, project direct-entry scopes from the launch CWD through the project
+root, user Skills below the effective `CLAUDE_CONFIG_DIR`, the proposed staging root, and every
+user-added directory participate in one conflict index. Relative configuration and `--add-dir`
+values resolve from the child launch CWD. A foreign managed collision fails under both conflict
+policies; an exact-source managed entry can be reused. Bundled names are not conflicts because the
+pinned release gives custom standalone Skills precedence.
+
+Exact `--bare`, `--safe-mode`, and `--disable-slash-commands` tokens in option position, a truthy
+inherited `CLAUDE_CODE_SAFE_MODE`, and user `--settings` or `--managed-settings` passthrough fail
+before state access. The bounded parser distinguishes values and stops at standalone `--`. The
+default launch prepends one `--add-dir <session>/root` pair, and every launch injects a temporary
+`skillOverrides` map that enables each selected catalog name before preserving validated user
+passthrough. It edits no persistent setting or permission mode.
+[ADR 0024](adr/0024-pin-the-claude-session-discovery-contract.md) records the corrected scope and
+launch contract. Enterprise managed settings can intentionally suppress all non-plugin Skills,
+outrank command-line settings, arrive asynchronously, and refresh during a child session.
+SkillMount does not bypass that policy; managed-policy sessions, authenticated real-agent link
+loading, and native Windows junction loading remain explicit compatibility-hardening gaps.
 
 ### Codex permission separation
 
@@ -354,7 +366,7 @@ observation establishes evidence for later operations but cannot prove continuit
 call; ADR 0015 records that residual window. Failure before initial evidence is reported and
 retained rather than followed by unchecked pathname rollback. Recovery eligibility comes from the
 held lock set before child exposure, never a recorded PID: PIDs are reusable and cannot authorize
-cleanup. Immediately before a Codex spawn attempt, the journal enters `supervising`. If a later
+cleanup. Immediately before an agent spawn attempt, the journal enters `supervising`. If a later
 invocation finds that journal with free locks, it cannot infer that the child process domain is
 empty; it quarantines the journal and mounts, blocks mutation with exit category 75, and waits for
 the future explicit cleanup contract. Unreadable or future-schema journals likewise block new
@@ -374,18 +386,21 @@ The crate sets `unsafe_code = "deny"`. Exactly six modules may opt in:
 
 The Codex macOS FFI module synchronizes the application preference domain and asks Core Foundation
 whether the exact managed configuration preference Codex reads has a value; it never decodes or
-exposes the property-list object. The paths Windows FFI module resolves `FOLDERID_Profile` and
-`FOLDERID_ProgramData`, copies the returned UTF-16 path, and releases its COM task allocation. The
-two `src/link/` modules wrap filesystem operations that have no safe standard-library
-equivalent, including atomic no-replace placement and Windows reparse-point observation, handle
-rename, and handle disposition. The process FFI modules wrap process-lifetime Unix signal
-registration and Windows console-handler and Job Object operations. Each unsafe block has a
+exposes the property-list object. The paths Windows FFI module resolves `FOLDERID_Profile`,
+`FOLDERID_ProgramData`, and `FOLDERID_ProgramFiles`, copies the returned UTF-16 path, and releases
+its COM task allocation. The two `src/link/` modules wrap filesystem operations that have no safe
+standard-library equivalent, including atomic no-replace placement, Windows reparse-point
+observation, handle rename, and handle disposition. The process FFI modules wrap process-lifetime
+Unix signal registration and Windows console-handler and Job Object operations. Each unsafe block has a
 `SAFETY` justification, raw platform types do not cross its module boundary, and event storage,
 process policy, and reparse decoding stay in safe Rust.
 [ADR 0011](adr/0011-scoped-unsafe-for-platform-link-backends.md) records why `deny` with an audited
 scope replaced crate-wide `forbid`; [ADR 0019](adr/0019-supervise-process-domains-through-reusable-native-dispatchers.md)
-records the two process boundaries; [ADR 0023](adr/0023-pin-the-codex-session-discovery-contract.md)
-records the fifth and sixth boundaries and the pinned child overrides.
+records the two process boundaries;
+[ADR 0023](adr/0023-pin-the-codex-session-discovery-contract.md) records the fifth and sixth
+boundaries and the pinned Codex child overrides;
+[ADR 0024](adr/0024-pin-the-claude-session-discovery-contract.md) extends the Windows Known Folder
+allowlist for Claude's managed Skill root.
 
 Paths and forwarded arguments remain `PathBuf` and `OsString` through every public seam. They are
 never joined into a shell command or converted lossily for policy, journal, lock, or ownership
@@ -485,24 +500,25 @@ needed to preserve them inside an implementation.
 - complete bounded Codex `exec`/`review` session composition through executable preflight, locked
   reinspection, durable apply, pre-spawn supervising intent, fake-child acceptance, liveness-gated
   cleanup, quarantined uncertain journals, and child/cleanup exit precedence;
+- complete Claude 2.1.220 session composition through isolated staging, ancestor/user/add-dir
+  preflight, exact passthrough injection, fake-child acceptance, concurrent roots, and the same
+  liveness-gated cleanup and exit precedence;
 - crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
 
 ### Reserved work
 
-- the Claude launch boundary and complete Claude session adapter built on the generic supervisor,
-  including discovery-model and argument-contract validation against supported agent versions;
-- compatibility work to add any Codex release beyond the exact 0.146.0 contract, plus native
-  Windows junction discovery and an authenticated real-agent smoke test;
+- compatibility work to add any Codex release beyond the exact 0.146.0 contract or Claude release
+  beyond exact 2.1.220, plus native Windows junction discovery, asynchronously delivered Claude
+  managed-policy handling, and authenticated real-agent smoke tests;
 - `doctor`, explicit `cleanup`, lock-file reclamation, compatibility evidence, and user recovery
   documentation;
 - binding a public transaction's lifetime to the lock guard validated when it is opened or adopted;
 - rejecting pre-existing links in application-state directory paths before creation or permission changes;
 - versioned release packaging and publication.
 
-Until Claude launch integration is implemented, a normal Claude session applies and then cleans up
-before returning exit category 70. Codex uses the supervisor in the product application path, but
-real-agent and Windows-junction certification remain release-hardening gates rather than claims of
-this fake-agent change. Until operator cleanup is implemented, lock files accumulate for distinct
+Both session adapters use the supervisor in the product application path, but real-agent and
+Windows-junction certification remain release-hardening gates rather than claims of fake-agent
+coverage. Until operator cleanup is implemented, lock files accumulate for distinct
 logical and physical lock keys. Owner sidecars are removed on ordinary release but may remain after
 a crash or failed removal; neither file's presence blocks or proves a live session.
 

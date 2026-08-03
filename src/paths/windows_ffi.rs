@@ -1,4 +1,4 @@
-//! Audited Windows Known Folder boundary for Codex discovery roots.
+//! Audited Windows Known Folder boundary for agent discovery roots.
 
 #![allow(unsafe_code)]
 
@@ -10,7 +10,9 @@ use std::slice;
 
 use windows_sys::Win32::Globalization::lstrlenW;
 use windows_sys::Win32::System::Com::CoTaskMemFree;
-use windows_sys::Win32::UI::Shell::{FOLDERID_Profile, FOLDERID_ProgramData, SHGetKnownFolderPath};
+use windows_sys::Win32::UI::Shell::{
+    FOLDERID_Profile, FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath,
+};
 use windows_sys::core::{GUID, PWSTR};
 
 /// Resolves the profile directory through the same Known Folder API as Codex 0.146.0.
@@ -23,9 +25,14 @@ pub(super) fn program_data_directory() -> Option<PathBuf> {
     known_folder(FOLDERID_ProgramData)
 }
 
+/// Resolves the machine-wide installation base used by Claude Code managed configuration.
+pub(super) fn program_files_directory() -> Option<PathBuf> {
+    known_folder(FOLDERID_ProgramFiles)
+}
+
 fn known_folder(folder_id: GUID) -> Option<PathBuf> {
     let mut path_ptr: PWSTR = ptr::null_mut();
-    // SAFETY: `folder_id` is one of the two static Known Folder GUID values above, the token is
+    // SAFETY: `folder_id` is one of the three static Known Folder GUID values above, the token is
     // null for the current user, and `path_ptr` is a valid out pointer. On success Windows returns
     // a null-terminated allocation owned by the COM task allocator. `lstrlenW` reads only through
     // that terminator, the slice is copied into an OsString before `CoTaskMemFree`, and the pointer

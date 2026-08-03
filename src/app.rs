@@ -139,8 +139,9 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     // creating SkillMount state. The later locked replan repeats the pure argument check, but it
     // must not be the first time a mutating invocation learns that its launch contract is unsafe.
     adapter_for(context.agent).validate_passthrough_args(&context.passthrough_args)?;
-    if context.agent == AgentId::Codex {
-        crate::agent::codex::verify_supported_launch(context)?;
+    match context.agent {
+        AgentId::Codex => crate::agent::codex::verify_supported_launch(context)?,
+        AgentId::Claude => crate::agent::claude::verify_supported_launch(context)?,
     }
 
     // Unknown ownership state is checked before creating even SkillMount's own staging or lock
@@ -210,11 +211,12 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
         ))
     })?;
 
-    // Lock acquisition may wait behind a long-running session while the installed Codex is
+    // Lock acquisition may wait behind a long-running session while the installed agent is
     // upgraded. Re-probe after the lock set stabilizes so a plan is never persisted or applied
     // using only compatibility evidence captured before that wait.
-    if context.agent == AgentId::Codex {
-        crate::agent::codex::verify_supported_launch(&context)?;
+    match context.agent {
+        AgentId::Codex => crate::agent::codex::verify_supported_launch(&context)?,
+        AgentId::Claude => crate::agent::claude::verify_supported_launch(&context)?,
     }
 
     warn(&render::render_warnings(
@@ -234,31 +236,16 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
         .apply()
         .map_err(|failure| failure.into_error())?;
 
-    // Codex is the only launch contract this change validates. Keep Claude at the previous
-    // apply-and-release boundary until its own adapter change proves the child discovery model,
-    // forwarded arguments, and staging lifetime end to end.
-    if context.agent == AgentId::Claude {
-        let cleanup = transaction.cleanup()?;
-        warn(&cleanup.describe());
-        return Err(AppError::Internal(format!(
-            "applied and then released {} mount action(s) for {} Skill(s); launching Claude is \
-             reserved for a later change, so the session stopped at that boundary rather than \
-             leaving mounts behind for a process that never starts",
-            rebuilt.plan.actions.len(),
-            rebuilt.catalog.resolutions.len()
-        )));
-    }
-
     // Apply can itself take time and runs after the last version probe. Check once more at the
-    // child boundary. If an updater replaced Codex, no child is spawned and the active
+    // child boundary. If an updater replaced the agent, no child is spawned and the active
     // transaction is released through the normal evidence-checked cleanup path.
-    verify_codex_spawn_boundary(&context, &rebuilt.catalog, &mut transaction)?;
+    verify_spawn_boundary(&context, &rebuilt.catalog, &mut transaction)?;
 
     if let Err(error) = transaction.begin_supervision() {
         match transaction.cleanup_required() {
             Ok(report) => warn(&report.describe()),
             Err(cleanup_error) => warn(&[format!(
-                "recording Codex supervision intent failed and cleanup also failed: {cleanup_error}"
+                "recording agent supervision intent failed and cleanup also failed: {cleanup_error}"
             )]),
         }
         return Err(error);
@@ -277,18 +264,21 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     Ok(decision.code)
 }
 
-fn verify_codex_spawn_boundary(
+fn verify_spawn_boundary(
     context: &RunContext,
     catalog: &SkillCatalog,
     transaction: &mut Transaction,
 ) -> Result<(), AppError> {
-    let compatibility = crate::agent::codex::verify_supported_launch(context)
-        .and_then(|()| crate::agent::codex::verify_selected_plugin_namespaces(catalog));
+    let compatibility = match context.agent {
+        AgentId::Codex => crate::agent::codex::verify_supported_launch(context)
+            .and_then(|()| crate::agent::codex::verify_selected_plugin_namespaces(catalog)),
+        AgentId::Claude => crate::agent::claude::verify_supported_launch(context),
+    };
     if let Err(error) = compatibility {
         match transaction.cleanup_required() {
             Ok(report) => warn(&report.describe()),
             Err(cleanup_error) => warn(&[format!(
-                "Codex compatibility changed before launch and cleanup also failed: {cleanup_error}"
+                "agent compatibility changed before launch and cleanup also failed: {cleanup_error}"
             )]),
         }
         return Err(error);

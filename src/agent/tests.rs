@@ -82,6 +82,8 @@ impl Project {
             codex_home: self.root.join("codex-home"),
             codex_home_override: None,
             codex_admin_skills: Some(self.root.join("admin/skills")),
+            claude_config_dir: self.root.join("home/.claude"),
+            claude_managed_skills: self.root.join("claude-managed/skills"),
             skill_sources: Vec::new(),
             session_id: None,
             agent_bin: PathBuf::from(agent.executable_name()),
@@ -128,6 +130,15 @@ fn plan_codex(
     let catalog = project.catalog(AgentId::Codex);
     let snapshot = CodexAdapter.inspect_discovery(context)?;
     CodexAdapter.build_mount_plan(context, &catalog, &snapshot)
+}
+
+fn plan_claude(
+    project: &Project,
+    context: &RunContext,
+) -> Result<MountPlan, crate::error::AppError> {
+    let catalog = project.catalog(AgentId::Claude);
+    let snapshot = ClaudeAdapter.inspect_discovery(context)?;
+    ClaudeAdapter.build_mount_plan(context, &catalog, &snapshot)
 }
 
 #[test]
@@ -1331,6 +1342,14 @@ fn claude_staging_injects_add_dir_and_leaves_the_project_alone() {
         PathBuf::from(&plan.launch.injected_args[1]),
         plan.discovery.entry
     );
+    assert_eq!(plan.launch.injected_args[2], OsString::from("--settings"));
+    let settings: serde_json::Value = serde_json::from_str(
+        plan.launch.injected_args[3]
+            .to_str()
+            .expect("generated settings are Unicode JSON"),
+    )
+    .expect("generated settings are valid JSON");
+    assert_eq!(settings["skillOverrides"]["alpha"], "on");
     assert!(
         plan.discovery
             .backing_store
@@ -1392,6 +1411,198 @@ fn an_add_dir_scope_participates_in_conflict_detection() {
         .build_mount_plan(&context, &catalog, &snapshot)
         .expect_err("a passthrough scope can veto a mount");
 
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn a_launch_cwd_ancestor_claude_scope_blocks_staging() {
+    let project = Project::new("claude-ancestor-conflict");
+    project.source_skill("alpha");
+    let nested = project.make_dir("nested/deeper");
+    let existing = project.make_dir("nested/.claude/skills/alpha");
+    std::fs::write(
+        existing.join("SKILL.md"),
+        "---\nname: alpha\ndescription: ancestor fixture\n---\n",
+    )
+    .expect("ancestor Skill metadata");
+    let mut context = project.context(AgentId::Claude, MountMode::Staging, ConflictPolicy::Error);
+    context.launch_cwd = nested;
+
+    let error = plan_claude(&project, &context)
+        .expect_err("the pinned Claude release loads ancestor project scopes at startup");
+
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn a_relative_claude_add_dir_is_resolved_from_the_launch_cwd() {
+    let project = Project::new("claude-relative-add-dir");
+    project.source_skill("alpha");
+    let nested = project.make_dir("nested");
+    let existing = project.make_dir("nested/extra/.claude/skills/alpha");
+    std::fs::write(
+        existing.join("SKILL.md"),
+        "---\nname: alpha\ndescription: add-dir fixture\n---\n",
+    )
+    .expect("add-dir Skill metadata");
+    let mut context = project.context(AgentId::Claude, MountMode::Staging, ConflictPolicy::Error);
+    context.launch_cwd = nested;
+    context.passthrough_args = vec![OsString::from("--add-dir"), OsString::from("extra")];
+
+    let error = plan_claude(&project, &context)
+        .expect_err("relative add-dir discovery uses the child launch CWD");
+
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn a_same_source_claude_user_skill_is_reused_without_cleanup_ownership() {
+    let project = Project::new("claude-user-same-source");
+    let source = project.source_skill("alpha");
+    let user_store = project.make_dir("home/.claude/skills");
+    if !symlink_dir_or_skip(&source, &user_store.join("alpha")) {
+        return;
+    }
+    let context = project.context(AgentId::Claude, MountMode::Staging, ConflictPolicy::Error);
+
+    let plan = plan_claude(&project, &context).expect("the source is already visible to Claude");
+
+    assert_eq!(reuse_destinations(&plan), [user_store.join("alpha")]);
+    assert!(link_destinations(&plan).is_empty());
+    assert!(
+        plan.owned_actions()
+            .all(|action| !matches!(&action.operation, MountAction::ReuseExistingLink { .. }))
+    );
+}
+
+#[test]
+fn claude_config_dir_relocates_the_user_skill_scope() {
+    let project = Project::new("claude-config-dir-user-scope");
+    project.source_skill("alpha");
+    let existing = project.make_dir("custom-claude/skills/alpha");
+    std::fs::write(
+        existing.join("SKILL.md"),
+        "---\nname: alpha\ndescription: relocated user fixture\n---\n",
+    )
+    .expect("relocated user Skill metadata");
+    let mut context = project.context(AgentId::Claude, MountMode::Staging, ConflictPolicy::Error);
+    context.claude_config_dir = project.root.join("custom-claude");
+
+    let error = plan_claude(&project, &context)
+        .expect_err("CLAUDE_CONFIG_DIR replaces the default user discovery root");
+
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn a_foreign_managed_claude_skill_cannot_be_skipped() {
+    for policy in [ConflictPolicy::Error, ConflictPolicy::Skip] {
+        let project = Project::new(&format!("claude-managed-foreign-{policy:?}"));
+        project.source_skill("alpha");
+        let existing = project.make_dir("claude-managed/skills/alpha");
+        std::fs::write(
+            existing.join("SKILL.md"),
+            "---\nname: alpha\ndescription: managed fixture\n---\n",
+        )
+        .expect("managed Skill metadata");
+        let context = project.context(AgentId::Claude, MountMode::Staging, policy);
+
+        let error = plan_claude(&project, &context)
+            .expect_err("the managed scope outranks staging under every conflict policy");
+
+        assert_eq!(error.category(), ExitCategory::Filesystem, "{policy:?}");
+        assert!(error.to_string().contains("claude managed"), "{policy:?}");
+    }
+}
+
+#[test]
+fn an_exact_source_managed_claude_skill_is_reused() {
+    let project = Project::new("claude-managed-same-source");
+    let source = project.source_skill("alpha");
+    let managed = project.make_dir("claude-managed/skills");
+    if !symlink_dir_or_skip(&source, &managed.join("alpha")) {
+        return;
+    }
+    let context = project.context(AgentId::Claude, MountMode::Staging, ConflictPolicy::Error);
+
+    let plan = plan_claude(&project, &context).expect("managed exact-source visibility is stable");
+
+    assert_eq!(reuse_destinations(&plan), [managed.join("alpha")]);
+    assert!(link_destinations(&plan).is_empty());
+}
+
+#[test]
+fn a_foreign_claude_user_skill_errors_or_is_preserved_by_skip() {
+    let project = Project::new("claude-user-foreign");
+    project.source_skill("alpha");
+    let existing = project.make_dir("home/.claude/skills/alpha");
+    std::fs::write(
+        existing.join("SKILL.md"),
+        "---\nname: alpha\ndescription: user fixture\n---\n",
+    )
+    .expect("user Skill metadata");
+
+    let error = plan_claude(
+        &project,
+        &project.context(AgentId::Claude, MountMode::Staging, ConflictPolicy::Error),
+    )
+    .expect_err("a foreign user Skill is ambiguous under the default policy");
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+
+    let plan = plan_claude(
+        &project,
+        &project.context(AgentId::Claude, MountMode::Staging, ConflictPolicy::Skip),
+    )
+    .expect("skip preserves the visible user Skill");
+    assert!(link_destinations(&plan).is_empty());
+    assert_eq!(plan.preserved.len(), 1);
+    assert_eq!(plan.preserved[0].existing, existing);
+    assert_eq!(plan.preserved[0].scope, ScopeKind::ClaudeUser);
+    let settings: serde_json::Value = serde_json::from_str(
+        plan.launch.injected_args[3]
+            .to_str()
+            .expect("generated settings are Unicode JSON"),
+    )
+    .expect("generated settings are valid JSON");
+    assert_eq!(
+        settings["skillOverrides"]["alpha"], "on",
+        "skip accepts the existing Skill, so it must remain visible for this session"
+    );
+}
+
+#[test]
+fn claude_case_variant_diagnostics_are_typed_and_conflicts_fail_closed() {
+    let project = Project::new("claude-user-case-variants");
+    project.source_skill("alpha");
+    for name in ["alpha", "Alpha"] {
+        let existing = project.make_dir(&format!("home/.claude/skills/{name}"));
+        std::fs::write(
+            existing.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: case fixture\n---\n"),
+        )
+        .expect("case-variant metadata");
+    }
+    let context = project.context(AgentId::Claude, MountMode::Staging, ConflictPolicy::Error);
+    let snapshot = ClaudeAdapter
+        .inspect_discovery(&context)
+        .expect("case variants are retained as evidence");
+
+    let distinct_entries = std::fs::read_dir(project.root.join("home/.claude/skills"))
+        .expect("user Skill scope")
+        .filter_map(Result::ok)
+        .count();
+    if distinct_entries == 2 {
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == DiagnosticKind::ClaudeDiscovery),
+            "a case-sensitive host retains both variants and reports a typed ambiguity"
+        );
+    }
+    let error = ClaudeAdapter
+        .build_mount_plan(&context, &project.catalog(AgentId::Claude), &snapshot)
+        .expect_err("case-variant conflicts fail closed under the default policy");
     assert_eq!(error.category(), ExitCategory::Filesystem);
 }
 
