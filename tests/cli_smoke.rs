@@ -47,7 +47,13 @@ fn run(executable: &str, arguments: &[&str]) -> Output {
 /// from the test harness's own working directory and mount into this repository, and without
 /// `SKILLMOUNT_STATE_DIR` it would write journals and locks into the developer's real
 /// application-support directory.
-fn run_session(executable: &str, project: &Path, state: &Path, arguments: &[&str]) -> Output {
+fn run_session(
+    executable: &str,
+    project: &Path,
+    state: &Path,
+    record_name: &str,
+    arguments: &[&str],
+) -> Output {
     let home = state.join("home");
     fs::create_dir_all(home.join("codex-home")).expect("session Codex home");
     Command::new(executable)
@@ -68,10 +74,7 @@ fn run_session(executable: &str, project: &Path, state: &Path, arguments: &[&str
         .env("LOCALAPPDATA", home.join("AppData/Local"))
         .env("CODEX_HOME", home.join("codex-home"))
         .env("SKILLMOUNT_TEST_CODEX_VERSION", "codex-cli 0.146.0")
-        .env(
-            "SKILLMOUNT_FAKE_RECORD",
-            state.join("cli-smoke-codex.record"),
-        )
+        .env("SKILLMOUNT_FAKE_RECORD", state.join(record_name))
         .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
         .env(
             "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
@@ -160,6 +163,7 @@ fn wrapper_maps_missing_and_invalid_catalog_inputs_to_stable_codes() {
         ASM,
         &project,
         &state,
+        "missing-codex.record",
         &["codex", "--skills-dir", &missing.to_string_lossy()],
     );
     assert_eq!(missing_output.status.code(), Some(66));
@@ -181,6 +185,7 @@ fn wrapper_maps_missing_and_invalid_catalog_inputs_to_stable_codes() {
         ASM,
         &project,
         &state,
+        "invalid-codex.record",
         &["codex", "--skills-dir", &invalid.to_string_lossy()],
     );
     assert_eq!(invalid_output.status.code(), Some(65));
@@ -237,41 +242,62 @@ fn inspect_and_codex_session_preserve_binary_parity() {
     fs::create_dir(&project).expect("project fixture");
     let state = fixture.join("state");
     let session_arguments = ["codex", "--skills-dir", &skill.to_string_lossy()];
-    let session = run_session(ASM, &project, &state, &session_arguments);
-    let fallback_session = run_session(SKILLMOUNT, &project, &state, &session_arguments);
+    let asm_record = state.join("asm-codex.record");
+    let session = run_session(
+        ASM,
+        &project,
+        &state,
+        "asm-codex.record",
+        &session_arguments,
+    );
+    assert_completed_session(&session, &project, &state, &asm_record);
 
-    if std::env::var_os(RELEASE_CODEX_ENV).is_some() {
-        assert!(
-            session.status.success(),
-            "the release smoke fixture is a supported Codex executable: {}",
-            String::from_utf8_lossy(&session.stderr)
-        );
-        assert!(
-            state.join("cli-smoke-codex.record").is_file(),
-            "the release smoke fixture records the child launch"
-        );
-    } else {
-        assert_eq!(session.status.code(), Some(64));
-        assert!(
-            String::from_utf8_lossy(&session.stderr)
-                .contains("discovery does not grant sandbox access"),
-            "the debug session reports permission separation: {}",
-            String::from_utf8_lossy(&session.stderr)
-        );
-    }
+    let fallback_record = state.join("skillmount-codex.record");
+    let fallback_session = run_session(
+        SKILLMOUNT,
+        &project,
+        &state,
+        "skillmount-codex.record",
+        &session_arguments,
+    );
+    assert_completed_session(&fallback_session, &project, &state, &fallback_record);
+
     assert_eq!(session.status, fallback_session.status);
     assert_eq!(session.stdout, fallback_session.stdout);
     assert_eq!(session.stderr, fallback_session.stderr);
-    assert!(
-        !project.join(".agents").exists() && !project.join(".codex").exists(),
-        "a completed session releases everything it applied"
-    );
-    assert!(
-        journal_count(&state) == 0,
-        "a completed transaction leaves no journal behind"
-    );
 
     fs::remove_dir_all(fixture).expect("fixture cleanup");
+}
+
+fn assert_completed_session(output: &Output, project: &Path, state: &Path, record: &Path) {
+    if std::env::var_os(RELEASE_CODEX_ENV).is_some() {
+        assert!(
+            output.status.success(),
+            "the release smoke fixture is a supported Codex executable: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            record.is_file(),
+            "each wrapper independently records its child launch at {}",
+            record.display()
+        );
+    } else {
+        assert_eq!(output.status.code(), Some(64));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("discovery does not grant sandbox access"),
+            "the debug session reports permission separation: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        !project.join(".agents").exists() && !project.join(".codex").exists(),
+        "each completed wrapper session releases everything it applied"
+    );
+    assert!(
+        journal_count(state) == 0,
+        "each completed wrapper transaction leaves no journal behind"
+    );
 }
 
 /// Counts journals left in a redirected state root.
