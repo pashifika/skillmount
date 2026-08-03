@@ -98,9 +98,9 @@ impl fmt::Display for TransactionId {
 /// How far a transaction has durably progressed.
 ///
 /// Only [`TransactionStatus::Completed`] and [`TransactionStatus::Kept`] are terminal. Every other
-/// state means a later invocation must reconcile the transaction before it can plan its own, and
-/// [`TransactionStatus::Failed`] is deliberately among them: a rollback that could not finish left
-/// entries that a later run, holding the same locks, may still be able to verify and remove.
+/// state needs attention before a later invocation may mutate overlapping resources.
+/// [`TransactionStatus::Supervising`] is quarantined because free wrapper locks do not prove child
+/// death; the remaining incomplete states are eligible for ordinary locked recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionStatus {
     /// The complete plan is durable and no mutation has been attempted.
@@ -109,6 +109,8 @@ pub enum TransactionStatus {
     Applying,
     /// Every planned action is durably applied.
     Active,
+    /// A child may be using the mounted entries; only proven process-domain death may advance it.
+    Supervising,
     /// Ordinary cleanup is in progress.
     Cleaning,
     /// Cleanup finished and nothing transaction-owned remains to reconcile.
@@ -127,6 +129,7 @@ impl TransactionStatus {
             Self::Planned => "planned",
             Self::Applying => "applying",
             Self::Active => "active",
+            Self::Supervising => "supervising",
             Self::Cleaning => "cleaning",
             Self::Completed => "completed",
             Self::Kept => "kept",
@@ -141,6 +144,7 @@ impl TransactionStatus {
             "planned" => Some(Self::Planned),
             "applying" => Some(Self::Applying),
             "active" => Some(Self::Active),
+            "supervising" => Some(Self::Supervising),
             "cleaning" => Some(Self::Cleaning),
             "completed" => Some(Self::Completed),
             "kept" => Some(Self::Kept),
@@ -155,10 +159,20 @@ impl TransactionStatus {
         matches!(self, Self::Completed | Self::Kept)
     }
 
-    /// Returns whether a later invocation must reconcile this transaction.
+    /// Returns whether a later invocation must resolve this non-terminal transaction.
     #[must_use]
     pub const fn is_incomplete(self) -> bool {
         !self.is_terminal()
+    }
+
+    /// Returns whether free transaction locks are sufficient to authorize automatic recovery.
+    ///
+    /// A supervising wrapper can disappear while its child or descendant remains alive. Its locks
+    /// then become free without proving process-domain death, so that state requires an explicit
+    /// operator cleanup decision instead of stale-transaction recovery.
+    #[must_use]
+    pub const fn is_automatically_recoverable(self) -> bool {
+        self.is_incomplete() && !matches!(self, Self::Supervising)
     }
 }
 
@@ -224,7 +238,7 @@ impl ActionStatus {
 pub enum ActionOperation {
     /// Create a helper directory the plan needs.
     CreateDirectory,
-    /// Create a directory link for a selected Skill or for the authoritative discovery entry.
+    /// Create a directory link for a selected Skill.
     CreateDirectoryLink,
     /// Record an entry that already satisfies the mount and is not transaction-owned.
     ReuseExistingLink,
@@ -445,7 +459,7 @@ pub struct TransactionJournal {
     pub project_root: PathBuf,
     /// Directory the agent would have run in.
     pub launch_cwd: PathBuf,
-    /// Authoritative discovery entry the child reads.
+    /// Logical discovery entry the child reads.
     pub discovery_entry: PathBuf,
     /// Store selected Skills are mounted into.
     pub backing_store: PathBuf,

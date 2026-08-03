@@ -206,6 +206,25 @@ impl Transaction {
         &self.path
     }
 
+    /// Durably records that a child may begin using the mounted entries.
+    ///
+    /// This transition precedes every spawn attempt. If the wrapper disappears afterwards, free
+    /// advisory locks alone cannot prove that the child process domain is empty, so recovery
+    /// quarantines this journal until an explicit cleanup decision.
+    pub(crate) fn begin_supervision(&mut self) -> Result<(), AppError> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SKILLMOUNT_TEST_FAIL_BEGIN_SUPERVISION").is_some() {
+            return Err(crate::error::JournalError::Write {
+                path: self.path.clone(),
+                reason: "injected begin-supervision persistence failure".to_owned(),
+            }
+            .into());
+        }
+        self.advance(TransactionStatus::Supervising)?;
+        crate::checkpoint::reached(crate::checkpoint::Checkpoint::JournalSupervising, 1);
+        Ok(())
+    }
+
     /// Lets a test damage the durable record the way an interrupted run would.
     ///
     /// Not exposed outside tests: every ordinary path reaches the journal through a method that

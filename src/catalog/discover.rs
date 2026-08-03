@@ -76,9 +76,13 @@ fn prepare_source(occurrence: &SourceOccurrence) -> Result<SkillSource, AppError
 }
 
 fn scan_source(source: &SkillSource) -> Result<Vec<RawCandidate>, AppError> {
-    let direct_skill_md = source.resolved_path.join("SKILL.md");
-    match fs::symlink_metadata(&direct_skill_md) {
-        Ok(_) => {
+    match super::find_exact_entry(&source.resolved_path, OsStr::new("SKILL.md")).map_err(
+        |error| AppError::MissingInput {
+            path: source.resolved_path.clone(),
+            reason: error.to_string(),
+        },
+    )? {
+        Some(entry) => {
             let name = source
                 .resolved_path
                 .file_name()
@@ -87,14 +91,10 @@ fn scan_source(source: &SkillSource) -> Result<Vec<RawCandidate>, AppError> {
                 source,
                 &source.resolved_path,
                 name,
-                direct_skill_md,
+                entry.path(),
             )])
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => scan_catalog(source),
-        Err(error) => Err(AppError::MissingInput {
-            path: direct_skill_md,
-            reason: error.to_string(),
-        }),
+        None => scan_catalog(source),
     }
 }
 
@@ -119,16 +119,18 @@ fn scan_catalog(source: &SkillSource) -> Result<Vec<RawCandidate>, AppError> {
         }
 
         let entry_path = entry.path();
-        let skill_md = entry_path.join("SKILL.md");
-        match fs::symlink_metadata(&skill_md) {
-            Ok(_) => candidates.push(candidate(source, &entry_path, &entry.file_name(), skill_md)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(AppError::MissingInput {
-                    path: skill_md,
-                    reason: error.to_string(),
-                });
-            }
+        if let Some(skill_md) = super::find_exact_entry(&entry_path, OsStr::new("SKILL.md"))
+            .map_err(|error| AppError::MissingInput {
+                path: entry_path.clone(),
+                reason: error.to_string(),
+            })?
+        {
+            candidates.push(candidate(
+                source,
+                &entry_path,
+                &entry.file_name(),
+                skill_md.path(),
+            ));
         }
     }
 

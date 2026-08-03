@@ -7,10 +7,36 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
 const SKILLMOUNT: &str = env!("CARGO_BIN_EXE_skillmount");
+const RELEASE_CODEX_ENV: &str = "SKILLMOUNT_CLI_SMOKE_CODEX_BIN";
+
+fn session_agent() -> PathBuf {
+    if let Some(executable) = std::env::var_os(RELEASE_CODEX_ENV) {
+        return PathBuf::from(executable);
+    }
+
+    #[cfg(debug_assertions)]
+    return PathBuf::from(ASM);
+
+    #[cfg(not(debug_assertions))]
+    panic!("{RELEASE_CODEX_ENV} must name the explicit Codex fixture for a release smoke run");
+}
 
 fn run(executable: &str, arguments: &[&str]) -> Output {
+    let home =
+        std::env::temp_dir().join(format!("skillmount-cli-smoke-home-{}", std::process::id()));
+    fs::create_dir_all(home.join("codex-home")).expect("smoke-test Codex home");
     Command::new(executable)
         .args(arguments)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("SKILLMOUNT_TEST_CODEX_USER_HOME", &home)
+        .env("SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG", "absent")
+        .env("LOCALAPPDATA", home.join("AppData/Local"))
+        .env("CODEX_HOME", home.join("codex-home"))
+        .env(
+            "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
+            home.join("admin-skills"),
+        )
         .output()
         .expect("smoke-test executable should run")
 }
@@ -21,13 +47,39 @@ fn run(executable: &str, arguments: &[&str]) -> Output {
 /// from the test harness's own working directory and mount into this repository, and without
 /// `SKILLMOUNT_STATE_DIR` it would write journals and locks into the developer's real
 /// application-support directory.
-fn run_session(executable: &str, project: &Path, state: &Path, arguments: &[&str]) -> Output {
+fn run_session(
+    executable: &str,
+    project: &Path,
+    state: &Path,
+    record_name: &str,
+    arguments: &[&str],
+) -> Output {
+    let home = state.join("home");
+    fs::create_dir_all(home.join("codex-home")).expect("session Codex home");
     Command::new(executable)
         .args(arguments)
         .arg("--project-root")
         .arg(project)
         .arg("--cwd")
         .arg(project)
+        .arg("--agent-bin")
+        .arg(session_agent())
+        .arg("--")
+        .arg("exec")
+        .arg("fixture")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("SKILLMOUNT_TEST_CODEX_USER_HOME", &home)
+        .env("SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG", "absent")
+        .env("LOCALAPPDATA", home.join("AppData/Local"))
+        .env("CODEX_HOME", home.join("codex-home"))
+        .env("SKILLMOUNT_TEST_CODEX_VERSION", "codex-cli 0.146.0")
+        .env("SKILLMOUNT_FAKE_RECORD", state.join(record_name))
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
+        .env(
+            "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
+            home.join("admin-skills"),
+        )
         .env("SKILLMOUNT_STATE_DIR", state)
         .current_dir(project)
         .output()
@@ -111,6 +163,7 @@ fn wrapper_maps_missing_and_invalid_catalog_inputs_to_stable_codes() {
         ASM,
         &project,
         &state,
+        "missing-codex.record",
         &["codex", "--skills-dir", &missing.to_string_lossy()],
     );
     assert_eq!(missing_output.status.code(), Some(66));
@@ -132,6 +185,7 @@ fn wrapper_maps_missing_and_invalid_catalog_inputs_to_stable_codes() {
         ASM,
         &project,
         &state,
+        "invalid-codex.record",
         &["codex", "--skills-dir", &invalid.to_string_lossy()],
     );
     assert_eq!(invalid_output.status.code(), Some(65));
@@ -146,7 +200,7 @@ fn wrapper_maps_missing_and_invalid_catalog_inputs_to_stable_codes() {
 }
 
 #[test]
-fn inspect_resolves_without_crossing_the_unimplemented_mount_boundary() {
+fn inspect_and_codex_session_preserve_binary_parity() {
     let fixture = temporary_fixture("inspect");
     let skill = fixture.join("demo");
     fs::create_dir(&skill).expect("Skill fixture");
@@ -171,6 +225,9 @@ fn inspect_resolves_without_crossing_the_unimplemented_mount_boundary() {
         "--skills-dir",
         &skill.to_string_lossy(),
         "--dry-run",
+        "--",
+        "exec",
+        "fixture",
     ];
     let dry_run = run(ASM, &dry_run_arguments);
     assert!(dry_run.status.success(), "a dry run completes normally");
@@ -185,28 +242,62 @@ fn inspect_resolves_without_crossing_the_unimplemented_mount_boundary() {
     fs::create_dir(&project).expect("project fixture");
     let state = fixture.join("state");
     let session_arguments = ["codex", "--skills-dir", &skill.to_string_lossy()];
-    let session = run_session(ASM, &project, &state, &session_arguments);
-    let fallback_session = run_session(SKILLMOUNT, &project, &state, &session_arguments);
+    let asm_record = state.join("asm-codex.record");
+    let session = run_session(
+        ASM,
+        &project,
+        &state,
+        "asm-codex.record",
+        &session_arguments,
+    );
+    assert_completed_session(&session, &project, &state, &asm_record);
 
-    assert_eq!(session.status.code(), Some(70));
+    let fallback_record = state.join("skillmount-codex.record");
+    let fallback_session = run_session(
+        SKILLMOUNT,
+        &project,
+        &state,
+        "skillmount-codex.record",
+        &session_arguments,
+    );
+    assert_completed_session(&fallback_session, &project, &state, &fallback_record);
+
     assert_eq!(session.status, fallback_session.status);
     assert_eq!(session.stdout, fallback_session.stdout);
     assert_eq!(session.stderr, fallback_session.stderr);
-    assert!(
-        String::from_utf8_lossy(&session.stderr).contains("launching the agent is"),
-        "a normal session now completes the transaction and stops at the launch boundary: {}",
-        String::from_utf8_lossy(&session.stderr)
-    );
-    assert!(
-        !project.join(".agents").exists() && !project.join(".codex").exists(),
-        "a session that cannot launch a child releases everything it applied"
-    );
-    assert!(
-        journal_count(&state) == 0,
-        "a completed transaction leaves no journal behind"
-    );
 
     fs::remove_dir_all(fixture).expect("fixture cleanup");
+}
+
+fn assert_completed_session(output: &Output, project: &Path, state: &Path, record: &Path) {
+    if std::env::var_os(RELEASE_CODEX_ENV).is_some() {
+        assert!(
+            output.status.success(),
+            "the release smoke fixture is a supported Codex executable: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            record.is_file(),
+            "each wrapper independently records its child launch at {}",
+            record.display()
+        );
+    } else {
+        assert_eq!(output.status.code(), Some(64));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("discovery does not grant sandbox access"),
+            "the debug session reports permission separation: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(
+        !project.join(".agents").exists() && !project.join(".codex").exists(),
+        "each completed wrapper session releases everything it applied"
+    );
+    assert!(
+        journal_count(state) == 0,
+        "each completed wrapper transaction leaves no journal behind"
+    );
 }
 
 /// Counts journals left in a redirected state root.

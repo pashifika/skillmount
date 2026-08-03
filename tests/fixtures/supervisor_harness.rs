@@ -71,6 +71,7 @@ fn run() -> io::Result<u8> {
         cwd: cleanup_cwd.clone(),
         injected_args: injected_args.to_vec(),
         passthrough_args: passthrough_args.to_vec(),
+        environment_overrides: Vec::new(),
     };
     let mut outcomes = Vec::with_capacity(runs);
     let mut decisions = Vec::with_capacity(runs);

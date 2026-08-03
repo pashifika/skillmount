@@ -134,7 +134,7 @@ impl ResolvedChain {
 /// Classifies `entry` and walks any directory-link chain it starts.
 ///
 /// Broken, cyclic, over-deep, and non-directory layouts are returned as states rather than errors.
-/// An unusable ancestor scope and an unusable authoritative entry have different consequences, so
+/// An unusable ancestor scope and an unusable preferred entry have different consequences, so
 /// the decision belongs to each caller instead of being forced into the walker.
 ///
 /// # Errors

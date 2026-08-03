@@ -13,7 +13,7 @@ use crate::mount::resolve::PathKind;
 /// Which discovery entry the child reads and which store backs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryPlan {
-    /// Authoritative discovery entry the agent searches.
+    /// Logical discovery entry the agent searches.
     pub entry: PathBuf,
     /// Store that selected Skills are mounted into.
     pub backing_store: PathBuf,
@@ -27,7 +27,7 @@ pub struct DiscoveryPlan {
 pub enum PathPrecondition {
     /// Nothing exists at the destination.
     Missing,
-    /// A directory link already points at the recorded source.
+    /// An existing directory or directory link resolves to the recorded source.
     ExistingLinkToSource,
 }
 
@@ -70,7 +70,8 @@ pub enum MountAction {
         /// time, because the Windows symlink-to-junction fallback depends on runtime privilege.
         mode: LinkMode,
     },
-    /// An entry already points at the intended source, so nothing is created.
+    /// A directory or directory link already resolves to the intended source, so nothing is
+    /// created.
     ///
     /// A reused entry is never transaction-owned and must never be removed at cleanup.
     ReuseExistingLink {
@@ -148,6 +149,10 @@ pub struct LaunchPlan {
     pub injected_args: Vec<OsString>,
     /// Arguments forwarded verbatim after `--`.
     pub passthrough_args: Vec<OsString>,
+    /// Environment variables set explicitly for the child.
+    ///
+    /// Each value remains platform-native and is passed directly to `Command::env`.
+    pub environment_overrides: Vec<(OsString, OsString)>,
 }
 
 impl LaunchPlan {

@@ -15,14 +15,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const ASM: &str = env!("CARGO_BIN_EXE_asm");
+use skillmount::domain::LinkMode;
+use skillmount::link::{LinkRequest, PlacementOutcome, platform_backend};
 
-/// Every boundary the transaction layer announces, in the order a session reaches them.
+const ASM: &str = env!("CARGO_BIN_EXE_asm");
+/// The reused `asm` child rejects Codex-native injected arguments with this usage status.
+const FIXTURE_CHILD_STATUS: i32 = 64;
+
+/// Every boundary from preliminary discovery through automatically recoverable transaction state.
 ///
 /// Kept as literals rather than imported from the crate on purpose: the names are a contract
 /// between the library and this suite, and a rename that silently updated both sides would turn a
 /// crash test into a no-crash test without anyone noticing.
-const BOUNDARIES: [&str; 11] = [
+const BOUNDARIES: [&str; 12] = [
+    "discovery-inspected",
     "journal-planned",
     "journal-applying",
     "action-intent",
@@ -34,6 +40,20 @@ const BOUNDARIES: [&str; 11] = [
     "journal-cleaning",
     "entry-removed",
     "directory-removed",
+];
+
+/// Durable checkpoints reachable when the current Codex layout needs only one Skill link.
+const CURRENT_LAYOUT_BOUNDARIES: [&str; 10] = [
+    "journal-planned",
+    "journal-applying",
+    "action-intent",
+    "temporary-created",
+    "action-staged",
+    "final-placed",
+    "action-applied",
+    "journal-active",
+    "journal-cleaning",
+    "entry-removed",
 ];
 
 /// A project, a Skill source, and a private state root.
@@ -77,6 +97,33 @@ impl Fixture {
         self
     }
 
+    fn install_current_codex_layout(&self) {
+        let agents = self.project.join(".agents");
+        let store = self.project.join(".codex/skills");
+        fs::create_dir_all(&agents).expect("current .agents helper");
+        fs::create_dir_all(store.join("rasen")).expect("project-owned rasen Skill");
+        fs::write(
+            store.join("rasen/SKILL.md"),
+            "---\nname: rasen\ndescription: project fixture\n---\n",
+        )
+        .expect("project-owned Skill metadata");
+
+        let backend = platform_backend();
+        let staged = backend
+            .create_directory_link(&LinkRequest {
+                source: backend
+                    .canonical_directory(&store)
+                    .expect("canonical current store"),
+                staged_path: agents.join(".skills.skillmount-fixture"),
+                mode: LinkMode::Auto,
+            })
+            .expect("current discovery-link fixture");
+        let outcome = backend
+            .place_no_replace(&staged, &agents.join("skills"))
+            .expect("place current discovery-link fixture");
+        assert!(matches!(outcome, PlacementOutcome::Placed(_)));
+    }
+
     /// Builds a session command with every redirection this suite depends on.
     ///
     /// The project root and the state root are both redirected. Without the first, a session would
@@ -84,21 +131,46 @@ impl Fixture {
     /// without the second, it would write journals and locks into the developer's real
     /// application-support directory and contend with concurrent test runs.
     fn command(&self, agent: &str, extra: &[&str]) -> Command {
+        self.command_for(agent, extra, &self.project, &self.root.join("home"))
+    }
+
+    fn command_for(&self, agent: &str, extra: &[&str], project: &Path, home: &Path) -> Command {
+        fs::create_dir_all(home.join("codex-home")).expect("Codex home fixture");
         let mut command = Command::new(ASM);
         command
             .arg(agent)
             .arg("--skills-dir")
             .arg(&self.sources)
             .arg("--project-root")
-            .arg(&self.project)
+            .arg(project)
             .arg("--cwd")
-            .arg(&self.project)
+            .arg(project)
+            .arg("--agent-bin")
+            .arg(ASM)
             .args(extra)
+            // Reuse the already-built cross-platform `asm` executable as a harmless Codex child.
+            // The static `exec` shape passes the Codex adapter boundary; `asm` then rejects the
+            // injected Codex-native prefix with usage 64. Claude remains at its pre-launch
+            // apply-and-release boundary and returns the existing internal-error code.
+            .arg("--")
+            .arg("exec")
+            .arg("fixture")
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("SKILLMOUNT_TEST_CODEX_USER_HOME", home)
+            .env("SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG", "absent")
+            .env("LOCALAPPDATA", home.join("AppData/Local"))
+            .env("CODEX_HOME", home.join("codex-home"))
+            .env("SKILLMOUNT_TEST_CODEX_VERSION", "codex-cli 0.146.0")
+            .env(
+                "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
+                home.join("admin-skills"),
+            )
             .env("SKILLMOUNT_STATE_DIR", &self.state)
             // Contention must be reported rather than waited out, so a serialization test finishes
             // in milliseconds instead of the production timeout.
             .env("SKILLMOUNT_LOCK_WAIT_MS", "200")
-            .current_dir(&self.project);
+            .current_dir(project);
         command
     }
 
@@ -211,8 +283,8 @@ fn a_second_invocation_recovers_every_boundary_and_leaves_the_project_clean() {
 
         assert_eq!(
             recovered.status.code(),
-            Some(70),
-            "the recovering session must reach the launch boundary at {boundary}: {}",
+            Some(FIXTURE_CHILD_STATUS),
+            "the recovering session must launch and clean up after its fixture child at {boundary}: {}",
             String::from_utf8_lossy(&recovered.stderr)
         );
         assert!(
@@ -258,12 +330,73 @@ fn a_second_invocation_recovers_every_boundary_and_leaves_the_project_clean() {
 }
 
 #[test]
+fn current_codex_layout_survives_every_reachable_recovery_boundary() {
+    for boundary in CURRENT_LAYOUT_BOUNDARIES {
+        let fixture = Fixture::new(&format!("recover-current-{boundary}"));
+        fixture.skill("alpha");
+        fixture.install_current_codex_layout();
+
+        let discovery = fixture.project.join(".agents/skills");
+        let discovery_before = platform_backend()
+            .inspect_no_follow(&discovery)
+            .expect("inspect current discovery link");
+        let baseline = fixture.project_tree();
+        let rasen_body = fs::read_to_string(fixture.project.join(".codex/skills/rasen/SKILL.md"))
+            .expect("read project-owned Skill");
+
+        let killed = fixture.run_stopping_at("codex", boundary, &[]);
+        assert!(!killed.status.success(), "{boundary} must stop the session");
+
+        let recovered = fixture.run("codex", &[]);
+        assert_eq!(
+            recovered.status.code(),
+            Some(FIXTURE_CHILD_STATUS),
+            "the current layout must recover and launch at {boundary}: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        assert_eq!(
+            platform_backend()
+                .inspect_no_follow(&discovery)
+                .expect("reinspect current discovery link"),
+            discovery_before,
+            "the pre-existing discovery entry changed at {boundary}"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.project.join(".codex/skills/rasen/SKILL.md"))
+                .expect("project-owned Skill survives"),
+            rasen_body
+        );
+
+        let recovered_tree = fixture.project_tree();
+        if boundary == "temporary-created" {
+            assert!(
+                baseline.iter().all(|entry| recovered_tree.contains(entry)),
+                "the current layout must remain a subset of retained residue at {boundary}: {recovered_tree:?}"
+            );
+            assert!(
+                recovered_tree
+                    .iter()
+                    .any(|entry| entry.contains(".skillmount-")),
+                "the unrecorded staged entry must be retained at {boundary}: {recovered_tree:?}"
+            );
+            assert_eq!(fixture.journals().len(), 1);
+        } else {
+            assert_eq!(
+                recovered_tree, baseline,
+                "only the pre-existing current layout may remain after {boundary}"
+            );
+            assert!(fixture.journals().is_empty());
+        }
+    }
+}
+
+#[test]
 fn recovery_removes_a_staged_entry_that_was_never_placed() {
     let fixture = Fixture::new("staged-only");
     fixture.skill("alpha");
 
-    // The second `action-staged` occurrence is the store directory: action 1 is `.codex`, action 2
-    // is `.codex/skills`. Stopping there leaves a staged sibling whose identity is durable.
+    // The second `action-staged` occurrence is the store directory: action 1 is `.agents`, action
+    // 2 is `.agents/skills`. Stopping there leaves a staged sibling whose identity is durable.
     fixture.run_stopping_at("codex", "action-staged@2", &[]);
     let staged_before = fixture
         .project_tree()
@@ -278,7 +411,7 @@ fn recovery_removes_a_staged_entry_that_was_never_placed() {
         1,
         "the fixture must actually leave a staged entry: {staged_before:?}"
     );
-    assert_eq!(recovered.status.code(), Some(70));
+    assert_eq!(recovered.status.code(), Some(FIXTURE_CHILD_STATUS));
     assert!(
         !fixture
             .project_tree()
@@ -296,8 +429,8 @@ fn recovery_removes_an_entry_placed_before_its_applied_record() {
 
     // Stopping after the last placement leaves the journal saying `staged` while the entry already
     // occupies its final path. Recovery has to inspect both paths and remove the matching one.
-    fixture.run_stopping_at("codex", "final-placed@5", &[]);
-    let mounted = fixture.project.join(".codex/skills/alpha");
+    fixture.run_stopping_at("codex", "final-placed@3", &[]);
+    let mounted = fixture.project.join(".agents/skills/alpha");
     assert!(
         exists(&mounted),
         "the fixture must leave the mount in place: {:?}",
@@ -306,7 +439,7 @@ fn recovery_removes_an_entry_placed_before_its_applied_record() {
 
     let recovered = fixture.run("codex", &[]);
 
-    assert_eq!(recovered.status.code(), Some(70));
+    assert_eq!(recovered.status.code(), Some(FIXTURE_CHILD_STATUS));
     assert!(
         fixture.project_tree().is_empty(),
         "recovery must reconcile the placed-but-unrecorded entry: {:?}",
@@ -322,7 +455,7 @@ fn auto_link_intent_with_an_unrecorded_kind_retains_every_existing_candidate() {
     // Establish the normal pre-existing Codex layout without relying on a test-only link helper.
     // The kept bootstrap transaction owns that layout and remains terminal throughout this test.
     let bootstrap = fixture.run("codex", &["--keep-mounts"]);
-    assert_eq!(bootstrap.status.code(), Some(70));
+    assert_eq!(bootstrap.status.code(), Some(FIXTURE_CHILD_STATUS));
     fs::remove_file(fixture.sources.join("bootstrap/SKILL.md"))
         .expect("bootstrap is no longer selected");
     fixture.skill("alpha");
@@ -332,7 +465,7 @@ fn auto_link_intent_with_an_unrecorded_kind_retains_every_existing_candidate() {
     // reached the journal yet.
     let stopped = fixture.run_stopping_at("codex", "temporary-created@1", &[]);
     assert!(!stopped.status.success());
-    let store = fixture.project.join(".codex/skills");
+    let store = fixture.project.join(".agents/skills");
     let staged_before = fs::read_dir(&store)
         .expect("pre-existing store")
         .filter_map(Result::ok)
@@ -348,7 +481,11 @@ fn auto_link_intent_with_an_unrecorded_kind_retains_every_existing_candidate() {
     let recovered = fixture.run("codex", &[]);
     let stderr = String::from_utf8_lossy(&recovered.stderr);
 
-    assert_eq!(recovered.status.code(), Some(70), "{stderr}");
+    assert_eq!(
+        recovered.status.code(),
+        Some(FIXTURE_CHILD_STATUS),
+        "{stderr}"
+    );
     assert!(stderr.contains("concrete kind and identity"), "{stderr}");
     assert!(
         staged_before.iter().all(|path| exists(path)),
@@ -368,7 +505,7 @@ fn recovery_never_removes_an_entry_a_user_replaced_after_the_crash() {
     fixture.run_stopping_at("codex", "journal-active", &[]);
 
     // The operator replaces the mount with work of their own before the next session runs.
-    let mounted = fixture.project.join(".codex/skills/alpha");
+    let mounted = fixture.project.join(".agents/skills/alpha");
     if cfg!(windows) {
         fs::remove_dir(&mounted)
     } else {
@@ -414,6 +551,39 @@ fn no_recover_fails_closed_and_changes_nothing() {
 }
 
 #[test]
+fn a_session_stopped_after_supervision_intent_is_quarantined_not_recovered() {
+    let fixture = Fixture::new("supervising-stop");
+    fixture.skill("alpha");
+
+    let stopped = fixture.run_stopping_at("codex", "journal-supervising", &[]);
+    let mounted = fixture.project.join(".agents/skills/alpha");
+
+    assert!(!stopped.status.success());
+    assert!(exists(&mounted), "the stopped session left an active mount");
+    assert_eq!(fixture.journals().len(), 1);
+
+    let reported = fixture.run("codex", &["--dry-run"]);
+    let report = String::from_utf8_lossy(&reported.stdout);
+    assert!(reported.status.success(), "{report}");
+    assert!(report.contains("WOULD QUARANTINE"), "{report}");
+    assert!(
+        exists(&mounted),
+        "read-only quarantine reporting must not remove the mount"
+    );
+
+    let refused = fixture.run("codex", &[]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+
+    assert_eq!(refused.status.code(), Some(75), "{stderr}");
+    assert!(
+        stderr.contains("process-domain death was never proved"),
+        "{stderr}"
+    );
+    assert!(exists(&mounted), "quarantine must not remove the mount");
+    assert_eq!(fixture.journals().len(), 1, "ownership evidence remains");
+}
+
+#[test]
 fn no_recover_succeeds_when_there_is_nothing_to_reconcile() {
     let fixture = Fixture::new("no-recover-clean");
     fixture.skill("alpha");
@@ -422,7 +592,7 @@ fn no_recover_succeeds_when_there_is_nothing_to_reconcile() {
 
     assert_eq!(
         output.status.code(),
-        Some(70),
+        Some(FIXTURE_CHILD_STATUS),
         "a clean state must not be refused: {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -434,7 +604,7 @@ fn a_kept_transaction_survives_every_later_session() {
     fixture.skill("alpha");
 
     let kept = fixture.run("codex", &["--keep-mounts"]);
-    assert_eq!(kept.status.code(), Some(70));
+    assert_eq!(kept.status.code(), Some(FIXTURE_CHILD_STATUS));
     let kept_stderr = String::from_utf8_lossy(&kept.stderr);
     assert!(
         kept_stderr.contains("retained because --keep-mounts was requested"),
@@ -444,7 +614,7 @@ fn a_kept_transaction_survives_every_later_session() {
         !kept_stderr.contains("cleanup could not finish"),
         "intentional retention is not a cleanup failure: {kept_stderr}"
     );
-    let mounted = fixture.project.join(".codex/skills/alpha");
+    let mounted = fixture.project.join(".agents/skills/alpha");
     assert!(exists(&mounted), "--keep-mounts retains the mounts");
     assert_eq!(fixture.journals().len(), 1, "the kept journal is retained");
 
@@ -453,7 +623,7 @@ fn a_kept_transaction_survives_every_later_session() {
 
     assert_eq!(
         later.status.code(),
-        Some(70),
+        Some(FIXTURE_CHILD_STATUS),
         "{}",
         String::from_utf8_lossy(&later.stderr)
     );
@@ -474,7 +644,7 @@ fn keep_enabled_crashes_before_terminal_keep_are_reconciled() {
     for boundary in [
         "journal-planned",
         "journal-applying",
-        "action-staged@5",
+        "action-staged@3",
         "journal-active",
         "journal-cleaning",
     ] {
@@ -492,7 +662,7 @@ fn keep_enabled_crashes_before_terminal_keep_are_reconciled() {
 
         assert_eq!(
             recovered.status.code(),
-            Some(70),
+            Some(FIXTURE_CHILD_STATUS),
             "the incomplete keep request must reconcile at {boundary}: {}",
             String::from_utf8_lossy(&recovered.stderr)
         );
@@ -585,7 +755,7 @@ fn an_unknown_journal_blocks_recovery_of_healthy_neighbors_before_any_removal() 
     assert!(!stopped.status.success());
     let before = fixture.project_tree();
     assert!(
-        exists(&fixture.project.join(".codex/skills/alpha")),
+        exists(&fixture.project.join(".agents/skills/alpha")),
         "the healthy incomplete journal must own a visible mount: {before:?}"
     );
     let unknown = fixture.transactions().join("ffff-future.journal");
@@ -604,11 +774,11 @@ fn an_unknown_journal_blocks_recovery_of_healthy_neighbors_before_any_removal() 
 }
 
 #[test]
-fn a_destination_conflict_rolls_back_and_leaves_the_obstruction() {
+fn a_preexisting_destination_conflict_leaves_the_obstruction_untouched() {
     let fixture = Fixture::new("late-conflict");
     fixture.skill("alpha").skill("beta");
     // Occupies the destination of a later Skill link, so earlier actions apply and one fails.
-    fs::create_dir_all(fixture.project.join(".codex/skills/beta/mine")).expect("obstruction");
+    fs::create_dir_all(fixture.project.join(".agents/skills/beta/mine")).expect("obstruction");
 
     let output = fixture.run("codex", &[]);
 
@@ -619,17 +789,47 @@ fn a_destination_conflict_rolls_back_and_leaves_the_obstruction() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        exists(&fixture.project.join(".codex/skills/beta/mine")),
+        exists(&fixture.project.join(".agents/skills/beta/mine")),
         "the obstruction is never touched"
     );
+    assert!(fixture.project.join(".agents/skills").is_dir());
     assert!(
-        !exists(&fixture.project.join(".agents/skills")),
-        "everything the failed transaction applied is rolled back: {:?}",
-        fixture.project_tree()
+        !exists(&fixture.project.join(".agents/skills/alpha")),
+        "including the mount that had already succeeded"
+    );
+}
+
+#[test]
+fn a_conflict_introduced_after_preliminary_discovery_is_seen_under_lock() {
+    let fixture = Fixture::new("conflict-after-discovery");
+    fixture.skill("alpha");
+
+    let mut session = fixture
+        .command("codex", &[])
+        .env("SKILLMOUNT_HOLD_AT", "discovery-inspected")
+        .env("SKILLMOUNT_HOLD_MS", "4000")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the session should reach preliminary discovery");
+    let mut diagnostics = wait_for_hold(&mut session, "discovery-inspected");
+
+    let obstruction = fixture.project.join(".agents/skills/alpha/operator-owned");
+    fs::create_dir_all(&obstruction).expect("late operator-owned Skill");
+
+    let status = session.wait().expect("the held session remains waitable");
+    let mut remaining = String::new();
+    diagnostics
+        .read_to_string(&mut remaining)
+        .expect("the held session diagnostics remain readable");
+
+    assert_eq!(status.code(), Some(73), "{remaining}");
+    assert!(
+        obstruction.is_dir(),
+        "the late conflict must never be replaced"
     );
     assert!(
-        !exists(&fixture.project.join(".codex/skills/alpha")),
-        "including the mount that had already succeeded"
+        fixture.journals().is_empty(),
+        "the locked rebuild must reject the conflict before opening a transaction"
     );
 }
 
@@ -641,11 +841,11 @@ fn a_cleanup_that_cannot_finish_keeps_its_journal_and_its_evidence() {
 
     // Something is added to the store, so the store directory can no longer be removed while the
     // mount inside it still can.
-    fs::write(fixture.project.join(".codex/skills/notes.md"), "mine").expect("user content");
+    fs::write(fixture.project.join(".agents/skills/notes.md"), "mine").expect("user content");
     let recovered = fixture.run("codex", &[]);
 
     assert!(
-        exists(&fixture.project.join(".codex/skills/notes.md")),
+        exists(&fixture.project.join(".agents/skills/notes.md")),
         "the operator's file must survive"
     );
     let stderr = String::from_utf8_lossy(&recovered.stderr);
@@ -682,8 +882,8 @@ fn two_codex_sessions_on_one_store_serialize() {
 
         assert_eq!(
             holder_status.code(),
-            Some(70),
-            "the first session must finish at the reserved launch boundary after holding at \
+            Some(FIXTURE_CHILD_STATUS),
+            "the first session must launch and finish after holding at \
              {checkpoint}: {holder_diagnostics}"
         );
 
@@ -704,6 +904,84 @@ fn two_codex_sessions_on_one_store_serialize() {
             "{checkpoint}: {stderr}"
         );
     }
+}
+
+#[test]
+fn codex_sessions_reaching_one_nested_collection_through_distinct_links_serialize() {
+    let fixture = Fixture::new("codex-nested-terminal-lock");
+    fixture.skill("alpha");
+    let second_project = fixture.root.join("second-project");
+    let first_home = fixture.root.join("first-home");
+    let second_home = fixture.root.join("second-home");
+    let shared = fixture.root.join("shared-collection");
+    fs::create_dir_all(&second_project).expect("second project");
+    let foreign = shared.join("nested/foreign");
+    fs::create_dir_all(&foreign).expect("shared Skill collection");
+    fs::write(
+        foreign.join("SKILL.md"),
+        "---\nname: foreign\ndescription: shared collection fixture\n---\n",
+    )
+    .expect("shared Skill metadata");
+
+    for home in [&first_home, &second_home] {
+        let root = home.join(".agents/skills");
+        fs::create_dir_all(&root).expect("isolated user Skill root");
+        let staged_path = root.join(".collection.skillmount-fixture");
+        let backend = platform_backend();
+        let staged = backend
+            .create_directory_link(&LinkRequest {
+                source: backend
+                    .canonical_directory(&shared)
+                    .expect("canonical shared collection"),
+                staged_path,
+                mode: LinkMode::Auto,
+            })
+            .expect("nested collection link fixture");
+        let outcome = backend
+            .place_no_replace(&staged, &root.join("collection"))
+            .expect("place nested collection link fixture");
+        assert!(matches!(outcome, PlacementOutcome::Placed(_)));
+    }
+
+    let mut holder: Child = fixture
+        .command_for("codex", &[], &fixture.project, &first_home)
+        .env("SKILLMOUNT_HOLD_AT", "journal-active")
+        .env("SKILLMOUNT_HOLD_MS", "4000")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the first session should start");
+    let mut holder_stderr = wait_for_hold(&mut holder, "journal-active");
+
+    let contender = fixture
+        .command_for("codex", &[], &second_project, &second_home)
+        .output()
+        .expect("the second session should report contention");
+    let holder_status = holder.wait().expect("the first session remains waitable");
+    let mut holder_diagnostics = String::new();
+    holder_stderr
+        .read_to_string(&mut holder_diagnostics)
+        .expect("the first session stderr remains readable");
+
+    assert_eq!(
+        holder_status.code(),
+        Some(FIXTURE_CHILD_STATUS),
+        "{holder_diagnostics}"
+    );
+    assert_eq!(
+        contender.status.code(),
+        Some(75),
+        "distinct logical roots reaching one collection must share its physical lock: {}",
+        String::from_utf8_lossy(&contender.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&contender.stderr).contains("another SkillMount session holds"),
+        "{}",
+        String::from_utf8_lossy(&contender.stderr)
+    );
+    assert!(
+        !exists(&second_project.join(".agents")),
+        "the contending project must remain untouched"
+    );
 }
 
 #[test]

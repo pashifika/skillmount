@@ -21,6 +21,43 @@ pub(super) fn validate_candidate(
             reason: error.to_string(),
         })?;
 
+    if request.agent == AgentId::Codex {
+        let exact_entry = super::find_exact_entry(
+            &candidate.origin.source_entry,
+            std::ffi::OsStr::new("SKILL.md"),
+        )
+        .map_err(|error| CatalogError::InvalidSelectedSkill {
+            path: candidate.origin.source_entry.clone(),
+            reason: format!("cannot enumerate the Skill directory: {error}"),
+        })?
+        .ok_or_else(|| CatalogError::InvalidSelectedSkill {
+            path: candidate.origin.source_entry.clone(),
+            reason: "Codex requires an exact SKILL.md directory-entry name".to_owned(),
+        })?;
+        if exact_entry.path() != candidate.skill_md {
+            return Err(CatalogError::InvalidSelectedSkill {
+                path: candidate.origin.source_entry.clone(),
+                reason: "the exact SKILL.md directory entry changed during catalog validation"
+                    .to_owned(),
+            }
+            .into());
+        }
+        let entry_metadata = fs::symlink_metadata(exact_entry.path()).map_err(|error| {
+            CatalogError::InvalidSelectedSkill {
+                path: candidate.origin.source_entry.clone(),
+                reason: format!("cannot inspect SKILL.md entry: {error}"),
+            }
+        })?;
+        if !entry_metadata.file_type().is_file() {
+            return Err(CatalogError::InvalidSelectedSkill {
+                path: candidate.origin.source_entry.clone(),
+                reason: "Codex discovers only regular SKILL.md entries, not file links or other special files"
+                    .to_owned(),
+            }
+            .into());
+        }
+    }
+
     let canonical_directory = validate_directory(candidate)?;
     let canonical_skill_md = resolve_terminal(&candidate.skill_md).map_err(|reason| {
         CatalogError::InvalidSelectedSkill {
@@ -159,10 +196,10 @@ fn validate_metadata(
     agent: AgentId,
     level: ValidationLevel,
 ) -> Result<(SkillMetadata, Option<Diagnostic>), AppError> {
-    if level == ValidationLevel::None {
-        fs::File::open(skill_md).map_err(|error| CatalogError::InvalidSelectedSkill {
+    if level == ValidationLevel::None && agent != AgentId::Codex {
+        frontmatter::readable(skill_md).map_err(|reason| CatalogError::InvalidSelectedSkill {
             path: skill_md.to_path_buf(),
-            reason: format!("SKILL.md is not readable: {error}"),
+            reason: format!("SKILL.md is not readable: {reason}"),
         })?;
         return Ok((
             SkillMetadata::default(),

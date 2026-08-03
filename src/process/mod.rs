@@ -226,6 +226,7 @@ fn launch_command(launch: &LaunchPlan) -> Command {
     command
         .args(&launch.injected_args)
         .args(&launch.passthrough_args)
+        .envs(launch.environment_overrides.iter().cloned())
         .current_dir(&launch.cwd)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())

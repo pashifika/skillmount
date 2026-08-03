@@ -53,6 +53,10 @@ impl Session {
         let mut arguments = vec![
             OsString::from("asm"),
             OsString::from("codex"),
+            OsString::from("--agent-bin"),
+            std::env::current_exe()
+                .expect("the test executable path is available")
+                .into_os_string(),
             OsString::from("--skills-dir"),
             sources.into_os_string(),
             OsString::from("--project-root"),
@@ -61,6 +65,11 @@ impl Session {
             project.into_os_string(),
         ];
         arguments.extend(extra.iter().map(OsString::from));
+        arguments.extend([
+            OsString::from("--"),
+            OsString::from("exec"),
+            OsString::from("fixture"),
+        ]);
         let ParsedCommand::Session(input) = parse_command_from(arguments).expect("valid CLI")
         else {
             panic!("expected a session command");
@@ -254,7 +263,7 @@ fn applying_creates_the_whole_layout_and_marks_the_journal_active() {
             .collect::<Vec<_>>()
     );
     for name in ["alpha", "beta"] {
-        let mounted = project.join(".codex/skills").join(name);
+        let mounted = project.join(".agents/skills").join(name);
         assert_eq!(
             fs::canonicalize(&mounted).expect("the mount resolves"),
             session.source(name),
@@ -263,13 +272,12 @@ fn applying_creates_the_whole_layout_and_marks_the_journal_active() {
     }
     assert!(
         fs::symlink_metadata(project.join(".agents/skills"))
-            .expect("the authoritative entry exists")
-            .file_type()
-            .is_symlink(),
-        "the authoritative discovery entry is a link to the backing store"
+            .expect("the preferred entry exists")
+            .is_dir(),
+        "the preferred discovery entry is the regular backing store"
     );
     assert!(
-        staged_leftovers(&project.join(".codex/skills")).is_empty(),
+        staged_leftovers(&project.join(".agents/skills")).is_empty(),
         "placement must consume every staged sibling"
     );
 }
@@ -298,14 +306,14 @@ fn a_destination_that_appears_after_planning_stops_the_apply_and_rolls_back() {
 
     // Something outside SkillMount creates the destination between planning and applying. It holds
     // no lock, so this is the race the persisted precondition exists to catch.
-    fs::create_dir_all(project.join(".codex/skills/alpha")).expect("intruding entry");
+    fs::create_dir_all(project.join(".agents/skills/alpha")).expect("intruding entry");
 
     let failure = transaction
         .apply()
         .expect_err("a plan built against stale state must not overwrite anything");
 
     assert!(
-        project.join(".codex/skills/alpha").exists(),
+        project.join(".agents/skills/alpha").exists(),
         "the entry that was already there must survive untouched"
     );
     let journal = on_disk(&transaction);
@@ -328,7 +336,7 @@ fn a_destination_that_appears_after_planning_stops_the_apply_and_rolls_back() {
 fn a_staged_replacement_is_retained_and_never_recorded_as_applied() {
     let session = Session::codex("txn-staged-replacement", &["alpha"], &[]);
     let project = session.project();
-    let mounted = project.join(".codex/skills/alpha");
+    let mounted = project.join(".agents/skills/alpha");
     let (mut transaction, _locks) = session.open();
     let staged = transaction
         .journal()
@@ -391,7 +399,7 @@ fn a_staged_replacement_is_retained_and_never_recorded_as_applied() {
 #[test]
 fn a_destination_created_at_the_placement_boundary_is_preserved() {
     let session = Session::codex("txn-placement-contention", &["alpha"], &[]);
-    let mounted = session.project().join(".codex/skills/alpha");
+    let mounted = session.project().join(".agents/skills/alpha");
     let (mut transaction, _locks) = session.open();
     let hook_destination = mounted.clone();
 
@@ -434,8 +442,8 @@ fn a_destination_created_at_the_placement_boundary_is_preserved() {
 #[test]
 fn an_ambiguous_final_entry_is_retained_by_rollback_and_recovery() {
     let session = Session::codex("txn-final-residue", &["alpha"], &[]);
-    let mounted = session.project().join(".codex/skills/alpha");
-    let displaced = session.project().join(".codex/skills/displaced-alpha");
+    let mounted = session.project().join(".agents/skills/alpha");
+    let displaced = session.project().join(".agents/skills/displaced-alpha");
     let (mut transaction, locks) = session.open();
     let journal_path = transaction.journal_path().to_path_buf();
     let hook_destination = mounted.clone();
@@ -552,17 +560,15 @@ fn failed_creation_reports_its_original_cause_and_unproved_staged_residue() {
 
 #[test]
 fn rollback_undoes_applied_actions_and_leaves_the_obstruction_alone() {
-    let session = Session::codex("txn-rollback", &["alpha"], &[]);
+    let session = Session::codex("txn-rollback", &["alpha", "beta"], &[]);
     let project = session.project();
-    // The store and the `.agents` parent already exist, so the plan owns exactly two actions: the
-    // authoritative link, then the Skill link. That is the shape rollback exists for — an earlier
-    // action succeeds and a later one fails.
-    fs::create_dir_all(project.join(".codex/skills")).expect("store fixture");
-    fs::create_dir_all(project.join(".agents")).expect("agents fixture");
+    // The store already exists, so the plan owns exactly two Skill links. Alpha applies before a
+    // late beta obstruction stops the second action.
+    fs::create_dir_all(project.join(".agents/skills")).expect("store fixture");
     let (mut transaction, _locks) = session.open();
     let planned = transaction.journal().actions.len();
 
-    fs::create_dir_all(project.join(".codex/skills/alpha")).expect("conflicting entry");
+    fs::create_dir_all(project.join(".agents/skills/beta")).expect("conflicting entry");
     let failure = transaction.apply().expect_err("the last action must fail");
 
     assert_eq!(
@@ -575,15 +581,15 @@ fn rollback_undoes_applied_actions_and_leaves_the_obstruction_alone() {
         failure.rollback_errors
     );
     assert!(
-        !project.join(".agents/skills").exists(),
-        "the authoritative link applied before the failure must be gone"
+        !project.join(".agents/skills/alpha").exists(),
+        "the earlier Skill link must be rolled back"
     );
     assert!(
-        project.join(".agents").exists() && project.join(".codex/skills").exists(),
+        project.join(".agents").exists() && project.join(".agents/skills").exists(),
         "directories this transaction did not create are never rolled back"
     );
     assert!(
-        project.join(".codex/skills/alpha").exists(),
+        project.join(".agents/skills/beta").exists(),
         "the pre-existing entry is never rolled back"
     );
     let journal = on_disk(&transaction);
@@ -599,17 +605,16 @@ fn rollback_undoes_applied_actions_and_leaves_the_obstruction_alone() {
 }
 
 #[test]
-fn a_failed_rollback_keeps_the_original_cause_and_every_retained_path() {
-    let session = Session::codex("txn-both-contexts", &["alpha"], &[]);
+fn a_successful_rollback_keeps_the_original_apply_failure() {
+    let session = Session::codex("txn-both-contexts", &["alpha", "beta"], &[]);
     let project = session.project();
-    fs::create_dir_all(project.join(".codex/skills")).expect("store fixture");
+    fs::create_dir_all(project.join(".agents/skills")).expect("store fixture");
     fs::create_dir_all(project.join(".agents")).expect("agents fixture");
     let (mut transaction, _locks) = session.open();
 
-    // The authoritative link applies, the Skill link then hits a conflict, and rollback finds the
-    // authoritative link replaced by something it cannot prove it owns. Both failures matter.
-    fs::create_dir_all(project.join(".codex/skills/alpha")).expect("conflicting entry");
-    let authoritative = project.join(".agents/skills");
+    // Alpha applies, beta then hits a late conflict, and rollback removes alpha while preserving
+    // the obstruction. The original cause remains the primary failure.
+    fs::create_dir_all(project.join(".agents/skills/beta")).expect("conflicting entry");
 
     let failure = transaction
         .apply()
@@ -617,8 +622,8 @@ fn a_failed_rollback_keeps_the_original_cause_and_every_retained_path() {
     let journal = on_disk(&transaction);
 
     assert!(
-        !authoritative.exists(),
-        "the applied link is rolled back when nothing interferes"
+        !project.join(".agents/skills/alpha").exists(),
+        "the applied Skill link is rolled back when nothing interferes"
     );
     assert!(
         journal
@@ -643,8 +648,8 @@ fn a_rollback_that_cannot_finish_reports_the_cause_and_the_residue_together() {
     transaction.apply().expect("a clean fixture applies");
 
     // A cleanup that cannot finish must surface both halves: what went wrong and what is left.
-    remove_directory_link(&project.join(".codex/skills/alpha"));
-    fs::write(project.join(".codex/skills/notes.md"), "mine").expect("user content");
+    remove_directory_link(&project.join(".agents/skills/alpha"));
+    fs::write(project.join(".agents/skills/notes.md"), "mine").expect("user content");
     let report = transaction.cleanup().expect("cleanup completes");
     let journal = on_disk(&transaction);
 
@@ -694,7 +699,7 @@ fn cleanup_removes_everything_it_owns_and_then_removes_the_journal() {
 #[test]
 fn disposition_failure_retains_the_mount_and_its_journal_evidence() {
     let session = Session::codex("txn-disposition-failure", &["alpha"], &[]);
-    let mounted = session.project().join(".codex/skills/alpha");
+    let mounted = session.project().join(".agents/skills/alpha");
     let (mut transaction, _locks) = session.open();
     transaction.apply().expect("a clean fixture applies");
     let journal_path = transaction.journal_path().to_path_buf();
@@ -745,7 +750,7 @@ fn disposition_failure_retains_the_mount_and_its_journal_evidence() {
 fn cleanup_checks_the_final_path_after_retaining_a_staged_path_replacement() {
     let session = Session::codex("txn-staged-replacement-after-apply", &["alpha"], &[]);
     let project = session.project();
-    let mounted = project.join(".codex/skills/alpha");
+    let mounted = project.join(".agents/skills/alpha");
     let (mut transaction, _locks) = session.open();
     transaction.apply().expect("a clean fixture applies");
 
@@ -789,7 +794,7 @@ fn cleanup_checks_the_final_path_after_retaining_a_staged_path_replacement() {
 fn rollback_checks_the_final_path_after_a_staged_placement_residue() {
     let session = Session::codex("txn-placement-residue-final", &["alpha"], &[]);
     let project = session.project();
-    let mounted = project.join(".codex/skills/alpha");
+    let mounted = project.join(".agents/skills/alpha");
     let (mut transaction, _locks) = session.open();
     transaction.apply().expect("a clean fixture applies");
 
@@ -840,7 +845,7 @@ fn rollback_checks_the_final_path_after_a_staged_placement_residue() {
 fn recovery_checks_the_final_path_after_retaining_a_staged_path_replacement() {
     let session = Session::codex("txn-recovery-staged-replacement", &["alpha"], &[]);
     let project = session.project();
-    let mounted = project.join(".codex/skills/alpha");
+    let mounted = project.join(".agents/skills/alpha");
     let (mut transaction, locks) = session.open();
     transaction.apply().expect("a clean fixture applies");
     let journal_path = transaction.journal_path().to_path_buf();
@@ -899,7 +904,7 @@ fn a_user_replaced_entry_is_retained_and_reported() {
     transaction.apply().expect("a clean fixture applies");
 
     // The operator replaces the mount with a directory of their own.
-    let mounted = project.join(".codex/skills/alpha");
+    let mounted = project.join(".agents/skills/alpha");
     remove_directory_link(&mounted);
     fs::create_dir_all(mounted.join("their-own-work")).expect("replacement");
 
@@ -938,7 +943,7 @@ fn a_link_retargeted_by_someone_else_is_left_alone() {
     let (mut transaction, _locks) = session.open();
     transaction.apply().expect("a clean fixture applies");
 
-    let mounted = project.join(".codex/skills/alpha");
+    let mounted = project.join(".agents/skills/alpha");
     remove_directory_link(&mounted);
     if !symlink_dir_or_skip(&elsewhere, &mounted) {
         return;
@@ -971,20 +976,20 @@ fn a_helper_directory_that_gained_contents_keeps_them() {
     transaction.apply().expect("a clean fixture applies");
 
     // The mount is removed by hand but something else is left in the store.
-    remove_directory_link(&project.join(".codex/skills/alpha"));
-    fs::write(project.join(".codex/skills/notes.md"), "mine").expect("user content");
+    remove_directory_link(&project.join(".agents/skills/alpha"));
+    fs::write(project.join(".agents/skills/notes.md"), "mine").expect("user content");
 
     let report = transaction.cleanup().expect("cleanup completes");
 
     assert!(
-        project.join(".codex/skills/notes.md").exists(),
+        project.join(".agents/skills/notes.md").exists(),
         "an empty-check that removed this would have taken the operator's file with it"
     );
     assert!(
         report
             .retained
             .iter()
-            .any(|entry| entry.path == project.join(".codex/skills")
+            .any(|entry| entry.path == project.join(".agents/skills")
                 && entry.reason.contains("holds entries")),
         "{:?}",
         report.retained
@@ -1000,8 +1005,8 @@ fn a_directory_recorded_without_an_identity_is_never_removed() {
 
     // Simulates a journal written by a host that reported no identity: the directory is genuinely
     // this transaction's, and it still must not be removed, because nothing proves that.
-    remove_directory_link(&project.join(".codex/skills/alpha"));
-    let store_path = project.join(".codex/skills");
+    remove_directory_link(&project.join(".agents/skills/alpha"));
+    let store_path = project.join(".agents/skills");
     for action in &mut transaction.journal_mut().actions {
         if action.final_path == store_path {
             action.identity = None;
@@ -1027,7 +1032,7 @@ fn an_entry_that_is_already_gone_is_a_harmless_cleanup() {
     let project = session.project();
     let (mut transaction, _locks) = session.open();
     transaction.apply().expect("a clean fixture applies");
-    remove_directory_link(&project.join(".codex/skills/alpha"));
+    remove_directory_link(&project.join(".agents/skills/alpha"));
 
     let report = transaction.cleanup().expect("cleanup completes");
 
@@ -1044,7 +1049,7 @@ fn keep_mounts_retains_everything_and_reaches_a_terminal_state() {
 
     let report = transaction.cleanup().expect("cleanup completes");
 
-    assert!(project.join(".codex/skills/alpha").exists());
+    assert!(project.join(".agents/skills/alpha").exists());
     assert_eq!(
         report.journal_retained.as_ref().map(JournalRetention::path),
         Some(transaction.journal_path())
@@ -1070,7 +1075,7 @@ fn a_failed_keep_enabled_transaction_is_reconciled_instead_of_terminalized() {
 
     // Drift the first planned helper path after the journal opens. Apply records `failed`, but the
     // directory is user state with no transaction identity and must survive recovery.
-    fs::create_dir(project.join(".codex")).expect("operator-created drift");
+    fs::create_dir(project.join(".agents")).expect("operator-created drift");
     transaction
         .apply()
         .expect_err("the drift must leave an incomplete failed journal");
@@ -1084,7 +1089,7 @@ fn a_failed_keep_enabled_transaction_is_reconciled_instead_of_terminalized() {
     assert_eq!(report.reconciled.len(), 1, "{report:?}");
     assert!(report.active.is_empty(), "{report:?}");
     assert!(
-        project.join(".codex").is_dir(),
+        project.join(".agents").is_dir(),
         "recovery must not remove the unowned drift"
     );
     assert!(
@@ -1099,8 +1104,8 @@ fn a_reuse_action_is_recorded_unowned_and_survives_cleanup() {
     let project = session.project();
     let source = session.source("alpha");
     // A pre-existing mount pointing at exactly the source this session selected.
-    fs::create_dir_all(project.join(".codex/skills")).expect("store fixture");
-    if !symlink_dir_or_skip(&source, &project.join(".codex/skills/alpha")) {
+    fs::create_dir_all(project.join(".agents/skills")).expect("store fixture");
+    if !symlink_dir_or_skip(&source, &project.join(".agents/skills/alpha")) {
         return;
     }
 
@@ -1119,14 +1124,14 @@ fn a_reuse_action_is_recorded_unowned_and_survives_cleanup() {
         "the existing mount must be reused, not recreated"
     );
     assert!(
-        project.join(".codex/skills/alpha").exists(),
+        project.join(".agents/skills/alpha").exists(),
         "a reused entry belongs to whoever made it and must outlive the session"
     );
     assert!(
         report
             .removed
             .iter()
-            .all(|path| path != &project.join(".codex/skills/alpha")),
+            .all(|path| path != &project.join(".agents/skills/alpha")),
         "cleanup must never own a reused entry: {:?}",
         report.removed
     );
@@ -1137,8 +1142,8 @@ fn a_reused_entry_that_changed_since_planning_stops_the_apply() {
     let session = Session::codex("txn-reuse-drift", &["alpha"], &[]);
     let project = session.project();
     let source = session.source("alpha");
-    fs::create_dir_all(project.join(".codex/skills")).expect("store fixture");
-    let mounted = project.join(".codex/skills/alpha");
+    fs::create_dir_all(project.join(".agents/skills")).expect("store fixture");
+    let mounted = project.join(".agents/skills/alpha");
     if !symlink_dir_or_skip(&source, &mounted) {
         return;
     }

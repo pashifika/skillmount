@@ -1,19 +1,33 @@
 //! Side-effect-free Skill source discovery, overlay resolution, and validation.
 
 mod discover;
-mod frontmatter;
+pub(crate) mod frontmatter;
 mod resolve;
 mod validate;
 
 #[cfg(test)]
 mod tests;
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::fs::{self, DirEntry};
+use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::domain::{AgentId, SkillCatalog, SourceOccurrence, ValidationLevel};
 use crate::error::AppError;
 
 pub(crate) use discover::RawCandidate;
+
+/// Finds a child by its exact directory-entry name instead of a case-folding path lookup.
+pub(crate) fn find_exact_entry(directory: &Path, name: &OsStr) -> io::Result<Option<DirEntry>> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_name() == name {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
+}
 
 /// Read-only inputs that control catalog validation.
 #[derive(Debug, Clone)]

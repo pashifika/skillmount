@@ -48,7 +48,7 @@ cargo fmt --all -- --check
 env RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 cargo deny --locked check
 cargo run --locked --bin asm -- inspect --skills-dir path/to/skills
-cargo run --locked --bin asm -- codex --skills-dir path/to/skills --dry-run --verbose
+cargo run --locked --bin asm -- codex --skills-dir path/to/skills --dry-run --verbose -- exec "prompt"
 ```
 
 `SKILLMOUNT_REQUIRE_LINKS=1` turns an unavailable directory-link fixture into a failure. A skipped
@@ -87,8 +87,10 @@ and transaction code owns ordering and application. `src/link/` is the sealed bo
 platform-specific discovery-entry and mount-link classification and for every mount-link creation,
 placement, and removal. It exposes no recursive removal operation.
 
-`unsafe_code` is denied crate-wide. Only `src/link/unix_ffi.rs`, `src/link/windows_ffi.rs`,
-`src/process/unix_ffi.rs`, and `src/process/windows_ffi.rs` may allow it, under ADRs 0011 and 0019.
+`unsafe_code` is denied crate-wide. Only `src/agent/codex/macos_ffi.rs`,
+`src/paths/windows_ffi.rs`, `src/link/unix_ffi.rs`, `src/link/windows_ffi.rs`,
+`src/process/unix_ffi.rs`, and `src/process/windows_ffi.rs` may allow it, under ADRs 0011, 0019,
+and 0023.
 Every unsafe block needs a `SAFETY` comment, and no raw `libc` or `windows_sys` type may cross those
 module boundaries.
 

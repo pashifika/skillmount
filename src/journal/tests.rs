@@ -419,15 +419,18 @@ fn incomplete_and_terminal_statuses_are_partitioned_exhaustively() {
         TransactionStatus::Planned,
         TransactionStatus::Applying,
         TransactionStatus::Active,
+        TransactionStatus::Supervising,
         TransactionStatus::Cleaning,
         TransactionStatus::Failed,
     ] {
         assert!(
             status.is_incomplete(),
-            "{} must be recovered",
+            "{} must remain non-terminal",
             status.label()
         );
     }
+    assert!(TransactionStatus::Active.is_automatically_recoverable());
+    assert!(!TransactionStatus::Supervising.is_automatically_recoverable());
     for status in [TransactionStatus::Completed, TransactionStatus::Kept] {
         assert!(
             status.is_terminal(),

@@ -108,8 +108,9 @@ The decision is enforced by tests rather than by review:
 - `tests/transaction.rs::recovery_never_removes_an_entry_a_user_replaced_after_the_crash` fails if
   planning is moved back in front of recovery, because recovery stops being reached.
 - `tests/transaction.rs::a_second_invocation_recovers_every_boundary_and_leaves_the_project_clean`
-  kills a real process at each of the eleven durable boundaries and requires a real second
-  invocation to reconcile it.
+  kills a real process at each automatically recoverable boundary, including the unlocked
+  discovery checkpoint, and requires a real second invocation to reconcile it. ADR 0022 separately
+  covers the non-recoverable `supervising` boundary.
 - `src/transaction/tests.rs::a_transaction_refuses_to_open_without_the_locks_its_plan_needs` and
   `::a_partially_locked_session_cannot_open_a_transaction` fail if the lock guard is weakened.
 - `tests/transaction.rs::two_isolated_claude_sessions_do_not_serialize` fails if the identifier is

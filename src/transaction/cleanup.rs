@@ -107,6 +107,21 @@ impl CleanupReport {
 }
 
 impl Transaction {
+    /// Removes transaction-owned entries even when the requested terminal policy was keep.
+    ///
+    /// This is the pre-launch failure path: no child was allowed to use the mounts, so a failed
+    /// compatibility or supervision-intent check must not turn `--keep-mounts` into retained state.
+    /// Clearing the request before the durable `cleaning` transition persists that decision before
+    /// the first removal.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors and evidence-rich partial report as [`Self::cleanup`].
+    pub fn cleanup_required(&mut self) -> Result<CleanupReport, AppError> {
+        self.journal.keep_mounts = false;
+        self.cleanup()
+    }
+
     /// Removes everything this transaction owns when an orderly session releases it.
     ///
     /// `--keep-mounts` short-circuits the whole pass: the journal reaches the terminal `kept` state
@@ -120,9 +135,9 @@ impl Transaction {
     /// because the remaining entries still have to be attempted.
     pub fn cleanup(&mut self) -> Result<CleanupReport, AppError> {
         // Enter cleanup durably before deciding whether this orderly session may terminalize a
-        // keep request. A crash in planned, applying, active, failed, or even at this cleaning
-        // boundary remains incomplete and recovery reconciles it; only the following durable
-        // `kept` transition turns requested retention into a terminal state.
+        // keep request. A crash in planned, applying, active, supervising, failed, or even at this
+        // cleaning boundary remains incomplete. Once `cleaning` is durable it is automatically
+        // recoverable; only the following durable `kept` transition makes retention terminal.
         self.advance(TransactionStatus::Cleaning)?;
         reached(Checkpoint::JournalCleaning, 1);
         if self.journal.keep_mounts {

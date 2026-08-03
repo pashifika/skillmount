@@ -12,6 +12,13 @@ const DESCENDANT_RECORD_ENV: &str = "SKILLMOUNT_FAKE_DESCENDANT_RECORD";
 const BEHAVIOR_ENV: &str = "SKILLMOUNT_FAKE_BEHAVIOR";
 const EXIT_ENV: &str = "SKILLMOUNT_FAKE_EXIT";
 const RAW_EXIT_ENV: &str = "SKILLMOUNT_FAKE_RAW_EXIT";
+const EXPECT_PATHS_ENV: &str = "SKILLMOUNT_FAKE_EXPECT_PATHS";
+const CREATE_FILE_ENV: &str = "SKILLMOUNT_FAKE_CREATE_FILE";
+const RECORD_CODEX_HOME_ENV: &str = "SKILLMOUNT_FAKE_RECORD_CODEX_HOME";
+const VERSION_RECORD_ENV: &str = "SKILLMOUNT_FAKE_VERSION_RECORD";
+const UNSUPPORTED_VERSION_AT_ENV: &str = "SKILLMOUNT_FAKE_UNSUPPORTED_VERSION_AT";
+const CREATE_PLUGIN_MANIFEST_AT_ENV: &str = "SKILLMOUNT_FAKE_CREATE_PLUGIN_MANIFEST_AT";
+const PLUGIN_MANIFEST_PATH_ENV: &str = "SKILLMOUNT_FAKE_PLUGIN_MANIFEST_PATH";
 
 fn main() -> ExitCode {
     match run() {
@@ -24,13 +31,24 @@ fn main() -> ExitCode {
 }
 
 fn run() -> io::Result<ExitCode> {
+    if env::args_os().skip(1).eq([OsStr::new("--version")]) {
+        return report_version();
+    }
     let record_path = required_path(RECORD_ENV)?;
     let recorder = Recorder::create(record_path)?;
     recorder.number("pid", std::process::id())?;
     for argument in env::args_os().skip(1) {
         recorder.os("arg", &argument)?;
     }
+    if let (Some(_), Some(codex_home)) = (
+        env::var_os(RECORD_CODEX_HOME_ENV),
+        env::var_os("CODEX_HOME"),
+    ) {
+        recorder.os("env:CODEX_HOME", &codex_home)?;
+    }
     recorder.os("cwd", &env::current_dir()?.into_os_string())?;
+    verify_expected_paths(&recorder)?;
+    create_requested_file(&recorder)?;
 
     let behavior = env::var(BEHAVIOR_ENV).unwrap_or_else(|_| "exit".to_owned());
     match behavior.as_str() {
@@ -71,6 +89,69 @@ fn run() -> io::Result<ExitCode> {
         .parse::<u8>()
         .map_err(invalid_data)?;
     Ok(ExitCode::from(code))
+}
+
+fn report_version() -> io::Result<ExitCode> {
+    let probe = if let Some(path) = env::var_os(VERSION_RECORD_ENV).map(PathBuf::from) {
+        let prior = match fs::read_to_string(&path) {
+            Ok(contents) => contents.lines().count(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?
+            .write_all(b"probe\n")?;
+        prior + 1
+    } else {
+        1
+    };
+    let unsupported_at = env::var(UNSUPPORTED_VERSION_AT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    let create_plugin_manifest_at = env::var(CREATE_PLUGIN_MANIFEST_AT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    if create_plugin_manifest_at == Some(probe) {
+        let manifest = required_path(PLUGIN_MANIFEST_PATH_ENV)?;
+        fs::create_dir_all(manifest.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "plugin manifest has no parent")
+        })?)?;
+        fs::write(manifest, br#"{"name":"late-plugin"}"#)?;
+    }
+    if unsupported_at == Some(probe) {
+        println!("codex-cli 0.147.0");
+    } else {
+        println!("codex-cli 0.146.0");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn create_requested_file(recorder: &Recorder) -> io::Result<()> {
+    let Some(path) = env::var_os(CREATE_FILE_ENV).map(PathBuf::from) else {
+        return Ok(());
+    };
+    fs::write(&path, b"created by fake agent\n")?;
+    recorder.os("created", path.as_os_str())
+}
+
+fn verify_expected_paths(recorder: &Recorder) -> io::Result<()> {
+    let Some(encoded) = env::var_os(EXPECT_PATHS_ENV) else {
+        return Ok(());
+    };
+    for path in env::split_paths(&encoded) {
+        let metadata = fs::metadata(&path)?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected visible directory {}", path.display()),
+            ));
+        }
+        recorder.os("visible", path.as_os_str())?;
+        recorder.os("visible-target", fs::canonicalize(&path)?.as_os_str())?;
+    }
+    Ok(())
 }
 
 fn use_inherited_streams(recorder: &Recorder) -> io::Result<()> {

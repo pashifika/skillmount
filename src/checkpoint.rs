@@ -42,6 +42,8 @@ pub const HOLD_MS: &str = "SKILLMOUNT_HOLD_MS";
 /// into a no-crash test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Checkpoint {
+    /// Preliminary discovery is complete and no resource lock has been acquired yet.
+    DiscoveryInspected,
     /// The complete plan is durable and nothing has been mutated.
     JournalPlanned,
     /// The transaction is durably marked as mutating.
@@ -58,6 +60,8 @@ pub enum Checkpoint {
     ActionApplied,
     /// Every action is applied and the transaction is durably active.
     JournalActive,
+    /// Child supervision intent is durable; process-domain death has not been proved.
+    JournalSupervising,
     /// Cleanup has durably begun and nothing has been removed yet.
     JournalCleaning,
     /// One entry has been removed and the journal has not recorded it yet.
@@ -71,6 +75,7 @@ impl Checkpoint {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::DiscoveryInspected => "discovery-inspected",
             Self::JournalPlanned => "journal-planned",
             Self::JournalApplying => "journal-applying",
             Self::ActionIntent => "action-intent",
@@ -79,6 +84,7 @@ impl Checkpoint {
             Self::FinalPlaced => "final-placed",
             Self::ActionApplied => "action-applied",
             Self::JournalActive => "journal-active",
+            Self::JournalSupervising => "journal-supervising",
             Self::JournalCleaning => "journal-cleaning",
             Self::EntryRemoved => "entry-removed",
             Self::DirectoryRemoved => "directory-removed",
@@ -86,7 +92,8 @@ impl Checkpoint {
     }
 
     /// Every boundary, so a test suite can assert it covers all of them.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
+        Self::DiscoveryInspected,
         Self::JournalPlanned,
         Self::JournalApplying,
         Self::ActionIntent,
@@ -95,6 +102,7 @@ impl Checkpoint {
         Self::FinalPlaced,
         Self::ActionApplied,
         Self::JournalActive,
+        Self::JournalSupervising,
         Self::JournalCleaning,
         Self::EntryRemoved,
         Self::DirectoryRemoved,
