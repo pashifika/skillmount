@@ -53,6 +53,10 @@ impl Session {
         let mut arguments = vec![
             OsString::from("asm"),
             OsString::from("codex"),
+            OsString::from("--agent-bin"),
+            std::env::current_exe()
+                .expect("the test executable path is available")
+                .into_os_string(),
             OsString::from("--skills-dir"),
             sources.into_os_string(),
             OsString::from("--project-root"),
