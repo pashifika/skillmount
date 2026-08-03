@@ -2,7 +2,7 @@
 
 #![cfg(feature = "test-fixtures")]
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -149,6 +149,52 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+fn record_contains_os(record: &str, name: &str, value: &OsStr) -> bool {
+    let expected = format!("{name}={}", native_hex(value));
+    record.lines().any(|line| line == expected)
+}
+
+fn recorded_os(record: &str, name: &str) -> OsString {
+    let prefix = format!("{name}=");
+    let encoded = record
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("fake Codex record has no {name} entry"));
+    native_from_hex(encoded)
+}
+
+fn decode_hex(value: &str) -> Vec<u8> {
+    assert_eq!(value.len() % 2, 0, "odd hexadecimal record");
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).expect("ASCII hexadecimal pair");
+            u8::from_str_radix(pair, 16).expect("valid hexadecimal pair")
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn native_from_hex(value: &str) -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+
+    OsString::from_vec(decode_hex(value))
+}
+
+#[cfg(windows)]
+fn native_from_hex(value: &str) -> OsString {
+    use std::os::windows::ffi::OsStringExt;
+
+    let bytes = decode_hex(value);
+    assert_eq!(bytes.len() % 2, 0, "odd UTF-16 byte record");
+    let wide = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    OsString::from_wide(&wide)
+}
+
 #[test]
 fn selected_skills_stay_mounted_while_fake_codex_runs_then_cleanup_succeeds() {
     let fixture = Fixture::new("happy-path");
@@ -173,16 +219,20 @@ fn selected_skills_stay_mounted_while_fake_codex_runs_then_cleanup_succeeds() {
         "external bundled-resource access must be explained"
     );
     let record = fs::read_to_string(&fixture.record).expect("fake Codex launch record");
-    let launch_cwd = fs::canonicalize(&fixture.project).expect("canonical project fixture");
-    assert!(record.contains(&format!("cwd={}\n", native_hex(launch_cwd.as_os_str()))));
-    assert!(record.contains(&format!("arg={}\n", native_hex(OsStr::new("--literal")))));
-    assert!(record.contains(&format!(
-        "arg={}\n",
-        native_hex(OsStr::new("value with spaces"))
-    )));
-    assert!(!record.contains(&format!("arg={}\n", native_hex(OsStr::new("-C")))));
-    assert!(!record.contains(&format!("arg={}\n", native_hex(OsStr::new("--add-dir")))));
-    assert!(record.contains(&format!("visible={}\n", native_hex(mounted.as_os_str()))));
+    let recorded_cwd = PathBuf::from(recorded_os(&record, "cwd"));
+    assert_eq!(
+        fs::canonicalize(recorded_cwd).expect("canonical fake Codex CWD"),
+        fs::canonicalize(&fixture.project).expect("canonical project fixture")
+    );
+    assert!(record_contains_os(&record, "arg", OsStr::new("--literal")));
+    assert!(record_contains_os(
+        &record,
+        "arg",
+        OsStr::new("value with spaces")
+    ));
+    assert!(!record_contains_os(&record, "arg", OsStr::new("-C")));
+    assert!(!record_contains_os(&record, "arg", OsStr::new("--add-dir")));
+    assert!(record_contains_os(&record, "visible", mounted.as_os_str()));
     assert!(fixture.sources.join("alpha/SKILL.md").is_file());
     assert!(!exists(&fixture.project.join(".agents")));
     assert!(!exists(&fixture.project.join(".codex")));
