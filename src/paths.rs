@@ -807,7 +807,7 @@ mod tests {
     #[test]
     fn launch_cwd_is_the_fallback_without_git() {
         let fixture = TestDir::new("no-git");
-        let input = parsed_session(&["claude", "--skills-dir=skills"]);
+        let input = parsed_session(&["claude", "--skills-dir=skills", "--dry-run"]);
         let context = resolve_session(input, &fixture.0).expect("paths should resolve");
         assert_eq!(context.project_root, context.launch_cwd);
     }
