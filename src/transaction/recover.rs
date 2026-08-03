@@ -19,7 +19,9 @@ use std::path::PathBuf;
 
 use crate::error::AppError;
 use crate::journal::store::{self, JournalScan, RejectedJournal};
+use crate::link::resolve::ComparablePath;
 use crate::lock::LockResource;
+use crate::lock::acquire::LockContention;
 use crate::lock::acquire::{HeldLocks, LockOwner};
 
 use super::Transaction;
@@ -100,6 +102,107 @@ pub struct ReconciledTransaction {
     pub journal: PathBuf,
     /// What the removal pass did.
     pub report: CleanupReport,
+}
+
+/// Results of an explicit, operator-authorized cleanup pass.
+#[derive(Debug, Default)]
+pub(crate) struct ExplicitCleanupReport {
+    pub(crate) reconciled: Vec<ReconciledTransaction>,
+    pub(crate) active: Vec<ActiveTransaction>,
+    pub(crate) unreadable: Vec<RejectedJournal>,
+    pub(crate) failures: Vec<ExplicitCleanupFailure>,
+    pub(crate) completed: Vec<PathBuf>,
+    pub(crate) out_of_scope: usize,
+}
+
+/// A selected transaction whose operating-system locks are still held.
+#[derive(Debug)]
+pub(crate) struct ActiveTransaction {
+    pub(crate) transaction: String,
+    pub(crate) journal: PathBuf,
+    pub(crate) contention: LockContention,
+}
+
+/// A selected transaction that failed before or while running shared cleanup.
+#[derive(Debug)]
+pub(crate) struct ExplicitCleanupFailure {
+    pub(crate) transaction: String,
+    pub(crate) journal: PathBuf,
+    pub(crate) error: AppError,
+}
+
+/// Reconciles selected journals after the operator explicitly asserts that no related child
+/// process domain should still be using their mounts.
+///
+/// `project_root` selects one canonical project. `None` is the explicit `--all` scope. Unknown
+/// journal state remains a global fail-closed condition: a rejected journal can name resources in
+/// either scope, so no valid neighbor is touched until every journal is readable.
+pub(crate) fn cleanup_explicit(
+    project_root: Option<&std::path::Path>,
+) -> Result<ExplicitCleanupReport, AppError> {
+    let scan = store::scan()?;
+    let mut report = ExplicitCleanupReport {
+        unreadable: scan.rejected,
+        ..ExplicitCleanupReport::default()
+    };
+    if !report.unreadable.is_empty() {
+        return Ok(report);
+    }
+
+    let scope = project_root.map(ComparablePath::new);
+    for scanned in scan.journals {
+        let in_scope = scope.as_ref().is_none_or(|scope| {
+            scope.names_same_path(&ComparablePath::new(&scanned.journal.project_root))
+        });
+        if !in_scope {
+            report.out_of_scope += 1;
+            continue;
+        }
+        if scanned.journal.status == crate::journal::TransactionStatus::Completed {
+            report.completed.push(scanned.path);
+            continue;
+        }
+
+        let transaction = scanned.journal.transaction_id.to_string();
+        let resources = scanned.journal.lock_resources();
+        let owner = LockOwner::for_transaction(&scanned.journal.transaction_id);
+        let locks = match HeldLocks::try_acquire_all(&resources, &owner)? {
+            Ok(locks) => locks,
+            Err(contention) => {
+                report.active.push(ActiveTransaction {
+                    transaction,
+                    journal: scanned.path,
+                    contention,
+                });
+                continue;
+            }
+        };
+        let mut adopted =
+            match Transaction::adopt(scanned.journal.clone(), scanned.path.clone(), &locks) {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    report.failures.push(ExplicitCleanupFailure {
+                        transaction,
+                        journal: scanned.path,
+                        error,
+                    });
+                    continue;
+                }
+            };
+        match adopted.cleanup_required() {
+            Ok(outcome) => report.reconciled.push(ReconciledTransaction {
+                transaction,
+                journal: scanned.path,
+                report: outcome,
+            }),
+            Err(error) => report.failures.push(ExplicitCleanupFailure {
+                transaction,
+                journal: scanned.path,
+                error,
+            }),
+        }
+    }
+    Ok(report)
 }
 
 /// Reconciles automatically recoverable transactions whose locks are free and quarantines

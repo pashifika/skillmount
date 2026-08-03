@@ -680,6 +680,10 @@ impl TransactionJournal {
 
     /// Rejects a structurally decodable journal whose contents cannot be acted on safely.
     fn validate(&self) -> Result<(), String> {
+        if self.locks.is_empty() {
+            return Err("a mutating transaction must record at least one resource lock".to_owned());
+        }
+
         let mut previous = 0;
         for action in &self.actions {
             if action.id <= previous {

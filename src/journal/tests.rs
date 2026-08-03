@@ -210,6 +210,14 @@ fn a_path_holding_a_field_separator_round_trips() {
 
 #[test]
 fn validation_rejects_states_no_apply_sequence_can_produce() {
+    let mut unlocked = sample(TransactionStatus::Planned);
+    unlocked.locks.clear();
+    assert!(
+        round_trip(&unlocked)
+            .expect_err("a mutating transaction always records its complete lock set")
+            .contains("at least one resource lock")
+    );
+
     let mut duplicate_ids = sample(TransactionStatus::Planned);
     duplicate_ids.actions[1].id = 1;
     assert!(

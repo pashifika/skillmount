@@ -102,6 +102,44 @@ fn direct_skill_and_catalog_classification_are_non_recursive_and_deterministic()
 }
 
 #[test]
+fn direct_skill_and_catalog_occurrences_share_one_rightmost_wins_overlay() {
+    let fixture = TestDir::new("mixed-overlay");
+    let catalog = fixture.0.join("catalog");
+    fs::create_dir(&catalog).expect("catalog fixture");
+    let catalog_alpha = valid_skill(&catalog, "alpha");
+    valid_skill(&catalog, "beta");
+    let direct_parent = fixture.0.join("direct");
+    fs::create_dir(&direct_parent).expect("direct parent");
+    let direct_alpha = valid_skill(&direct_parent, "alpha");
+
+    let direct_wins = resolve(
+        &[catalog.clone(), direct_alpha.clone()],
+        AgentId::Codex,
+        ValidationLevel::Basic,
+    )
+    .expect("a direct Skill may override one catalog entry");
+    assert_eq!(selected_names(&direct_wins), ["alpha", "beta"]);
+    assert_eq!(
+        direct_wins.resolutions[0].selected.origin.source_canonical,
+        fs::canonicalize(&direct_alpha).expect("canonical direct Skill")
+    );
+    assert_eq!(direct_wins.resolutions[0].shadowed.len(), 1);
+    assert_eq!(direct_wins.override_count(), 1);
+
+    let catalog_wins = resolve(
+        &[direct_alpha, catalog],
+        AgentId::Codex,
+        ValidationLevel::Basic,
+    )
+    .expect("a later catalog entry may override a direct Skill");
+    assert_eq!(
+        catalog_wins.resolutions[0].selected.origin.source_canonical,
+        fs::canonicalize(catalog_alpha).expect("canonical catalog Skill")
+    );
+    assert_eq!(catalog_wins.override_count(), 1);
+}
+
+#[test]
 fn missing_input_wins_over_an_earlier_empty_catalog() {
     let fixture = TestDir::new("missing-priority");
     let empty = fixture.0.join("empty");
@@ -286,6 +324,31 @@ fn invalid_shadowed_candidate_is_ignored_but_invalid_winner_has_no_fallback() {
     let error = resolve(&[valid, invalid], AgentId::Codex, ValidationLevel::Basic)
         .expect_err("invalid winner should fail without fallback");
     assert_eq!(error.category(), ExitCategory::Data);
+}
+
+#[test]
+fn a_child_without_skill_md_is_ignored_but_a_present_invalid_candidate_fails() {
+    let fixture = TestDir::new("candidate-boundary");
+    let catalog = fixture.0.join("catalog");
+    fs::create_dir(&catalog).expect("catalog fixture");
+    fs::create_dir(catalog.join("missing-metadata")).expect("non-Skill child");
+    valid_skill(&catalog, "valid");
+
+    let successful = resolve(
+        std::slice::from_ref(&catalog),
+        AgentId::Codex,
+        ValidationLevel::Basic,
+    )
+    .expect("a directory without SKILL.md is not a candidate");
+    assert_eq!(selected_names(&successful), ["valid"]);
+
+    skill_with(&catalog, "invalid", "not frontmatter\n");
+    let error = resolve(&[catalog], AgentId::Codex, ValidationLevel::Basic)
+        .expect_err("a structurally present selected candidate must be validated");
+    assert!(matches!(
+        error,
+        AppError::Catalog(CatalogError::InvalidSelectedSkill { .. })
+    ));
 }
 
 #[test]

@@ -50,11 +50,19 @@ impl Fixture {
     }
 
     fn skill(&self, name: &str) -> PathBuf {
-        let skill = self.sources.join(name);
+        self.skill_in(&self.sources, name, "fixture")
+    }
+
+    fn skill_in(&self, source: &Path, name: &str, marker: &str) -> PathBuf {
+        assert!(
+            source.starts_with(&self.root),
+            "fixture Skills must stay inside the isolated root"
+        );
+        let skill = source.join(name);
         fs::create_dir_all(&skill).expect("Skill fixture");
         fs::write(
             skill.join("SKILL.md"),
-            format!("---\nname: {name}\ndescription: {name} fixture\n---\n"),
+            format!("---\nname: {name}\ndescription: {name} fixture\n---\n{marker}\n"),
         )
         .expect("Skill metadata");
         skill
@@ -73,11 +81,21 @@ impl Fixture {
     }
 
     fn command_with_agent_and_options(&self, agent: Option<&Path>, options: &[&str]) -> Command {
+        self.command_with_sources_agent_and_options(&[self.sources.as_path()], agent, options)
+    }
+
+    fn command_with_sources_agent_and_options(
+        &self,
+        sources: &[&Path],
+        agent: Option<&Path>,
+        options: &[&str],
+    ) -> Command {
         let mut command = Command::new(ASM);
+        command.arg("codex");
+        for source in sources {
+            command.arg("--skills-dir").arg(source);
+        }
         command
-            .arg("codex")
-            .arg("--skills-dir")
-            .arg(&self.sources)
             .arg("--project-root")
             .arg(&self.project)
             .arg("--cwd")
@@ -90,7 +108,13 @@ impl Fixture {
             .arg("--")
             .arg("exec")
             .arg("--literal")
-            .arg("value with spaces")
+            .arg("value with spaces");
+        self.configure_environment(&mut command, &self.project);
+        command
+    }
+
+    fn configure_environment(&self, command: &mut Command, process_cwd: &Path) {
+        command
             .env("HOME", self.root.join("home"))
             .env("USERPROFILE", self.root.join("home"))
             .env("SKILLMOUNT_TEST_CODEX_USER_HOME", self.root.join("home"))
@@ -106,8 +130,7 @@ impl Fixture {
             .env("SKILLMOUNT_FAKE_VERSION_RECORD", &self.version_record)
             .env("SKILLMOUNT_FAKE_RECORD_CODEX_HOME", "1")
             .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
-            .current_dir(&self.project);
-        command
+            .current_dir(process_cwd);
     }
 
     fn install_current_discovery_link(&self) {
@@ -218,6 +241,15 @@ fn recorded_os(record: &str, name: &str) -> OsString {
     native_from_hex(encoded)
 }
 
+fn recorded_os_values(record: &str, name: &str) -> Vec<OsString> {
+    let prefix = format!("{name}=");
+    record
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .map(native_from_hex)
+        .collect()
+}
+
 fn decode_hex(value: &str) -> Vec<u8> {
     assert_eq!(value.len() % 2, 0, "odd hexadecimal record");
     value
@@ -269,11 +301,36 @@ fn selected_skills_stay_mounted_while_fake_codex_runs_then_cleanup_succeeds() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Mounted 1 skill from 1 source argument for Codex (0 source overrides)."),
+        "{stdout}"
+    );
+    assert!(stdout.contains("  alpha\n"), "{stdout}");
+    assert!(stdout.contains("Launching codex..."), "{stdout}");
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("discovery does not grant sandbox access"),
         "external bundled-resource access must be explained"
     );
     let record = fs::read_to_string(&fixture.record).expect("fake Codex launch record");
+    let recorded_arguments = recorded_os_values(&record, "arg");
+    assert_eq!(
+        recorded_arguments,
+        vec![
+            OsString::from("-C"),
+            fs::canonicalize(&fixture.project)
+                .expect("canonical project fixture")
+                .into_os_string(),
+            OsString::from("-c"),
+            OsString::from("project_root_markers=[\".git\"]"),
+            OsString::from("-c"),
+            OsString::from("skills.config=[{name=\"alpha\",enabled=true}]"),
+            OsString::from("exec"),
+            OsString::from("--literal"),
+            OsString::from("value with spaces"),
+        ],
+        "injected arguments must precede unchanged passthrough values"
+    );
     let recorded_cwd = PathBuf::from(recorded_os(&record, "cwd"));
     assert_eq!(
         fs::canonicalize(recorded_cwd).expect("canonical fake Codex CWD"),
@@ -326,6 +383,51 @@ fn selected_skills_stay_mounted_while_fake_codex_runs_then_cleanup_succeeds() {
 }
 
 #[test]
+fn three_source_codex_overlay_mounts_the_rightmost_winner_and_lists_every_origin() {
+    let fixture = Fixture::new("three-source-overlay");
+    fixture.skill_in(&fixture.sources, "alpha", "first");
+    let second = fixture.root.join("second");
+    let third = fixture.root.join("third");
+    fs::create_dir(&second).expect("second catalog");
+    fs::create_dir(&third).expect("third catalog");
+    fixture.skill_in(&second, "alpha", "second");
+    let winner = fixture.skill_in(&third, "alpha", "third winner");
+    let mounted = fixture.project.join(".agents/skills/alpha");
+    let expected_paths = std::env::join_paths([&mounted]).expect("fixture path list");
+
+    let output = fixture
+        .command_with_sources_agent_and_options(
+            &[fixture.sources.as_path(), second.as_path(), third.as_path()],
+            Some(Path::new(FAKE_CODEX)),
+            &["--verbose"],
+        )
+        .env("SKILLMOUNT_FAKE_EXPECT_PATHS", expected_paths)
+        .output()
+        .expect("three-source Codex session");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Mounted 1 skill from 3 source arguments for Codex (1 source override)."),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("(different source)").count(), 2, "{stdout}");
+    assert!(stdout.contains("[3]"), "{stdout}");
+    let record = fs::read_to_string(&fixture.record).expect("fake Codex launch record");
+    assert_eq!(
+        fs::canonicalize(PathBuf::from(recorded_os(&record, "visible-target")))
+            .expect("canonical mounted target"),
+        fs::canonicalize(winner).expect("canonical rightmost winner")
+    );
+    assert!(!exists(&mounted));
+}
+
+#[test]
 fn current_discovery_link_and_project_owned_skill_are_preserved() {
     let fixture = Fixture::new("current-layout");
     fixture.skill("alpha");
@@ -346,7 +448,7 @@ fn current_discovery_link_and_project_owned_skill_are_preserved() {
         std::env::join_paths([&project_skill, &mounted]).expect("fixture path list");
 
     let output = fixture
-        .command()
+        .command_with_options(&["--verbose"])
         .env("SKILLMOUNT_FAKE_EXPECT_PATHS", expected_paths)
         .output()
         .expect("asm should run");
@@ -357,6 +459,11 @@ fn current_discovery_link_and_project_owned_skill_are_preserved() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("link[0]"), "{stdout}");
+    assert!(stdout.contains("terminal"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("info: cleanup removed"), "{stderr}");
     let discovery_after = backend
         .inspect_no_follow(&discovery)
         .expect("reinspect fixture discovery link");
@@ -507,6 +614,56 @@ fn codex_is_resolved_from_path_before_mounting() {
 }
 
 #[test]
+fn every_relative_wrapper_path_resolves_from_the_invocation_cwd_in_a_real_session() {
+    let fixture = Fixture::new("relative-wrapper-paths");
+    fixture.skill("alpha");
+    let agent_name = Path::new(FAKE_CODEX)
+        .file_name()
+        .expect("fake agent filename");
+    let local_agent = fixture.root.join(agent_name);
+    fs::copy(FAKE_CODEX, &local_agent).expect("copy relative fake agent");
+    let mounted = fixture.project.join(".agents/skills/alpha");
+    let expected_paths = std::env::join_paths([&mounted]).expect("fixture path list");
+
+    let mut command = Command::new(ASM);
+    command
+        .arg("codex")
+        .arg("--skills-dir")
+        .arg("sources")
+        .arg("--project-root")
+        .arg("project")
+        .arg("--cwd")
+        .arg("project")
+        .arg("--agent-bin")
+        .arg(agent_name)
+        .arg("--")
+        .arg("exec")
+        .arg("relative fixture")
+        .env("SKILLMOUNT_FAKE_EXPECT_PATHS", expected_paths);
+    fixture.configure_environment(&mut command, &fixture.root);
+
+    let output = command.output().expect("relative-path Codex session");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = fs::read_to_string(&fixture.record).expect("fake Codex launch record");
+    assert_eq!(
+        fs::canonicalize(PathBuf::from(recorded_os(&record, "cwd"))).expect("canonical child CWD"),
+        fs::canonicalize(&fixture.project).expect("canonical project")
+    );
+    assert_eq!(
+        fs::canonicalize(PathBuf::from(recorded_os(&record, "visible-target")))
+            .expect("canonical mounted target"),
+        fs::canonicalize(fixture.sources.join("alpha")).expect("canonical source Skill")
+    );
+    assert!(!exists(&mounted));
+}
+
+#[test]
 fn a_missing_path_codex_fails_with_66_before_mutation() {
     let fixture = Fixture::new("missing-path-agent");
     fixture.skill("alpha");
@@ -595,6 +752,18 @@ fn child_failure_remains_primary_when_cleanup_also_fails() {
         !stderr.contains("error: session cleanup failed"),
         "{stderr}"
     );
+    assert!(stderr.contains("retained path"), "{stderr}");
+    assert!(stderr.contains("journal retained at"), "{stderr}");
+    assert!(stderr.contains("recovery argv[0] = asm"), "{stderr}");
+    assert!(stderr.contains("recovery argv[1] = cleanup"), "{stderr}");
+    assert!(
+        stderr.contains("recovery argv[2] = --project-root"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("asm cleanup --project-root"),
+        "recovery guidance must not construct a shell command: {stderr}"
+    );
 }
 
 #[cfg(unix)]
@@ -634,9 +803,10 @@ fn a_supervising_journal_is_quarantined_while_an_orphan_descendant_remains_alive
         "{stderr}"
     );
     assert!(
-        stderr.contains("journals and their mounts were retained"),
+        stderr.contains("quarantined mounts were not changed and remain journal-backed"),
         "{stderr}"
     );
+    assert!(stderr.contains("recovery argv[1] = cleanup"), "{stderr}");
     assert!(
         exists(&mounted),
         "automatic recovery must not remove the live mount"

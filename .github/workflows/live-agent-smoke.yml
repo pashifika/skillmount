@@ -1,0 +1,121 @@
+name: Live agent smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Native runner group to exercise
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - macos-arm64
+          - windows
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.97.1"
+
+jobs:
+  macos-arm64:
+    name: macOS arm64 / symlink
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'macos-arm64' }}
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned agents
+        run: npm install --global @openai/codex@0.146.0 @anthropic-ai/claude-code@2.1.220
+      - name: Build native SkillMount
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          cargo build --locked --bin asm
+      - name: Run real-agent discovery smoke
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: >-
+          python3 .github/scripts/live_agent_smoke.py
+          --asm target/debug/asm
+          --link-mode symlink
+          --wrapper-target aarch64-apple-darwin
+          --evidence-dir "${{ runner.temp }}/live-agent-evidence"
+      - name: Upload evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: live-agent-macos-arm64-symlink
+          path: ${{ runner.temp }}/live-agent-evidence
+          if-no-files-found: error
+
+  windows:
+    name: Windows ${{ matrix.arch }} / junction
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: x86
+            target: i686-pc-windows-msvc
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned native agents
+        shell: pwsh
+        run: |
+          npm install --global @openai/codex@0.146.0
+          & ([scriptblock]::Create((Invoke-RestMethod https://claude.ai/install.ps1))) 2.1.220
+      - name: Locate native agent executables
+        id: agents
+        shell: pwsh
+        run: |
+          $npmRoot = (& npm root --global).Trim()
+          $codex = Get-ChildItem -Path $npmRoot -Filter codex.exe -File -Recurse |
+            Where-Object { $_.FullName -like '*x86_64-pc-windows-msvc*bin*codex.exe' } |
+            Select-Object -First 1
+          if ($null -eq $codex) {
+            throw "The pinned Codex package did not contain its native x64 executable"
+          }
+          $claude = Join-Path $env:USERPROFILE '.local/bin/claude.exe'
+          if (-not (Test-Path -PathType Leaf $claude)) {
+            throw "The pinned Claude installer did not create $claude"
+          }
+          "codex=$($codex.FullName)" >> $env:GITHUB_OUTPUT
+          "claude=$claude" >> $env:GITHUB_OUTPUT
+      - name: Build native SkillMount target
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup target add --toolchain "$RUST_TOOLCHAIN" "${{ matrix.target }}"
+          cargo build --locked --target "${{ matrix.target }}" --bin asm
+      - name: Run real-agent discovery smoke
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: >-
+          python .github/scripts/live_agent_smoke.py
+          --asm "target/${{ matrix.target }}/debug/asm.exe"
+          --link-mode junction
+          --wrapper-target "${{ matrix.target }}"
+          --codex-bin "${{ steps.agents.outputs.codex }}"
+          --claude-bin "${{ steps.agents.outputs.claude }}"
+          --evidence-dir "${{ runner.temp }}/live-agent-evidence"
+      - name: Upload evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: live-agent-windows-${{ matrix.arch }}-junction
+          path: ${{ runner.temp }}/live-agent-evidence
+          if-no-files-found: error

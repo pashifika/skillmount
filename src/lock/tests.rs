@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::acquire::{HeldLocks, LockOwner, LockPolicy};
+use super::acquire::{AdvisoryLockState, HeldLocks, LockOwner, LockPolicy, observe};
 use super::{LockResource, LockResourceKind, key};
 use crate::mount::resolve::classify;
 use crate::state::testing::StateRootGuard;
@@ -568,6 +568,52 @@ fn holder_diagnostics_are_recorded_without_becoming_liveness_evidence() {
         !description.exists(),
         "releasing the lock clears the description, so a contention message never names a session \
          that already finished"
+    );
+}
+
+#[test]
+fn advisory_observation_is_read_only_and_uses_the_kernel_lock_as_liveness() {
+    let fixture = TestDir::new("lock-observe");
+    let _guard = StateRootGuard::set(fixture.path());
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let resource =
+        LockResource::describe(LockResourceKind::BackingStore, &root, &root.join("s")).unwrap();
+    let lock_base = crate::state::lock_base().unwrap();
+    assert!(!lock_base.exists());
+
+    let absent = observe(std::slice::from_ref(&resource)).expect("missing locks are free");
+    assert!(
+        absent
+            .iter()
+            .all(|entry| entry.state == AdvisoryLockState::Free)
+    );
+    assert!(
+        !lock_base.exists(),
+        "observation must not create a lock directory or file"
+    );
+
+    let held = HeldLocks::acquire(
+        std::slice::from_ref(&resource),
+        LockPolicy::immediate(),
+        &LockOwner {
+            transaction: "observed".to_owned(),
+            pid: 4242,
+        },
+    )
+    .expect("fixture lock");
+    let active = observe(std::slice::from_ref(&resource)).expect("held lock is observable");
+    assert!(active.iter().any(|entry| matches!(
+        &entry.state,
+        AdvisoryLockState::Held { holder: Some(holder) } if holder.contains("transaction=observed")
+    )));
+
+    drop(held);
+    let released = observe(&[resource]).expect("released lock is observable");
+    assert!(
+        released
+            .iter()
+            .all(|entry| entry.state == AdvisoryLockState::Free),
+        "a leftover lock file is not liveness evidence"
     );
 }
 

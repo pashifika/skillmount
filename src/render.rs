@@ -62,6 +62,44 @@ pub(crate) fn render(report: &ReadOnlyReport<'_>) -> String {
     out
 }
 
+/// Renders the brief session summary emitted immediately before the child starts.
+pub(crate) fn render_session_start(report: &ReadOnlyReport<'_>) -> String {
+    let selected = report
+        .catalog
+        .resolutions
+        .iter()
+        .filter(|resolution| {
+            !report.plan.preserved.iter().any(|preserved| {
+                preserved.comparison_key == resolution.selected.mount_name.comparison_key()
+            })
+        })
+        .collect::<Vec<_>>();
+    let skill_count = selected.len();
+    let source_count = report.context.skill_sources.len();
+    let override_count = report.catalog.override_count();
+    let agent = match report.context.agent {
+        crate::domain::AgentId::Codex => "Codex",
+        crate::domain::AgentId::Claude => "Claude",
+    };
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "Mounted {skill_count} {} from {source_count} {} for {agent} ({override_count} {}).",
+        plural(skill_count, "skill", "skills"),
+        plural(source_count, "source argument", "source arguments"),
+        plural(override_count, "source override", "source overrides")
+    );
+    for resolution in selected {
+        let _ = writeln!(output, "  {}", resolution.selected.mount_name);
+    }
+    let _ = writeln!(output, "Launching {}...", report.context.agent.label());
+    output
+}
+
+const fn plural(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 { singular } else { plural }
+}
+
 fn header(out: &mut String, report: &ReadOnlyReport<'_>) {
     let context = report.context;
     let field = |out: &mut String, label: &str, value: &Path| {
@@ -181,6 +219,20 @@ fn scopes(out: &mut String, report: &ReadOnlyReport<'_>) {
             );
         }
         if report.verbose() {
+            for (index, target) in scope.state.link_chain.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "      link[{index}]                    {}",
+                    path_value(target, true)
+                );
+            }
+            if let Some(terminal) = &scope.state.terminal {
+                let _ = writeln!(
+                    out,
+                    "      terminal                     {}",
+                    path_value(terminal, true)
+                );
+            }
             for existing in scope.existing_skills.values().flatten() {
                 let _ = writeln!(
                     out,
@@ -371,7 +423,7 @@ pub(crate) fn render_warnings(catalog: &SkillCatalog, snapshot: &DiscoverySnapsh
         .collect()
 }
 
-fn path_value(path: &Path, verbose: bool) -> String {
+pub(crate) fn path_value(path: &Path, verbose: bool) -> String {
     os_value(path.as_os_str(), verbose)
 }
 
@@ -385,7 +437,7 @@ const ESCAPED_PREFIX: &str = "escaped:";
 /// case unreadable for no gain. Only a value that is not representable as text is escaped, and it
 /// carries a prefix so a reader can tell the two forms apart. A literal value that would collide
 /// with that prefix is escaped as well.
-fn os_value(value: &OsStr, verbose: bool) -> String {
+pub(crate) fn os_value(value: &OsStr, verbose: bool) -> String {
     if !verbose {
         return Path::new(value).display().to_string();
     }

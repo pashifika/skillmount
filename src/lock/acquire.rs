@@ -148,6 +148,83 @@ pub struct LockContention {
     pub holder: Option<String>,
 }
 
+/// Kernel-backed state observed without creating a lock file or holder record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdvisoryLockState {
+    /// No process holds this key, or its lock file has never existed.
+    Free,
+    /// The operating system refused the advisory lock because another handle holds it.
+    Held {
+        /// Best-effort owner text; diagnostic only and never liveness evidence.
+        holder: Option<String>,
+    },
+}
+
+/// One resource key observed by `doctor` without changing lock state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdvisoryLockObservation {
+    pub(crate) key: LockKey,
+    pub(crate) path: PathBuf,
+    pub(crate) resources: Vec<PathBuf>,
+    pub(crate) state: AdvisoryLockState,
+}
+
+/// Observes every deduplicated resource lock without creating files or owner sidecars.
+pub(crate) fn observe(
+    resources: &[LockResource],
+) -> Result<Vec<AdvisoryLockObservation>, AppError> {
+    let directory = state::lock_base()?;
+    let mut observations = Vec::new();
+    for (key, resource_paths) in sorted_keys(resources) {
+        let path = directory.join(key.file_name());
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                observations.push(AdvisoryLockObservation {
+                    key,
+                    path,
+                    resources: resource_paths,
+                    state: AdvisoryLockState::Free,
+                });
+                continue;
+            }
+            Err(error) => {
+                return Err(AppError::Filesystem(format!(
+                    "cannot open existing lock file {} for observation: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let state = match FileExt::try_lock(&file) {
+            Ok(()) => {
+                FileExt::unlock(&file).map_err(|error| {
+                    AppError::Filesystem(format!(
+                        "cannot release observed lock {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                AdvisoryLockState::Free
+            }
+            Err(TryLockError::WouldBlock) => AdvisoryLockState::Held {
+                holder: read_holder(&key),
+            },
+            Err(TryLockError::Error(error)) => {
+                return Err(AppError::Filesystem(format!(
+                    "cannot observe advisory lock {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        observations.push(AdvisoryLockObservation {
+            key,
+            path,
+            resources: resource_paths,
+            state,
+        });
+    }
+    Ok(observations)
+}
+
 impl LockContention {
     /// Renders the operator-facing explanation.
     #[must_use]
