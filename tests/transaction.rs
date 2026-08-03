@@ -21,6 +21,8 @@ use skillmount::link::{LinkRequest, PlacementOutcome, platform_backend};
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
 /// The reused `asm` child rejects Codex-native injected arguments with this usage status.
 const FIXTURE_CHILD_STATUS: i32 = 64;
+/// Real-process startup includes durable filesystem I/O on the selected native volume.
+const HOLD_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Every boundary from preliminary discovery through automatically recoverable transaction state.
 ///
@@ -1608,7 +1610,7 @@ fn wait_for_hold(child: &mut Child, checkpoint: &str) -> BufReader<ChildStderr> 
         let _ = sender.send(outcome);
     });
 
-    match receiver.recv_timeout(Duration::from_secs(2)) {
+    match receiver.recv_timeout(HOLD_START_TIMEOUT) {
         Ok(Ok(stderr)) => {
             reader.join().expect("the stderr reader must not panic");
             stderr
@@ -1624,8 +1626,8 @@ fn wait_for_hold(child: &mut Child, checkpoint: &str) -> BufReader<ChildStderr> 
             let status = child.wait();
             reader.join().expect("the stderr reader must unblock");
             panic!(
-                "the holder did not reach {checkpoint} within two seconds; kill: {kill_result:?}; \
-                 status: {status:?}"
+                "the holder did not reach {checkpoint} within {HOLD_START_TIMEOUT:?}; kill: \
+                 {kill_result:?}; status: {status:?}"
             );
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
