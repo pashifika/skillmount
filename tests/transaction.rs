@@ -236,6 +236,26 @@ impl Fixture {
         found
     }
 
+    #[cfg(windows)]
+    fn retired_journals(&self) -> Vec<PathBuf> {
+        let mut found = fs::read_dir(self.transactions()).map_or_else(
+            |_| Vec::new(),
+            |entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name().is_some_and(|name| {
+                            name.to_string_lossy().contains(".journal.removed-")
+                        })
+                    })
+                    .collect()
+            },
+        );
+        found.sort();
+        found
+    }
+
     /// Returns every entry beneath the project, so residue is visible in an assertion message.
     fn project_tree(&self) -> Vec<String> {
         let mut entries = Vec::new();
@@ -595,6 +615,52 @@ fn every_named_boundary_actually_stops_a_session() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn terminal_journal_retirement_can_stop_after_the_write_through_rename() {
+    let fixture = Fixture::new("journal-retired");
+    fixture.skill("alpha");
+
+    let stopped = fixture.run_stopping_at("codex", "journal-retired", &[]);
+
+    assert!(!stopped.status.success());
+    let stderr = String::from_utf8_lossy(&stopped.stderr);
+    assert!(
+        stderr.contains("stopping at journal-retired occurrence 1"),
+        "the session did not reach terminal write-through retirement: {stderr}"
+    );
+    assert!(
+        fixture.journals().is_empty(),
+        "the terminal journal must already be outside the scanner namespace"
+    );
+    let retired = fixture.retired_journals();
+    assert_eq!(
+        retired.len(),
+        1,
+        "forced termination must preserve the retired tombstone: {retired:?}"
+    );
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+    assert!(
+        !exists(&fixture.project.join(".agents/skills/alpha")),
+        "terminal retirement may occur only after the owned mount is gone"
+    );
+
+    let later = fixture.run("codex", &[]);
+
+    assert_eq!(
+        later.status.code(),
+        Some(FIXTURE_CHILD_STATUS),
+        "a retired tombstone must not re-enter journal recovery: {}",
+        String::from_utf8_lossy(&later.stderr)
+    );
+    assert!(fixture.journals().is_empty());
+    assert!(
+        retired[0].is_file(),
+        "the inert evidence remains inspectable"
+    );
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
 }
 
 #[test]

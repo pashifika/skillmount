@@ -208,6 +208,7 @@ fn remove_durably(path: &Path) -> Result<(), AppError> {
     let retired = parent.join(retired_name);
     match crate::link::replace_file_write_through(path, &retired) {
         Ok(()) => {
+            crate::checkpoint::reached(crate::checkpoint::Checkpoint::JournalRetired, 1);
             let _ = fs::remove_file(retired);
             Ok(())
         }

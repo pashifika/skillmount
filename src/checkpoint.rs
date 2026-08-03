@@ -68,6 +68,8 @@ pub enum Checkpoint {
     EntryRemoved,
     /// A helper directory has been removed and the journal has not recorded it yet.
     DirectoryRemoved,
+    /// The terminal journal has been durably renamed out of the scanner namespace.
+    JournalRetired,
 }
 
 impl Checkpoint {
@@ -88,11 +90,12 @@ impl Checkpoint {
             Self::JournalCleaning => "journal-cleaning",
             Self::EntryRemoved => "entry-removed",
             Self::DirectoryRemoved => "directory-removed",
+            Self::JournalRetired => "journal-retired",
         }
     }
 
     /// Every boundary, so a test suite can assert it covers all of them.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::DiscoveryInspected,
         Self::JournalPlanned,
         Self::JournalApplying,
@@ -106,6 +109,7 @@ impl Checkpoint {
         Self::JournalCleaning,
         Self::EntryRemoved,
         Self::DirectoryRemoved,
+        Self::JournalRetired,
     ];
 }
 
