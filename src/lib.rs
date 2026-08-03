@@ -8,9 +8,9 @@
 //!
 //! A mutating session acquires the discovery snapshot's resource locks, recovers incomplete
 //! transactions, builds and stabilizes the full plan under those locks, persists a write-ahead
-//! journal, and applies it. Codex sessions then launch through the generic process supervisor and
-//! clean up after the managed process domain is dead. Claude child-launch composition remains
-//! reserved; see `docs/architecture.md` for the current boundaries.
+//! journal, and applies it. Implemented Codex and Claude sessions then launch through the generic
+//! process supervisor and clean up after the managed process domain is dead; see
+//! `docs/architecture.md` for their pinned compatibility boundaries.
 
 pub mod agent;
 mod app;

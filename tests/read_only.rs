@@ -76,6 +76,13 @@ impl Fixture {
             .env("LOCALAPPDATA", self.home.join("AppData/Local"))
             .env("CODEX_HOME", self.root.join("codex-home"))
             .env("SKILLMOUNT_TEST_CODEX_VERSION", "codex-cli 0.146.0")
+            .env("CLAUDE_CONFIG_DIR", self.home.join(".claude"))
+            .env(
+                "SKILLMOUNT_CLAUDE_MANAGED_SKILLS_DIR",
+                self.root.join("claude-managed/skills"),
+            )
+            .env_remove("CLAUDE_CODE_SAFE_MODE")
+            .env_remove("CLAUDE_CODE_SIMPLE")
             .env("SKILLMOUNT_STATE_DIR", self.root.join("state"))
             .env(
                 "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",

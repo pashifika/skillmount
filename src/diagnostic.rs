@@ -9,6 +9,8 @@ pub enum DiagnosticKind {
     General,
     /// A Codex discovery-layout or metadata observation.
     CodexDiscovery,
+    /// A Claude Code discovery-layout or compatibility observation.
+    ClaudeDiscovery,
     /// A reminder that Codex Skill discovery and sandbox access are separate policies.
     CodexPermissionSeparation,
 }

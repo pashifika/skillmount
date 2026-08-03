@@ -43,6 +43,10 @@ pub enum ScopeKind {
     CodexAdmin,
     /// The project's own `.claude/skills`, which `SkillMount` never modifies by default.
     ClaudeProject,
+    /// An unqualified `.claude/skills` between the launch CWD and the project root.
+    ClaudeAncestor,
+    /// The host-wide enterprise Claude Code Skill namespace.
+    ClaudeManaged,
     /// The user-level `.claude/skills`.
     ClaudeUser,
     /// The isolated session root's `.claude/skills` that a launch would stage into.
@@ -65,6 +69,8 @@ impl ScopeKind {
             Self::CodexSystem => "codex system",
             Self::CodexAdmin => "codex admin",
             Self::ClaudeProject => "claude project",
+            Self::ClaudeAncestor => "claude ancestor",
+            Self::ClaudeManaged => "claude managed",
             Self::ClaudeUser => "claude user",
             Self::ClaudeStaging => "claude staging",
             Self::ClaudeAddDir => "claude add-dir",
@@ -357,10 +363,12 @@ pub(crate) fn dedupe_scopes_by_terminal(
 /// Returns whether two roots are guaranteed to produce the same recursive inventory.
 ///
 /// Bundled-system discovery deliberately refuses directory links, while every other supported
-/// Codex root follows them. Folding those scopes merely because their roots share a terminal would
-/// discard Skills that the non-system scope can still reach.
+/// Codex root follows them. Claude's managed scope follows links like the other Claude scopes but
+/// carries higher-precedence conflict semantics that cannot be discarded during a fold. Those two
+/// scope kinds therefore only fold with another scope of the same semantic class.
 const fn compatible_traversal(left: ScopeKind, right: ScopeKind) -> bool {
     matches!(left, ScopeKind::CodexSystem) == matches!(right, ScopeKind::CodexSystem)
+        && matches!(left, ScopeKind::ClaudeManaged) == matches!(right, ScopeKind::ClaudeManaged)
 }
 
 /// Builds the merged visible-name index and the separate destination-occupancy map.

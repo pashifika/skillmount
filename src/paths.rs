@@ -28,16 +28,18 @@ pub(crate) fn resolve_session(
         None => inferred_project_root.clone(),
     };
 
-    if input.agent == AgentId::Codex && !launch_cwd.starts_with(&project_root) {
+    if !launch_cwd.starts_with(&project_root) {
         return Err(AppError::Usage(format!(
-            "Codex project root {} does not contain launch CWD {}",
+            "{} project root {} does not contain launch CWD {}",
+            agent_label(input.agent),
             project_root.display(),
             launch_cwd.display()
         )));
     }
-    if input.agent == AgentId::Codex && project_root != inferred_project_root {
+    if project_root != inferred_project_root {
         return Err(AppError::Usage(format!(
-            "Codex project root {} does not match the default root {} inferred from launch CWD {}; --project-root cannot change the root used by the child",
+            "{} project root {} does not match the default root {} inferred from launch CWD {}; --project-root cannot change the root used by the child",
+            agent_label(input.agent),
             project_root.display(),
             inferred_project_root.display(),
             launch_cwd.display()
@@ -50,19 +52,20 @@ pub(crate) fn resolve_session(
     } else {
         (user_home.join(".codex"), None)
     };
+    let claude_config_dir = claude_config_dir(&user_home, &launch_cwd)?;
 
     let skill_sources = resolve_source_occurrences(&input.skills_dirs, &invocation_cwd)?;
-    let resolve_codex_executable = input.agent == AgentId::Codex && !input.options.dry_run;
+    let resolve_agent_executable = !input.options.dry_run;
     let agent_bin = match input.agent_bin {
         Some(path) => {
             let resolved = absolute_from(&invocation_cwd, &path)?;
-            if resolve_codex_executable {
+            if resolve_agent_executable {
                 validate_explicit_executable(&resolved)?
             } else {
                 resolved
             }
         }
-        None if resolve_codex_executable => {
+        None if resolve_agent_executable => {
             resolve_path_executable(input.agent.executable_name(), &invocation_cwd)?
         }
         None => PathBuf::from(input.agent.executable_name()),
@@ -77,12 +80,21 @@ pub(crate) fn resolve_session(
         codex_home,
         codex_home_override,
         codex_admin_skills: codex_admin_skills(),
+        claude_config_dir,
+        claude_managed_skills: claude_managed_skills(),
         skill_sources,
         session_id: None,
         agent_bin,
         passthrough_args: input.passthrough_args,
         options: input.options,
     })
+}
+
+const fn agent_label(agent: AgentId) -> &'static str {
+    match agent {
+        AgentId::Codex => "Codex",
+        AgentId::Claude => "Claude",
+    }
 }
 
 fn validate_explicit_executable(path: &Path) -> Result<PathBuf, AppError> {
@@ -222,6 +234,7 @@ pub(crate) fn resolve_inspection(
     } else {
         (user_home.join(".codex"), None)
     };
+    let claude_config_dir = claude_config_dir(&user_home, &invocation_cwd)?;
     Ok(RunContext {
         agent,
         launch_cwd: invocation_cwd.clone(),
@@ -232,6 +245,8 @@ pub(crate) fn resolve_inspection(
         codex_home,
         codex_home_override,
         codex_admin_skills: codex_admin_skills(),
+        claude_config_dir,
+        claude_managed_skills: claude_managed_skills(),
         session_id: None,
         agent_bin: PathBuf::from(agent.executable_name()),
         passthrough_args: Vec::new(),
@@ -355,6 +370,43 @@ fn codex_home_from_value(
 
 fn unicode_codex_home(value: Result<String, std::env::VarError>) -> Option<String> {
     value.ok().filter(|value| !value.is_empty())
+}
+
+/// Mirrors Claude Code's relocation of every user `~/.claude` path.
+fn claude_config_dir(user_home: &Path, launch_cwd: &Path) -> Result<PathBuf, AppError> {
+    claude_config_dir_from_value(user_home, launch_cwd, std::env::var_os("CLAUDE_CONFIG_DIR"))
+}
+
+fn claude_config_dir_from_value(
+    user_home: &Path,
+    launch_cwd: &Path,
+    value: Option<OsString>,
+) -> Result<PathBuf, AppError> {
+    let Some(configured) = value.filter(|value| !value.is_empty()) else {
+        return Ok(user_home.join(".claude"));
+    };
+    absolute_from(launch_cwd, Path::new(&configured))
+}
+
+/// Returns the host-wide enterprise Claude Code Skill root supported by 2.1.220.
+fn claude_managed_skills() -> PathBuf {
+    #[cfg(debug_assertions)]
+    if let Some(path) =
+        std::env::var_os("SKILLMOUNT_CLAUDE_MANAGED_SKILLS_DIR").filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(path);
+    }
+
+    #[cfg(windows)]
+    {
+        let program_files = windows_ffi::program_files_directory()
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+        program_files.join("ClaudeCode/.claude/skills")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/Library/Application Support/ClaudeCode/.claude/skills")
+    }
 }
 
 /// Returns the host-wide Codex Skill root supported by the current loader.
@@ -512,8 +564,8 @@ mod tests {
     #[cfg(unix)]
     use super::validate_runnable;
     use super::{
-        absolute_codex_user_home, absolute_from, codex_home_from_value, nearest_git_root,
-        resolve_session,
+        absolute_codex_user_home, absolute_from, claude_config_dir_from_value,
+        claude_managed_skills, codex_home_from_value, nearest_git_root, resolve_session,
     };
     #[cfg(windows)]
     use super::{codex_admin_skills, executable_names, validate_explicit_executable};
@@ -584,23 +636,24 @@ mod tests {
     #[test]
     fn every_relative_wrapper_path_uses_invocation_cwd() {
         let fixture = TestDir::new("relative-paths");
-        fs::create_dir_all(fixture.0.join("launch")).expect("launch fixture");
-        fs::create_dir_all(fixture.0.join("project")).expect("project fixture");
+        fs::create_dir_all(fixture.0.join("project/launch")).expect("launch fixture");
+        fs::create_dir(fixture.0.join("project/.git")).expect("project marker");
         let input = parsed_session(&[
             "claude",
             "--skills-dir=skills/one",
             "--skills-dir=skills/two",
             "--skills-dir=skills/three",
-            "--cwd=launch",
+            "--cwd=project/launch",
             "--project-root=project",
             "--agent-bin=bin/claude",
+            "--dry-run",
         ]);
 
         let context = resolve_session(input, &fixture.0).expect("paths should resolve");
 
         assert_eq!(
             context.launch_cwd,
-            fs::canonicalize(fixture.0.join("launch")).unwrap()
+            fs::canonicalize(fixture.0.join("project/launch")).unwrap()
         );
         assert_eq!(
             context.project_root,
@@ -683,6 +736,35 @@ mod tests {
     }
 
     #[test]
+    fn relative_claude_config_dir_resolves_from_the_child_launch_cwd() {
+        let fixture = TestDir::new("relative-claude-config");
+        let user_home = fixture.0.join("home");
+        let launch_cwd = fixture.0.join("launch");
+
+        assert_eq!(
+            claude_config_dir_from_value(
+                &user_home,
+                &launch_cwd,
+                Some(OsString::from("custom-claude")),
+            )
+            .expect("relative Claude config directory"),
+            launch_cwd.join("custom-claude")
+        );
+        assert_eq!(
+            claude_config_dir_from_value(&user_home, &launch_cwd, None)
+                .expect("default Claude config directory"),
+            user_home.join(".claude")
+        );
+    }
+
+    #[test]
+    fn claude_managed_root_uses_the_documented_platform_layout() {
+        let root = claude_managed_skills();
+        assert!(root.is_absolute());
+        assert!(root.ends_with(Path::new("ClaudeCode/.claude/skills")));
+    }
+
+    #[test]
     fn codex_user_home_must_be_absolute_like_the_supported_loader_requires() {
         assert_eq!(
             absolute_codex_user_home(Some(PathBuf::from("relative-home")))
@@ -722,58 +804,70 @@ mod tests {
     #[test]
     fn launch_cwd_is_the_fallback_without_git() {
         let fixture = TestDir::new("no-git");
-        let input = parsed_session(&["claude", "--skills-dir=skills"]);
+        let input = parsed_session(&["claude", "--skills-dir=skills", "--dry-run"]);
         let context = resolve_session(input, &fixture.0).expect("paths should resolve");
         assert_eq!(context.project_root, context.launch_cwd);
     }
 
     #[test]
-    fn codex_project_root_must_contain_launch_cwd() {
-        let fixture = TestDir::new("containment");
-        fs::create_dir_all(fixture.0.join("launch")).expect("launch fixture");
-        fs::create_dir_all(fixture.0.join("other")).expect("project fixture");
-        let input = parsed_session(&[
-            "codex",
-            "--skills-dir=skills",
-            "--cwd=launch",
-            "--project-root=other",
-        ]);
-        let error = resolve_session(input, &fixture.0).expect_err("containment should fail");
-        assert_eq!(error.category(), ExitCategory::Usage);
+    fn every_agent_project_root_must_contain_launch_cwd() {
+        for agent in ["codex", "claude"] {
+            let fixture = TestDir::new(&format!("{agent}-containment"));
+            fs::create_dir_all(fixture.0.join("launch")).expect("launch fixture");
+            fs::create_dir_all(fixture.0.join("other")).expect("project fixture");
+            let input = parsed_session(&[
+                agent,
+                "--skills-dir=skills",
+                "--cwd=launch",
+                "--project-root=other",
+            ]);
+            let error = resolve_session(input, &fixture.0).expect_err("containment should fail");
+            assert_eq!(error.category(), ExitCategory::Usage);
+            assert!(error.to_string().contains(if agent == "codex" {
+                "Codex project root"
+            } else {
+                "Claude project root"
+            }));
+        }
     }
 
     #[test]
-    fn codex_explicit_project_root_must_match_the_default_discovered_root() {
-        let fixture = TestDir::new("codex-project-root-match");
-        fs::create_dir(fixture.0.join(".git")).expect("Git root marker");
-        fs::create_dir_all(fixture.0.join("nested/deep")).expect("nested fixture");
-        let input = parsed_session(&[
-            "codex",
-            "--skills-dir=skills",
-            "--cwd=nested/deep",
-            "--project-root=nested",
-        ]);
+    fn every_agent_explicit_project_root_must_match_the_discovered_root() {
+        for agent in ["codex", "claude"] {
+            let fixture = TestDir::new(&format!("{agent}-project-root-match"));
+            fs::create_dir(fixture.0.join(".git")).expect("Git root marker");
+            fs::create_dir_all(fixture.0.join("nested/deep")).expect("nested fixture");
+            let input = parsed_session(&[
+                agent,
+                "--skills-dir=skills",
+                "--cwd=nested/deep",
+                "--project-root=nested",
+            ]);
 
-        let error = resolve_session(input, &fixture.0)
-            .expect_err("the wrapper and child must use the same project root");
+            let error = resolve_session(input, &fixture.0)
+                .expect_err("the wrapper and child must use the same project root");
 
-        assert_eq!(error.category(), ExitCategory::Usage);
-        assert!(
-            error
-                .to_string()
-                .contains("does not match the default root")
-        );
+            assert_eq!(error.category(), ExitCategory::Usage);
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not match the default root")
+            );
+        }
     }
 
     #[test]
     fn a_missing_explicit_agent_fails_before_a_mutating_session_can_plan() {
-        let fixture = TestDir::new("missing-agent");
-        let input = parsed_session(&["codex", "--skills-dir=skills", "--agent-bin=missing-codex"]);
+        for agent in ["codex", "claude"] {
+            let fixture = TestDir::new(&format!("{agent}-missing-agent"));
+            let input =
+                parsed_session(&[agent, "--skills-dir=skills", "--agent-bin=missing-agent"]);
 
-        let error = resolve_session(input, &fixture.0)
-            .expect_err("an explicit missing executable must fail during context resolution");
+            let error = resolve_session(input, &fixture.0)
+                .expect_err("an explicit missing executable must fail during context resolution");
 
-        assert_eq!(error.category(), ExitCategory::MissingInput);
+            assert_eq!(error.category(), ExitCategory::MissingInput);
+        }
     }
 
     #[cfg(unix)]
@@ -842,6 +936,15 @@ mod tests {
     #[test]
     fn drive_relative_wrapper_paths_are_rejected_as_ambiguous() {
         let fixture = TestDir::new("drive-relative");
+        let error = claude_config_dir_from_value(
+            &fixture.0.join("home"),
+            &fixture.0,
+            Some(OsString::from("C:config")),
+        )
+        .expect_err("drive-relative CLAUDE_CONFIG_DIR must fail closed");
+        assert_eq!(error.category(), ExitCategory::Usage);
+        assert!(error.to_string().contains("drive-relative Windows path"));
+
         for arguments in [
             &["claude", "--skills-dir=skills", "--cwd=C:launch"][..],
             &["claude", "--skills-dir=skills", "--project-root=C:project"][..],

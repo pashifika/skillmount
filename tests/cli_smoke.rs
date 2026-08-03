@@ -33,6 +33,13 @@ fn run(executable: &str, arguments: &[&str]) -> Output {
         .env("SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG", "absent")
         .env("LOCALAPPDATA", home.join("AppData/Local"))
         .env("CODEX_HOME", home.join("codex-home"))
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env(
+            "SKILLMOUNT_CLAUDE_MANAGED_SKILLS_DIR",
+            home.join("claude-managed/skills"),
+        )
+        .env_remove("CLAUDE_CODE_SAFE_MODE")
+        .env_remove("CLAUDE_CODE_SIMPLE")
         .env(
             "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
             home.join("admin-skills"),
@@ -74,6 +81,13 @@ fn run_session(
         .env("LOCALAPPDATA", home.join("AppData/Local"))
         .env("CODEX_HOME", home.join("codex-home"))
         .env("SKILLMOUNT_TEST_CODEX_VERSION", "codex-cli 0.146.0")
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env(
+            "SKILLMOUNT_CLAUDE_MANAGED_SKILLS_DIR",
+            home.join("claude-managed/skills"),
+        )
+        .env_remove("CLAUDE_CODE_SAFE_MODE")
+        .env_remove("CLAUDE_CODE_SIMPLE")
         .env("SKILLMOUNT_FAKE_RECORD", state.join(record_name))
         .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
         .env(

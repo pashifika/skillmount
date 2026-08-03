@@ -1,13 +1,15 @@
 //! Claude Code adapter: isolated session staging surfaced through `--add-dir`.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use crate::agent::{
     AgentAdapter, DiscoverySnapshot, ScopeKind, dedupe_scopes_by_terminal, discovery_indexes,
     inspect_scope,
 };
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::domain::{AgentId, MountMode, RunContext, SkillCatalog};
 use crate::error::AppError;
 use crate::lock::{LockResource, LockResourceKind};
@@ -21,12 +23,101 @@ use crate::state::{PENDING_SESSION, session_root_base};
 /// Namespace Claude Code searches inside any directory it is given.
 const SKILLS_SUFFIX: &str = ".claude/skills";
 
+/// Claude Code release whose discovery and CLI contract this adapter implements.
+pub(crate) const SUPPORTED_CLAUDE_VERSION: &str = "2.1.220";
+const SUPPORTED_CLAUDE_VERSION_OUTPUT: &str = "2.1.220 (Claude Code)";
+const VERSION_OUTPUT_LIMIT: usize = 1024;
+
 /// Passthrough arguments that switch off Skill loading entirely.
 ///
 /// Mounting Skills and then starting an agent that ignores them wastes the mount and misleads the
 /// operator, so these fail before anything is planned. A future `--allow-agent-conflicts` option
 /// can downgrade them to warnings.
 const SKILL_DISABLING_ARGS: [&str; 3] = ["--bare", "--safe-mode", "--disable-slash-commands"];
+
+/// Passthrough settings inputs that could undo `SkillMount`'s session visibility override.
+const SKILL_VISIBILITY_ARGS: [&str; 3] = ["--managed-settings", "--setting-sources", "--settings"];
+
+/// Passthrough controls that detach the logical session or relocate its discovery root.
+const SESSION_BOUNDARY_ARGS: [&str; 5] = ["--background", "--bg", "--tmux", "--worktree", "-w"];
+
+/// Pinned 2.1.220 commands that do not start a supervised foreground session.
+///
+/// Claude selects a command from the first unconsumed positional argument, including after a
+/// standalone `--`. Forwarding one of these commands would hand the staged root to an operator or
+/// service process whose lifetime and discovery behavior are outside this adapter's contract.
+const NON_SESSION_SUBCOMMANDS: [&str; 14] = [
+    "agents",
+    "auth",
+    "auto-mode",
+    "doctor",
+    "gateway",
+    "install",
+    "mcp",
+    "plugin",
+    "plugins",
+    "project",
+    "setup-token",
+    "ultrareview",
+    "update",
+    "upgrade",
+];
+
+/// Pinned 2.1.220 options that consume exactly one following value.
+///
+/// This table exists only to keep flag-shaped values opaque while locating Skill discovery
+/// controls. It is not a second Claude CLI parser and deliberately has no validation policy for
+/// these options.
+const SINGLE_VALUE_ARGS: [&str; 22] = [
+    "--agent",
+    "--agents",
+    "--append-system-prompt",
+    "--debug-file",
+    "--effort",
+    "--fallback-model",
+    "--input-format",
+    "--json-schema",
+    "--max-budget-usd",
+    "--managed-settings",
+    "--model",
+    "--name",
+    "-n",
+    "--output-format",
+    "--permission-mode",
+    "--plugin-dir",
+    "--plugin-url",
+    "--remote-control-session-name-prefix",
+    "--session-id",
+    "--setting-sources",
+    "--settings",
+    "--system-prompt",
+];
+
+/// Pinned options whose value is optional and never consumes the next option token.
+const OPTIONAL_VALUE_ARGS: [&str; 9] = [
+    "--debug",
+    "-d",
+    "--from-pr",
+    "--prompt-suggestions",
+    "--remote-control",
+    "--resume",
+    "-r",
+    "--worktree",
+    "-w",
+];
+
+/// Pinned options that consume non-option values until the next option token.
+const VARIADIC_VALUE_ARGS: [&str; 9] = [
+    "--allowedTools",
+    "--allowed-tools",
+    "--betas",
+    "--disallowedTools",
+    "--disallowed-tools",
+    "--file",
+    "--mcp-config",
+    "--tools",
+    "--add-dir",
+];
 
 /// The Claude Code agent adapter.
 #[derive(Debug, Clone, Copy, Default)]
@@ -97,30 +188,129 @@ fn missing_directory_chain(leaf: &Path, boundary: &Path) -> Vec<PathBuf> {
 /// following values until the next option, because Claude Code accepts several directories per
 /// occurrence. Over-collecting is the safe direction: an extra inspected scope can only add a
 /// conflict check, never remove one.
-pub(crate) fn parse_add_dirs(args: &[OsString]) -> Vec<PathBuf> {
-    let flag = OsStr::new("--add-dir");
+pub(crate) fn parse_add_dirs(args: &[OsString]) -> Result<Vec<PathBuf>, AppError> {
+    scan_passthrough(args).map(|scan| scan.add_dirs)
+}
+
+#[derive(Debug, Default)]
+struct PassthroughScan {
+    add_dirs: Vec<PathBuf>,
+    disabling_arg: Option<&'static str>,
+    visibility_arg: Option<&'static str>,
+    session_boundary_arg: Option<&'static str>,
+    non_session_subcommand: Option<&'static str>,
+}
+
+fn scan_passthrough(args: &[OsString]) -> Result<PassthroughScan, AppError> {
+    let mut scan = PassthroughScan::default();
     let mut directories = Vec::new();
     let mut index = 0;
+    let mut command_position_open = true;
     while index < args.len() {
         let argument = args[index].as_os_str();
+        if argument == OsStr::new("--") {
+            if command_position_open {
+                scan.non_session_subcommand = args
+                    .get(index + 1)
+                    .and_then(|argument| non_session_subcommand(argument));
+            }
+            break;
+        }
+        if let Some(rejected) = SKILL_DISABLING_ARGS
+            .iter()
+            .find(|candidate| argument == OsStr::new(candidate))
+        {
+            scan.disabling_arg = Some(rejected);
+            break;
+        }
+        if let Some(rejected) = SKILL_VISIBILITY_ARGS.iter().find(|candidate| {
+            argument == OsStr::new(candidate)
+                || strip_prefix(argument, &format!("{candidate}=")).is_some()
+        }) {
+            scan.visibility_arg = Some(rejected);
+            break;
+        }
+        if let Some(rejected) = session_boundary_arg(argument) {
+            scan.session_boundary_arg = Some(rejected);
+            break;
+        }
         if let Some(value) = strip_prefix(argument, "--add-dir=") {
-            if !value.is_empty() {
-                directories.push(PathBuf::from(value));
+            if value.is_empty() {
+                return Err(AppError::Usage(
+                    "Claude Code --add-dir requires a non-empty directory value".to_owned(),
+                ));
+            }
+            directories.push(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if contains_os(&SINGLE_VALUE_ARGS, argument) {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if contains_os(&OPTIONAL_VALUE_ARGS, argument) {
+            index += 1;
+            if index < args.len() && !is_option(&args[index]) {
+                index += 1;
+            }
+            continue;
+        }
+        if !contains_os(&VARIADIC_VALUE_ARGS, argument) {
+            if command_position_open && !is_option(argument) {
+                if let Some(rejected) = non_session_subcommand(argument) {
+                    scan.non_session_subcommand = Some(rejected);
+                    break;
+                }
+                command_position_open = false;
             }
             index += 1;
             continue;
         }
-        if argument != flag {
-            index += 1;
-            continue;
-        }
         index += 1;
-        while index < args.len() && strip_prefix(args[index].as_os_str(), "-").is_none() {
-            directories.push(PathBuf::from(&args[index]));
+        let value_start = index;
+        while index < args.len() && !is_option(&args[index]) {
+            if argument == OsStr::new("--add-dir") {
+                directories.push(PathBuf::from(&args[index]));
+            }
             index += 1;
+        }
+        if argument == OsStr::new("--add-dir") && index == value_start {
+            return Err(AppError::Usage(
+                "Claude Code --add-dir requires at least one directory value".to_owned(),
+            ));
         }
     }
-    directories
+    scan.add_dirs = directories;
+    Ok(scan)
+}
+
+fn contains_os(values: &[&str], candidate: &OsStr) -> bool {
+    values.iter().any(|value| candidate == OsStr::new(value))
+}
+
+fn session_boundary_arg(argument: &OsStr) -> Option<&'static str> {
+    SESSION_BOUNDARY_ARGS
+        .iter()
+        .find(|candidate| argument == OsStr::new(candidate))
+        .copied()
+        .or_else(|| strip_prefix(argument, "--worktree=").map(|_| "--worktree"))
+        .or_else(|| strip_prefix(argument, "--tmux=").map(|_| "--tmux"))
+        .or_else(|| {
+            strip_prefix(argument, "-w")
+                .filter(|value| !value.is_empty())
+                .map(|_| "-w")
+        })
+}
+
+fn non_session_subcommand(argument: &OsStr) -> Option<&'static str> {
+    NON_SESSION_SUBCOMMANDS
+        .iter()
+        .find(|candidate| argument == OsStr::new(candidate))
+        .copied()
+}
+
+fn is_option(value: &OsStr) -> bool {
+    strip_prefix(value, "-").is_some()
 }
 
 /// Returns the remainder of `value` after `prefix`, preserving platform-native encoding.
@@ -168,6 +358,105 @@ impl ClaudeAdapter {
             }
         }
     }
+
+    /// Collects every unqualified project scope the pinned Claude release reads at startup.
+    fn project_scopes(context: &RunContext) -> Result<Vec<crate::agent::DiscoveryScope>, AppError> {
+        let mut scopes = vec![inspect_claude_scope(
+            ScopeKind::ClaudeProject,
+            &context.project_root.join(SKILLS_SUFFIX),
+        )?];
+        for ancestor in context.launch_cwd.ancestors() {
+            if ancestor == context.project_root {
+                break;
+            }
+            if !ancestor.starts_with(&context.project_root) {
+                break;
+            }
+            scopes.push(inspect_claude_scope(
+                ScopeKind::ClaudeAncestor,
+                &ancestor.join(SKILLS_SUFFIX),
+            )?);
+        }
+        Ok(scopes)
+    }
+}
+
+fn inspect_claude_scope(
+    kind: ScopeKind,
+    entry: &Path,
+) -> Result<crate::agent::DiscoveryScope, AppError> {
+    let mut scope = inspect_scope(kind, entry)?;
+    for warning in &mut scope.warnings {
+        warning.kind = DiagnosticKind::ClaudeDiscovery;
+    }
+    Ok(scope)
+}
+
+/// Proves that the executable still matches the pinned Claude Code contract.
+pub(crate) fn verify_supported_launch(context: &RunContext) -> Result<(), AppError> {
+    if env_flag_enabled(std::env::var_os("CLAUDE_CODE_SAFE_MODE").as_deref()) {
+        return Err(AppError::Usage(
+            "CLAUDE_CODE_SAFE_MODE disables Claude Code's custom Skill discovery; unset it or run the agent directly"
+                .to_owned(),
+        ));
+    }
+    if env_flag_enabled(std::env::var_os("CLAUDE_CODE_SIMPLE").as_deref()) {
+        return Err(AppError::Usage(
+            "CLAUDE_CODE_SIMPLE enables Claude Code's bare mode and disables normal Skill discovery; unset it or run the agent directly"
+                .to_owned(),
+        ));
+    }
+
+    // Native integration suites use the shared fake-agent executable. The override is absent from
+    // release builds, like failure checkpoints and other deterministic platform fixtures.
+    #[cfg(debug_assertions)]
+    if let Some(version) = std::env::var_os("SKILLMOUNT_TEST_CLAUDE_VERSION") {
+        return verify_version_text(version.to_string_lossy().as_ref());
+    }
+
+    let output = Command::new(&context.agent_bin)
+        .arg("--version")
+        .current_dir(&context.invocation_cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| AppError::MissingInput {
+            path: context.agent_bin.clone(),
+            reason: format!("cannot query Claude Code version: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(AppError::MissingInput {
+            path: context.agent_bin.clone(),
+            reason: format!("Claude Code --version exited with {}", output.status),
+        });
+    }
+    if output.stdout.len() > VERSION_OUTPUT_LIMIT || output.stderr.len() > VERSION_OUTPUT_LIMIT {
+        return Err(AppError::Usage(format!(
+            "Claude Code --version output exceeds the {VERSION_OUTPUT_LIMIT}-byte compatibility bound"
+        )));
+    }
+    let version = std::str::from_utf8(&output.stdout).map_err(|_| {
+        AppError::Usage("Claude Code --version output is not valid UTF-8".to_owned())
+    })?;
+    verify_version_text(version.trim())
+}
+
+fn env_flag_enabled(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| {
+        !value.is_empty() && value != OsStr::new("0") && !value.eq_ignore_ascii_case("false")
+    })
+}
+
+fn verify_version_text(version: &str) -> Result<(), AppError> {
+    if version.trim() == SUPPORTED_CLAUDE_VERSION_OUTPUT {
+        Ok(())
+    } else {
+        Err(AppError::Usage(format!(
+            "Claude Code {SUPPORTED_CLAUDE_VERSION} is required by this adapter, but --version reported {:?}",
+            version.trim()
+        )))
+    }
 }
 
 impl AgentAdapter for ClaudeAdapter {
@@ -180,14 +469,26 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     fn validate_passthrough_args(&self, args: &[OsString]) -> Result<Vec<Diagnostic>, AppError> {
-        for argument in args {
-            for rejected in SKILL_DISABLING_ARGS {
-                if argument == OsStr::new(rejected) {
-                    return Err(AppError::Usage(format!(
-                        "{rejected} disables Claude Code Skill loading, so mounted Skills would be ignored; remove it or run the agent directly"
-                    )));
-                }
-            }
+        let scan = scan_passthrough(args)?;
+        if let Some(rejected) = scan.disabling_arg {
+            return Err(AppError::Usage(format!(
+                "{rejected} disables Claude Code's normal Skill discovery, so mounted Skills would not satisfy the session contract; remove it or run the agent directly"
+            )));
+        }
+        if let Some(rejected) = scan.visibility_arg {
+            return Err(AppError::Usage(format!(
+                "{rejected} can override selected Skill visibility after SkillMount plans the session; remove it or run the agent directly"
+            )));
+        }
+        if let Some(rejected) = scan.session_boundary_arg {
+            return Err(AppError::Usage(format!(
+                "{rejected} detaches Claude Code or relocates its discovery root outside SkillMount's supervised session contract; remove it or run the agent directly"
+            )));
+        }
+        if let Some(rejected) = scan.non_session_subcommand {
+            return Err(AppError::Usage(format!(
+                "Claude Code subcommand {rejected:?} does not start a supervised foreground session; run that subcommand directly"
+            )));
         }
         Ok(Vec::new())
     }
@@ -197,21 +498,29 @@ impl AgentAdapter for ClaudeAdapter {
         let backing_state = classify(&backing_store)?;
 
         let mut scopes = vec![match context.options.mount_mode {
-            MountMode::Staging => inspect_scope(ScopeKind::ClaudeStaging, &backing_store)?,
-            MountMode::Project => inspect_scope(ScopeKind::ClaudeProject, &backing_store)?,
+            MountMode::Staging => inspect_claude_scope(ScopeKind::ClaudeStaging, &backing_store)?,
+            MountMode::Project => inspect_claude_scope(ScopeKind::ClaudeProject, &backing_store)?,
         }];
         if context.options.mount_mode == MountMode::Staging {
-            scopes.push(inspect_scope(
-                ScopeKind::ClaudeProject,
-                &context.project_root.join(SKILLS_SUFFIX),
-            )?);
+            scopes.extend(Self::project_scopes(context)?);
+        } else {
+            scopes.extend(
+                Self::project_scopes(context)?
+                    .into_iter()
+                    .filter(|scope| scope.state.entry != backing_store),
+            );
         }
-        scopes.push(inspect_scope(
-            ScopeKind::ClaudeUser,
-            &context.user_home.join(SKILLS_SUFFIX),
+        scopes.push(inspect_claude_scope(
+            ScopeKind::ClaudeManaged,
+            &context.claude_managed_skills,
         )?);
-        for directory in parse_add_dirs(&context.passthrough_args) {
-            scopes.push(inspect_scope(
+        scopes.push(inspect_claude_scope(
+            ScopeKind::ClaudeUser,
+            &context.claude_config_dir.join("skills"),
+        )?);
+        for directory in parse_add_dirs(&context.passthrough_args)? {
+            let directory = crate::paths::absolute_from(&context.launch_cwd, &directory)?;
+            scopes.push(inspect_claude_scope(
                 ScopeKind::ClaudeAddDir,
                 &directory.join(SKILLS_SUFFIX),
             )?);
@@ -287,13 +596,30 @@ impl AgentAdapter for ClaudeAdapter {
         let mut preserved = Vec::new();
         apply_conflict_policy(context, catalog, discovery, &mut actions, &mut preserved)?;
 
-        let injected_args = match context.options.mount_mode {
+        let mut injected_args = match context.options.mount_mode {
             MountMode::Staging => vec![
                 OsString::from("--add-dir"),
                 discovery.discovery_entry.clone().into_os_string(),
             ],
             MountMode::Project => Vec::new(),
         };
+        let overrides = catalog
+            .resolutions
+            .iter()
+            .map(|resolution| (resolution.selected.mount_name.as_str(), "on"))
+            .collect::<BTreeMap<_, _>>();
+        if !overrides.is_empty() {
+            let settings = serde_json::to_string(&serde_json::json!({
+                "skillOverrides": overrides,
+            }))
+            .map_err(|error| {
+                AppError::Usage(format!(
+                    "cannot serialize Claude Code Skill visibility settings: {error}"
+                ))
+            })?;
+            injected_args.push(OsString::from("--settings"));
+            injected_args.push(OsString::from(settings));
+        }
 
         Ok(MountPlan {
             agent: AgentId::Claude,
@@ -316,7 +642,10 @@ impl AgentAdapter for ClaudeAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaudeAdapter, missing_directory_chain, parse_add_dirs};
+    use super::{
+        ClaudeAdapter, env_flag_enabled, missing_directory_chain, parse_add_dirs,
+        verify_version_text,
+    };
     use crate::agent::AgentAdapter;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -328,7 +657,8 @@ mod tests {
     #[test]
     fn add_dir_is_recognised_in_both_argument_forms() {
         assert_eq!(
-            parse_add_dirs(&args(&["--add-dir=/a", "--add-dir", "/b", "/c", "--other"])),
+            parse_add_dirs(&args(&["--add-dir=/a", "--add-dir", "/b", "/c", "--other"]))
+                .expect("valid add-dir arguments"),
             [
                 PathBuf::from("/a"),
                 PathBuf::from("/b"),
@@ -339,7 +669,11 @@ mod tests {
 
     #[test]
     fn unrelated_arguments_contribute_no_scopes() {
-        assert!(parse_add_dirs(&args(&["--model", "opus", "--verbose"])).is_empty());
+        assert!(
+            parse_add_dirs(&args(&["--model", "opus", "--verbose"]))
+                .expect("unrelated options")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -353,11 +687,205 @@ mod tests {
     }
 
     #[test]
+    fn session_detaching_or_root_relocating_arguments_fail_before_planning() {
+        for rejected in [
+            "--bg",
+            "--background",
+            "--worktree",
+            "--worktree=review",
+            "-w",
+            "-wreview",
+            "--tmux",
+            "--tmux=classic",
+        ] {
+            let error = ClaudeAdapter
+                .validate_passthrough_args(&args(&[rejected]))
+                .expect_err("session detachment and root relocation must be rejected");
+            assert_eq!(error.category(), crate::error::ExitCategory::Usage);
+        }
+    }
+
+    #[test]
+    fn non_session_subcommands_fail_before_planning() {
+        for rejected in [
+            "agents",
+            "auth",
+            "auto-mode",
+            "doctor",
+            "gateway",
+            "install",
+            "mcp",
+            "plugin",
+            "plugins",
+            "project",
+            "setup-token",
+            "ultrareview",
+            "update",
+            "upgrade",
+        ] {
+            for passthrough in [args(&[rejected]), args(&["--verbose", rejected])] {
+                let error = ClaudeAdapter
+                    .validate_passthrough_args(&passthrough)
+                    .expect_err("non-session Claude subcommands must be rejected");
+                assert_eq!(error.category(), crate::error::ExitCategory::Usage);
+            }
+        }
+
+        let error = ClaudeAdapter
+            .validate_passthrough_args(&args(&["--", "agents", "list"]))
+            .expect_err("the separator does not prevent Claude subcommand dispatch");
+        assert_eq!(error.category(), crate::error::ExitCategory::Usage);
+    }
+
+    #[test]
+    fn passthrough_settings_that_can_hide_selected_skills_are_rejected() {
+        for rejected in [
+            args(&["--settings", "settings.json"]),
+            args(&["--settings={\"skillOverrides\":{}}"]),
+            args(&["--managed-settings", "{}"]),
+            args(&["--managed-settings={}"]),
+            args(&["--setting-sources", "user"]),
+            args(&["--setting-sources=project"]),
+        ] {
+            let error = ClaudeAdapter
+                .validate_passthrough_args(&rejected)
+                .expect_err("user settings cannot override SkillMount's visibility contract");
+            assert_eq!(error.category(), crate::error::ExitCategory::Usage);
+        }
+    }
+
+    #[test]
     fn ordinary_arguments_are_forwarded_without_complaint() {
         let diagnostics = ClaudeAdapter
             .validate_passthrough_args(&args(&["--model", "opus", "--add-dir", "/tmp"]))
             .expect("ordinary arguments are accepted");
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn standalone_separator_keeps_flag_shaped_prompt_text_opaque() {
+        let passthrough = args(&[
+            "--",
+            "--bare",
+            "--setting-sources",
+            "project",
+            "--background",
+            "--worktree=review",
+            "--tmux",
+            "--add-dir",
+            "/not-a-scope",
+        ]);
+
+        let diagnostics = ClaudeAdapter
+            .validate_passthrough_args(&passthrough)
+            .expect("everything after Claude's separator is prompt text");
+
+        assert!(diagnostics.is_empty());
+        assert!(
+            parse_add_dirs(&passthrough)
+                .expect("opaque prompt text")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn values_consumed_by_other_options_are_not_treated_as_discovery_controls() {
+        for passthrough in [
+            args(&["--model", "--bare", "prompt"]),
+            args(&["--model", "--settings", "prompt"]),
+            args(&["--model", "--setting-sources", "prompt"]),
+            args(&["--model", "--background", "prompt"]),
+            args(&["--model", "--worktree=review", "prompt"]),
+            args(&["--model", "--tmux", "prompt"]),
+            args(&["--model", "agents", "prompt"]),
+            args(&["--system-prompt", "--disable-slash-commands", "prompt"]),
+        ] {
+            ClaudeAdapter
+                .validate_passthrough_args(&passthrough)
+                .expect("a flag-shaped value belongs to the preceding pinned option");
+        }
+    }
+
+    #[test]
+    fn a_subcommand_name_after_the_prompt_position_is_opaque() {
+        ClaudeAdapter
+            .validate_passthrough_args(&args(&["review", "agents"]))
+            .expect("only Claude's first positional argument selects a subcommand");
+    }
+
+    #[test]
+    fn safe_mode_environment_uses_the_pinned_boolean_semantics() {
+        assert!(!env_flag_enabled(None));
+        assert!(!env_flag_enabled(Some(OsString::from("").as_os_str())));
+        assert!(!env_flag_enabled(Some(OsString::from("0").as_os_str())));
+        assert!(!env_flag_enabled(Some(OsString::from("FALSE").as_os_str())));
+        assert!(env_flag_enabled(Some(OsString::from("1").as_os_str())));
+        assert!(env_flag_enabled(Some(OsString::from("true").as_os_str())));
+    }
+
+    #[test]
+    fn disabling_flags_are_rejected_in_option_positions() {
+        for passthrough in [
+            args(&["--bare"]),
+            args(&["prompt", "--safe-mode"]),
+            args(&["--model=opus", "--disable-slash-commands", "prompt"]),
+        ] {
+            assert!(
+                ClaudeAdapter
+                    .validate_passthrough_args(&passthrough)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn add_dir_requires_a_value_before_the_next_option_or_separator() {
+        for passthrough in [args(&["--add-dir"]), args(&["--add-dir", "--"])] {
+            let error = ClaudeAdapter
+                .validate_passthrough_args(&passthrough)
+                .expect_err("an empty add-dir occurrence is invalid before staging");
+            assert_eq!(error.category(), crate::error::ExitCategory::Usage);
+        }
+    }
+
+    #[test]
+    fn a_non_unicode_add_dir_value_remains_platform_native() {
+        let opaque = non_unicode_argument();
+        let passthrough = vec![OsString::from("--add-dir"), opaque.clone()];
+
+        assert_eq!(
+            parse_add_dirs(&passthrough).expect("the parser does not require UTF-8"),
+            [PathBuf::from(opaque)]
+        );
+    }
+
+    #[test]
+    fn compatibility_gate_accepts_only_the_pinned_claude_release() {
+        verify_version_text("2.1.220 (Claude Code)\n").expect("supported Claude Code version");
+        for unsupported in [
+            "2.1.219 (Claude Code)",
+            "2.1.221 (Claude Code)",
+            "codex-cli 0.146.0",
+        ] {
+            assert!(
+                verify_version_text(unsupported).is_err(),
+                "{unsupported} must not borrow the 2.1.220 discovery contract"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn non_unicode_argument() -> OsString {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        OsString::from_vec(vec![0xff])
+    }
+
+    #[cfg(windows)]
+    fn non_unicode_argument() -> OsString {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        OsString::from_wide(&[0xd800])
     }
 
     #[test]

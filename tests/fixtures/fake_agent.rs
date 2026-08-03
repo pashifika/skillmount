@@ -1,11 +1,13 @@
 //! Cross-platform executable fixture for process-supervision integration tests.
 
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const RECORD_ENV: &str = "SKILLMOUNT_FAKE_RECORD";
 const DESCENDANT_RECORD_ENV: &str = "SKILLMOUNT_FAKE_DESCENDANT_RECORD";
@@ -13,10 +15,15 @@ const BEHAVIOR_ENV: &str = "SKILLMOUNT_FAKE_BEHAVIOR";
 const EXIT_ENV: &str = "SKILLMOUNT_FAKE_EXIT";
 const RAW_EXIT_ENV: &str = "SKILLMOUNT_FAKE_RAW_EXIT";
 const EXPECT_PATHS_ENV: &str = "SKILLMOUNT_FAKE_EXPECT_PATHS";
+const EXPECT_ADD_DIR_SKILLS_ENV: &str = "SKILLMOUNT_FAKE_EXPECT_ADD_DIR_SKILLS";
 const CREATE_FILE_ENV: &str = "SKILLMOUNT_FAKE_CREATE_FILE";
+const CREATE_IN_ADD_DIR_ENV: &str = "SKILLMOUNT_FAKE_CREATE_IN_ADD_DIR";
+const RELEASE_FILE_ENV: &str = "SKILLMOUNT_FAKE_RELEASE_FILE";
 const RECORD_CODEX_HOME_ENV: &str = "SKILLMOUNT_FAKE_RECORD_CODEX_HOME";
 const VERSION_RECORD_ENV: &str = "SKILLMOUNT_FAKE_VERSION_RECORD";
 const UNSUPPORTED_VERSION_AT_ENV: &str = "SKILLMOUNT_FAKE_UNSUPPORTED_VERSION_AT";
+const VERSION_OUTPUT_ENV: &str = "SKILLMOUNT_FAKE_VERSION_OUTPUT";
+const UNSUPPORTED_VERSION_OUTPUT_ENV: &str = "SKILLMOUNT_FAKE_UNSUPPORTED_VERSION_OUTPUT";
 const CREATE_PLUGIN_MANIFEST_AT_ENV: &str = "SKILLMOUNT_FAKE_CREATE_PLUGIN_MANIFEST_AT";
 const PLUGIN_MANIFEST_PATH_ENV: &str = "SKILLMOUNT_FAKE_PLUGIN_MANIFEST_PATH";
 
@@ -34,11 +41,12 @@ fn run() -> io::Result<ExitCode> {
     if env::args_os().skip(1).eq([OsStr::new("--version")]) {
         return report_version();
     }
+    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
     let record_path = required_path(RECORD_ENV)?;
     let recorder = Recorder::create(record_path)?;
     recorder.number("pid", std::process::id())?;
-    for argument in env::args_os().skip(1) {
-        recorder.os("arg", &argument)?;
+    for argument in &arguments {
+        recorder.os("arg", argument)?;
     }
     if let (Some(_), Some(codex_home)) = (
         env::var_os(RECORD_CODEX_HOME_ENV),
@@ -48,7 +56,9 @@ fn run() -> io::Result<ExitCode> {
     }
     recorder.os("cwd", &env::current_dir()?.into_os_string())?;
     verify_expected_paths(&recorder)?;
+    verify_add_dir_skills(&recorder, &arguments)?;
     create_requested_file(&recorder)?;
+    create_in_add_dir(&recorder, &arguments)?;
 
     let behavior = env::var(BEHAVIOR_ENV).unwrap_or_else(|_| "exit".to_owned());
     match behavior.as_str() {
@@ -57,6 +67,7 @@ fn run() -> io::Result<ExitCode> {
         "wait" => wait_for_interrupt(&recorder, Some(1))?,
         "ignore-first" => wait_for_interrupt(&recorder, Some(2))?,
         "ignore-all" => wait_for_interrupt(&recorder, None)?,
+        "wait-for-file" => wait_for_file(&recorder)?,
         "descendant-wait" => {
             let descendant_record = required_path(DESCENDANT_RECORD_ENV)?;
             spawn_descendant(&descendant_record, "wait")?;
@@ -121,11 +132,96 @@ fn report_version() -> io::Result<ExitCode> {
         fs::write(manifest, br#"{"name":"late-plugin"}"#)?;
     }
     if unsupported_at == Some(probe) {
-        println!("codex-cli 0.147.0");
+        println!(
+            "{}",
+            env::var(UNSUPPORTED_VERSION_OUTPUT_ENV)
+                .unwrap_or_else(|_| "codex-cli 0.147.0".to_owned())
+        );
     } else {
-        println!("codex-cli 0.146.0");
+        println!(
+            "{}",
+            env::var(VERSION_OUTPUT_ENV).unwrap_or_else(|_| "codex-cli 0.146.0".to_owned())
+        );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn verify_add_dir_skills(recorder: &Recorder, arguments: &[OsString]) -> io::Result<()> {
+    let Some(encoded) = env::var_os(EXPECT_ADD_DIR_SKILLS_ENV) else {
+        return Ok(());
+    };
+    let add_dir = injected_add_dir(arguments)?;
+    for name in env::split_paths(&encoded) {
+        if name
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "expected Skill name is not one path component: {}",
+                    name.display()
+                ),
+            ));
+        }
+        let path = add_dir.join(".claude/skills").join(name);
+        let metadata = fs::metadata(&path)?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected visible Claude Skill {}", path.display()),
+            ));
+        }
+        recorder.os("visible", path.as_os_str())?;
+        recorder.os("visible-target", fs::canonicalize(path)?.as_os_str())?;
+    }
+    Ok(())
+}
+
+fn create_in_add_dir(recorder: &Recorder, arguments: &[OsString]) -> io::Result<()> {
+    let Some(relative) = env::var_os(CREATE_IN_ADD_DIR_ENV).map(PathBuf::from) else {
+        return Ok(());
+    };
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the add-dir fixture path must be a non-empty relative path without traversal",
+        ));
+    }
+    let path = injected_add_dir(arguments)?.join(relative);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, b"created by fake agent\n")?;
+    recorder.os("created", path.as_os_str())
+}
+
+fn injected_add_dir(arguments: &[OsString]) -> io::Result<PathBuf> {
+    arguments
+        .windows(2)
+        .find(|pair| pair[0] == OsStr::new("--add-dir"))
+        .map(|pair| PathBuf::from(&pair[1]))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no injected --add-dir pair"))
+}
+
+fn wait_for_file(recorder: &Recorder) -> io::Result<()> {
+    let release = required_path(RELEASE_FILE_ENV)?;
+    recorder.event("ready")?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !release.exists() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("release file did not appear at {}", release.display()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    recorder.event("released")
 }
 
 fn create_requested_file(recorder: &Recorder) -> io::Result<()> {

@@ -151,6 +151,12 @@ fn visible_occupant<'a>(
         if visible.scope == ScopeKind::CodexSystem {
             occupancy = Occupancy::Unsupported;
         }
+        // Claude's enterprise scope has higher precedence than every personal, project, and
+        // additional-directory Skill. Preserving a foreign managed entry under `skip` would not
+        // expose the selected source, so only exact-source reuse can satisfy the contract.
+        if visible.scope == ScopeKind::ClaudeManaged && occupancy != Occupancy::SameSource {
+            occupancy = Occupancy::Unsupported;
+        }
         if occupancy == Occupancy::SameSource {
             matching.get_or_insert((visible.scope, &visible.skill, occupancy));
         } else if occupancy == Occupancy::Unsupported {
