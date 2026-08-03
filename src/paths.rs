@@ -1,6 +1,6 @@
 //! Invocation-relative path resolution and project-root discovery.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -32,8 +32,19 @@ pub(crate) fn resolve_session(
     }
 
     let skill_sources = resolve_source_occurrences(&input.skills_dirs, &invocation_cwd)?;
+    let resolve_codex_executable = input.agent == AgentId::Codex && !input.options.dry_run;
     let agent_bin = match input.agent_bin {
-        Some(path) => absolute_from(&invocation_cwd, &path)?,
+        Some(path) => {
+            let resolved = absolute_from(&invocation_cwd, &path)?;
+            if resolve_codex_executable {
+                validate_explicit_executable(&resolved)?
+            } else {
+                resolved
+            }
+        }
+        None if resolve_codex_executable => {
+            resolve_path_executable(input.agent.executable_name(), &invocation_cwd)?
+        }
         None => PathBuf::from(input.agent.executable_name()),
     };
 
@@ -47,6 +58,125 @@ pub(crate) fn resolve_session(
         agent_bin,
         passthrough_args: input.passthrough_args,
         options: input.options,
+    })
+}
+
+fn validate_explicit_executable(path: &Path) -> Result<PathBuf, AppError> {
+    reject_implicit_shell(path)?;
+    validate_runnable(path)?;
+    fs::canonicalize(path).map_err(|error| AppError::MissingInput {
+        path: path.to_path_buf(),
+        reason: format!("cannot resolve agent executable: {error}"),
+    })
+}
+
+fn resolve_path_executable(name: &OsStr, invocation_cwd: &Path) -> Result<PathBuf, AppError> {
+    let search_path = std::env::var_os("PATH").ok_or_else(|| AppError::MissingInput {
+        path: PathBuf::from(name),
+        reason: "PATH is not set, so the agent executable cannot be resolved".to_owned(),
+    })?;
+
+    for directory in std::env::split_paths(&search_path) {
+        let directory = if directory.as_os_str().is_empty() {
+            invocation_cwd.to_path_buf()
+        } else if directory.is_absolute() {
+            directory
+        } else {
+            invocation_cwd.join(directory)
+        };
+        for candidate_name in executable_names(name) {
+            let candidate = directory.join(candidate_name);
+            if reject_implicit_shell(&candidate).is_ok() && validate_runnable(&candidate).is_ok() {
+                return fs::canonicalize(&candidate).map_err(|error| AppError::MissingInput {
+                    path: candidate,
+                    reason: format!("cannot resolve agent executable: {error}"),
+                });
+            }
+        }
+    }
+
+    Err(AppError::MissingInput {
+        path: PathBuf::from(name),
+        reason: "no runnable shell-free executable was found on PATH".to_owned(),
+    })
+}
+
+#[cfg(unix)]
+fn executable_names(name: &OsStr) -> Vec<OsString> {
+    vec![name.to_os_string()]
+}
+
+#[cfg(windows)]
+fn executable_names(name: &OsStr) -> Vec<OsString> {
+    if Path::new(name).extension().is_some() {
+        return vec![name.to_os_string()];
+    }
+    let mut exe = name.to_os_string();
+    exe.push(".exe");
+    let mut com = name.to_os_string();
+    com.push(".com");
+    vec![name.to_os_string(), exe, com]
+}
+
+#[cfg(unix)]
+fn validate_runnable(path: &Path) -> Result<(), AppError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::metadata(path).map_err(|error| AppError::MissingInput {
+        path: path.to_path_buf(),
+        reason: format!("agent executable is unavailable: {error}"),
+    })?;
+    if !metadata.is_file() {
+        return Err(AppError::MissingInput {
+            path: path.to_path_buf(),
+            reason: "agent executable is not a regular file".to_owned(),
+        });
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(AppError::MissingInput {
+            path: path.to_path_buf(),
+            reason: "agent executable has no execute permission".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_runnable(path: &Path) -> Result<(), AppError> {
+    let metadata = fs::metadata(path).map_err(|error| AppError::MissingInput {
+        path: path.to_path_buf(),
+        reason: format!("agent executable is unavailable: {error}"),
+    })?;
+    if metadata.is_file() {
+        Ok(())
+    } else {
+        Err(AppError::MissingInput {
+            path: path.to_path_buf(),
+            reason: "agent executable is not a regular file".to_owned(),
+        })
+    }
+}
+
+fn reject_implicit_shell(path: &Path) -> Result<(), AppError> {
+    if requires_implicit_shell(path) {
+        Err(AppError::Usage(format!(
+            "agent executable {} is a batch file and would require implicit cmd.exe execution; use a native executable",
+            path.display()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn requires_implicit_shell(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn requires_implicit_shell(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
     })
 }
 
@@ -344,6 +474,31 @@ mod tests {
         ]);
         let error = resolve_session(input, &fixture.0).expect_err("containment should fail");
         assert_eq!(error.category(), ExitCategory::Usage);
+    }
+
+    #[test]
+    fn a_missing_explicit_agent_fails_before_a_mutating_session_can_plan() {
+        let fixture = TestDir::new("missing-agent");
+        let input = parsed_session(&["codex", "--skills-dir=skills", "--agent-bin=missing-codex"]);
+
+        let error = resolve_session(input, &fixture.0)
+            .expect_err("an explicit missing executable must fail during context resolution");
+
+        assert_eq!(error.category(), ExitCategory::MissingInput);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_explicit_batch_agent_is_rejected_as_implicit_shell_execution() {
+        let fixture = TestDir::new("batch-agent");
+        fs::write(fixture.0.join("codex.cmd"), "@exit /b 0\r\n").expect("batch fixture");
+        let input = parsed_session(&["codex", "--skills-dir=skills", "--agent-bin=codex.cmd"]);
+
+        let error = resolve_session(input, &fixture.0)
+            .expect_err("a batch file would require an implicit command shell");
+
+        assert_eq!(error.category(), ExitCategory::Usage);
+        assert!(error.to_string().contains("implicit cmd.exe"));
     }
 
     #[cfg(windows)]

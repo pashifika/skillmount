@@ -28,6 +28,10 @@ fn run_session(executable: &str, project: &Path, state: &Path, arguments: &[&str
         .arg(project)
         .arg("--cwd")
         .arg(project)
+        .arg("--agent-bin")
+        .arg(ASM)
+        .arg("--")
+        .arg("--help")
         .env("SKILLMOUNT_STATE_DIR", state)
         .current_dir(project)
         .output()
@@ -146,7 +150,7 @@ fn wrapper_maps_missing_and_invalid_catalog_inputs_to_stable_codes() {
 }
 
 #[test]
-fn inspect_resolves_without_crossing_the_unimplemented_mount_boundary() {
+fn inspect_and_codex_session_preserve_binary_parity() {
     let fixture = temporary_fixture("inspect");
     let skill = fixture.join("demo");
     fs::create_dir(&skill).expect("Skill fixture");
@@ -188,13 +192,14 @@ fn inspect_resolves_without_crossing_the_unimplemented_mount_boundary() {
     let session = run_session(ASM, &project, &state, &session_arguments);
     let fallback_session = run_session(SKILLMOUNT, &project, &state, &session_arguments);
 
-    assert_eq!(session.status.code(), Some(70));
+    assert_eq!(session.status.code(), Some(0));
     assert_eq!(session.status, fallback_session.status);
     assert_eq!(session.stdout, fallback_session.stdout);
     assert_eq!(session.stderr, fallback_session.stderr);
     assert!(
-        String::from_utf8_lossy(&session.stderr).contains("launching the agent is"),
-        "a normal session now completes the transaction and stops at the launch boundary: {}",
+        String::from_utf8_lossy(&session.stderr)
+            .contains("discovery does not grant sandbox access"),
+        "a normal Codex session launches and reports permission separation: {}",
         String::from_utf8_lossy(&session.stderr)
     );
     assert!(

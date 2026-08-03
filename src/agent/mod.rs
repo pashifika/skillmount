@@ -15,7 +15,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::domain::{AgentId, RunContext, SkillCatalog, SkillNameKey};
 use crate::error::AppError;
 use crate::lock::LockResource;
@@ -27,10 +27,13 @@ use crate::mount::resolve::{PathKind, ResolvedEntry, classify};
 pub enum ScopeKind {
     /// A Codex `.agents/skills` namespace, the authoritative discovery entry.
     CodexAuthoritative,
-    /// A Codex `.codex/skills` namespace, a compatibility backing candidate only.
+    /// The project Codex `.codex/skills` namespace: a compatibility backing candidate and a
+    /// legacy discovery root.
     CodexCompatibility,
     /// An ancestor `.agents/skills` between the launch CWD and the project root.
     CodexAncestor,
+    /// An ancestor `.codex/skills` retained by Codex for compatibility.
+    CodexAncestorCompatibility,
     /// The project's own `.claude/skills`, which `SkillMount` never modifies by default.
     ClaudeProject,
     /// The user-level `.claude/skills`.
@@ -49,6 +52,7 @@ impl ScopeKind {
             Self::CodexAuthoritative => "codex authoritative",
             Self::CodexCompatibility => "codex compatibility",
             Self::CodexAncestor => "codex ancestor",
+            Self::CodexAncestorCompatibility => "codex ancestor compatibility",
             Self::ClaudeProject => "claude project",
             Self::ClaudeUser => "claude user",
             Self::ClaudeStaging => "claude staging",
@@ -91,7 +95,13 @@ pub struct DiscoveryScope {
     /// store was reached.
     pub aliases: Vec<PathBuf>,
     /// Visible Skills keyed by comparison key, ordered deterministically.
-    pub existing_skills: BTreeMap<SkillNameKey, ExistingSkill>,
+    pub existing_skills: BTreeMap<SkillNameKey, Vec<ExistingSkill>>,
+    /// Immediate namespace entries keyed by their filesystem name.
+    ///
+    /// For direct-entry discovery models this mirrors `existing_skills`. Codex keeps it separate:
+    /// recursive frontmatter names describe what the child can select, while these entries decide
+    /// whether a mount destination path is physically free.
+    pub direct_entries: BTreeMap<SkillNameKey, Vec<ExistingSkill>>,
     /// Non-fatal observations about this scope.
     pub warnings: Vec<Diagnostic>,
 }
@@ -100,7 +110,29 @@ impl DiscoveryScope {
     /// Returns the entry occupying `key`, if the agent can already see one.
     #[must_use]
     pub fn occupant(&self, key: &SkillNameKey) -> Option<&ExistingSkill> {
-        self.existing_skills.get(key)
+        self.existing_skills
+            .get(key)
+            .and_then(|occupants| occupants.first())
+    }
+
+    /// Returns every visible Skill declaring `key`, in deterministic path order.
+    #[must_use]
+    pub fn occupants(&self, key: &SkillNameKey) -> &[ExistingSkill] {
+        self.existing_skills.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    /// Returns the immediate entry occupying a destination comparison key, if any.
+    #[must_use]
+    pub fn direct_occupant(&self, key: &SkillNameKey) -> Option<&ExistingSkill> {
+        self.direct_entries
+            .get(key)
+            .and_then(|occupants| occupants.first())
+    }
+
+    /// Returns every immediate entry occupying `key`, including case variants.
+    #[must_use]
+    pub fn direct_occupants(&self, key: &SkillNameKey) -> &[ExistingSkill] {
+        self.direct_entries.get(key).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -135,9 +167,9 @@ impl DiscoverySnapshot {
 
 /// A read-only agent adapter.
 ///
-/// Command preparation is intentionally absent from this trait: it would consume an applied plan
-/// and mutate a `Command`, while this boundary is restricted to read-only observation and
-/// description. Keeping it out also makes the currently reserved child-launch boundary explicit.
+/// Command mutation is intentionally absent from this trait. An adapter describes a
+/// [`crate::mount::LaunchPlan`], while the shared application and process layers create and own the
+/// child after the transaction is active.
 pub trait AgentAdapter {
     /// Returns the adapter's agent.
     fn id(&self) -> AgentId;
@@ -151,6 +183,15 @@ pub trait AgentAdapter {
     ///
     /// Returns [`AppError::Usage`] when an argument is incompatible with mounting Skills.
     fn validate_passthrough_args(&self, args: &[OsString]) -> Result<Vec<Diagnostic>, AppError>;
+
+    /// Returns agent-specific observations that depend on the selected catalog.
+    fn catalog_diagnostics(
+        &self,
+        _context: &RunContext,
+        _catalog: &SkillCatalog,
+    ) -> Vec<Diagnostic> {
+        Vec::new()
+    }
 
     /// Inspects every scope in the adapter's current discovery model without modifying any of them.
     ///
@@ -193,6 +234,7 @@ pub fn inspect_scope(kind: ScopeKind, entry: &Path) -> Result<DiscoveryScope, Ap
         state,
         aliases: Vec::new(),
         existing_skills: BTreeMap::new(),
+        direct_entries: BTreeMap::new(),
         warnings: Vec::new(),
     };
     if !matches!(
@@ -220,8 +262,10 @@ pub fn inspect_scope(kind: ScopeKind, entry: &Path) -> Result<DiscoveryScope, Ap
             kind: child_state.kind,
             source_canonical: child_state.terminal,
         };
-        insert_deterministically(&mut scope, existing);
+        insert_deterministically(&mut scope, existing, DiagnosticKind::General);
     }
+
+    scope.direct_entries.clone_from(&scope.existing_skills);
 
     Ok(scope)
 }
@@ -268,35 +312,37 @@ pub(crate) fn dedupe_scopes_by_terminal(
     kept
 }
 
-/// Keeps one representative per comparison key so host enumeration order cannot change results.
+/// Retains every representative per comparison key in deterministic order.
 ///
-/// Two entries fold to one key on a case-sensitive filesystem. The smaller raw name always wins,
-/// and the collision is reported rather than silently dropped, because the agent's own duplicate
-/// precedence is undocumented and must not be relied on.
-fn insert_deterministically(scope: &mut DiscoveryScope, existing: ExistingSkill) {
-    let Some(previous) = scope.existing_skills.get(&existing.comparison_key) else {
-        scope
-            .existing_skills
-            .insert(existing.comparison_key.clone(), existing);
-        return;
-    };
-
-    let (kept, displaced) = if existing.raw_name < previous.raw_name {
-        (existing, previous.clone())
-    } else {
-        (previous.clone(), existing)
-    };
-    scope.warnings.push(Diagnostic::warning(
-        format!(
-            "{} scope contains two entries with the logical name {}; {} is reported and {} is ignored",
-            scope.kind.label(),
-            kept.comparison_key,
-            kept.entry.display(),
-            displaced.entry.display()
-        ),
-        displaced.entry.clone(),
-    ));
-    scope
+/// Multiple entries can fold to one key on a case-sensitive filesystem or declare one frontmatter
+/// name under Codex. None may be dropped because a foreign source must outrank an otherwise
+/// reusable link during conflict evaluation.
+fn insert_deterministically(
+    scope: &mut DiscoveryScope,
+    existing: ExistingSkill,
+    diagnostic_kind: DiagnosticKind,
+) {
+    let occupants = scope
         .existing_skills
-        .insert(kept.comparison_key.clone(), kept);
+        .entry(existing.comparison_key.clone())
+        .or_default();
+    if let Some(previous) = occupants.first() {
+        scope.warnings.push(Diagnostic::warning_with_kind(
+            diagnostic_kind,
+            format!(
+                "{} scope contains multiple entries with the logical name {}; both {} and {} remain visible",
+                scope.kind.label(),
+                existing.comparison_key,
+                previous.entry.display(),
+                existing.entry.display()
+            ),
+            existing.entry.clone(),
+        ));
+    }
+    occupants.push(existing);
+    occupants.sort_by(|left, right| {
+        left.raw_name
+            .cmp(&right.raw_name)
+            .then_with(|| left.entry.cmp(&right.entry))
+    });
 }

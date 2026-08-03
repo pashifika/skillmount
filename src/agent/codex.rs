@@ -1,14 +1,17 @@
-//! Codex adapter: authoritative `.agents/skills` discovery over an optional `.codex/skills` store.
+//! Codex adapter: preferred `.agents/skills` mounts with observed `.agents` and legacy `.codex`
+//! discovery roots.
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::agent::{
     AgentAdapter, DiscoveryScope, DiscoverySnapshot, ScopeKind, dedupe_scopes_by_terminal,
     inspect_scope,
 };
-use crate::diagnostic::Diagnostic;
-use crate::domain::{AgentId, RunContext, SkillCatalog};
+use crate::diagnostic::{Diagnostic, DiagnosticKind};
+use crate::domain::{AgentId, RunContext, SkillCatalog, SkillNameKey};
 use crate::error::{AppError, PlanError};
 use crate::lock::{LockResource, LockResourceKind};
 use crate::mount::plan::apply_conflict_policy;
@@ -19,8 +22,10 @@ use crate::mount::{
 
 /// Relative discovery entry Codex reads.
 const AUTHORITATIVE: &str = ".agents/skills";
-/// Relative compatibility store Codex historically used.
+/// Relative compatibility store and legacy discovery root Codex retains.
 const COMPATIBILITY: &str = ".codex/skills";
+/// Maximum distinct terminal directories one Codex discovery root may traverse.
+const MAX_DISCOVERY_DIRECTORIES: usize = 16_384;
 
 /// The Codex agent adapter.
 #[derive(Debug, Clone, Copy, Default)]
@@ -43,11 +48,11 @@ pub(crate) struct CodexBacking {
 
 /// Applies the authoritative Codex discovery-entry state table.
 ///
-/// `.agents/skills` is authoritative: when it exists, its configuration decides the outcome.
-/// `.codex/skills` is only a backing candidate, used when the authoritative entry is absent or
-/// already resolves to it. Selecting "whichever side is not a link" is deliberately not
-/// implemented; that heuristic is unsafe when both sides are directories, when both are links, or
-/// when the authoritative entry points somewhere else entirely.
+/// `.agents/skills` is authoritative for placement: when it exists, its configuration decides the
+/// mount destination. `.codex/skills` remains an independently visible legacy discovery root even
+/// when it is not the selected backing store. Selecting "whichever side is not a link" is
+/// deliberately not implemented; that heuristic is unsafe when both sides are directories, when
+/// both are links, or when the authoritative entry points somewhere else entirely.
 ///
 /// # Errors
 ///
@@ -74,9 +79,10 @@ pub(crate) fn resolve_backing(
             // even when it points away from the compatibility store.
             let reaches_compatibility = authoritative.shares_terminal_with(compatibility);
             if !reaches_compatibility && compatibility.kind != PathKind::Missing {
-                warnings.push(Diagnostic::warning(
+                warnings.push(Diagnostic::warning_with_kind(
+                    DiagnosticKind::CodexDiscovery,
                     format!(
-                        "{} links outside {}; the authoritative entry is preferred and the compatibility store is left alone",
+                        "{} links outside {}; new mounts use the authoritative entry while the separate legacy root remains visible for conflict detection",
                         authoritative.entry.display(),
                         compatibility.entry.display()
                     ),
@@ -102,12 +108,15 @@ pub(crate) fn resolve_backing(
             })
         }
         PathKind::Directory => {
-            if compatibility.kind == PathKind::Directory
-                && !authoritative.shares_terminal_with(compatibility)
+            if matches!(
+                compatibility.kind,
+                PathKind::Directory | PathKind::DirectoryLink
+            ) && !authoritative.shares_terminal_with(compatibility)
             {
-                warnings.push(Diagnostic::warning(
+                warnings.push(Diagnostic::warning_with_kind(
+                    DiagnosticKind::CodexDiscovery,
                     format!(
-                        "{} and {} are separate directories; they are not merged and only the authoritative entry is used",
+                        "{} and {} resolve to separate directories; new mounts use the authoritative entry while both roots remain visible for conflict detection",
                         authoritative.entry.display(),
                         compatibility.entry.display()
                     ),
@@ -204,7 +213,8 @@ impl CodexAdapter {
         context.project_root.join(COMPATIBILITY)
     }
 
-    /// Collects every `.agents/skills` between the launch CWD and the project root, exclusive.
+    /// Collects every `.agents/skills` and `.codex/skills` between the launch CWD and the project
+    /// root, exclusive.
     ///
     /// The project root's own entry is inspected separately as the authoritative scope.
     fn ancestor_scopes(context: &RunContext) -> Result<Vec<DiscoveryScope>, AppError> {
@@ -216,13 +226,125 @@ impl CodexAdapter {
             if !ancestor.starts_with(&context.project_root) {
                 break;
             }
-            scopes.push(inspect_scope(
+            scopes.push(inspect_codex_scope(
                 ScopeKind::CodexAncestor,
                 &ancestor.join(AUTHORITATIVE),
+            )?);
+            scopes.push(inspect_codex_scope(
+                ScopeKind::CodexAncestorCompatibility,
+                &ancestor.join(COMPATIBILITY),
             )?);
         }
         Ok(scopes)
     }
+}
+
+/// Mirrors Codex's recursive `**/SKILL.md` discovery while retaining immediate path occupancy.
+fn inspect_codex_scope(kind: ScopeKind, entry: &Path) -> Result<DiscoveryScope, AppError> {
+    let mut scope = inspect_scope(kind, entry)?;
+    scope.existing_skills.clear();
+    // Direct filename collisions remain physical occupancy through `direct_entries`, but they are
+    // not logical Codex Skill collisions until valid frontmatter declares the same name.
+    scope.warnings.clear();
+    if !matches!(
+        scope.state.kind,
+        PathKind::Directory | PathKind::DirectoryLink
+    ) {
+        return Ok(scope);
+    }
+
+    let mut pending = vec![entry.to_path_buf()];
+    let mut visited = BTreeSet::new();
+    while let Some(directory) = pending.pop() {
+        let state = classify(&directory)?;
+        if !matches!(state.kind, PathKind::Directory | PathKind::DirectoryLink) {
+            continue;
+        }
+        let terminal = state.terminal.clone().ok_or_else(|| {
+            AppError::Internal(
+                "a usable Codex discovery directory must expose a terminal path".to_owned(),
+            )
+        })?;
+        if !visited.insert(terminal.clone()) {
+            continue;
+        }
+        if visited.len() > MAX_DISCOVERY_DIRECTORIES {
+            return Err(PlanError::UnsupportedLayout {
+                path: entry.to_path_buf(),
+                reason: format!(
+                    "recursive Codex discovery exceeds {MAX_DISCOVERY_DIRECTORIES} distinct directories"
+                ),
+            }
+            .into());
+        }
+
+        let skill_md = directory.join("SKILL.md");
+        match fs::symlink_metadata(&skill_md) {
+            Ok(_) => match crate::catalog::frontmatter::metadata(&skill_md) {
+                Ok(metadata) => {
+                    let name = metadata.name.filter(|name| !name.trim().is_empty());
+                    let description = metadata
+                        .description
+                        .filter(|description| !description.trim().is_empty());
+                    if let (Some(name), Some(_)) = (name, description) {
+                        super::insert_deterministically(
+                            &mut scope,
+                            crate::agent::ExistingSkill {
+                                comparison_key: SkillNameKey::new(OsStr::new(&name)),
+                                raw_name: OsString::from(name),
+                                entry: directory.clone(),
+                                kind: state.kind,
+                                source_canonical: Some(terminal.clone()),
+                            },
+                            DiagnosticKind::CodexDiscovery,
+                        );
+                    } else {
+                        scope.warnings.push(Diagnostic::warning_with_kind(
+                            DiagnosticKind::CodexDiscovery,
+                            "Codex Skill metadata requires non-empty name and description fields",
+                            skill_md,
+                        ));
+                    }
+                }
+                Err(reason) => scope.warnings.push(Diagnostic::warning_with_kind(
+                    DiagnosticKind::CodexDiscovery,
+                    format!("Codex will not load this malformed SKILL.md: {reason}"),
+                    skill_md,
+                )),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::MissingInput {
+                    path: skill_md,
+                    reason: error.to_string(),
+                });
+            }
+        }
+
+        let entries = fs::read_dir(&directory).map_err(|error| AppError::MissingInput {
+            path: directory.clone(),
+            reason: error.to_string(),
+        })?;
+        let mut children = Vec::new();
+        for child in entries {
+            let child = child.map_err(|error| AppError::MissingInput {
+                path: directory.clone(),
+                reason: error.to_string(),
+            })?;
+            let child_path = child.path();
+            let child_state = classify(&child_path)?;
+            if matches!(
+                child_state.kind,
+                PathKind::Directory | PathKind::DirectoryLink
+            ) {
+                children.push(child_path);
+            }
+        }
+        children.sort();
+        pending.extend(children.into_iter().rev());
+    }
+
+    Ok(scope)
 }
 
 impl AgentAdapter for CodexAdapter {
@@ -241,6 +363,34 @@ impl AgentAdapter for CodexAdapter {
         Ok(Vec::new())
     }
 
+    fn catalog_diagnostics(&self, context: &RunContext, catalog: &SkillCatalog) -> Vec<Diagnostic> {
+        catalog
+            .resolutions
+            .iter()
+            .filter(|resolution| {
+                !resolution
+                    .selected
+                    .origin
+                    .source_canonical
+                    .starts_with(&context.project_root)
+            })
+            .map(|resolution| {
+                let skill = &resolution.selected;
+                let mut diagnostic = Diagnostic::warning_with_kind(
+                    DiagnosticKind::CodexPermissionSeparation,
+                    format!(
+                        "Codex can discover linked Skill {}, but discovery does not grant sandbox access to {}; if bundled files are denied, give this path explicit read access in a Codex permission profile. SkillMount does not change permissions or inject --add-dir",
+                        skill.mount_name,
+                        skill.origin.source_canonical.display()
+                    ),
+                    skill.origin.source_canonical.clone(),
+                );
+                diagnostic.source_ordinal = Some(skill.origin.source_ordinal);
+                diagnostic
+            })
+            .collect()
+    }
+
     fn inspect_discovery(&self, context: &RunContext) -> Result<DiscoverySnapshot, AppError> {
         let authoritative_path = Self::authoritative_entry(context);
         let compatibility_path = Self::compatibility_entry(context);
@@ -249,30 +399,33 @@ impl AgentAdapter for CodexAdapter {
         let backing = resolve_backing(&context.project_root, &authoritative, &compatibility)?;
 
         let mut scopes = vec![
-            inspect_scope(ScopeKind::CodexAuthoritative, &authoritative_path)?,
-            inspect_scope(ScopeKind::CodexCompatibility, &compatibility_path)?,
+            inspect_codex_scope(ScopeKind::CodexAuthoritative, &authoritative_path)?,
+            inspect_codex_scope(ScopeKind::CodexCompatibility, &compatibility_path)?,
         ];
         scopes.extend(Self::ancestor_scopes(context)?);
+        let mut lock_resources = scopes
+            .iter()
+            .map(|scope| {
+                LockResource::describe_entry(
+                    LockResourceKind::DiscoveryEntry,
+                    &context.project_root,
+                    &scope.state,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        lock_resources.push(LockResource::describe(
+            LockResourceKind::BackingStore,
+            &context.project_root,
+            &backing.store,
+        )?);
+        lock_resources.sort_by_key(LockResource::ordering_key);
+        lock_resources.dedup();
+
         let mut warnings = backing.warnings;
         // An authoritative entry that links to the compatibility store makes both scopes the same
         // physical directory. Keeping both would make the store's own contents look like a foreign
         // cross-scope Skill and turn every mount into a spurious reuse.
         scopes = dedupe_scopes_by_terminal(scopes, &backing.store);
-
-        let mut lock_resources = vec![
-            LockResource::describe(
-                LockResourceKind::DiscoveryEntry,
-                &context.project_root,
-                &authoritative_path,
-            )?,
-            LockResource::describe(
-                LockResourceKind::BackingStore,
-                &context.project_root,
-                &backing.store,
-            )?,
-        ];
-        lock_resources.sort_by_key(LockResource::ordering_key);
-        lock_resources.dedup();
 
         for scope in &scopes {
             warnings.extend(scope.warnings.iter().cloned());

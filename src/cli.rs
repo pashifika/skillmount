@@ -24,7 +24,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
-    /// Resolve Skills for a future Codex session.
+    /// Run a Codex session with the selected Skills.
     Codex(SessionArgs),
     /// Resolve Skills for a future Claude Code session.
     Claude(SessionArgs),
@@ -42,7 +42,7 @@ struct SessionArgs {
     #[arg(long = "skills-dir", value_name = "PATH", required = true)]
     skills_dirs: Vec<PathBuf>,
 
-    /// Working directory for the future agent process.
+    /// Working directory for the selected agent process.
     #[arg(long, value_name = "PATH")]
     cwd: Option<PathBuf>,
 
@@ -86,7 +86,7 @@ struct SessionArgs {
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     verbosity: u8,
 
-    /// Opaque arguments forwarded to the future agent process.
+    /// Opaque arguments forwarded to the selected agent process.
     #[arg(last = true, value_name = "AGENT_ARGS", allow_hyphen_values = true)]
     passthrough_args: Vec<OsString>,
 }

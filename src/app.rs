@@ -19,7 +19,11 @@ use crate::journal::{TransactionId, store};
 use crate::lock::acquire::{HeldLocks, LockOwner, LockPolicy};
 use crate::mount::MountPlan;
 use crate::paths::{resolve_inspection, resolve_session};
+use crate::process::{
+    CleanupFailure, ProcessSupervisor, SupervisionDiagnostic, SupervisionRequest, map_exit,
+};
 use crate::render;
+use crate::transaction::cleanup::CleanupReport;
 use crate::transaction::{Transaction, recover};
 
 /// Maximum discovery/recovery passes allowed while a mutating lock set expands.
@@ -48,12 +52,12 @@ where
         Err(error) => return report_clap_error(&error),
     };
     match execute(command, &invocation_cwd) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(error) => report_error(&error),
     }
 }
 
-fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<(), AppError> {
+fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError> {
     match command {
         ParsedCommand::Session(input) => {
             let dry_run = input.options.dry_run;
@@ -70,7 +74,7 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<(), AppError
                 verbosity: context.options.verbosity,
             }))?;
             warn(&render::render_warnings(&report.catalog, &report.snapshot));
-            Ok(())
+            Ok(0)
         }
         ParsedCommand::Inspect(input) => {
             let mut rendered = String::new();
@@ -97,7 +101,7 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<(), AppError
             }
             emit(&rendered)?;
             warn(&warnings);
-            Ok(())
+            Ok(0)
         }
         ParsedCommand::Reserved(utility) => {
             let name = match utility {
@@ -118,7 +122,7 @@ pub(crate) struct ReadOnlyOutcome {
     pub(crate) plan: MountPlan,
 }
 
-/// Runs the mutating half of a session: lock, recover, plan, apply, clean up.
+/// Runs the mutating half of a session: lock, recover, plan, apply, supervise, and clean up.
 ///
 /// The order is not negotiable, and no complete plan is built before the lock. After the journal
 /// preflight and any staging-control setup, discovery yields the lock set on its own. A
@@ -126,10 +130,11 @@ pub(crate) struct ReadOnlyOutcome {
 /// a source this run did not select, the conflict table would refuse it, and the run would exit
 /// before recovery ever got the chance to remove the very entry it was refusing.
 ///
-/// Launching the child is the one step still reserved. The session therefore runs cleanup before
-/// reporting the boundary; cleanup conservatively retains and reports any entry it cannot safely
-/// remove. `--keep-mounts` bypasses removal because retaining the mounts is exactly what it asks for.
-fn run_session(context: &RunContext) -> Result<(), AppError> {
+/// The supervisor owns the single orderly cleanup call. It invokes cleanup only after proving no
+/// child was spawned or the managed process domain is empty; uncertain liveness leaves the active
+/// journal untouched for recovery. `--keep-mounts` reaches the transaction's terminal kept state
+/// through that same callback.
+fn run_session(context: &RunContext) -> Result<u8, AppError> {
     // Unknown ownership state is checked before creating even SkillMount's own staging or lock
     // directories. Recovery scans again after locks are held, so a journal appearing between this
     // read-only preflight and acquisition still fails closed rather than entering a new plan.
@@ -196,6 +201,11 @@ fn run_session(context: &RunContext) -> Result<(), AppError> {
         ))
     })?;
 
+    warn(&render::render_warnings(
+        &rebuilt.catalog,
+        &rebuilt.snapshot,
+    ));
+
     let mut transaction = Transaction::open_with(
         &context,
         &rebuilt.catalog,
@@ -208,15 +218,137 @@ fn run_session(context: &RunContext) -> Result<(), AppError> {
         .apply()
         .map_err(|failure| failure.into_error())?;
 
-    let cleanup = transaction.cleanup()?;
-    warn(&cleanup.describe());
-    Err(AppError::Internal(format!(
-        "applied and then released {} mount action(s) for {} Skill(s); launching the agent is \
-         reserved for a later change, so the session stopped at that boundary rather than leaving \
-         mounts behind for a process that never starts",
-        rebuilt.plan.actions.len(),
-        rebuilt.catalog.resolutions.len()
-    )))
+    // Codex is the only launch contract this change validates. Keep Claude at the previous
+    // apply-and-release boundary until its own adapter change proves the child discovery model,
+    // forwarded arguments, and staging lifetime end to end.
+    if context.agent == AgentId::Claude {
+        let cleanup = transaction.cleanup()?;
+        warn(&cleanup.describe());
+        return Err(AppError::Internal(format!(
+            "applied and then released {} mount action(s) for {} Skill(s); launching Claude is \
+             reserved for a later change, so the session stopped at that boundary rather than \
+             leaving mounts behind for a process that never starts",
+            rebuilt.plan.actions.len(),
+            rebuilt.catalog.resolutions.len()
+        )));
+    }
+
+    let journal_path = transaction.journal_path().to_path_buf();
+    let request = SupervisionRequest::new(rebuilt.plan.launch.clone());
+    let outcome = ProcessSupervisor::new().supervise(request, move || {
+        cleanup_for_supervisor(&mut transaction, &journal_path)
+    });
+    // Lock ownership covers the whole child lifetime and the cleanup callback. Keeping this
+    // explicit prevents a future refactor from shortening the guard to the last planning use.
+    drop(locks);
+
+    let decision = map_exit(&outcome);
+    report_supervision_diagnostics(&decision);
+    Ok(decision.code)
+}
+
+fn cleanup_for_supervisor(
+    transaction: &mut Transaction,
+    journal_path: &Path,
+) -> Result<(), CleanupFailure> {
+    match transaction.cleanup() {
+        Ok(report) => {
+            let messages = report.describe();
+            warn(&messages);
+            if report.needs_attention() {
+                Err(cleanup_failure_from_report(
+                    &report,
+                    &messages,
+                    journal_path,
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => Err(CleanupFailure {
+            reason: error.to_string(),
+            failed_paths: Vec::new(),
+            retained_journal: Some(journal_path.to_path_buf()),
+            recovery_command: Vec::new(),
+        }),
+    }
+}
+
+fn cleanup_failure_from_report(
+    report: &CleanupReport,
+    messages: &[String],
+    fallback_journal: &Path,
+) -> CleanupFailure {
+    CleanupFailure {
+        reason: messages.join("; "),
+        failed_paths: report
+            .retained
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect(),
+        retained_journal: report
+            .journal_retained
+            .as_ref()
+            .map(|retention| retention.path().to_path_buf())
+            .or_else(|| Some(fallback_journal.to_path_buf())),
+        recovery_command: Vec::new(),
+    }
+}
+
+fn report_supervision_diagnostics(decision: &crate::process::ExitDecision) {
+    if let Some(primary) = &decision.primary {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "error: {}",
+            describe_supervision_diagnostic(primary)
+        );
+    }
+    for secondary in &decision.secondary {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "warning: {}",
+            describe_supervision_diagnostic(secondary)
+        );
+    }
+}
+
+fn describe_supervision_diagnostic(diagnostic: &SupervisionDiagnostic) -> String {
+    match diagnostic {
+        SupervisionDiagnostic::Process(failure) => {
+            let cwd = failure
+                .cwd()
+                .map(|path| format!(" in {}", path.display()))
+                .unwrap_or_default();
+            format!(
+                "agent process {:?} failed for {}{cwd}: {}",
+                failure.stage(),
+                failure.executable().display(),
+                failure.reason()
+            )
+        }
+        SupervisionDiagnostic::LivenessUncertain => {
+            "agent process liveness could not be proved; cleanup was deferred".to_owned()
+        }
+        SupervisionDiagnostic::UnexpectedCleanupDeferral => {
+            "cleanup was unexpectedly deferred after a terminal child outcome".to_owned()
+        }
+        SupervisionDiagnostic::ExceptionalWindowsStatus { raw_status } => {
+            format!("agent returned exceptional Windows status 0x{raw_status:08x}")
+        }
+        SupervisionDiagnostic::ExceptionalUnixSignal { signal } => {
+            format!("agent terminated with unrepresentable Unix signal {signal}")
+        }
+        SupervisionDiagnostic::ExceptionalUnixStatus { raw_status } => {
+            format!("agent returned unrepresentable Unix wait status {raw_status}")
+        }
+        SupervisionDiagnostic::Cleanup(failure) => {
+            let journal = failure.retained_journal.as_ref().map_or_else(
+                || "no journal path was available".to_owned(),
+                |path| format!("journal retained at {}", path.display()),
+            );
+            format!("session cleanup failed: {}; {journal}", failure.reason)
+        }
+    }
 }
 
 /// Recovers or refuses, according to `--no-recover`.
@@ -299,7 +431,10 @@ pub(crate) fn plan_read_only(context: &RunContext) -> Result<ReadOnlyOutcome, Ap
             destination_stores: &destination_stores,
         },
     )?;
-    let snapshot = adapter.inspect_discovery(context)?;
+    let mut snapshot = adapter.inspect_discovery(context)?;
+    snapshot
+        .warnings
+        .extend(adapter.catalog_diagnostics(context, &catalog));
     let plan = adapter.build_mount_plan(context, &catalog, &snapshot)?;
     Ok(ReadOnlyOutcome {
         catalog,

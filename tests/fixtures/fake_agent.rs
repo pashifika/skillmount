@@ -12,6 +12,8 @@ const DESCENDANT_RECORD_ENV: &str = "SKILLMOUNT_FAKE_DESCENDANT_RECORD";
 const BEHAVIOR_ENV: &str = "SKILLMOUNT_FAKE_BEHAVIOR";
 const EXIT_ENV: &str = "SKILLMOUNT_FAKE_EXIT";
 const RAW_EXIT_ENV: &str = "SKILLMOUNT_FAKE_RAW_EXIT";
+const EXPECT_PATHS_ENV: &str = "SKILLMOUNT_FAKE_EXPECT_PATHS";
+const CREATE_FILE_ENV: &str = "SKILLMOUNT_FAKE_CREATE_FILE";
 
 fn main() -> ExitCode {
     match run() {
@@ -31,6 +33,8 @@ fn run() -> io::Result<ExitCode> {
         recorder.os("arg", &argument)?;
     }
     recorder.os("cwd", &env::current_dir()?.into_os_string())?;
+    verify_expected_paths(&recorder)?;
+    create_requested_file(&recorder)?;
 
     let behavior = env::var(BEHAVIOR_ENV).unwrap_or_else(|_| "exit".to_owned());
     match behavior.as_str() {
@@ -71,6 +75,32 @@ fn run() -> io::Result<ExitCode> {
         .parse::<u8>()
         .map_err(invalid_data)?;
     Ok(ExitCode::from(code))
+}
+
+fn create_requested_file(recorder: &Recorder) -> io::Result<()> {
+    let Some(path) = env::var_os(CREATE_FILE_ENV).map(PathBuf::from) else {
+        return Ok(());
+    };
+    fs::write(&path, b"created by fake agent\n")?;
+    recorder.os("created", path.as_os_str())
+}
+
+fn verify_expected_paths(recorder: &Recorder) -> io::Result<()> {
+    let Some(encoded) = env::var_os(EXPECT_PATHS_ENV) else {
+        return Ok(());
+    };
+    for path in env::split_paths(&encoded) {
+        let metadata = fs::metadata(&path)?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected visible directory {}", path.display()),
+            ));
+        }
+        recorder.os("visible", path.as_os_str())?;
+        recorder.os("visible-target", fs::canonicalize(&path)?.as_os_str())?;
+    }
+    Ok(())
 }
 
 fn use_inherited_streams(recorder: &Recorder) -> io::Result<()> {

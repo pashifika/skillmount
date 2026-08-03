@@ -43,6 +43,11 @@ pub(super) fn parse(path: &Path) -> Result<ParsedFrontmatter, String> {
     })
 }
 
+/// Parses the known metadata fields without exposing the validation-only envelope representation.
+pub(crate) fn metadata(path: &Path) -> Result<SkillMetadata, String> {
+    parse(path).map(|parsed| parsed.metadata)
+}
+
 fn envelope(content: &str) -> Result<&str, String> {
     let Some(after_start) = content
         .strip_prefix("---\n")

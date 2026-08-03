@@ -56,57 +56,55 @@ pub(crate) fn apply_conflict_policy(
         let source = &skill.origin.source_canonical;
         let destination = discovery.backing_store.join(skill.mount_name.as_str());
 
-        if let Some((scope, existing)) =
-            mount_scope.and_then(|scope| scope.occupant(&key).map(|existing| (scope, existing)))
+        let visible = visible_occupant(discovery, &key, source);
+        if let Some((scope, existing, other)) =
+            visible.filter(|(_, _, occupancy)| *occupancy != Occupancy::SameSource)
         {
-            match occupancy(existing, source) {
-                Occupancy::SameSource => {
-                    actions.push(
-                        MountAction::ReuseExistingLink {
-                            source: source.clone(),
-                            destination: existing.entry.clone(),
-                        },
-                        PathPrecondition::ExistingLinkToSource,
-                    );
-                }
-                other if other.is_skippable() && policy == ConflictPolicy::Skip => {
-                    preserved.push(preserve(scope, existing, source));
-                }
-                _ => return Err(conflict(scope, existing, skill, source).into()),
+            if other.is_skippable() && policy == ConflictPolicy::Skip {
+                preserved.push(preserve(scope, existing, source));
+                continue;
             }
+            return Err(conflict(scope, existing, skill, source).into());
+        }
+
+        let direct = mount_scope.and_then(|scope| {
+            most_restrictive(scope.direct_occupants(&key), source)
+                .map(|(existing, occupancy)| (scope, existing, occupancy))
+        });
+        if let Some((scope, existing, other)) =
+            direct.filter(|(_, _, occupancy)| *occupancy != Occupancy::SameSource)
+        {
+            if other.is_skippable() && policy == ConflictPolicy::Skip {
+                preserved.push(preserve(scope, existing, source));
+                continue;
+            }
+            return Err(conflict(scope, existing, skill, source).into());
+        }
+
+        let reusable = direct
+            .or(visible)
+            .filter(|(_, _, occupancy)| *occupancy == Occupancy::SameSource);
+        if let Some((_scope, existing, _)) = reusable {
+            // The child already sees this exact source. A second mount would add another entry
+            // whose duplicate-name behavior SkillMount does not control.
+            actions.push(
+                MountAction::ReuseExistingLink {
+                    source: source.clone(),
+                    destination: existing.entry.clone(),
+                },
+                PathPrecondition::ExistingLinkToSource,
+            );
             continue;
         }
 
-        match cross_scope_occupant(discovery, &key, source) {
-            Some((_scope, existing, Occupancy::SameSource)) => {
-                // The child can already see this exact source through another scope, so mounting
-                // a second copy would add a duplicate the agent resolves by undocumented rules.
-                actions.push(
-                    MountAction::ReuseExistingLink {
-                        source: source.clone(),
-                        destination: existing.entry.clone(),
-                    },
-                    PathPrecondition::ExistingLinkToSource,
-                );
-            }
-            Some((scope, existing, other)) => {
-                if other.is_skippable() && policy == ConflictPolicy::Skip {
-                    preserved.push(preserve(scope, existing, source));
-                } else {
-                    return Err(conflict(scope, existing, skill, source).into());
-                }
-            }
-            None => {
-                actions.push(
-                    MountAction::CreateDirectoryLink {
-                        source: source.clone(),
-                        destination,
-                        mode: context.options.link_mode,
-                    },
-                    PathPrecondition::Missing,
-                );
-            }
-        }
+        actions.push(
+            MountAction::CreateDirectoryLink {
+                source: source.clone(),
+                destination,
+                mode: context.options.link_mode,
+            },
+            PathPrecondition::Missing,
+        );
     }
 
     Ok(())
@@ -124,32 +122,48 @@ fn occupancy(existing: &ExistingSkill, source: &std::path::Path) -> Occupancy {
     }
 }
 
-/// Finds the most restrictive occupant of `key` outside the scope being mounted into.
+/// Finds the most restrictive visible occupant of `key` across every discovery scope.
 ///
 /// A different or unknown source anywhere the child can see outranks a matching one: the agent
 /// picks between duplicates by rules `SkillMount` does not control, so the presence of any foreign
 /// Skill under this name has to drive the decision.
-fn cross_scope_occupant<'a>(
+fn visible_occupant<'a>(
     discovery: &'a DiscoverySnapshot,
     key: &crate::domain::SkillNameKey,
     source: &std::path::Path,
 ) -> Option<(&'a DiscoveryScope, &'a ExistingSkill, Occupancy)> {
     let mut matching = None;
     for scope in &discovery.scopes {
-        if scope.state.entry == discovery.backing_store {
-            continue;
-        }
-        let Some(existing) = scope.occupant(key) else {
-            continue;
-        };
-        let occupancy = occupancy(existing, source);
-        if occupancy == Occupancy::SameSource {
-            matching.get_or_insert((scope, existing, occupancy));
-        } else {
-            return Some((scope, existing, occupancy));
+        if let Some((existing, occupancy)) = most_restrictive(scope.occupants(key), source) {
+            if occupancy == Occupancy::SameSource {
+                matching.get_or_insert((scope, existing, occupancy));
+            } else {
+                return Some((scope, existing, occupancy));
+            }
         }
     }
     matching
+}
+
+fn most_restrictive<'a>(
+    occupants: &'a [ExistingSkill],
+    source: &std::path::Path,
+) -> Option<(&'a ExistingSkill, Occupancy)> {
+    let mut matching = None;
+    let mut skippable = None;
+    for existing in occupants {
+        let occupancy = occupancy(existing, source);
+        match occupancy {
+            Occupancy::Unsupported => return Some((existing, occupancy)),
+            Occupancy::SameSource => {
+                matching.get_or_insert((existing, occupancy));
+            }
+            Occupancy::DifferentSource | Occupancy::ProjectDirectory => {
+                skippable.get_or_insert((existing, occupancy));
+            }
+        }
+    }
+    skippable.or(matching)
 }
 
 fn preserve(

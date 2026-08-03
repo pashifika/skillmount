@@ -5,6 +5,7 @@ use super::claude::ClaudeAdapter;
 use super::codex::{CodexAdapter, resolve_backing};
 use super::{AgentAdapter, ScopeKind, inspect_scope};
 use crate::catalog::{CatalogRequest, resolve_catalog};
+use crate::diagnostic::DiagnosticKind;
 use crate::domain::{
     AgentId, ConflictPolicy, LinkMode, MountMode, RunContext, RunOptions, SkillCatalog,
     SkillNameKey, SourceOccurrence, ValidationLevel,
@@ -122,6 +123,54 @@ fn plan_codex(
     let catalog = project.catalog(AgentId::Codex);
     let snapshot = CodexAdapter.inspect_discovery(context)?;
     CodexAdapter.build_mount_plan(context, &catalog, &snapshot)
+}
+
+#[test]
+fn codex_permission_diagnostics_are_typed_and_only_cover_external_skills() {
+    let project = Project::new("codex-permission-diagnostic");
+    project.source_skill("inside");
+    let context = project.codex_context(ConflictPolicy::Error);
+    assert!(
+        CodexAdapter
+            .catalog_diagnostics(&context, &project.catalog(AgentId::Codex))
+            .is_empty(),
+        "project-contained Skills need no permission-separation warning"
+    );
+
+    let external = TestDir::new("codex-permission-external");
+    let external_source = external.dir("source");
+    let external_skill = external.dir("source/outside");
+    std::fs::write(
+        external_skill.join("SKILL.md"),
+        "---\nname: outside\ndescription: external fixture\n---\n",
+    )
+    .expect("external Skill metadata");
+    let catalog = resolve_catalog(
+        &[SourceOccurrence {
+            ordinal: 0,
+            input_path: external_source.clone(),
+            resolved_path: external_source,
+        }],
+        &CatalogRequest {
+            agent: AgentId::Codex,
+            validation: ValidationLevel::Basic,
+            destination_stores: &[],
+        },
+    )
+    .expect("external catalog");
+
+    let diagnostics = CodexAdapter.catalog_diagnostics(&context, &catalog);
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(
+        diagnostics[0].kind,
+        DiagnosticKind::CodexPermissionSeparation
+    );
+    assert_eq!(diagnostics[0].source_ordinal, Some(0));
+    assert!(
+        diagnostics[0]
+            .message
+            .contains("does not grant sandbox access")
+    );
 }
 
 /// Returns only the per-Skill links, excluding the authoritative discovery link.
@@ -273,6 +322,27 @@ fn a_compatibility_link_back_to_agents_selects_agents_without_warning() {
         backing.warnings.is_empty(),
         "both entries already name one directory, so there is nothing to report"
     );
+}
+
+#[test]
+fn a_separate_compatibility_link_remains_visible_and_warns() {
+    let project = Project::new("codex-row-c-links-elsewhere");
+    let authoritative = project.make_dir(AUTHORITATIVE);
+    let legacy = project.make_dir("legacy-store");
+    project.make_dir(".codex");
+    if !symlink_dir_or_skip(&legacy, &project.compatibility()) {
+        return;
+    }
+
+    let backing = resolve_backing(
+        &project.root,
+        &classify(&authoritative).unwrap(),
+        &classify(&project.compatibility()).unwrap(),
+    )
+    .expect("the authoritative regular directory remains the mount store");
+
+    assert_eq!(backing.store, authoritative);
+    assert_eq!(backing.warnings.len(), 1);
 }
 
 #[test]
@@ -465,6 +535,7 @@ fn scope_enumeration_is_independent_of_host_ordering() {
         scope
             .existing_skills
             .values()
+            .flatten()
             .map(|existing| existing.raw_name.clone())
             .collect::<Vec<_>>()
     };
@@ -686,7 +757,13 @@ fn a_same_key_skill_in_an_ancestor_scope_blocks_a_mount_whose_destination_is_fre
     project.make_dir(COMPATIBILITY);
     let nested = project.make_dir("nested");
     let ancestor_store = project.make_dir("nested/.agents/skills");
-    std::fs::create_dir_all(ancestor_store.join("alpha")).expect("ancestor skill");
+    let ancestor_skill = ancestor_store.join("alpha");
+    std::fs::create_dir_all(&ancestor_skill).expect("ancestor skill");
+    std::fs::write(
+        ancestor_skill.join("SKILL.md"),
+        "---\nname: alpha\ndescription: ancestor alpha\n---\n",
+    )
+    .expect("ancestor Skill metadata");
 
     let mut context = project.codex_context(ConflictPolicy::Error);
     context.launch_cwd = nested;
@@ -695,6 +772,155 @@ fn a_same_key_skill_in_an_ancestor_scope_blocks_a_mount_whose_destination_is_fre
         .expect_err("a Skill already visible to the child must not be silently duplicated");
 
     assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn a_same_key_skill_in_an_ancestor_codex_scope_blocks_a_mount() {
+    let project = Project::new("cross-scope-ancestor-codex");
+    project.source_skill("alpha");
+    project.make_dir(COMPATIBILITY);
+    let nested = project.make_dir("nested");
+    let existing = project.make_dir("nested/.codex/skills/alpha");
+    std::fs::write(
+        existing.join("SKILL.md"),
+        "---\nname: alpha\ndescription: legacy alpha\n---\n",
+    )
+    .expect("existing Skill metadata");
+
+    let mut context = project.codex_context(ConflictPolicy::Error);
+    context.launch_cwd = nested;
+
+    let error = plan_codex(&project, &context)
+        .expect_err("a legacy Skill visible to Codex must veto a duplicate mount");
+
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn a_recursive_frontmatter_name_conflicts_when_directory_names_differ() {
+    let project = Project::new("cross-scope-recursive-frontmatter");
+    project.source_skill("alpha");
+    let existing = project.make_dir(".agents/skills/group/legacy-alpha");
+    std::fs::write(
+        existing.join("SKILL.md"),
+        "---\nname: alpha\ndescription: nested alpha\n---\n",
+    )
+    .expect("existing Skill metadata");
+
+    let error = plan_codex(&project, &project.codex_context(ConflictPolicy::Error))
+        .expect_err("Codex uses recursive frontmatter names rather than direct directory names");
+
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn a_symlinked_collection_is_discovered_once_even_when_it_links_back() {
+    let project = Project::new("cross-scope-symlinked-collection");
+    project.source_skill("alpha");
+    let store = project.make_dir(AUTHORITATIVE);
+    let collection = project.make_dir("collection/deep/foreign");
+    std::fs::write(
+        collection.join("SKILL.md"),
+        "---\nname: alpha\ndescription: linked collection alpha\n---\n",
+    )
+    .expect("linked collection Skill metadata");
+    if !symlink_dir_or_skip(&project.root.join("collection"), &store.join("collection")) {
+        return;
+    }
+    if !symlink_dir_or_skip(&store, &project.root.join("collection/loop")) {
+        return;
+    }
+
+    let error = plan_codex(&project, &project.codex_context(ConflictPolicy::Error))
+        .expect_err("Codex follows linked collections, and terminal identity must stop the cycle");
+
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn duplicate_frontmatter_names_retain_a_foreign_conflict() {
+    let project = Project::new("cross-scope-duplicate-frontmatter");
+    let source = project.source_skill("alpha");
+    let store = project.make_dir(AUTHORITATIVE);
+    if !symlink_dir_or_skip(&source, &store.join("one")) {
+        return;
+    }
+    let foreign = project.make_dir(".agents/skills/two");
+    std::fs::write(
+        foreign.join("SKILL.md"),
+        "---\nname: alpha\ndescription: foreign alpha\n---\n",
+    )
+    .expect("foreign Skill metadata");
+
+    let error = plan_codex(&project, &project.codex_context(ConflictPolicy::Error))
+        .expect_err("one matching duplicate must not hide a foreign duplicate");
+
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unsupported_case_variant_outranks_a_skippable_destination() {
+    let project = Project::new("cross-scope-duplicate-unsupported");
+    project.source_skill("alpha");
+    let store = project.make_dir(AUTHORITATIVE);
+    std::fs::create_dir(store.join("ALPHA")).expect("skippable case-variant directory");
+    if !symlink_dir_or_skip(Path::new("missing-target"), &store.join("alpha")) {
+        return;
+    }
+
+    let error = plan_codex(&project, &project.codex_context(ConflictPolicy::Skip))
+        .expect_err("skip must not hide an unsupported occupant under the same key");
+
+    assert_eq!(error.category(), ExitCategory::Filesystem);
+}
+
+#[test]
+fn every_codex_discovery_root_and_backing_store_is_locked() {
+    let project = Project::new("codex-complete-lock-set");
+    project.source_skill("alpha");
+    project.make_dir(COMPATIBILITY);
+    let nested = project.make_dir("nested");
+    project.make_dir("nested/.agents/skills");
+    project.make_dir("nested/.codex/skills");
+
+    let mut context = project.codex_context(ConflictPolicy::Error);
+    context.launch_cwd = nested.clone();
+    let snapshot = CodexAdapter
+        .inspect_discovery(&context)
+        .expect("discovery snapshot");
+
+    let resources = snapshot
+        .lock_resources
+        .iter()
+        .map(|resource| (resource.kind, resource.path.clone()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = [
+        (
+            crate::lock::LockResourceKind::DiscoveryEntry,
+            project.authoritative(),
+        ),
+        (
+            crate::lock::LockResourceKind::DiscoveryEntry,
+            project.compatibility(),
+        ),
+        (
+            crate::lock::LockResourceKind::BackingStore,
+            project.compatibility(),
+        ),
+        (
+            crate::lock::LockResourceKind::DiscoveryEntry,
+            nested.join(AUTHORITATIVE),
+        ),
+        (
+            crate::lock::LockResourceKind::DiscoveryEntry,
+            nested.join(COMPATIBILITY),
+        ),
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(resources, expected);
 }
 
 #[test]

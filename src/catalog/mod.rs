@@ -1,7 +1,7 @@
 //! Side-effect-free Skill source discovery, overlay resolution, and validation.
 
 mod discover;
-mod frontmatter;
+pub(crate) mod frontmatter;
 mod resolve;
 mod validate;
 

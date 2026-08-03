@@ -180,7 +180,7 @@ fn scopes(out: &mut String, report: &ReadOnlyReport<'_>) {
             );
         }
         if report.verbose() {
-            for existing in scope.existing_skills.values() {
+            for existing in scope.existing_skills.values().flatten() {
                 let _ = writeln!(
                     out,
                     "      {:<28} {}",
