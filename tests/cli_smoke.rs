@@ -7,6 +7,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
 const SKILLMOUNT: &str = env!("CARGO_BIN_EXE_skillmount");
+const RELEASE_CODEX_ENV: &str = "SKILLMOUNT_CLI_SMOKE_CODEX_BIN";
+
+fn session_agent() -> PathBuf {
+    if let Some(executable) = std::env::var_os(RELEASE_CODEX_ENV) {
+        return PathBuf::from(executable);
+    }
+
+    #[cfg(debug_assertions)]
+    return PathBuf::from(ASM);
+
+    #[cfg(not(debug_assertions))]
+    panic!("{RELEASE_CODEX_ENV} must name the explicit Codex fixture for a release smoke run");
+}
 
 fn run(executable: &str, arguments: &[&str]) -> Output {
     let home =
@@ -44,7 +57,7 @@ fn run_session(executable: &str, project: &Path, state: &Path, arguments: &[&str
         .arg("--cwd")
         .arg(project)
         .arg("--agent-bin")
-        .arg(ASM)
+        .arg(session_agent())
         .arg("--")
         .arg("exec")
         .arg("fixture")
@@ -55,6 +68,11 @@ fn run_session(executable: &str, project: &Path, state: &Path, arguments: &[&str
         .env("LOCALAPPDATA", home.join("AppData/Local"))
         .env("CODEX_HOME", home.join("codex-home"))
         .env("SKILLMOUNT_TEST_CODEX_VERSION", "codex-cli 0.146.0")
+        .env(
+            "SKILLMOUNT_FAKE_RECORD",
+            state.join("cli-smoke-codex.record"),
+        )
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
         .env(
             "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
             home.join("admin-skills"),
@@ -222,19 +240,31 @@ fn inspect_and_codex_session_preserve_binary_parity() {
     let session = run_session(ASM, &project, &state, &session_arguments);
     let fallback_session = run_session(SKILLMOUNT, &project, &state, &session_arguments);
 
-    assert_eq!(session.status.code(), Some(64));
+    if std::env::var_os(RELEASE_CODEX_ENV).is_some() {
+        assert!(
+            session.status.success(),
+            "the release smoke fixture is a supported Codex executable: {}",
+            String::from_utf8_lossy(&session.stderr)
+        );
+        assert!(
+            state.join("cli-smoke-codex.record").is_file(),
+            "the release smoke fixture records the child launch"
+        );
+    } else {
+        assert_eq!(session.status.code(), Some(64));
+        assert!(
+            String::from_utf8_lossy(&session.stderr)
+                .contains("discovery does not grant sandbox access"),
+            "the debug session reports permission separation: {}",
+            String::from_utf8_lossy(&session.stderr)
+        );
+    }
     assert_eq!(session.status, fallback_session.status);
     assert_eq!(session.stdout, fallback_session.stdout);
     assert_eq!(session.stderr, fallback_session.stderr);
     assert!(
-        String::from_utf8_lossy(&session.stderr)
-            .contains("discovery does not grant sandbox access"),
-        "the Codex session launches the parity fixture and reports permission separation: {}",
-        String::from_utf8_lossy(&session.stderr)
-    );
-    assert!(
         !project.join(".agents").exists() && !project.join(".codex").exists(),
-        "a session that cannot launch a child releases everything it applied"
+        "a completed session releases everything it applied"
     );
     assert!(
         journal_count(&state) == 0,

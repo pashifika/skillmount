@@ -86,7 +86,11 @@ jobs:
           cargo +"$MSRV" build --locked --all-targets --all-features
       - name: Build release binaries
         run: cargo build --locked --release --bins
+      - name: Build release smoke-test agent
+        run: cargo build --locked --release --features test-fixtures --bin skillmount-fake-agent
       - name: Run release executable smoke suite
+        env:
+          SKILLMOUNT_CLI_SMOKE_CODEX_BIN: ${{ github.workspace }}/target/release/skillmount-fake-agent
         run: cargo test --locked --release --test cli_smoke
 
   test:
