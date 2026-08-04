@@ -25,11 +25,19 @@ REPOSITORY = "pashifika/skillmount"
 CHOCO_ROOT = r"C:\ProgramData\chocolatey"
 LIB = rf"{CHOCO_ROOT}\lib"
 BIN = rf"{CHOCO_ROOT}\bin"
-SPEC = (
-    Path(__file__).resolve().parents[2]
-    / "rasen/changes/publish-homebrew-and-chocolatey-packages"
-    / "specs/chocolatey-distribution/spec.md"
-)
+# The planning store is machine-local and root-ignored, so it is absent from a CI checkout. The
+# scenario-mapping test resolves it lazily and skips rather than failing when it is not present.
+SPEC_GLOB = "rasen/**/chocolatey-distribution/spec.md"
+
+
+def spec_path() -> Path:
+    """Return the `chocolatey-distribution` spec in this checkout, or skip."""
+
+    candidates = sorted(Path(__file__).resolve().parents[2].glob(SPEC_GLOB))
+    if not candidates:
+        raise unittest.SkipTest("chocolatey-distribution/spec.md is not in this checkout")
+    return candidates[0]
+
 
 SKILLMOUNT = harness.PackageSelection(
     package_id="skillmount",
@@ -1080,7 +1088,7 @@ class ScenarioCoverageTests(unittest.TestCase):
             harness.validate_scenario_map((harness.ScenarioMapping("partial", ("pack",)),))
 
     def test_every_scenario_in_the_spec_is_mapped(self) -> None:
-        text = SPEC.read_text(encoding="utf-8")
+        text = spec_path().read_text(encoding="utf-8")
         scenarios = tuple(
             line.removeprefix("#### Scenario:").strip()
             for line in text.splitlines()

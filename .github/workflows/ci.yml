@@ -147,8 +147,11 @@ jobs:
           rustup target add --toolchain "$RUST_TOOLCHAIN" "${{ matrix.target }}"
       - name: Test native live-smoke timeout safeguards
         run: python .github/scripts/test_live_agent_smoke.py
-      - name: Test native package acceptance-harness safeguards
-        run: python -B .github/scripts/test_homebrew_acceptance.py
+      # The Homebrew harness reasons about POSIX Homebrew paths, so `/opt/homebrew` and keg
+      # containment are only meaningful on a runner that can reach `brew`.
+      - name: Test native Homebrew acceptance-harness safeguards
+        if: runner.os == 'macOS'
+        run: python3 -B .github/scripts/test_homebrew_acceptance.py
       - name: Test native Chocolatey acceptance-harness safeguards
         run: python -B .github/scripts/test_chocolatey_acceptance.py
       - name: Build both executables

@@ -1702,4 +1702,15 @@ class BrewInvocationTests(FixtureCase):
 
 
 if __name__ == "__main__":
+    # Homebrew exists only on macOS and Linux, and these fixtures assert POSIX Homebrew paths:
+    # `/opt/homebrew` is not absolute under Windows path semantics, and a Windows short name such
+    # as `RUNNER~1` breaks keg-containment comparison. Refusing to run here is honest, because the
+    # real coverage runs on the macOS and Linux jobs that can actually reach `brew`.
+    if os.name != "posix":
+        print(
+            f"skipping: the Homebrew acceptance harness is POSIX-only; observed os.name="
+            f"{os.name!r}. Run this suite on macOS or Linux.",
+            file=sys.stderr,
+        )
+        raise SystemExit(0)
     unittest.main()
