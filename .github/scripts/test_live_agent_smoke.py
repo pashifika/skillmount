@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -178,6 +179,93 @@ class LiveAgentSmokeTests(unittest.TestCase):
 
 
 class AgentPackageTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows command resolution regression")
+    def test_prepare_cli_launches_windows_npm_cmd_from_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "npm-invocation.txt"
+            (root / "npm.cmd").write_text(
+                "@echo off\r\n"
+                "> \"%SKILLMOUNT_NPM_MARKER%\" echo %*\r\n"
+                "exit /b 23\r\n",
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = str(root) + os.pathsep + environment.get("PATH", "")
+            environment["SKILLMOUNT_NPM_MARKER"] = str(marker)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("prepare_live_agents.py")),
+                    "--platform",
+                    "windows-x64",
+                    "--output-dir",
+                    str(root / "agents"),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=30,
+            )
+
+            self.assertTrue(
+                marker.is_file(),
+                f"prepare CLI did not launch npm.cmd:\n{completed.stderr}",
+            )
+            self.assertIn(
+                "pack @openai/codex@0.146.0-win32-x64 --ignore-scripts --json",
+                marker.read_text(encoding="utf-8"),
+            )
+
+    @unittest.skipUnless(os.name == "nt", "Windows npm metadata regression")
+    def test_prepare_cli_accepts_npm_object_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = root / "npm-fixture.py"
+            fixture.write_text(
+                "import json\n"
+                "print(json.dumps({\n"
+                "    '@openai/codex': {\n"
+                "        'name': '@openai/codex',\n"
+                "        'version': '0.146.0-win32-x64',\n"
+                "        'integrity': "
+                "'sha512-b3lxMYeR0+IhstNo4JjX1P9cPc1xwVcCVkPd1lD1wpWPJ0SBhpIkPczwbu3ZRkJcdyl342+rgyf4DUrbZLdrGA==',\n"
+                "        'filename': '../unsafe.tgz',\n"
+                "    },\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            (root / "npm.cmd").write_text(
+                "@echo off\r\n"
+                '"%SKILLMOUNT_TEST_PYTHON%" "%SKILLMOUNT_NPM_FIXTURE%"\r\n'
+                "exit /b %ERRORLEVEL%\r\n",
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = str(root) + os.pathsep + environment.get("PATH", "")
+            environment["SKILLMOUNT_TEST_PYTHON"] = sys.executable
+            environment["SKILLMOUNT_NPM_FIXTURE"] = str(fixture)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("prepare_live_agents.py")),
+                    "--platform",
+                    "windows-x64",
+                    "--output-dir",
+                    str(root / "agents"),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=30,
+            )
+
+            self.assertIn("npm returned an unsafe archive name", completed.stderr)
+
     def test_manifest_binds_both_native_binary_hashes_and_platform(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

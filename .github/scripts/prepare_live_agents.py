@@ -8,6 +8,7 @@ import base64
 import hashlib
 import hmac
 import json
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -150,9 +151,12 @@ def extract_regular_file(archive: Path, member_name: str, destination: Path) -> 
 
 
 def fetch(package: Package, output_dir: Path, download_dir: Path) -> dict[str, object]:
+    npm = shutil.which("npm")
+    if npm is None:
+        raise RuntimeError("npm is not installed on PATH")
     completed = subprocess.run(
         [
-            "npm",
+            npm,
             "pack",
             package.spec,
             "--ignore-scripts",
@@ -170,12 +174,20 @@ def fetch(package: Package, output_dir: Path, download_dir: Path) -> dict[str, o
             f"npm pack failed for {package.spec} with exit {completed.returncode}"
         )
     try:
-        records = json.loads(completed.stdout)
-        record = records[0]
-    except (IndexError, KeyError, TypeError, json.JSONDecodeError) as error:
+        metadata = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
         raise RuntimeError(f"npm pack returned invalid metadata for {package.spec}") from error
+    if isinstance(metadata, list):
+        records = metadata
+    elif isinstance(metadata, dict):
+        records = list(metadata.values())
+    else:
+        raise RuntimeError(f"npm pack returned invalid metadata for {package.spec}")
     if len(records) != 1:
         raise RuntimeError(f"npm pack returned multiple packages for {package.spec}")
+    record = records[0]
+    if not isinstance(record, dict):
+        raise RuntimeError(f"npm pack returned invalid metadata for {package.spec}")
     observed = (record.get("name"), record.get("version"), record.get("integrity"))
     expected = (package.package_name, package.version, package.integrity)
     if observed != expected:
