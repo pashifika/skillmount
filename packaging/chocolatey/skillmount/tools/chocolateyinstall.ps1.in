@@ -1,0 +1,113 @@
+# SkillMount Chocolatey install template for `@PACKAGE_ID@` @VERSION@, release tag @TAG@.
+#
+# Generated into @PACKAGE_ID@/tools/chocolateyinstall.ps1 by
+# `.github/scripts/package_channels.py generate-chocolatey`. Edit this template, never the
+# generated script.
+#
+# One release archive carries both product executables, and this package must keep exactly
+# one of them. Extraction therefore lands in a package-owned temporary directory and never
+# in the tools directory, because Chocolatey discovers shim candidates under tools and would
+# otherwise expose the executable this package did not select.
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 2
+
+$packageId = '@PACKAGE_ID@'
+$selectedExecutable = '@SELECTED_EXECUTABLE@'
+$unselectedExecutable = '@OTHER_EXECUTABLE@'
+$toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+
+if ($selectedExecutable -ne '@COMMAND@.exe') {
+    throw ("$packageId was rendered with an inconsistent selection: expected executable " +
+        "'@COMMAND@.exe', observed '$selectedExecutable'.")
+}
+if ($selectedExecutable -eq $unselectedExecutable) {
+    throw ("$packageId was rendered with an ambiguous selection: expected two distinct " +
+        "executables, observed '$selectedExecutable' as both selected and unselected.")
+}
+
+# Refuse to install over residue, so a partially removed earlier install can never leave a
+# second product executable behind for shim discovery to find.
+foreach ($residue in @($selectedExecutable, $unselectedExecutable)) {
+    $residuePath = Join-Path $toolsDir $residue
+    if (Test-Path -LiteralPath $residuePath) {
+        throw ("$packageId refuses to install over existing package content: expected no " +
+            "'$residue' under '$toolsDir', observed '$residuePath'.")
+    }
+}
+
+$osBits = Get-OSArchitectureWidth
+$forcedX86 = (Test-Path 'Env:\ChocolateyForceX86') -and ($env:ChocolateyForceX86 -eq 'true')
+if (($osBits -eq 64) -and (-not $forcedX86)) {
+    $expectedRoot = '@ARCHIVE_ROOT_X64@'
+} else {
+    $expectedRoot = '@ARCHIVE_ROOT_X86@'
+}
+
+$stagingRoot = Join-Path $env:TEMP "$packageId-@VERSION@-staging-$PID"
+$archivePath = Join-Path $stagingRoot 'release-archive.zip'
+$extractRoot = Join-Path $stagingRoot 'extracted'
+
+try {
+    if (Test-Path -LiteralPath $stagingRoot) {
+        Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
+
+    $download = @{
+        PackageName    = $packageId
+        FileFullPath   = $archivePath
+        Url            = '@URL_X86@'
+        Checksum       = '@SHA256_X86@'
+        ChecksumType   = 'sha256'
+        Url64bit       = '@URL_X64@'
+        Checksum64     = '@SHA256_X64@'
+        ChecksumType64 = 'sha256'
+    }
+    Get-ChocolateyWebFile @download
+
+    Get-ChocolateyUnzip -FileFullPath $archivePath -Destination $extractRoot -PackageName $packageId
+
+    $roots = @(Get-ChildItem -LiteralPath $extractRoot -Force)
+    $singleRoot = ($roots.Count -eq 1) -and $roots[0].PSIsContainer
+    if ((-not $singleRoot) -or ($roots[0].Name -ne $expectedRoot)) {
+        $observed = ($roots | ForEach-Object { $_.Name }) -join ', '
+        throw ("$packageId extracted an unexpected archive layout: expected exactly one " +
+            "directory named '$expectedRoot', observed '$observed'.")
+    }
+    $productRoot = $roots[0].FullName
+
+    # Prove the dual-binary release contract from the extracted bytes before selecting.
+    $requiredMembers = @(
+        $selectedExecutable,
+        $unselectedExecutable,
+        'LICENSE-APACHE',
+        'LICENSE-MIT',
+        'VERSION'
+    )
+    foreach ($required in $requiredMembers) {
+        $requiredPath = Join-Path $productRoot $required
+        if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+            throw ("$packageId extracted an incomplete archive: expected member " +
+                "'$expectedRoot\$required', observed no file at '$requiredPath'.")
+        }
+    }
+
+    foreach ($retained in @($selectedExecutable, 'VERSION')) {
+        $source = Join-Path $productRoot $retained
+        Copy-Item -LiteralPath $source -Destination (Join-Path $toolsDir $retained) -Force
+    }
+
+    $installedExecutable = Join-Path $toolsDir $selectedExecutable
+    if (-not (Test-Path -LiteralPath $installedExecutable -PathType Leaf)) {
+        throw ("$packageId failed to retain its selected executable: expected " +
+            "'$installedExecutable', observed no file.")
+    }
+
+    Write-Host ("$packageId @VERSION@ installed the '@COMMAND@' command from " +
+        "'$expectedRoot'.")
+} finally {
+    if (Test-Path -LiteralPath $stagingRoot) {
+        Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+    }
+}
