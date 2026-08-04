@@ -1549,7 +1549,14 @@ class BrewInvocationTests(FixtureCase):
     def harness_for(self, responses: dict[tuple[str, ...], tuple[int, str, str]]):
         """Return a harness bound to one scripted gateway with a trusted tap."""
 
-        gateway = ScriptedGateway(responses)
+        trusted = [trusted_name(package_id) for package_id in harness.FORMULA_IDS]
+        gateway = ScriptedGateway(
+            {
+                ("brew", "trust", "--json"): (0, trust_json(formulae=trusted), ""),
+                ("brew", "trust", "--formula"): (0, "", ""),
+                **responses,
+            }
+        )
         subject = harness.Harness(gateway, options_for(self.root))
         subject.prefix = Path(harness.SUPPORTED_PREFIX)
         subject.commands = dict(harness.PACKAGE_TABLE_PINS)
@@ -1575,6 +1582,8 @@ class BrewInvocationTests(FixtureCase):
         self.assertEqual(
             gateway.calls,
             [
+                ("brew", "trust", "--json", harness.TRUST_JSON_VERSION),
+                ("brew", "trust", "--formula", reference),
                 ("brew", "install", "--formula", "--build-from-source", reference),
                 ("brew", "--cellar", reference),
             ],
@@ -1589,7 +1598,10 @@ class BrewInvocationTests(FixtureCase):
         gateway, subject = self.harness_for({("brew", "install"): (1, "", "build failed\n")})
         phase = subject.phase("install-asm-alone")
         self.assertFalse(subject.install(phase, "skillmount-asm"))
-        self.assertEqual(len(gateway.calls), 1)
+        self.assertEqual(
+            [call[:2] for call in gateway.calls],
+            [("brew", "trust"), ("brew", "trust"), ("brew", "install")],
+        )
         self.assertNotIn("skillmount-asm", subject.installed)
         phase.settle()
         self.assertEqual(phase.status, "failed")
@@ -1916,7 +1928,7 @@ class TrustTests(FixtureCase):
         )
 
     def test_trust_precedes_every_install_with_the_documented_argv(self) -> None:
-        """Trust each Formula by name before the first tap-qualified install."""
+        """Trust each Formula by name, then re-assert it immediately before installing."""
 
         cellar = self.root / "Cellar" / "skillmount"
         gateway, subject = self.trust_harness(
@@ -1925,7 +1937,8 @@ class TrustTests(FixtureCase):
         subject.phase_trust()
         phase = subject.phases["trust"]
         self.assertEqual(phase.status, "passed")
-        self.assertTrue(subject.install(subject.phase("install-skillmount-alone"), "skillmount"))
+        install_phase = subject.phase("install-skillmount-alone")
+        self.assertTrue(subject.install(install_phase, "skillmount"))
         self.assertEqual(
             gateway.calls,
             [
@@ -1933,6 +1946,8 @@ class TrustTests(FixtureCase):
                 ("brew", "trust", "--formula", acceptance_reference("skillmount")),
                 ("brew", "trust", "--formula", acceptance_reference("skillmount-asm")),
                 ("brew", "trust", "--json", harness.TRUST_JSON_VERSION),
+                ("brew", "trust", "--json", harness.TRUST_JSON_VERSION),
+                ("brew", "trust", "--formula", acceptance_reference("skillmount")),
                 (
                     "brew",
                     "install",
@@ -1947,17 +1962,236 @@ class TrustTests(FixtureCase):
             subject.added_trust,
             [acceptance_reference(package_id) for package_id in harness.FORMULA_IDS],
         )
-        recorded = subject.trust_evidence
+        recorded = subject.trust_report()
         self.assertEqual(
-            recorded["argv"][1], ["brew", "trust", "--formula", acceptance_reference("skillmount")]
+            recorded["argv"],
+            [list(call) for call in gateway.calls if call[:2] == ("brew", "trust")],
         )
+        self.assertEqual(recorded["dropped"], [])
         self.assertEqual(recorded["store"]["path"], str(gateway.path))
         self.assertTrue(recorded["store"]["existed"])
         self.assertEqual(recorded["trusted"], [trusted_name(name) for name in harness.FORMULA_IDS])
         self.assertIn("brew untrust --formula", str(recorded["restore"]))
+        self.assertIn("re-asserted", str(recorded["reassert"]))
         joined = " ".join(phase.observations)
         self.assertIn("keys trust by name", joined)
         self.assertIn("scoped to the install path", joined)
+        self.assertIn("one `brew trust --formula` per run is not enough", joined)
+        self.assertIn(
+            "still lists skillmount-acceptance/tap/skillmount immediately before installing it",
+            " ".join(install_phase.observations),
+        )
+
+    def test_every_install_reasserts_trust_even_after_an_uninstall(self) -> None:
+        """Re-trust the reference immediately before every install, reinstalls included."""
+
+        cellar = self.root / "Cellar" / "skillmount"
+        gateway, subject = self.trust_harness(
+            {
+                ("brew", "install"): (0, "", ""),
+                ("brew", "--cellar"): (0, f"{cellar}\n", ""),
+                ("brew", "uninstall"): (0, "", ""),
+            }
+        )
+        subject.phase_trust()
+        reference = acceptance_reference("skillmount")
+        self.assertTrue(subject.install(subject.phase("install-skillmount-alone"), "skillmount"))
+        subject.uninstall("skillmount", phase=subject.phase("uninstall"))
+        self.assertTrue(subject.install(subject.phase("co-install"), "skillmount"))
+        installs = [
+            index
+            for index, call in enumerate(gateway.calls)
+            if call[:2] == ("brew", "install")
+        ]
+        asserted = [
+            index
+            for index, call in enumerate(gateway.calls)
+            if call == ("brew", "trust", "--formula", reference)
+        ]
+        self.assertEqual(len(installs), 2)
+        self.assertEqual(len(asserted), 3)
+        for index in installs:
+            self.assertIn(index - 1, asserted)
+            self.assertEqual(gateway.calls[index - 2][:3], ("brew", "trust", "--json"))
+        self.assertEqual(
+            subject.added_trust,
+            [acceptance_reference(package_id) for package_id in harness.FORMULA_IDS],
+        )
+
+    def test_a_dropped_trust_entry_is_re_trusted_and_diagnosed(self) -> None:
+        """Name the reference, the phase, and the last phase that ran when trust vanished."""
+
+        cellar = self.root / "Cellar" / "skillmount"
+        gateway, subject = self.trust_harness(
+            {("brew", "install"): (0, "", ""), ("brew", "--cellar"): (0, f"{cellar}\n", "")}
+        )
+        subject.phase_trust()
+        name = trusted_name("skillmount")
+        gateway.store["formulae"] = [
+            entry for entry in gateway.store["formulae"] if entry != name
+        ]
+        gateway.write()
+        subject.phase("uninstall")
+        phase = subject.phase("co-install")
+        self.assertTrue(subject.install(phase, "skillmount"))
+        self.assertIn(name, gateway.store["formulae"])
+        diagnosis = phase.observations[0]
+        self.assertIn(f"Homebrew dropped {name}", diagnosis)
+        self.assertIn("in phase 'co-install'", diagnosis)
+        self.assertIn("the last phase that ran was uninstall", diagnosis)
+        self.assertIn(f'"{harness.trust_refusal(acceptance_reference("skillmount"))}"', diagnosis)
+        phase.settle()
+        self.assertEqual(phase.status, "passed")
+        self.assertEqual(phase.findings, [])
+        self.assertEqual(subject.trust_report()["dropped"], [diagnosis])
+        self.assertEqual(
+            subject.added_trust,
+            [acceptance_reference(package_id) for package_id in harness.FORMULA_IDS],
+        )
+
+    def test_three_reasserts_still_untrust_each_reference_exactly_once(self) -> None:
+        """Keep cleanup narrow however often trust was re-asserted."""
+
+        cellar = self.root / "Cellar" / "skillmount"
+        gateway, subject = self.trust_harness(
+            {
+                ("brew", "install"): (0, "", ""),
+                ("brew", "--cellar"): (0, f"{cellar}\n", ""),
+                ("brew", "uninstall"): (0, "", ""),
+            }
+        )
+        before = gateway.path.read_bytes()
+        subject.phase_trust()
+        reference = acceptance_reference("skillmount")
+        for name in ("install-skillmount-alone", "co-install", "upgrade-from-prior"):
+            self.assertTrue(subject.install(subject.phase(name), "skillmount"))
+            subject.uninstall("skillmount")
+        self.assertEqual(
+            [call for call in gateway.calls if call[:3] == ("brew", "trust", "--formula")].count(
+                ("brew", "trust", "--formula", reference)
+            ),
+            4,
+        )
+        self.assertEqual(
+            subject.added_trust,
+            [acceptance_reference(package_id) for package_id in harness.FORMULA_IDS],
+        )
+        subject.cleanup()
+        self.assertEqual(
+            [call for call in gateway.calls if call[:2] == ("brew", "untrust")],
+            [
+                ("brew", "untrust", "--formula", acceptance_reference("skillmount-asm")),
+                ("brew", "untrust", "--formula", reference),
+            ],
+        )
+        self.assertEqual(gateway.path.read_bytes(), before)
+        self.assertEqual(subject.cleanup_findings, [])
+
+    def test_a_pre_existing_trust_entry_survives_every_reassert(self) -> None:
+        """Leave an operator's own trust entry untouched however often it is re-asserted."""
+
+        already = trusted_name("skillmount")
+        cellar = self.root / "Cellar" / "skillmount"
+        gateway, subject = self.trust_harness(
+            {
+                ("brew", "install"): (0, "", ""),
+                ("brew", "--cellar"): (0, f"{cellar}\n", ""),
+                ("brew", "uninstall"): (0, "", ""),
+            },
+            formulae=(already,),
+        )
+        before = gateway.path.read_bytes()
+        subject.phase_trust()
+        for name in ("install-skillmount-alone", "co-install"):
+            self.assertTrue(subject.install(subject.phase(name), "skillmount"))
+            subject.uninstall("skillmount")
+        self.assertEqual(subject.added_trust, [acceptance_reference("skillmount-asm")])
+        subject.cleanup()
+        self.assertEqual(
+            [call for call in gateway.calls if call[:2] == ("brew", "untrust")],
+            [("brew", "untrust", "--formula", acceptance_reference("skillmount-asm"))],
+        )
+        self.assertIn(already, gateway.store["formulae"])
+        self.assertEqual(gateway.path.read_bytes(), before)
+        self.assertEqual(subject.cleanup_findings, [])
+
+    def test_a_refused_reassert_fails_the_install_phase_with_the_refusal_quoted(self) -> None:
+        """Fail the install phase by name when the pre-install `brew trust` is refused."""
+
+        gateway, subject = self.trust_harness({("brew", "install"): (0, "", "")})
+        subject.phase_trust()
+        self.assertEqual(subject.phases["trust"].status, "passed")
+        gateway.trust_status = 1
+        reference = acceptance_reference("skillmount")
+        phase = subject.phase("co-install")
+        self.assertFalse(subject.install(phase, "skillmount"))
+        self.assertNotIn(
+            ("brew", "install", "--formula", "--build-from-source", reference), gateway.calls
+        )
+        phase.settle()
+        self.assertEqual(phase.status, "failed")
+        finding = " ".join(phase.findings)
+        self.assertIn(f"brew trust --formula {reference} exited 1", finding)
+        self.assertIn(
+            "Refusing to load formula skillmount-acceptance/tap/skillmount from untrusted tap",
+            finding,
+        )
+        self.assertIn("brew trust --help", finding)
+
+    def test_an_install_refused_after_a_successful_reassert_is_its_own_failure(self) -> None:
+        """Report a refusal that survived a re-assert as a distinct trust-model regression."""
+
+        reference = acceptance_reference("skillmount")
+        gateway, subject = self.trust_harness(
+            {("brew", "install"): (1, "", f"Error: {harness.trust_refusal(reference)}\n")}
+        )
+        subject.phase_trust()
+        phase = subject.phase("co-install")
+        self.assertFalse(subject.install(phase, "skillmount"))
+        self.assertEqual(
+            gateway.calls[-1],
+            ("brew", "install", "--formula", "--build-from-source", reference),
+        )
+        self.assertEqual(len(phase.findings), 2)
+        self.assertNotIn("trust model changed", phase.findings[0])
+        regression = phase.findings[1]
+        self.assertIn(
+            f"`brew trust --formula {reference}` succeeded immediately before", regression
+        )
+        self.assertIn(f'"{harness.trust_refusal(reference)}"', regression)
+        self.assertIn("trust model changed again upstream", regression)
+
+    def test_an_unreadable_pre_install_trust_state_refuses_the_install(self) -> None:
+        """Refuse to install a reference whose current trust state cannot be read."""
+
+        gateway, subject = self.trust_harness({("brew", "install"): (0, "", "")})
+        subject.phase_trust()
+        original = gateway.answer
+
+        def answer(argv: tuple[str, ...]) -> harness.CommandEvidence:
+            if argv[:3] == ("brew", "trust", "--json"):
+                gateway.calls.append(argv)
+                return harness.CommandEvidence(
+                    argv=argv,
+                    returncode=1,
+                    stdout="",
+                    stderr="Error: unknown command: trust\n",
+                )
+            return original(argv)
+
+        gateway.answer = answer
+        reference = acceptance_reference("skillmount")
+        phase = subject.phase("install-skillmount-alone")
+        self.assertFalse(subject.install(phase, "skillmount"))
+        self.assertNotIn(
+            ("brew", "install", "--formula", "--build-from-source", reference), gateway.calls
+        )
+        phase.settle()
+        self.assertEqual(phase.status, "failed")
+        finding = " ".join(phase.findings)
+        self.assertIn(f"could not be read immediately before installing {reference}", finding)
+        self.assertIn("in phase 'install-skillmount-alone'", finding)
+        self.assertIn("unknown command: trust", finding)
 
     def test_a_refused_trust_quotes_homebrews_refusal_and_blocks_the_install(self) -> None:
         """Fail the trust phase by name and refuse to attempt any install."""
@@ -2087,6 +2321,7 @@ class TrustTests(FixtureCase):
         subject.phase_trust()
         phase = subject.phase("install-skillmount-alone")
         self.assertFalse(subject.install(phase, "skillmount"))
+        self.assertNotIn("trust model changed", " ".join(phase.findings))
         subject.cleanup()
         self.assertEqual(gateway.path.read_bytes(), before)
         self.assertEqual(subject.cleanup_findings, [])

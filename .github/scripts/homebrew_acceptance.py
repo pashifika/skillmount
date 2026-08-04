@@ -114,9 +114,10 @@ TRUST_JSON_VERSION = "v1"
 TRUST_SECTIONS = ("casks", "commands", "formulae", "taps")
 TRUST_STORE_UNDER_XDG = "homebrew/trust.json"
 TRUST_STORE_UNDER_HOME = ".homebrew/trust.json"
+TRUST_REFUSAL_MARKER = "Refusing to load formula {reference} from untrusted tap {tap}"
 TRUST_REFUSAL_TEMPLATE = (
-    "Refusing to load formula {reference} from untrusted tap {tap}. Run "
-    "'brew trust --formula {reference}' or 'brew trust {tap}' to trust it."
+    TRUST_REFUSAL_MARKER + ". Run 'brew trust --formula {reference}' or "
+    "'brew trust {tap}' to trust it."
 )
 TRUST_HELP_NOTICE = (
     "`brew trust --help` must still document `--formula`, and `brew untrust --help` must still "
@@ -130,8 +131,15 @@ TRUST_SCOPE_NOTICE = (
 )
 TRUST_NAME_NOTICE = (
     "notice: Homebrew keys trust by name, never by content, so one `brew trust --formula` "
-    "survives every later rewrite of the same Formula file; the upgrade rehearsal reuses it and "
-    "an operator trusts a tap formula once rather than once per release"
+    "survives every later rewrite of the same Formula file, which is why the upgrade rehearsal "
+    "reuses the entry it trusted for the candidate Formula"
+)
+TRUST_REASSERT_NOTICE = (
+    "notice: one `brew trust --formula` per run is not enough. This harness observed a reference "
+    "it had trusted, and never untrusted, missing from `brew trust --json v1` at a later install, "
+    "so trust is re-asserted immediately before every `brew install`. `brew trust` is idempotent "
+    "and prints `Already trusted` for an entry that survived, and cleanup still untrusts exactly "
+    "the references that were absent from the pre-run snapshot"
 )
 TRUST_RESTORE_MECHANISM = (
     "`brew untrust --formula <reference>` removes exactly the names this harness added, so an "
@@ -1028,6 +1036,15 @@ def trust_refusal(reference: str) -> str:
     return TRUST_REFUSAL_TEMPLATE.format(reference=canonical, tap=tap)
 
 
+def trust_refused_install(evidence: CommandEvidence, *, reference: str) -> bool:
+    """Return whether one failed install carries Homebrew's untrusted-tap refusal."""
+
+    canonical = canonical_reference(reference)
+    tap, _, _ = canonical.rpartition("/")
+    marker = TRUST_REFUSAL_MARKER.format(reference=canonical, tap=tap)
+    return marker in f"{evidence.stdout}\n{evidence.stderr}"
+
+
 def require_absolute(value: str, *, label: str) -> Path:
     """Return one environment path that Homebrew resolves its trust store under."""
 
@@ -1144,6 +1161,41 @@ def untrusted_install_finding(reference: str) -> str:
     return (
         f"{reference} was never trusted, so Homebrew would refuse the install with "
         f'"{trust_refusal(reference)}"; the trust phase must record it before any install'
+    )
+
+
+def trust_drop_observation(reference: str, *, phase: str, previous: str) -> str:
+    """Return the diagnosis a trust entry that vanished between phases produces."""
+
+    return (
+        f"Homebrew dropped {canonical_reference(reference)} from `brew trust --json "
+        f"{TRUST_JSON_VERSION}`: this run trusted that reference and never untrusted it, yet the "
+        f"read taken immediately before installing it in phase {phase!r} no longer lists it, and "
+        f"the last phase that ran was {previous or '(none)'}. Re-asserting `brew trust --formula "
+        f'{reference}` because Homebrew would otherwise refuse the install with '
+        f'"{trust_refusal(reference)}"'
+    )
+
+
+def trust_query_install_finding(reference: str, *, phase: str, reason: str) -> str:
+    """Return the named failure an unreadable pre-install trust state produces."""
+
+    return (
+        f"the trust state could not be read immediately before installing {reference} in phase "
+        f"{phase!r}, so this harness refuses to install a reference it cannot prove Homebrew still "
+        f"trusts: {reason}"
+    )
+
+
+def trust_regression_finding(evidence: CommandEvidence, *, reference: str) -> str:
+    """Return the named failure an install refused after a successful re-assert produces."""
+
+    return (
+        f"`brew trust --formula {reference}` succeeded immediately before "
+        f"{' '.join(evidence.argv)}, yet Homebrew still refused that install with "
+        f'"{trust_refusal(reference)}"; expected a trust entry asserted one command earlier to '
+        "hold for the install that follows it, so Homebrew's trust model changed again upstream "
+        "and trusting the reference by name no longer makes a third-party tap installable"
     )
 
 
@@ -1435,6 +1487,9 @@ class Harness:
         self.added_trust: list[str] = []
         self.trust_snapshot: TrustStore | None = None
         self.trust_evidence: dict[str, object] = {}
+        self.trust_argv: list[list[str]] = []
+        self.trust_drops: list[str] = []
+        self.phase_history: list[str] = []
         self.installed: dict[str, Path] = {}
         self.commands: dict[str, tuple[str, str]] = {}
         self.formula_paths: dict[str, Path] = {}
@@ -1460,7 +1515,14 @@ class Harness:
         except KeyError as error:
             raise HomebrewAcceptanceError(f"unknown phase {name!r}") from error
         self.active = phase
+        if not self.phase_history or self.phase_history[-1] != name:
+            self.phase_history.append(name)
         return phase
+
+    def previous_phase(self, name: str) -> str:
+        """Return the last phase this run activated before the named one, if any."""
+
+        return next((entry for entry in reversed(self.phase_history) if entry != name), "")
 
     def require(self, evidence: CommandEvidence) -> CommandEvidence:
         """Require one command to have succeeded, keeping it as evidence."""
@@ -1745,10 +1807,17 @@ class Harness:
             self.installed.pop(package_id, None)
         return evidence
 
+    def brew_trust(self, *arguments: str) -> CommandEvidence:
+        """Run one `brew trust` query or assertion, keeping its argv for the report."""
+
+        evidence = self.gateway.brew("trust", *arguments)
+        self.trust_argv.append(list(evidence.argv))
+        return evidence
+
     def read_trust(self, *, phase: Phase | None) -> dict[str, tuple[str, ...]]:
         """Return Homebrew's four trust sections, retaining the query as evidence."""
 
-        evidence = self.gateway.brew("trust", "--json", TRUST_JSON_VERSION)
+        evidence = self.brew_trust("--json", TRUST_JSON_VERSION)
         if phase is not None:
             phase.record(evidence)
         else:
@@ -1788,7 +1857,7 @@ class Harness:
         before = self.capture_trust(phase)
         for package_id in self.options.formula_ids:
             reference = self.formula_reference(package_id)
-            evidence = phase.record(self.gateway.brew("trust", "--formula", reference))
+            evidence = phase.record(self.brew_trust("--formula", reference))
             if evidence.returncode != 0:
                 phase.add((trust_failure(evidence, reference=reference),))
                 continue
@@ -1815,13 +1884,14 @@ class Harness:
                 )
         phase.note(TRUST_SCOPE_NOTICE)
         phase.note(TRUST_NAME_NOTICE)
+        phase.note(TRUST_REASSERT_NOTICE)
         self.trust_evidence = {
-            "argv": [list(evidence.argv) for evidence in phase.commands],
             "brew": self.observed_brew_version(),
             "store": before.to_json_object(),
             "trusted": [canonical_reference(reference) for reference in self.trusted],
             "added": [canonical_reference(reference) for reference in self.added_trust],
             "restore": TRUST_RESTORE_MECHANISM,
+            "reassert": TRUST_REASSERT_NOTICE,
             "restored": None,
         }
         phase.settle()
@@ -2041,12 +2111,47 @@ class Harness:
         self.inspect_rendered_pair(phase, rendered)
         phase.settle()
 
+    def reassert_trust(self, phase: Phase, reference: str) -> bool:
+        """Re-trust one reference immediately before installing it, diagnosing any drop."""
+
+        try:
+            observed = self.read_trust(phase=phase)
+        except HomebrewAcceptanceError as error:
+            phase.add(
+                (trust_query_install_finding(reference, phase=phase.name, reason=str(error)),)
+            )
+            return False
+        if set(trust_spellings(reference)).isdisjoint(observed["formulae"]):
+            observation = trust_drop_observation(
+                reference, phase=phase.name, previous=self.previous_phase(phase.name)
+            )
+            self.trust_drops.append(observation)
+            phase.note(observation)
+        else:
+            phase.note(
+                f"`brew trust --json {TRUST_JSON_VERSION}` still lists "
+                f"{canonical_reference(reference)} immediately before installing it, and "
+                "`brew trust --formula` is re-asserted anyway because it is idempotent"
+            )
+        evidence = phase.record(self.brew_trust("--formula", reference))
+        if evidence.returncode != 0:
+            phase.add((trust_failure(evidence, reference=reference),))
+            return False
+        # `added_trust` is derived once from the pre-run snapshot in `phase_trust`, so re-asserting
+        # an entry here never widens what cleanup untrusts and never claims an entry the operator
+        # trusted before this run.
+        return True
+
     def install(self, phase: Phase, package_id: str) -> bool:
-        """Build and install one Formula from source, recording the attempt."""
+        """Re-assert trust, then build and install one Formula from source."""
 
         reference = self.formula_reference(package_id)
+        # This list only proves the harness meant to trust the reference; Homebrew was observed to
+        # drop an entry between phases, so it is no proof that Homebrew still trusts it.
         if reference not in self.trusted:
             phase.add((untrusted_install_finding(reference),))
+            return False
+        if not self.reassert_trust(phase, reference):
             return False
         evidence = self.gateway.brew(
             "install", "--formula", "--build-from-source", reference, timeout=BUILD_TIMEOUT
@@ -2054,6 +2159,8 @@ class Harness:
         if not self.check(
             phase, evidence, expectation=f"{reference} must build and install from source"
         ):
+            if trust_refused_install(evidence, reference=reference):
+                phase.add((trust_regression_finding(evidence, reference=reference),))
             return False
         cellar = parse_single_path(
             self.require(self.gateway.brew("--cellar", reference)).stdout,
@@ -2496,6 +2603,17 @@ class Harness:
             else:
                 phase.skip("no single-Formula install stage produced an observation")
 
+    def trust_report(self) -> dict[str, object]:
+        """Return the trust object recorded in the report, argv-complete for the whole run."""
+
+        if not self.trust_evidence and not self.trust_argv:
+            return {}
+        return {
+            **self.trust_evidence,
+            "argv": [list(argv) for argv in self.trust_argv],
+            "dropped": list(self.trust_drops),
+        }
+
     def execute(self) -> dict[str, object]:
         """Run the harness end to end and return its report document."""
 
@@ -2523,7 +2641,7 @@ class Harness:
             source=self.source,
             prefix=self.prefix,
             environment=environment,
-            trust=self.trust_evidence,
+            trust=self.trust_report(),
             phases=[self.phases[name] for name in PHASE_ORDER],
             cleanup=self.cleanup_commands,
             cleanup_findings=self.cleanup_findings,
