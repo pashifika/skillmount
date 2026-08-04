@@ -165,6 +165,7 @@ impl Transaction {
         // removable. Marking it completed first means a crash between the two leaves a terminal
         // journal that recovery correctly leaves alone.
         self.advance(TransactionStatus::Completed)?;
+        reached(Checkpoint::JournalCompleted, 1);
         store::remove(&self.path)?;
         Ok(report)
     }

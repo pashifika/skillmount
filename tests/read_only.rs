@@ -454,7 +454,10 @@ fn a_destination_conflict_fails_without_changing_the_project() {
         Some(73),
         "a destination conflict is a filesystem-state failure"
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("conflicts with"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("conflicts with"), "{stderr}");
+    assert!(stderr.contains("was not replaced"), "{stderr}");
+    assert!(stderr.contains("--conflict=skip"), "{stderr}");
 }
 
 #[test]

@@ -62,6 +62,44 @@ pub(crate) fn render(report: &ReadOnlyReport<'_>) -> String {
     out
 }
 
+/// Renders the brief session summary emitted immediately before the child starts.
+pub(crate) fn render_session_start(report: &ReadOnlyReport<'_>) -> String {
+    let selected = report
+        .catalog
+        .resolutions
+        .iter()
+        .filter(|resolution| {
+            !report.plan.preserved.iter().any(|preserved| {
+                preserved.comparison_key == resolution.selected.mount_name.comparison_key()
+            })
+        })
+        .collect::<Vec<_>>();
+    let skill_count = selected.len();
+    let source_count = report.context.skill_sources.len();
+    let override_count = report.catalog.override_count();
+    let agent = match report.context.agent {
+        crate::domain::AgentId::Codex => "Codex",
+        crate::domain::AgentId::Claude => "Claude",
+    };
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "Mounted {skill_count} {} from {source_count} {} for {agent} ({override_count} {}).",
+        plural(skill_count, "skill", "skills"),
+        plural(source_count, "source argument", "source arguments"),
+        plural(override_count, "source override", "source overrides")
+    );
+    for resolution in selected {
+        let _ = writeln!(output, "  {}", resolution.selected.mount_name);
+    }
+    let _ = writeln!(output, "Launching {}...", report.context.agent.label());
+    output
+}
+
+const fn plural(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 { singular } else { plural }
+}
+
 fn header(out: &mut String, report: &ReadOnlyReport<'_>) {
     let context = report.context;
     let field = |out: &mut String, label: &str, value: &Path| {
@@ -181,6 +219,20 @@ fn scopes(out: &mut String, report: &ReadOnlyReport<'_>) {
             );
         }
         if report.verbose() {
+            for (index, target) in scope.state.link_chain.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "      link[{index}]                    {}",
+                    path_value(target, true)
+                );
+            }
+            if let Some(terminal) = &scope.state.terminal {
+                let _ = writeln!(
+                    out,
+                    "      terminal                     {}",
+                    path_value(terminal, true)
+                );
+            }
             for existing in scope.existing_skills.values().flatten() {
                 let _ = writeln!(
                     out,
@@ -315,7 +367,7 @@ fn recovery(out: &mut String) {
             out,
             "  WOULD RETAIN   {}  (unreadable: {})",
             path_value(&rejected.path, false),
-            rejected.reason
+            text_value(&rejected.reason)
         );
     }
 }
@@ -371,28 +423,47 @@ pub(crate) fn render_warnings(catalog: &SkillCatalog, snapshot: &DiscoverySnapsh
         .collect()
 }
 
-fn path_value(path: &Path, verbose: bool) -> String {
+pub(crate) fn path_value(path: &Path, verbose: bool) -> String {
     os_value(path.as_os_str(), verbose)
 }
 
 /// Marks a value that had to be escaped because it is not representable as text.
 const ESCAPED_PREFIX: &str = "escaped:";
 
-/// Renders a platform-native value, exactly when verbose output was requested.
+/// Renders a platform-native value without allowing it to control the diagnostics stream.
 ///
 /// A value that is already text is its own reversible representation, so it is printed verbatim.
 /// Escaping it unconditionally would double every separator in a Windows path and make the common
-/// case unreadable for no gain. Only a value that is not representable as text is escaped, and it
-/// carries a prefix so a reader can tell the two forms apart. A literal value that would collide
-/// with that prefix is escaped as well.
-fn os_value(value: &OsStr, verbose: bool) -> String {
-    if !verbose {
-        return Path::new(value).display().to_string();
-    }
+/// case unreadable for no gain. Values that are not representable as text are escaped in verbose
+/// output. Valid text is also escaped when it contains line, terminal-control, or bidirectional
+/// formatting characters, even in concise output, so one path can never forge another finding. A
+/// literal value that would collide with the escape prefix is escaped as well.
+pub(crate) fn os_value(value: &OsStr, verbose: bool) -> String {
+    let contains_display_control = value.to_string_lossy().chars().any(is_display_control);
     match value.to_str() {
-        Some(text) if !text.starts_with(ESCAPED_PREFIX) => text.to_owned(),
+        Some(text) if !text.starts_with(ESCAPED_PREFIX) && !contains_display_control => {
+            text.to_owned()
+        }
+        None if !verbose && !contains_display_control => Path::new(value).display().to_string(),
         _ => format!("{ESCAPED_PREFIX}{}", escaped(value)),
     }
+}
+
+/// Escapes characters that could forge a line or alter terminal display in arbitrary text.
+///
+/// Unlike [`os_value`], this helper does not add an encoding marker or escape backslashes. It is
+/// for already-rendered diagnostic prose whose structure must remain readable while control and
+/// bidirectional formatting characters become visible.
+pub(crate) fn text_value(value: &str) -> String {
+    let mut rendered = String::with_capacity(value.len());
+    for character in value.chars() {
+        if is_display_control(character) {
+            let _ = write!(rendered, "\\u{{{:X}}}", u32::from(character));
+        } else {
+            rendered.push(character);
+        }
+    }
+    rendered
 }
 
 /// Escapes a value so the original bytes can be recovered from the text.
@@ -409,6 +480,8 @@ fn escaped(value: &OsStr) -> String {
         for character in chunk.valid().chars() {
             if character == '\\' {
                 out.push_str("\\\\");
+            } else if is_display_control(character) {
+                let _ = write!(out, "\\u{{{:X}}}", u32::from(character));
             } else {
                 out.push(character);
             }
@@ -430,6 +503,9 @@ fn escaped(value: &OsStr) -> String {
     for decoded in char::decode_utf16(units) {
         match decoded {
             Ok('\\') => out.push_str("\\\\"),
+            Ok(character) if is_display_control(character) => {
+                let _ = write!(out, "\\u{{{:X}}}", u32::from(character));
+            }
             Ok(character) => out.push(character),
             Err(error) => {
                 let _ = write!(out, "\\u{:04X}", error.unpaired_surrogate());
@@ -439,9 +515,21 @@ fn escaped(value: &OsStr) -> String {
     out
 }
 
+fn is_display_control(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2066}'..='\u{206F}'
+        )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ESCAPED_PREFIX, escaped, os_value};
+    use super::{ESCAPED_PREFIX, escaped, os_value, text_value};
     use std::ffi::OsString;
 
     #[test]
@@ -470,6 +558,32 @@ mod tests {
 
         assert_eq!(rendered, "escaped:escaped:already");
         assert!(rendered.starts_with(ESCAPED_PREFIX));
+    }
+
+    #[test]
+    fn line_and_terminal_controls_are_escaped_in_every_output_mode() {
+        let value = OsString::from("line\n\u{1B}]52;forged\u{7}");
+        let expected = "escaped:line\\u{A}\\u{1B}]52;forged\\u{7}";
+
+        assert_eq!(os_value(&value, true), expected);
+        assert_eq!(os_value(&value, false), expected);
+        assert!(!os_value(&value, true).contains('\n'));
+        assert!(!os_value(&value, true).contains('\u{1B}'));
+    }
+
+    #[test]
+    fn bidirectional_formatting_is_visible_and_reversible() {
+        let value = OsString::from("safe\u{202E}txt");
+
+        assert_eq!(os_value(&value, true), "escaped:safe\\u{202E}txt");
+    }
+
+    #[test]
+    fn arbitrary_diagnostic_text_cannot_forge_lines_or_terminal_sequences() {
+        assert_eq!(
+            text_value("failure\n[PASS] forged\u{1B}]52;payload\u{7}"),
+            "failure\\u{A}[PASS] forged\\u{1B}]52;payload\\u{7}"
+        );
     }
 
     #[cfg(unix)]

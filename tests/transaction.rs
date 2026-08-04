@@ -21,14 +21,17 @@ use skillmount::link::{LinkRequest, PlacementOutcome, platform_backend};
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
 /// The reused `asm` child rejects Codex-native injected arguments with this usage status.
 const FIXTURE_CHILD_STATUS: i32 = 64;
+/// Real-process startup includes durable filesystem I/O on the selected native volume.
+const HOLD_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Every boundary from preliminary discovery through automatically recoverable transaction state.
 ///
 /// Kept as literals rather than imported from the crate on purpose: the names are a contract
 /// between the library and this suite, and a rename that silently updated both sides would turn a
 /// crash test into a no-crash test without anyone noticing.
-const BOUNDARIES: [&str; 12] = [
+const BOUNDARIES: [&str; 13] = [
     "discovery-inspected",
+    "journal-scan-complete",
     "journal-planned",
     "journal-applying",
     "action-intent",
@@ -193,8 +196,50 @@ impl Fixture {
             .expect("asm should run")
     }
 
+    fn cleanup(&self, all: bool) -> Output {
+        self.cleanup_for(&self.project, all)
+    }
+
+    fn cleanup_for(&self, project: &Path, all: bool) -> Output {
+        self.cleanup_command_for(project, all)
+            .output()
+            .expect("asm cleanup should run")
+    }
+
+    fn cleanup_command_for(&self, project: &Path, all: bool) -> Command {
+        let mut command = Command::new(ASM);
+        command
+            .arg("cleanup")
+            .env("SKILLMOUNT_STATE_DIR", &self.state)
+            .current_dir(project);
+        if all {
+            command.arg("--all");
+        } else {
+            command.arg("--project-root").arg(project);
+        }
+        command
+    }
+
     fn transactions(&self) -> PathBuf {
         self.state.join("transactions")
+    }
+
+    fn lock_files(&self) -> Vec<PathBuf> {
+        let mut found = fs::read_dir(self.state.join("locks")).map_or_else(
+            |_| Vec::new(),
+            |entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.extension()
+                            .is_some_and(|extension| extension == "lock")
+                    })
+                    .collect()
+            },
+        );
+        found.sort();
+        found
     }
 
     /// Returns every journal file currently present.
@@ -208,6 +253,26 @@ impl Fixture {
                     .filter(|path| {
                         path.extension()
                             .is_some_and(|extension| extension == "journal")
+                    })
+                    .collect()
+            },
+        );
+        found.sort();
+        found
+    }
+
+    #[cfg(windows)]
+    fn retired_journals(&self) -> Vec<PathBuf> {
+        let mut found = fs::read_dir(self.transactions()).map_or_else(
+            |_| Vec::new(),
+            |entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name().is_some_and(|name| {
+                            name.to_string_lossy().contains(".journal.removed-")
+                        })
                     })
                     .collect()
             },
@@ -264,6 +329,595 @@ fn exists(path: &Path) -> bool {
 }
 
 #[test]
+fn scoped_cleanup_reconciles_one_stale_transaction_through_the_shared_path() {
+    let fixture = Fixture::new("explicit-cleanup-scoped");
+    fixture.skill("alpha");
+    let stopped = fixture.run_stopping_at("codex", "journal-active", &[]);
+    assert!(!stopped.status.success());
+    assert_eq!(fixture.journals().len(), 1);
+    assert!(
+        fixture
+            .project_tree()
+            .iter()
+            .any(|entry| entry.ends_with("alpha")),
+        "the stopped transaction must leave its applied mount"
+    );
+
+    let cleaned = fixture.cleanup(false);
+
+    assert!(
+        cleaned.status.success(),
+        "explicit cleanup should succeed: {}",
+        String::from_utf8_lossy(&cleaned.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&cleaned.stdout);
+    assert!(rendered.contains("SkillMount cleanup"));
+    assert!(rendered.contains("[RECOVERED]"));
+    assert!(
+        rendered.contains("entry removed") || rendered.contains("entries removed"),
+        "cleanup reports its removal count: {rendered}"
+    );
+    assert!(
+        fixture.project_tree().is_empty(),
+        "all owned helpers are removed"
+    );
+    assert!(fixture.journals().is_empty());
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+}
+
+#[test]
+fn cleanup_reloads_a_journal_after_waiting_for_its_locks() {
+    let fixture = Fixture::new("explicit-cleanup-refresh-after-lock");
+    fixture.skill("alpha");
+    let session_release = fixture.root.join("release-session");
+    let cleanup_release = fixture.root.join("release-cleanup");
+
+    let mut session = fixture
+        .command("codex", &[])
+        .env("SKILLMOUNT_HOLD_AT", "journal-planned")
+        .env("SKILLMOUNT_HOLD_MS", "10000")
+        .env("SKILLMOUNT_HOLD_UNTIL", &session_release)
+        .env("SKILLMOUNT_STOP_AT", "final-placed@3")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("session that advances after cleanup scans");
+    let mut session_stderr = wait_for_hold(&mut session, "journal-planned");
+
+    let mut cleanup = fixture.cleanup_command_for(&fixture.project, false);
+    cleanup
+        .env("SKILLMOUNT_HOLD_AT", "journal-scan-complete")
+        .env("SKILLMOUNT_HOLD_MS", "10000")
+        .env("SKILLMOUNT_HOLD_UNTIL", &cleanup_release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut cleanup = cleanup.spawn().expect("overlapping explicit cleanup");
+    let mut cleanup_stderr = wait_for_hold(&mut cleanup, "journal-scan-complete");
+
+    fs::write(&session_release, "continue").expect("release the applying session");
+    let session_status = session.wait().expect("applying session stops");
+    let mut session_diagnostics = String::new();
+    session_stderr
+        .read_to_string(&mut session_diagnostics)
+        .expect("session diagnostics");
+    assert!(!session_status.success(), "{session_diagnostics}");
+    assert!(
+        session_diagnostics.contains("stopping at final-placed occurrence 3"),
+        "{session_diagnostics}"
+    );
+    let mounted = fixture.project.join(".agents/skills/alpha");
+    assert!(exists(&mounted), "the advancing session placed its mount");
+
+    fs::write(&cleanup_release, "continue").expect("release explicit cleanup");
+    let cleanup_status = cleanup.wait().expect("cleanup finishes");
+    let mut cleanup_output = String::new();
+    cleanup
+        .stdout
+        .take()
+        .expect("cleanup stdout")
+        .read_to_string(&mut cleanup_output)
+        .expect("cleanup report");
+    let mut cleanup_diagnostics = String::new();
+    cleanup_stderr
+        .read_to_string(&mut cleanup_diagnostics)
+        .expect("cleanup diagnostics");
+
+    assert!(
+        cleanup_status.success(),
+        "cleanup must use the fresh staged journal: {cleanup_output}\n{cleanup_diagnostics}"
+    );
+    assert!(cleanup_output.contains("[RECOVERED]"), "{cleanup_output}");
+    assert!(!exists(&mounted), "the freshly recorded mount is removed");
+    assert!(
+        fixture.journals().is_empty(),
+        "no ownership journal is discarded while its mount remains"
+    );
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+}
+
+#[test]
+fn cleanup_all_reports_an_active_transaction_without_touching_it() {
+    let fixture = Fixture::new("explicit-cleanup-active");
+    fixture.skill("alpha");
+    let mut holder = fixture
+        .command("codex", &[])
+        .env("SKILLMOUNT_HOLD_AT", "journal-active")
+        .env("SKILLMOUNT_HOLD_MS", "4000")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("active fixture session");
+    let mut holder_stderr = wait_for_hold(&mut holder, "journal-active");
+    let mounted = fixture.project.join(".agents/skills/alpha");
+    assert!(exists(&mounted));
+
+    let cleaned = fixture.cleanup(true);
+
+    assert_eq!(cleaned.status.code(), Some(75));
+    let rendered = String::from_utf8_lossy(&cleaned.stdout);
+    assert!(rendered.contains("[ACTIVE]"), "{rendered}");
+    assert!(
+        rendered.contains("another SkillMount session holds"),
+        "{rendered}"
+    );
+    assert!(exists(&mounted), "active mounts are left untouched");
+    assert_eq!(fixture.journals().len(), 1);
+
+    let status = holder.wait().expect("active fixture finishes");
+    let mut diagnostics = String::new();
+    holder_stderr
+        .read_to_string(&mut diagnostics)
+        .expect("holder diagnostics");
+    assert_eq!(status.code(), Some(FIXTURE_CHILD_STATUS), "{diagnostics}");
+}
+
+#[test]
+fn explicit_cleanup_releases_a_supervising_journal_after_operator_assertion() {
+    let fixture = Fixture::new("explicit-cleanup-supervising");
+    fixture.skill("alpha");
+    let stopped = fixture.run_stopping_at("codex", "journal-supervising", &[]);
+    assert!(!stopped.status.success());
+    assert!(exists(&fixture.project.join(".agents/skills/alpha")));
+
+    let cleaned = fixture.cleanup(false);
+
+    assert!(
+        cleaned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleaned.stdout)
+    );
+    assert!(String::from_utf8_lossy(&cleaned.stdout).contains("[RECOVERED]"));
+    assert!(fixture.project_tree().is_empty());
+    assert!(fixture.journals().is_empty());
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+}
+
+#[test]
+fn scoped_cleanup_releases_kept_mounts_and_leaves_other_projects_out_of_scope() {
+    let fixture = Fixture::new("explicit-cleanup-project-scope");
+    fixture.skill("alpha");
+    let second_project = fixture.root.join("second-project");
+    let second_home = fixture.root.join("second-home");
+    fs::create_dir(&second_project).expect("second project");
+
+    let first = fixture.run("codex", &["--keep-mounts"]);
+    assert_eq!(first.status.code(), Some(FIXTURE_CHILD_STATUS));
+    let second = fixture
+        .command_for("codex", &["--keep-mounts"], &second_project, &second_home)
+        .output()
+        .expect("second kept session");
+    assert_eq!(second.status.code(), Some(FIXTURE_CHILD_STATUS));
+    assert_eq!(fixture.journals().len(), 2);
+    let second_mount = second_project.join(".agents/skills/alpha");
+    assert!(exists(&second_mount));
+
+    let scoped = fixture.cleanup(false);
+
+    assert!(
+        scoped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&scoped.stdout)
+    );
+    let scoped_output = String::from_utf8_lossy(&scoped.stdout);
+    assert!(scoped_output.contains("1 recovered"), "{scoped_output}");
+    assert!(scoped_output.contains("1 out of scope"), "{scoped_output}");
+    assert!(fixture.project_tree().is_empty());
+    assert!(
+        exists(&second_mount),
+        "the other project is outside scoped cleanup"
+    );
+    assert_eq!(fixture.journals().len(), 1);
+
+    let all = fixture.cleanup(true);
+    assert!(
+        all.status.success(),
+        "{}",
+        String::from_utf8_lossy(&all.stdout)
+    );
+    assert!(!exists(&second_mount));
+    assert!(fixture.journals().is_empty());
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+}
+
+#[test]
+fn cleanup_reconciles_overlapping_kept_journals_and_their_shared_helpers_in_one_pass() {
+    let fixture = Fixture::new("explicit-cleanup-overlapping-kept");
+    fixture.skill("alpha");
+
+    let first = fixture.run("codex", &["--keep-mounts"]);
+    assert_eq!(first.status.code(), Some(FIXTURE_CHILD_STATUS));
+    fixture.skill("beta");
+    let second = fixture.run("codex", &["--keep-mounts"]);
+    assert_eq!(second.status.code(), Some(FIXTURE_CHILD_STATUS));
+    assert_eq!(fixture.journals().len(), 2);
+    assert!(exists(&fixture.project.join(".agents/skills/alpha")));
+    assert!(exists(&fixture.project.join(".agents/skills/beta")));
+
+    let cleaned = fixture.cleanup(false);
+    let output = String::from_utf8_lossy(&cleaned.stdout);
+
+    assert!(cleaned.status.success(), "{output}");
+    assert!(output.contains("2 recovered"), "{output}");
+    assert!(!output.contains("[ACTIVE]"), "{output}");
+    assert!(fixture.project_tree().is_empty());
+    assert!(fixture.journals().is_empty());
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+    assert!(fixture.sources.join("beta/SKILL.md").is_file());
+}
+
+#[test]
+fn cleanup_fails_closed_when_a_journal_disappears_after_its_candidate_scan() {
+    let fixture = Fixture::new("explicit-cleanup-missing-journal");
+    fixture.skill("alpha");
+    let kept = fixture.run("codex", &["--keep-mounts"]);
+    assert_eq!(kept.status.code(), Some(FIXTURE_CHILD_STATUS));
+    let mount = fixture.project.join(".agents/skills/alpha");
+    assert!(exists(&mount));
+    let journal = fixture.journals().into_iter().next().expect("kept journal");
+    let release = fixture.root.join("release-stale-cleanup-scan");
+
+    let mut stale = fixture.cleanup_command_for(&fixture.project, false);
+    stale
+        .env("SKILLMOUNT_HOLD_AT", "journal-scan-complete")
+        .env("SKILLMOUNT_HOLD_MS", "10000")
+        .env("SKILLMOUNT_HOLD_UNTIL", &release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut stale = stale.spawn().expect("cleanup with a stale candidate scan");
+    let mut stale_stderr = wait_for_hold(&mut stale, "journal-scan-complete");
+
+    fs::remove_file(&journal).expect("simulate journal-only external removal");
+    fs::write(&release, "continue").expect("release stale cleanup");
+
+    let stale_status = stale.wait().expect("stale cleanup finishes");
+    let mut stale_output = String::new();
+    stale
+        .stdout
+        .take()
+        .expect("stale cleanup stdout")
+        .read_to_string(&mut stale_output)
+        .expect("stale cleanup report");
+    let mut stale_diagnostics = String::new();
+    stale_stderr
+        .read_to_string(&mut stale_diagnostics)
+        .expect("stale cleanup diagnostics");
+
+    assert_eq!(
+        stale_status.code(),
+        Some(75),
+        "{stale_output}\n{stale_diagnostics}"
+    );
+    assert!(stale_output.contains("[CORRUPT]"), "{stale_output}");
+    assert!(stale_output.contains("disappeared"), "{stale_output}");
+    assert!(
+        exists(&mount),
+        "an unjournalled residual mount is never removed"
+    );
+    assert!(fixture.journals().is_empty());
+}
+
+#[test]
+fn cleanup_reports_corrupt_state_and_a_neighboring_lock_failure_together() {
+    let fixture = Fixture::new("explicit-cleanup-corrupt-and-lock-failure");
+    fixture.skill("alpha");
+
+    let first = fixture.run("codex", &["--keep-mounts"]);
+    assert_eq!(first.status.code(), Some(FIXTURE_CHILD_STATUS));
+    let first_journal = fixture
+        .journals()
+        .into_iter()
+        .next()
+        .expect("first kept journal");
+    let first_locks = fixture.lock_files();
+
+    let second_project = fixture.root.join("second-project");
+    let second_home = fixture.root.join("second-home");
+    fs::create_dir(&second_project).expect("second project");
+    let second = fixture
+        .command_for("codex", &["--keep-mounts"], &second_project, &second_home)
+        .output()
+        .expect("second kept session");
+    assert_eq!(second.status.code(), Some(FIXTURE_CHILD_STATUS));
+    let second_journal = fixture
+        .journals()
+        .into_iter()
+        .find(|journal| journal != &first_journal)
+        .expect("second kept journal");
+    let broken_lock = fixture
+        .lock_files()
+        .into_iter()
+        .find(|path| !first_locks.contains(path))
+        .expect("second project has a distinct lock file");
+    let first_mount = fixture.project.join(".agents/skills/alpha");
+    let second_mount = second_project.join(".agents/skills/alpha");
+    assert!(exists(&first_mount));
+    assert!(exists(&second_mount));
+
+    let release = fixture.root.join("release-mixed-cleanup-failures");
+    let mut cleanup = fixture.cleanup_command_for(&fixture.project, true);
+    cleanup
+        .env("SKILLMOUNT_HOLD_AT", "journal-scan-complete")
+        .env("SKILLMOUNT_HOLD_MS", "10000")
+        .env("SKILLMOUNT_HOLD_UNTIL", &release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut cleanup = cleanup.spawn().expect("cleanup with two late failures");
+    let mut cleanup_stderr = wait_for_hold(&mut cleanup, "journal-scan-complete");
+
+    fs::remove_file(&first_journal).expect("simulate journal-only external removal");
+    fs::remove_file(&broken_lock).expect("remove the neighboring lock file");
+    fs::create_dir(&broken_lock).expect("replace the neighboring lock with a directory");
+    fs::write(&release, "continue").expect("release mixed-failure cleanup");
+
+    let cleanup_status = cleanup.wait().expect("mixed-failure cleanup finishes");
+    let mut cleanup_output = String::new();
+    cleanup
+        .stdout
+        .take()
+        .expect("cleanup stdout")
+        .read_to_string(&mut cleanup_output)
+        .expect("cleanup report");
+    let mut cleanup_diagnostics = String::new();
+    cleanup_stderr
+        .read_to_string(&mut cleanup_diagnostics)
+        .expect("cleanup diagnostics");
+
+    assert_eq!(
+        cleanup_status.code(),
+        Some(73),
+        "{cleanup_output}\n{cleanup_diagnostics}"
+    );
+    assert!(cleanup_output.contains("[CORRUPT]"), "{cleanup_output}");
+    assert!(cleanup_output.contains("[FAILED]"), "{cleanup_output}");
+    assert!(cleanup_output.contains("disappeared"), "{cleanup_output}");
+    assert!(exists(&first_mount), "the unjournalled mount is retained");
+    assert!(exists(&second_mount), "the lock-failed mount is retained");
+    assert_eq!(fixture.journals(), vec![second_journal]);
+}
+
+#[test]
+fn cleanup_reports_completed_mutations_before_a_later_lock_io_failure() {
+    let fixture = Fixture::new("explicit-cleanup-partial-report");
+    fixture.skill("alpha");
+    let first_release = fixture.root.join("release-first-stale-session");
+    let mut first = fixture
+        .command("codex", &[])
+        .env("SKILLMOUNT_HOLD_AT", "journal-active")
+        .env("SKILLMOUNT_HOLD_MS", "10000")
+        .env("SKILLMOUNT_HOLD_UNTIL", &first_release)
+        .env("SKILLMOUNT_STOP_AT", "journal-active")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("first stale session");
+    let mut first_stderr = wait_for_hold(&mut first, "journal-active");
+    let first_journal = fixture
+        .journals()
+        .into_iter()
+        .next()
+        .expect("first stale journal");
+    let first_locks = fixture.lock_files();
+
+    let second_project = fixture.root.join("second-project");
+    let second_home = fixture.root.join("second-home");
+    fs::create_dir(&second_project).expect("second project");
+    let second = fixture
+        .command_for("codex", &[], &second_project, &second_home)
+        .env("SKILLMOUNT_STOP_AT", "journal-active")
+        .output()
+        .expect("second stale session");
+    assert!(!second.status.success());
+    fs::write(&first_release, "continue").expect("release first stale session");
+    let first_status = first.wait().expect("first stale session stops");
+    let mut first_diagnostics = String::new();
+    first_stderr
+        .read_to_string(&mut first_diagnostics)
+        .expect("first stale-session diagnostics");
+    assert!(!first_status.success(), "{first_diagnostics}");
+    let journals = fixture.journals();
+    assert_eq!(journals.len(), 2);
+    assert_eq!(
+        journals[0], first_journal,
+        "the first transaction must be reconciled before the injected later failure"
+    );
+
+    let broken_lock = fixture
+        .lock_files()
+        .into_iter()
+        .find(|path| !first_locks.contains(path))
+        .expect("the second project has a distinct lock file");
+    fs::remove_file(&broken_lock).expect("remove the second transaction lock file");
+    fs::create_dir(&broken_lock).expect("replace the lock file with a directory");
+
+    let cleaned = fixture.cleanup(true);
+    let rendered = String::from_utf8_lossy(&cleaned.stdout);
+
+    assert_eq!(cleaned.status.code(), Some(73), "{rendered}");
+    assert!(rendered.contains("[RECOVERED]"), "{rendered}");
+    assert!(rendered.contains("[FAILED]"), "{rendered}");
+    assert!(
+        fixture.project_tree().is_empty(),
+        "the first cleanup mutation is both completed and reported"
+    );
+    assert!(
+        exists(&second_project.join(".agents/skills/alpha")),
+        "the journal whose lock could not be opened remains untouched"
+    );
+    assert_eq!(fixture.journals().len(), 1);
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+}
+
+#[test]
+fn cleanup_retains_a_replaced_mount_and_its_journal() {
+    let fixture = Fixture::new("explicit-cleanup-replaced");
+    fixture.skill("alpha");
+    fixture.run_stopping_at("codex", "journal-active", &[]);
+    let mounted = fixture.project.join(".agents/skills/alpha");
+    remove_directory_link(&mounted);
+    fs::create_dir(&mounted).expect("replacement directory");
+    fs::write(mounted.join("operator-owned"), "mine").expect("replacement content");
+
+    let cleaned = fixture.cleanup(false);
+
+    assert_eq!(cleaned.status.code(), Some(73));
+    let rendered = String::from_utf8_lossy(&cleaned.stdout);
+    assert!(rendered.contains("retained"), "{rendered}");
+    assert!(
+        rendered.contains("regular directory replaced"),
+        "{rendered}"
+    );
+    assert!(mounted.join("operator-owned").is_file());
+    assert_eq!(fixture.journals().len(), 1);
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+}
+
+#[test]
+fn cleanup_accepts_an_already_missing_mount_but_never_touches_the_source() {
+    let fixture = Fixture::new("explicit-cleanup-missing");
+    fixture.skill("alpha");
+    fixture.run_stopping_at("codex", "journal-active", &[]);
+    let mounted = fixture.project.join(".agents/skills/alpha");
+    remove_directory_link(&mounted);
+
+    let cleaned = fixture.cleanup(false);
+
+    assert!(
+        cleaned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleaned.stdout)
+    );
+    assert!(fixture.project_tree().is_empty());
+    assert!(fixture.journals().is_empty());
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+}
+
+#[test]
+fn cleanup_uses_lock_state_not_a_reused_pid_in_holder_text() {
+    let fixture = Fixture::new("explicit-cleanup-pid-reuse");
+    fixture.skill("alpha");
+    fixture.run_stopping_at("codex", "journal-active", &[]);
+    let locks = fixture.state.join("locks");
+    for entry in fs::read_dir(&locks).expect("stopped transaction lock files") {
+        let path = entry.expect("lock entry").path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "lock")
+        {
+            let digest = path.file_stem().expect("lock digest").to_string_lossy();
+            fs::write(
+                locks.join(format!("{digest}.owner")),
+                format!("transaction=reused pid={}\n", std::process::id()),
+            )
+            .expect("stale holder text");
+        }
+    }
+
+    let cleaned = fixture.cleanup(false);
+
+    assert!(
+        cleaned.status.success(),
+        "PID-looking text is not liveness evidence: {}",
+        String::from_utf8_lossy(&cleaned.stdout)
+    );
+    assert!(fixture.project_tree().is_empty());
+    assert!(fixture.journals().is_empty());
+}
+
+#[test]
+fn cleanup_retains_a_non_empty_owned_helper_after_removing_its_mount() {
+    let fixture = Fixture::new("explicit-cleanup-non-empty-helper");
+    fixture.skill("alpha");
+    fixture.run_stopping_at("codex", "journal-active", &[]);
+    let operator_file = fixture.project.join(".agents/skills/operator-notes.txt");
+    fs::write(&operator_file, "mine").expect("operator helper content");
+
+    let cleaned = fixture.cleanup(false);
+
+    assert_eq!(cleaned.status.code(), Some(73));
+    let rendered = String::from_utf8_lossy(&cleaned.stdout);
+    assert!(rendered.contains("holds entries"), "{rendered}");
+    assert!(operator_file.is_file());
+    assert!(!exists(&fixture.project.join(".agents/skills/alpha")));
+    assert_eq!(fixture.journals().len(), 1);
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+}
+
+#[test]
+fn corrupt_journal_blocks_explicit_cleanup_of_a_healthy_neighbor() {
+    let fixture = Fixture::new("explicit-cleanup-corrupt");
+    fixture.skill("alpha");
+    fixture.run_stopping_at("codex", "journal-active", &[]);
+    let before = fixture.project_tree();
+    let corrupt = fixture.transactions().join("ffff-future.journal");
+    fs::write(&corrupt, "skillmount-journal 99 unix deadbeef\n").expect("future journal");
+
+    let cleaned = fixture.cleanup(true);
+
+    assert_eq!(cleaned.status.code(), Some(75));
+    let rendered = String::from_utf8_lossy(&cleaned.stdout);
+    assert!(rendered.contains("[CORRUPT]"), "{rendered}");
+    assert!(
+        rendered.contains("no valid neighbor was cleaned"),
+        "{rendered}"
+    );
+    assert_eq!(fixture.project_tree(), before);
+    assert_eq!(fixture.journals().len(), 2);
+    assert!(corrupt.is_file());
+}
+
+#[test]
+fn cleanup_all_is_bounded_to_journals_and_ignores_similarly_named_entries() {
+    let fixture = Fixture::new("explicit-cleanup-boundary");
+    fixture.skill("alpha");
+    fixture.run_stopping_at("codex", "journal-active", &[]);
+    let unrelated = fixture.state.join("transactions/looks-like-skillmount.txt");
+    fs::write(&unrelated, "operator data").expect("unrelated state file");
+    let arbitrary = fixture.root.join(".skillmount-not-owned");
+    fs::create_dir(&arbitrary).expect("similarly named arbitrary directory");
+    fs::write(arbitrary.join("sentinel"), "mine").expect("arbitrary sentinel");
+
+    let cleaned = fixture.cleanup(true);
+
+    assert!(
+        cleaned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleaned.stdout)
+    );
+    assert_eq!(fs::read_to_string(&unrelated).unwrap(), "operator data");
+    assert_eq!(
+        fs::read_to_string(arbitrary.join("sentinel")).unwrap(),
+        "mine"
+    );
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+}
+
+fn remove_directory_link(path: &Path) {
+    let result = if cfg!(windows) {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.unwrap_or_else(|error| panic!("removing link {} failed: {error}", path.display()));
+}
+
+#[test]
 fn every_named_boundary_actually_stops_a_session() {
     for boundary in BOUNDARIES {
         let fixture = Fixture::new(&format!("boundary-{boundary}"));
@@ -282,6 +936,52 @@ fn every_named_boundary_actually_stops_a_session() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn terminal_journal_retirement_can_stop_after_the_write_through_rename() {
+    let fixture = Fixture::new("journal-retired");
+    fixture.skill("alpha");
+
+    let stopped = fixture.run_stopping_at("codex", "journal-retired", &[]);
+
+    assert!(!stopped.status.success());
+    let stderr = String::from_utf8_lossy(&stopped.stderr);
+    assert!(
+        stderr.contains("stopping at journal-retired occurrence 1"),
+        "the session did not reach terminal write-through retirement: {stderr}"
+    );
+    assert!(
+        fixture.journals().is_empty(),
+        "the terminal journal must already be outside the scanner namespace"
+    );
+    let retired = fixture.retired_journals();
+    assert_eq!(
+        retired.len(),
+        1,
+        "forced termination must preserve the retired tombstone: {retired:?}"
+    );
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+    assert!(
+        !exists(&fixture.project.join(".agents/skills/alpha")),
+        "terminal retirement may occur only after the owned mount is gone"
+    );
+
+    let later = fixture.run("codex", &[]);
+
+    assert_eq!(
+        later.status.code(),
+        Some(FIXTURE_CHILD_STATUS),
+        "a retired tombstone must not re-enter journal recovery: {}",
+        String::from_utf8_lossy(&later.stderr)
+    );
+    assert!(fixture.journals().is_empty());
+    assert!(
+        retired[0].is_file(),
+        "the inert evidence remains inspectable"
+    );
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
 }
 
 #[test]
@@ -711,8 +1411,161 @@ fn a_session_stopped_after_supervision_intent_is_quarantined_not_recovered() {
         stderr.contains("process-domain death was never proved"),
         "{stderr}"
     );
+    assert!(stderr.contains("recovery[0] argv[1] = cleanup"), "{stderr}");
+    assert!(
+        stderr.contains("the quarantined mounts were not changed"),
+        "{stderr}"
+    );
     assert!(exists(&mounted), "quarantine must not remove the mount");
     assert_eq!(fixture.journals().len(), 1, "ownership evidence remains");
+}
+
+#[test]
+fn cross_project_quarantine_names_the_recorded_project_cleanup_argv() {
+    let fixture = Fixture::new("cross-project-quarantine-guidance");
+    fixture.skill("alpha");
+    let stopped = fixture.run_stopping_at("codex", "journal-supervising", &[]);
+    assert!(!stopped.status.success());
+
+    let second_project = fixture.root.join("second-project");
+    let second_home = fixture.root.join("second-home");
+    fs::create_dir(&second_project).expect("second project");
+    let refused = fixture
+        .command_for("codex", &[], &second_project, &second_home)
+        .output()
+        .expect("cross-project recovery attempt");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let recorded_project = fs::canonicalize(&fixture.project).expect("recorded project root");
+    let unrelated_project = fs::canonicalize(&second_project).expect("unrelated project root");
+
+    assert_eq!(refused.status.code(), Some(75), "{stderr}");
+    let recovery_project = stderr
+        .lines()
+        .find(|line| line.contains("recovery[0] argv[3] ="))
+        .expect("targeted project recovery argv");
+    assert!(
+        recovery_project.contains(&recorded_project.to_string_lossy().into_owned()),
+        "the recovery command must target the quarantined journal's project: {recovery_project}"
+    );
+    assert!(
+        !recovery_project.contains(&unrelated_project.to_string_lossy().into_owned()),
+        "the current but unrelated project must not be suggested: {recovery_project}"
+    );
+    assert!(exists(&fixture.project.join(".agents/skills/alpha")));
+    assert_eq!(fixture.journals().len(), 1);
+}
+
+#[test]
+fn automatic_recovery_reloads_a_journal_that_advanced_to_supervising() {
+    let fixture = Fixture::new("automatic-recovery-refresh-after-lock");
+    fixture.skill("alpha");
+    let session_release = fixture.root.join("release-supervising-session");
+    let recovery_release = fixture.root.join("release-recovery");
+
+    let mut session = fixture
+        .command("codex", &[])
+        .env("SKILLMOUNT_HOLD_AT", "journal-planned")
+        .env("SKILLMOUNT_HOLD_MS", "10000")
+        .env("SKILLMOUNT_HOLD_UNTIL", &session_release)
+        .env("SKILLMOUNT_STOP_AT", "journal-supervising")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("session that advances to supervision");
+    let mut session_stderr = wait_for_hold(&mut session, "journal-planned");
+
+    let second_project = fixture.root.join("second-project");
+    let second_home = fixture.root.join("second-home");
+    fs::create_dir(&second_project).expect("second project");
+    let mut recovery = fixture.command_for("codex", &[], &second_project, &second_home);
+    recovery
+        .env("SKILLMOUNT_HOLD_AT", "journal-scan-complete")
+        .env("SKILLMOUNT_HOLD_MS", "10000")
+        .env("SKILLMOUNT_HOLD_UNTIL", &recovery_release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut recovery = recovery.spawn().expect("overlapping recovery session");
+    let mut recovery_stderr = wait_for_hold(&mut recovery, "journal-scan-complete");
+
+    fs::write(&session_release, "continue").expect("release supervising session");
+    let session_status = session.wait().expect("supervising session stops");
+    let mut session_diagnostics = String::new();
+    session_stderr
+        .read_to_string(&mut session_diagnostics)
+        .expect("session diagnostics");
+    assert!(!session_status.success(), "{session_diagnostics}");
+    assert!(
+        session_diagnostics.contains("stopping at journal-supervising"),
+        "{session_diagnostics}"
+    );
+
+    fs::write(&recovery_release, "continue").expect("release recovery session");
+    let recovery_status = recovery.wait().expect("recovery session finishes");
+    let mut recovery_diagnostics = String::new();
+    recovery_stderr
+        .read_to_string(&mut recovery_diagnostics)
+        .expect("recovery diagnostics");
+
+    assert_eq!(recovery_status.code(), Some(75), "{recovery_diagnostics}");
+    assert!(
+        recovery_diagnostics.contains("process-domain death was never proved"),
+        "{recovery_diagnostics}"
+    );
+    assert!(
+        exists(&fixture.project.join(".agents/skills/alpha")),
+        "fresh supervising state must be quarantined, never automatically cleaned"
+    );
+    assert_eq!(fixture.journals().len(), 1, "ownership evidence remains");
+}
+
+#[test]
+fn automatic_recovery_fails_closed_when_a_scanned_journal_disappears() {
+    let fixture = Fixture::new("automatic-recovery-missing-journal");
+    fixture.skill("alpha");
+    let stopped = fixture.run_stopping_at("codex", "journal-active", &[]);
+    assert!(!stopped.status.success());
+    let mount = fixture.project.join(".agents/skills/alpha");
+    assert!(exists(&mount));
+    let journal = fixture
+        .journals()
+        .into_iter()
+        .next()
+        .expect("incomplete journal");
+
+    let second_project = fixture.root.join("second-project");
+    let second_home = fixture.root.join("second-home");
+    fs::create_dir(&second_project).expect("second project");
+    let release = fixture.root.join("release-missing-journal-recovery");
+    let mut recovery = fixture.command_for("codex", &[], &second_project, &second_home);
+    recovery
+        .env("SKILLMOUNT_HOLD_AT", "journal-scan-complete")
+        .env("SKILLMOUNT_HOLD_MS", "10000")
+        .env("SKILLMOUNT_HOLD_UNTIL", &release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut recovery = recovery
+        .spawn()
+        .expect("recovery with a stale candidate scan");
+    let mut recovery_stderr = wait_for_hold(&mut recovery, "journal-scan-complete");
+
+    fs::remove_file(&journal).expect("simulate journal-only external removal");
+    fs::write(&release, "continue").expect("release recovery");
+    let recovery_status = recovery.wait().expect("recovery finishes");
+    let mut recovery_diagnostics = String::new();
+    recovery_stderr
+        .read_to_string(&mut recovery_diagnostics)
+        .expect("recovery diagnostics");
+
+    assert_eq!(recovery_status.code(), Some(75), "{recovery_diagnostics}");
+    assert!(
+        recovery_diagnostics.contains("disappeared"),
+        "{recovery_diagnostics}"
+    );
+    assert!(exists(&mount), "the residual mount is retained");
+    assert!(
+        !exists(&second_project.join(".agents")),
+        "the new session must stop before planning or mutation"
+    );
+    assert!(fixture.journals().is_empty());
 }
 
 #[test]
@@ -1067,6 +1920,7 @@ fn two_codex_sessions_on_one_store_serialize() {
             stderr.contains("nothing was changed"),
             "{checkpoint}: {stderr}"
         );
+        assert!(stderr.contains("asm doctor"), "{checkpoint}: {stderr}");
     }
 }
 
@@ -1291,7 +2145,7 @@ fn wait_for_hold(child: &mut Child, checkpoint: &str) -> BufReader<ChildStderr> 
         let _ = sender.send(outcome);
     });
 
-    match receiver.recv_timeout(Duration::from_secs(2)) {
+    match receiver.recv_timeout(HOLD_START_TIMEOUT) {
         Ok(Ok(stderr)) => {
             reader.join().expect("the stderr reader must not panic");
             stderr
@@ -1307,8 +2161,8 @@ fn wait_for_hold(child: &mut Child, checkpoint: &str) -> BufReader<ChildStderr> 
             let status = child.wait();
             reader.join().expect("the stderr reader must unblock");
             panic!(
-                "the holder did not reach {checkpoint} within two seconds; kill: {kill_result:?}; \
-                 status: {status:?}"
+                "the holder did not reach {checkpoint} within {HOLD_START_TIMEOUT:?}; kill: \
+                 {kill_result:?}; status: {status:?}"
             );
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

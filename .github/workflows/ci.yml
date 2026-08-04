@@ -39,6 +39,8 @@ jobs:
           persist-credentials: false
       - name: Test branch-policy rules
         run: python .github/scripts/test_branch_policy.py
+      - name: Test live-smoke harness safeguards
+        run: python .github/scripts/test_live_agent_smoke.py
       - name: Validate pull-request branch flow
         if: github.event_name == 'pull_request'
         env:
@@ -120,6 +122,8 @@ jobs:
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup target add --toolchain "$RUST_TOOLCHAIN" "${{ matrix.target }}"
+      - name: Test native live-smoke timeout safeguards
+        run: python .github/scripts/test_live_agent_smoke.py
       - name: Build both executables
         run: cargo build --locked --target "${{ matrix.target }}" --bins
       - name: Run target tests and executable smoke suite

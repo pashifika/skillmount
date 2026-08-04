@@ -25,6 +25,7 @@ pub mod link;
 pub mod lock;
 pub mod mount;
 mod native;
+mod operator;
 mod paths;
 pub mod process;
 mod render;

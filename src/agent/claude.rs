@@ -394,6 +394,12 @@ fn inspect_claude_scope(
 
 /// Proves that the executable still matches the pinned Claude Code contract.
 pub(crate) fn verify_supported_launch(context: &RunContext) -> Result<(), AppError> {
+    verify_environment()?;
+    verify_version_text(&reported_version(context)?)
+}
+
+/// Verifies environment switches that disable the discovery model this adapter inspected.
+pub(crate) fn verify_environment() -> Result<(), AppError> {
     if env_flag_enabled(std::env::var_os("CLAUDE_CODE_SAFE_MODE").as_deref()) {
         return Err(AppError::Usage(
             "CLAUDE_CODE_SAFE_MODE disables Claude Code's custom Skill discovery; unset it or run the agent directly"
@@ -407,11 +413,16 @@ pub(crate) fn verify_supported_launch(context: &RunContext) -> Result<(), AppErr
         ));
     }
 
+    Ok(())
+}
+
+/// Captures the bounded, text version banner used by operator diagnostics and launch checks.
+pub(crate) fn reported_version(context: &RunContext) -> Result<String, AppError> {
     // Native integration suites use the shared fake-agent executable. The override is absent from
     // release builds, like failure checkpoints and other deterministic platform fixtures.
     #[cfg(debug_assertions)]
     if let Some(version) = std::env::var_os("SKILLMOUNT_TEST_CLAUDE_VERSION") {
-        return verify_version_text(version.to_string_lossy().as_ref());
+        return Ok(version.to_string_lossy().trim().to_owned());
     }
 
     let output = Command::new(&context.agent_bin)
@@ -439,7 +450,7 @@ pub(crate) fn verify_supported_launch(context: &RunContext) -> Result<(), AppErr
     let version = std::str::from_utf8(&output.stdout).map_err(|_| {
         AppError::Usage("Claude Code --version output is not valid UTF-8".to_owned())
     })?;
-    verify_version_text(version.trim())
+    Ok(version.trim().to_owned())
 }
 
 fn env_flag_enabled(value: Option<&OsStr>) -> bool {
@@ -448,7 +459,8 @@ fn env_flag_enabled(value: Option<&OsStr>) -> bool {
     })
 }
 
-fn verify_version_text(version: &str) -> Result<(), AppError> {
+/// Checks a captured version banner against the adapter-pinned release.
+pub(crate) fn verify_version_text(version: &str) -> Result<(), AppError> {
     if version.trim() == SUPPORTED_CLAUDE_VERSION_OUTPUT {
         Ok(())
     } else {

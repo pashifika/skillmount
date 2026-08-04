@@ -11,9 +11,10 @@ as current only after it exists in the tracked source and can be traced to repos
 
 Status: catalog resolution, discovery inspection, read-only planning, cross-platform link
 primitives, resource locking, durable transactions, cleanup, stale recovery, the generic child
-process supervisor, and the Codex and Claude session adapters are implemented. Operator commands,
-release automation, live-agent compatibility certification, and the remaining
-transaction-lifetime hardening named under [Reserved work](#reserved-work) are not implemented.
+process supervisor, the Codex and Claude session adapters, operator diagnosis and explicit
+recovery, and the repository evidence workflow are implemented. Release automation, executed
+live-agent compatibility certification, and the remaining transaction-lifetime hardening named
+under [Reserved work](#reserved-work) are not implemented.
 
 ## Product definition
 
@@ -70,7 +71,9 @@ behavior.
 | Session with `--keep-mounts` | After a child reaches the supervision boundary, records terminal kept state instead of removing owned entries. A pre-spawn compatibility or supervision-intent failure overrides the request and removes every verified owned entry. |
 | Session with `--no-recover` | Refuses when incomplete state requires reconciliation; otherwise continues through the normal mutating path. |
 | Session encountering a free `supervising` journal | Refuses with category 75 and retains every recorded mount because wrapper-lock release does not prove child-domain death. |
-| `doctor`, `cleanup` | Parsed but rejected as reserved and unimplemented. |
+| `asm doctor` | Resolves both pinned agents, inspects discovery links, visible-name conflicts, lock liveness, and journals, and runs isolated link-capability probes without SkillMount-owned mutation of project, agent, lock, or journal state. Version capture executes each selected trusted agent with literal `--version`; authenticated real-agent loading remains an `unverified` finding until live evidence exists, and any failed check exits with category 65. |
+| `asm cleanup --project-root <path>` | Reconciles every structurally valid, non-completed journal for the canonical project after taking that journal's complete recorded lock set. A `supervising` or kept journal is eligible only because invoking this command is the operator's assertion that its process domain is dead or its retained mounts may be released. |
+| `asm cleanup --all` | Applies the same journal-by-journal engine across the bounded state store. Corrupt state blocks all mutation; live locks retain their journals and produce category 75; an ownership or filesystem failure takes category 73 precedence. |
 
 A mutating agent invocation returns the child's ordinary status after successful cleanup. A spawn
 or supervision failure uses the shared typed exit mapping. Cleanup failure replaces child success
@@ -78,6 +81,12 @@ with category 73 and remains secondary evidence behind a failed child. Ordinary 
 to release every owned entry, while `--keep-mounts` retains them intentionally after the child
 boundary. A compatibility or supervision-intent failure before spawn forces verified cleanup;
 anything cleanup cannot prove safe to remove remains reported and journal-backed.
+
+Session stdout is exclusively the inherited child data stream. Wrapper-owned session summaries,
+warnings, informational lines, errors, and cleanup diagnostics use stderr, so Codex JSONL, Claude
+JSON, and ordinary pipelines receive no SkillMount prefix. Read-only plans and explicit operator
+reports remain stdout data. [ADR 0026](adr/0026-reserve-session-stdout-for-child-data.md) records
+this public stream boundary.
 
 ## Execution architecture
 
@@ -96,6 +105,42 @@ argv
 `inspect` and `--dry-run` stop at rendering. `tests/read_only.rs` snapshots the project, Skill
 sources, and redirected user state around success and error paths, and fails if a child executable
 is reached.
+
+The operator diagnosis path is independently read-only with respect to every user-visible or
+durable SkillMount resource:
+
+```text
+argv -> canonical operator context -> pinned agent probes -> discovery inspection
+     -> lock observation -> journal scan -> isolated temporary link probes -> typed findings
+```
+
+The executable-version steps are shell-free child launches, not filesystem observations. An
+explicit or `PATH`-resolved agent is trusted external code; SkillMount supplies only `--version`
+and does not claim to sandbox side effects implemented by that executable.
+
+The temporary probe root is unique, owner-restricted, and outside the project and application
+state. Probe cleanup removes links and now-empty directories only while their platform identities
+still match; it removes the create-new sentinel pathname only while it remains a regular file with
+the transaction-unique recorded bytes. There is no recursive deletion. Failure or incomplete
+cleanup is itself a failed finding and reports the retained path.
+
+Explicit cleanup reuses the transaction recovery engine rather than implementing a second removal
+path:
+
+```text
+bounded journal scan -> reject the whole operation on corrupt state -> canonical scope filter
+  -> per journal: claim missing keys into one shared complete lock set
+  -> reload and verify immutable fields
+  -> fail closed on disappearance or drift; otherwise classify the refreshed status
+  -> dependency-ordered adopt -> shared verified cleanup
+```
+
+The command never trusts PID-looking holder text as liveness evidence and never treats a free lock
+as proof that a child is dead. Invoking explicit cleanup supplies that otherwise unavailable
+operator assertion for `supervising` journals. [ADR 0025](adr/0025-share-operator-inspection-and-recovery-engines.md)
+records these public contracts. The scan is candidate discovery rather than mutation evidence:
+automatic and explicit recovery both reload each journal under its recorded locks before acting,
+as required by [ADR 0027](adr/0027-reload-recovery-journals-under-lock.md).
 
 The mutating path deliberately does not build a complete plan before locking:
 
@@ -130,7 +175,7 @@ conflict until recovery removes it. This ordering is the accepted decision in
 | `src/catalog/` | No-follow source discovery, ordered overlay selection, and selected-winner validation. |
 | `src/agent/` | Codex and Claude discovery inspection and declarative plan construction. |
 | `src/mount/` | Destination conflict policy and deterministic, read-only mount actions. |
-| `src/render.rs` | Read-only reports and warnings. |
+| `src/render.rs` | Read-only plans, normal/verbose session diagnostics, warnings, and reversible native-value rendering. |
 | `src/lock/` | Logical/physical resource identities and sorted operating-system advisory locks. |
 | `src/journal/` | Versioned, checksummed write-ahead ownership records and durable storage. |
 | `src/transaction/` | Apply, rollback, ordinary cleanup, kept state, and stale recovery. |
@@ -141,6 +186,7 @@ conflict until recovery removes it. This ordering is the accepted decision in
 | `src/domain.rs` | Shared values crossing the catalog, adapter, plan, lock, and transaction boundaries. |
 | `src/error.rs` | Typed failures and stable sysexits-style wrapper categories. |
 | `src/diagnostic.rs` | Non-fatal structured observations returned by lower layers. |
+| `src/operator/` | Typed `doctor` observations, isolated capability probes, and explicit-cleanup presentation over shared lower-layer engines. |
 | `src/app.rs` | The only top-level orchestration of read-only and mutating flows. |
 
 ### Dependency and mutation boundaries
@@ -375,10 +421,16 @@ retained rather than followed by unchecked pathname rollback. Recovery eligibili
 held lock set before child exposure, never a recorded PID: PIDs are reusable and cannot authorize
 cleanup. Immediately before an agent spawn attempt, the journal enters `supervising`. If a later
 invocation finds that journal with free locks, it cannot infer that the child process domain is
-empty; it quarantines the journal and mounts, blocks mutation with exit category 75, and waits for
-the future explicit cleanup contract. Unreadable or future-schema journals likewise block new
-mutation and are retained for operator inspection.
-[ADR 0022](adr/0022-quarantine-supervising-journals.md) records this post-launch recovery boundary.
+empty; automatic recovery quarantines the journal and mounts and blocks mutation with exit category
+75. `asm cleanup` may release it only after the operator has asserted that its process domain is
+dead and the command has acquired its complete recorded lock set. Read-only lock observations use
+the operating-system lock alone; holder sidecars are diagnostic text and never authority.
+Unreadable, corrupt, or future-schema journals block both automatic and explicit mutation and are
+retained for operator inspection. A current-schema journal with no resource lock is likewise
+rejected because no mutating session can produce it. [ADR 0022](adr/0022-quarantine-supervising-journals.md) records
+the post-launch recovery boundary, and
+[ADR 0025](adr/0025-share-operator-inspection-and-recovery-engines.md) records the explicit operator
+decision layered on it.
 
 ## Platform and unsafe boundary
 
@@ -415,6 +467,9 @@ decisions. Diagnostics may render a reversible representation only at the output
 
 macOS uses directory symbolic links and `renameatx_np(RENAME_EXCL)`. Windows prefers a directory
 symbolic link and falls back to a junction only for `ERROR_PRIVILEGE_NOT_HELD` in automatic mode;
+that fallback emits a pinned-version compatibility warning until native real-agent evidence has
+verified junction loading. Explicit symbolic-link mode fails instead of weakening the request, and
+SkillMount never seeks elevation.
 placement uses `SetFileInformationByHandle(FileRenameInfo)` with replacement disabled, and removal
 uses `FileDispositionInfoEx` with delete and POSIX-semantics flags on a verified handle that excludes
 ordinary write and delete access. Attribute-only reparse mutation can still occur without changing
@@ -473,7 +528,8 @@ The following are product rules rather than style preferences:
    plan, while the sealed platform backend executes only the link primitives it is asked for.
 11. Product behavior never edits Git state, escalates privileges, or weakens agent permissions.
 12. Child launch never uses a shell string, never reorders or duplicates injected/passthrough
-    arguments, and never replaces inherited standard streams with product-owned pipes.
+    arguments, and never replaces inherited standard streams with product-owned pipes. Session
+    stdout is reserved for child data; every wrapper-owned session diagnostic uses stderr.
 13. Exactly one orderly cleanup operation runs when no child was spawned or the managed process
     domain is proven dead. Uncertain liveness defers cleanup and preserves recovery evidence. A
     cleanup failure replaces only child success; otherwise it remains structured secondary
@@ -482,6 +538,19 @@ The following are product rules rather than style preferences:
 14. The process-lifetime event dispatcher preserves the first two handler occurrences for one
     active session, linearizes finalization against event recording, and returns inactive or
     finalizing events to platform default handling.
+15. SkillMount-owned `doctor` inspection never mutates project discovery, lock files, holder
+    sidecars, journals, or agent state. Capability probes are isolated under a unique
+    owner-restricted temporary root. Link and directory removal requires matching recorded kind,
+    target where applicable, and platform identity; sentinel removal requires its create-new
+    regular-file kind and transaction-unique recorded bytes. The selected trusted agent executable
+    is run with literal `--version`; its own behavior is outside this non-mutation guarantee.
+16. Explicit cleanup scans only the bounded journal store, rejects the whole operation before
+    mutation when any journal is corrupt, acquires each eligible journal's complete lock set, and
+    reloads and validates that journal under those locks before using the same ownership-checked
+    reverse-order cleanup as sessions and automatic recovery. Overlapping journals share one
+    claimed lock set and clean descendant owners before shared helper-directory owners. A journal
+    absent after its complete locks are held is unknown ownership and blocks mutation. A live lock
+    always wins over holder text; an ownership mismatch is retained and reported.
 
 Tests enforce the observable parts of these rules. Local comments retain the narrower preconditions
 needed to preserve them inside an implementation.
@@ -494,6 +563,9 @@ needed to preserve them inside an implementation.
 - catalog discovery, overlay selection, selected-winner validation, and provenance;
 - Codex and Claude discovery inspection and deterministic read-only planning;
 - `inspect`, `--dry-run`, concise/verbose plan rendering, and read-only regression tests;
+- normal session summaries on stderr, child-data-only session stdout, verbose
+  scope/link/provenance and cleanup diagnostics, reversible recovery arguments, and retained-path
+  reporting;
 - Unix/macOS symbolic-link and Windows symbolic-link/junction backends;
 - no-follow link-chain resolution, evidence-bearing atomic no-replace placement, Windows
   handle-bound mutation after initial observation, Unix ownership-checked pathname mutation under
@@ -510,24 +582,32 @@ needed to preserve them inside an implementation.
 - complete Claude 2.1.220 session composition through isolated staging, ancestor/user/add-dir
   preflight, exact passthrough injection, fake-child acceptance, concurrent roots, and the same
   liveness-gated cleanup and exit precedence;
+- `doctor` with typed pinned-version, discovery, lock, journal, conflict, and isolated
+  link-capability findings, plus read-only mutation regression tests;
+- project-scoped and bounded all-state explicit cleanup through shared recovery and ownership
+  engines, including active, corrupt, supervising, kept, replaced, missing, and mixed outcomes;
+- operator quick-start, lifecycle, recovery, safety, compatibility, and manual smoke-test
+  documentation, plus a dispatch-only native real-agent evidence workflow with integrity-locked
+  agent packages, provider-scoped credentials, redacted artifacts, and process-tree timeouts;
 - crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
 
 ### Reserved work
 
 - compatibility work to add any Codex release beyond the exact 0.146.0 contract or Claude release
   beyond exact 2.1.220, plus native Windows junction discovery, asynchronously delivered Claude
-  managed-policy handling, and authenticated real-agent smoke tests;
-- `doctor`, explicit `cleanup`, lock-file reclamation, compatibility evidence, and user recovery
-  documentation;
+  managed-policy handling, and executed authenticated real-agent certification;
+- lock-file reclamation;
 - binding a public transaction's lifetime to the lock guard validated when it is opened or adopted;
 - rejecting pre-existing links in application-state directory paths before creation or permission changes;
 - versioned release packaging and publication.
 
 Both session adapters use the supervisor in the product application path, but real-agent and
-Windows-junction certification remain release-hardening gates rather than claims of fake-agent
-coverage. Until operator cleanup is implemented, lock files accumulate for distinct
-logical and physical lock keys. Owner sidecars are removed on ordinary release but may remain after
-a crash or failed removal; neither file's presence blocks or proves a live session.
+Windows-junction certification remain non-blocking compatibility evidence gaps rather than claims
+of fake-agent coverage. The deterministic fake-agent and native filesystem suites remain the
+release gate. The manual workflow records evidence but does not update the compatibility table
+automatically. Lock files still accumulate for distinct logical and physical lock keys. Owner
+sidecars are removed on ordinary release but may remain after a crash or failed removal; neither
+file's presence blocks or proves a live session.
 
 ## Documentation governance
 

@@ -11,9 +11,9 @@ use crate::agent::claude::ClaudeAdapter;
 use crate::agent::codex::CodexAdapter;
 use crate::agent::{AgentAdapter, DiscoverySnapshot};
 use crate::catalog::{CatalogRequest, resolve_catalog};
-use crate::cli::{InspectAgent, ParsedCommand, ReservedUtility, parse_command_from};
-use crate::domain::{AgentId, MountMode, RunContext, SkillCatalog};
-use crate::error::{AppError, ExitCategory};
+use crate::cli::{InspectAgent, ParsedCommand, parse_command_from};
+use crate::domain::{AgentId, LinkMode, MountMode, RunContext, SkillCatalog};
+use crate::error::{AppError, CatalogError, ExitCategory, LinkError, PlanError};
 use crate::journal::store::RejectedJournal;
 use crate::journal::{TransactionId, store};
 use crate::lock::acquire::{HeldLocks, LockOwner, LockPolicy};
@@ -38,6 +38,10 @@ where
     if args.len() == 1 {
         args.push(OsString::from("--help"));
     }
+    let diagnostic_args = args
+        .iter()
+        .map(|argument| OsString::from(render::os_value(argument, true)))
+        .collect::<Vec<_>>();
     let invocation_cwd = match std::env::current_dir() {
         Ok(path) => path,
         Err(error) => {
@@ -49,7 +53,13 @@ where
 
     let command = match parse_command_from(args) {
         Ok(command) => command,
-        Err(error) => return report_clap_error(&error),
+        Err(error) => {
+            let original_kind = error.kind();
+            let Err(diagnostic_error) = parse_command_from(diagnostic_args) else {
+                return report_clap_fallback(original_kind);
+            };
+            return report_clap_error(&diagnostic_error, original_kind);
+        }
     };
     match execute(command, &invocation_cwd) {
         Ok(code) => ExitCode::from(code),
@@ -103,14 +113,15 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError
             warn(&warnings);
             Ok(0)
         }
-        ParsedCommand::Reserved(utility) => {
-            let name = match utility {
-                ReservedUtility::Doctor => "doctor",
-                ReservedUtility::Cleanup => "cleanup",
-            };
-            Err(AppError::Internal(format!(
-                "{name} is reserved for a later change and is not implemented"
-            )))
+        ParsedCommand::Doctor(input) => {
+            let outcome = crate::operator::doctor::run(&input, invocation_cwd)?;
+            emit(&outcome.output)?;
+            Ok(outcome.code)
+        }
+        ParsedCommand::Cleanup(input) => {
+            let outcome = crate::operator::cleanup::run(&input, invocation_cwd)?;
+            emit(&outcome.output)?;
+            Ok(outcome.code)
         }
     }
 }
@@ -224,6 +235,8 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
         &rebuilt.snapshot,
     ));
 
+    let session_output = render_session_output(&context, &rebuilt);
+
     let mut transaction = Transaction::open_with(
         &context,
         &rebuilt.catalog,
@@ -235,6 +248,9 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     transaction
         .apply()
         .map_err(|failure| failure.into_error())?;
+    if let Some(message) = automatic_junction_warning(&context, transaction.journal()) {
+        warn(&[message]);
+    }
 
     // Apply can itself take time and runs after the last version probe. Check once more at the
     // child boundary. If an updater replaced the agent, no child is spawned and the active
@@ -250,10 +266,20 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
         }
         return Err(error);
     }
+    if let Err(error) = emit_diagnostic(&session_output) {
+        match transaction.cleanup_required() {
+            Ok(report) => warn(&report.describe()),
+            Err(cleanup_error) => warn(&[format!(
+                "writing the session diagnostics failed and cleanup also failed: {cleanup_error}"
+            )]),
+        }
+        return Err(error);
+    }
     let journal_path = transaction.journal_path().to_path_buf();
     let request = SupervisionRequest::new(rebuilt.plan.launch.clone());
+    let verbose_cleanup = context.options.verbosity > 0;
     let outcome = ProcessSupervisor::new().supervise(request, move || {
-        cleanup_for_supervisor(&mut transaction, &journal_path)
+        cleanup_for_supervisor(&mut transaction, &journal_path, verbose_cleanup)
     });
     // Lock ownership covers the whole child lifetime and the cleanup callback. Keeping this
     // explicit prevents a future refactor from shortening the guard to the last planning use.
@@ -262,6 +288,55 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     let decision = map_exit(&outcome);
     report_supervision_diagnostics(&decision);
     Ok(decision.code)
+}
+
+fn render_session_output(context: &RunContext, outcome: &ReadOnlyOutcome) -> String {
+    let report = render::ReadOnlyReport {
+        context,
+        catalog: &outcome.catalog,
+        snapshot: &outcome.snapshot,
+        plan: &outcome.plan,
+        verbosity: context.options.verbosity,
+    };
+    let mut output = render::render_session_start(&report);
+    if context.options.verbosity > 0 {
+        output.push('\n');
+        output.push_str(&render::render(&report));
+    }
+    output
+}
+
+fn automatic_junction_warning(
+    context: &RunContext,
+    journal: &crate::journal::TransactionJournal,
+) -> Option<String> {
+    let used_junction_fallback = context.options.link_mode == LinkMode::Auto
+        && journal.actions.iter().any(|action| {
+            action.operation == crate::journal::ActionOperation::CreateDirectoryLink
+                && action.kind == crate::journal::RecordedKind::Junction
+        });
+    junction_policy_warning(
+        context.agent,
+        context.options.link_mode,
+        used_junction_fallback,
+    )
+}
+
+fn junction_policy_warning(
+    agent: AgentId,
+    requested: LinkMode,
+    used_junction: bool,
+) -> Option<String> {
+    (requested == LinkMode::Auto && used_junction).then(|| {
+        let version = match agent {
+            AgentId::Codex => crate::agent::codex::SUPPORTED_CODEX_VERSION,
+            AgentId::Claude => crate::agent::claude::SUPPORTED_CLAUDE_VERSION,
+        };
+        format!(
+            "automatic symlink fallback selected a Windows junction, but real {} {version} junction discovery is unverified in docs/compatibility.md; this session will continue with the ownership-verified junction. Run the opt-in native smoke before claiming compatibility, or request --link-mode=symlink to fail instead of falling back",
+            agent.label()
+        )
+    })
 }
 
 fn verify_spawn_boundary(
@@ -289,9 +364,26 @@ fn verify_spawn_boundary(
 fn cleanup_for_supervisor(
     transaction: &mut Transaction,
     journal_path: &Path,
+    verbose: bool,
 ) -> Result<(), CleanupFailure> {
+    let recovery_command = cleanup_recovery_arguments(&transaction.journal().project_root);
     match transaction.cleanup() {
         Ok(report) => {
+            if verbose {
+                if report.removed.is_empty() {
+                    inform(&["cleanup removed 0 transaction-owned entries".to_owned()]);
+                } else {
+                    inform(
+                        &report
+                            .removed
+                            .iter()
+                            .map(|path| {
+                                format!("cleanup removed {}", render::path_value(path, true))
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
             let messages = report.describe();
             warn(&messages);
             if report.needs_attention() {
@@ -299,6 +391,7 @@ fn cleanup_for_supervisor(
                     &report,
                     &messages,
                     journal_path,
+                    recovery_command,
                 ))
             } else {
                 Ok(())
@@ -308,7 +401,7 @@ fn cleanup_for_supervisor(
             reason: error.to_string(),
             failed_paths: Vec::new(),
             retained_journal: Some(journal_path.to_path_buf()),
-            recovery_command: Vec::new(),
+            recovery_command,
         }),
     }
 }
@@ -317,6 +410,7 @@ fn cleanup_failure_from_report(
     report: &CleanupReport,
     messages: &[String],
     fallback_journal: &Path,
+    recovery_command: Vec<OsString>,
 ) -> CleanupFailure {
     CleanupFailure {
         reason: messages.join("; "),
@@ -330,8 +424,17 @@ fn cleanup_failure_from_report(
             .as_ref()
             .map(|retention| retention.path().to_path_buf())
             .or_else(|| Some(fallback_journal.to_path_buf())),
-        recovery_command: Vec::new(),
+        recovery_command,
     }
+}
+
+fn cleanup_recovery_arguments(project_root: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("asm"),
+        OsString::from("cleanup"),
+        OsString::from("--project-root"),
+        project_root.as_os_str().to_os_string(),
+    ]
 }
 
 fn report_supervision_diagnostics(decision: &crate::process::ExitDecision) {
@@ -339,16 +442,20 @@ fn report_supervision_diagnostics(decision: &crate::process::ExitDecision) {
         let _ = writeln!(
             io::stderr().lock(),
             "error: {}",
-            describe_supervision_diagnostic(primary)
+            render_supervision_diagnostic(primary)
         );
     }
     for secondary in &decision.secondary {
         let _ = writeln!(
             io::stderr().lock(),
             "warning: {}",
-            describe_supervision_diagnostic(secondary)
+            render_supervision_diagnostic(secondary)
         );
     }
+}
+
+fn render_supervision_diagnostic(diagnostic: &SupervisionDiagnostic) -> String {
+    render::text_value(&describe_supervision_diagnostic(diagnostic))
 }
 
 fn describe_supervision_diagnostic(diagnostic: &SupervisionDiagnostic) -> String {
@@ -385,7 +492,34 @@ fn describe_supervision_diagnostic(diagnostic: &SupervisionDiagnostic) -> String
                 || "no journal path was available".to_owned(),
                 |path| format!("journal retained at {}", path.display()),
             );
-            format!("session cleanup failed: {}; {journal}", failure.reason)
+            let retained = failure
+                .failed_paths
+                .iter()
+                .map(|path| format!("retained path {}", render::path_value(path, true)))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let recovery = failure
+                .recovery_command
+                .iter()
+                .enumerate()
+                .map(|(index, argument)| {
+                    format!(
+                        "recovery argv[{index}] = {}",
+                        render::os_value(argument, true)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            [
+                format!("session cleanup failed: {}", failure.reason),
+                retained,
+                journal,
+                recovery,
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ")
         }
     }
 }
@@ -416,14 +550,38 @@ fn reconcile_incomplete_transactions(
         return Err(unreadable_journals_error(&report.unreadable));
     }
     if !report.quarantined.is_empty() {
+        let recovery = report
+            .quarantined
+            .iter()
+            .enumerate()
+            .flat_map(|(recovery_index, quarantined)| {
+                let mut lines = vec![format!(
+                    "recovery[{recovery_index}] journal = {}",
+                    render::path_value(&quarantined.journal, true)
+                )];
+                lines.extend(
+                    cleanup_recovery_arguments(&quarantined.project_root)
+                        .into_iter()
+                        .enumerate()
+                        .map(move |(argument_index, argument)| {
+                            format!(
+                                "recovery[{recovery_index}] argv[{argument_index}] = {}",
+                                render::os_value(&argument, true)
+                            )
+                        }),
+                );
+                lines
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         return Err(AppError::Temporary(format!(
-            "cannot start a mutating session because process-domain death was never proved for:\n{}\nthese journals and their mounts were retained; verify that every related process has exited, then use the future explicit cleanup command or account for the recorded paths manually",
-            report
-                .quarantined
-                .iter()
-                .map(|path| format!("transaction journal {}", path.display()))
-                .collect::<Vec<_>>()
-                .join("\n")
+            "cannot start a mutating session because process-domain death was never proved:\n{}\n\
+             state: recovered entries listed above were changed by ownership-checked recovery; \
+             the quarantined mounts were not changed and remain journal-backed\n\
+             safe next action: verify that every related process has exited, then invoke the \
+             explicit recovery arguments below or account for every recorded path manually:\n{}",
+            report.describe().join("\n"),
+            recovery
         )));
     }
     warn(&report.describe());
@@ -434,9 +592,9 @@ fn reconcile_incomplete_transactions(
 fn unreadable_journals_error(rejected: &[RejectedJournal]) -> AppError {
     AppError::Temporary(format!(
         "cannot start a mutating session while transaction state is unreadable or uses an \
-         unsupported schema; every journal was retained and no new plan was applied:\n{}\n\
-         inspect these files and account for every recorded path before moving or removing them, \
-         then retry",
+         unsupported schema; no cleanup was attempted and no new plan was applied:\n{}\n\
+         account for every recorded path that may belong to each reported journal before moving \
+         or removing any remaining state, then retry",
         rejected
             .iter()
             .map(|rejected| {
@@ -533,9 +691,30 @@ fn emit(text: &str) -> Result<(), AppError> {
     }
 }
 
+/// Writes wrapper-owned session diagnostics to stderr, preserving child stdout as a data stream.
+fn emit_diagnostic(text: &str) -> Result<(), AppError> {
+    match io::stderr().lock().write_all(text.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(AppError::Internal(format!(
+            "cannot write session diagnostics to standard error: {error}"
+        ))),
+    }
+}
+
 fn warn(messages: &[String]) {
     for message in messages {
-        let _ = writeln!(io::stderr().lock(), "warning: {message}");
+        let _ = writeln!(
+            io::stderr().lock(),
+            "warning: {}",
+            render::text_value(message)
+        );
+    }
+}
+
+fn inform(messages: &[String]) {
+    for message in messages {
+        let _ = writeln!(io::stderr().lock(), "info: {}", render::text_value(message));
     }
 }
 
@@ -549,9 +728,9 @@ fn destination_stores(context: &crate::domain::RunContext) -> Vec<PathBuf> {
     }
 }
 
-fn report_clap_error(error: &clap::Error) -> ExitCode {
+fn report_clap_error(error: &clap::Error, original_kind: ErrorKind) -> ExitCode {
     let success = matches!(
-        error.kind(),
+        original_kind,
         ErrorKind::DisplayHelp
             | ErrorKind::DisplayVersion
             | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
@@ -569,7 +748,160 @@ fn report_clap_error(error: &clap::Error) -> ExitCode {
     }
 }
 
+fn report_clap_fallback(original_kind: ErrorKind) -> ExitCode {
+    let success = matches!(
+        original_kind,
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    );
+    let message = if success {
+        "command help could not be rendered safely"
+    } else {
+        "invalid command-line arguments could not be rendered safely"
+    };
+    let stream = if success {
+        &mut io::stdout().lock() as &mut dyn Write
+    } else {
+        &mut io::stderr().lock() as &mut dyn Write
+    };
+    if writeln!(stream, "{message}").is_err() {
+        return ExitCode::from(ExitCategory::Internal.code());
+    }
+    if success {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(ExitCategory::Usage.code())
+    }
+}
+
 fn report_error(error: &AppError) -> ExitCode {
-    let _ = writeln!(io::stderr().lock(), "error: {error}");
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(stderr, "error: {}", render::text_value(&error.to_string()));
+    for line in error_guidance(error) {
+        let _ = writeln!(stderr, "{line}");
+    }
     ExitCode::from(error.category().code())
+}
+
+/// Adds stable state and recovery guidance without weakening the typed primary error.
+fn error_guidance(error: &AppError) -> Vec<&'static str> {
+    match error {
+        AppError::Catalog(CatalogError::InvalidSelectedSkill { .. }) => vec![
+            "state: no selected Skill was mounted and no existing destination was replaced; any earlier stale recovery was reported separately",
+            "safe next action: fix or remove the rightmost selected winner, or change the --skills-dir order; SkillMount does not fall back to a shadowed candidate",
+        ],
+        AppError::Catalog(_) => vec![
+            "state: no selected Skill was mounted and no existing destination was replaced; any earlier stale recovery was reported separately",
+            "safe next action: correct the named catalog entry or source ordering, then retry",
+        ],
+        AppError::Plan(PlanError::DestinationConflict { .. }) => vec![
+            "state: the conflicting destination was not replaced; any earlier stale recovery was reported separately",
+            "safe next action: --conflict=skip may preserve an ordinary project directory or different-source directory link while omitting this selected Skill; otherwise account for and repair the existing entry before retrying",
+        ],
+        AppError::Plan(_) => vec![
+            "state: the reported destination was not replaced; an ownership-checked rollback completed if mutation had already begun",
+            "safe next action: inspect and account for the reported discovery entry before repairing it and retrying",
+        ],
+        AppError::Link(
+            LinkError::Create { .. } | LinkError::SymlinkPrivilegeUnavailable { .. },
+        ) => vec![
+            "state: the final destination was not replaced; the attempt may have written private transaction state or retained an unverified staged path for recovery",
+            "safe next action: run asm doctor; on Windows, use --link-mode=junction only with passing compatibility evidence for this agent/version, or make symbolic links available without elevation",
+        ],
+        AppError::Link(_) => vec![
+            "state: no unowned entry was intentionally removed or replaced; any uncertain path remains retained for ownership-safe recovery",
+            "safe next action: run asm doctor, inspect every named retained path, and use asm cleanup only after proving no related process is active",
+        ],
+        AppError::Journal(_) => vec![
+            "state: the journal and every path whose ownership is uncertain were retained",
+            "safe next action: run asm doctor and account for every recorded path; do not edit or delete journal state merely to bypass the failure",
+        ],
+        AppError::MissingInput { .. } => vec![
+            "state: the agent was not launched; if an earlier diagnostic names a retained path or journal, that mount may still exist",
+            "safe next action: restore or correct the named input path, then retry",
+        ],
+        AppError::Filesystem(_) => vec![
+            "safe next action: inspect every retained path and journal named above with asm doctor; use asm cleanup only after proving no related process is active",
+        ],
+        AppError::Temporary(_) => vec![
+            "safe next action: run asm doctor and wait for any active session to exit; never delete a lock file or trust holder text as liveness proof, and use asm cleanup only after proving process-domain death",
+        ],
+        AppError::Usage(_) | AppError::Internal(_) | AppError::Interrupted => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use super::{error_guidance, junction_policy_warning, render_supervision_diagnostic};
+    use crate::domain::{AgentId, LinkMode};
+    use crate::error::{AppError, LinkError};
+    use crate::process::{CleanupFailure, SupervisionDiagnostic};
+
+    #[test]
+    fn only_automatic_junction_fallback_emits_the_unverified_compatibility_warning() {
+        let warning = junction_policy_warning(AgentId::Codex, LinkMode::Auto, true)
+            .expect("automatic junction fallback must be visible");
+        assert!(warning.contains("0.146.0"));
+        assert!(warning.contains("unverified"));
+        assert!(warning.contains("--link-mode=symlink"));
+
+        assert!(junction_policy_warning(AgentId::Codex, LinkMode::Auto, false).is_none());
+        assert!(junction_policy_warning(AgentId::Claude, LinkMode::Junction, true).is_none());
+        assert!(junction_policy_warning(AgentId::Claude, LinkMode::Symlink, false).is_none());
+    }
+
+    #[test]
+    fn link_creation_guidance_names_diagnosis_and_never_suggests_elevation() {
+        let error = AppError::Link(LinkError::Create {
+            destination: PathBuf::from("destination"),
+            source: PathBuf::from("source"),
+            reason: "symbolic-link privilege is unavailable".to_owned(),
+        });
+
+        let guidance = error_guidance(&error).join("\n");
+
+        assert!(guidance.contains("asm doctor"));
+        assert!(guidance.contains("--link-mode=junction"));
+        assert!(guidance.contains("without elevation"));
+        assert!(!guidance.contains("sudo"));
+        assert!(!guidance.contains("runas"));
+    }
+
+    #[test]
+    fn missing_input_guidance_never_denies_a_preceding_cleanup_failure() {
+        let error = AppError::MissingInput {
+            path: PathBuf::from("agent"),
+            reason: "disappeared before spawn".to_owned(),
+        };
+
+        let guidance = error_guidance(&error).join("\n");
+
+        assert!(guidance.contains("the agent was not launched"));
+        assert!(guidance.contains("retained path or journal"));
+        assert!(!guidance.contains("no selected Skill was mounted"));
+    }
+
+    #[test]
+    fn supervision_diagnostics_escape_line_and_terminal_controls() {
+        let diagnostic = SupervisionDiagnostic::Cleanup(CleanupFailure {
+            reason: "cleanup failed\n[PASS] forged\u{1B}]52;clipboard\u{7}".to_owned(),
+            failed_paths: vec![PathBuf::from("mount\n[PASS] path")],
+            retained_journal: Some(PathBuf::from("journal\u{202E}txt")),
+            recovery_command: vec![OsString::from("cleanup\n[PASS] argv")],
+        });
+
+        let rendered = render_supervision_diagnostic(&diagnostic);
+
+        assert!(rendered.contains("\\u{A}"), "{rendered}");
+        assert!(rendered.contains("\\u{1B}"), "{rendered}");
+        assert!(rendered.contains("\\u{7}"), "{rendered}");
+        assert!(rendered.contains("\\u{202E}"), "{rendered}");
+        assert!(!rendered.contains("\n[PASS]"), "{rendered}");
+        assert!(!rendered.contains('\u{1B}'), "{rendered}");
+        assert!(!rendered.contains('\u{202E}'), "{rendered}");
+    }
 }

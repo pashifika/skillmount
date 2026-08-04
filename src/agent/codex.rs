@@ -217,12 +217,17 @@ impl CodexAdapter {
 /// Proves that the executable and higher-precedence configuration match the loader contract.
 pub(crate) fn verify_supported_launch(context: &RunContext) -> Result<(), AppError> {
     verify_managed_configuration(context)?;
+    verify_version_text(&reported_version(context)?)
+}
+
+/// Captures the bounded, text version banner used by operator diagnostics and launch checks.
+pub(crate) fn reported_version(context: &RunContext) -> Result<String, AppError> {
     // Integration suites reuse test executables whose real version banners intentionally are not
     // Codex. The escape hatch is absent from release builds, like failure checkpoints and the
     // isolated administrator-root override.
     #[cfg(debug_assertions)]
     if let Some(version) = std::env::var_os("SKILLMOUNT_TEST_CODEX_VERSION") {
-        return verify_version_text(version.to_string_lossy().as_ref());
+        return Ok(version.to_string_lossy().trim().to_owned());
     }
 
     let output = Command::new(&context.agent_bin)
@@ -249,10 +254,11 @@ pub(crate) fn verify_supported_launch(context: &RunContext) -> Result<(), AppErr
     }
     let version = std::str::from_utf8(&output.stdout)
         .map_err(|_| AppError::Usage("Codex --version output is not valid UTF-8".to_owned()))?;
-    verify_version_text(version.trim())
+    Ok(version.trim().to_owned())
 }
 
-fn verify_managed_configuration(context: &RunContext) -> Result<(), AppError> {
+/// Verifies higher-precedence configuration that can change the inspected discovery model.
+pub(crate) fn verify_managed_configuration(context: &RunContext) -> Result<(), AppError> {
     #[cfg(debug_assertions)]
     if let Some(value) = std::env::var_os("SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG") {
         return match value.to_str() {
@@ -301,7 +307,8 @@ fn unsupported_managed_configuration() -> AppError {
     )
 }
 
-fn verify_version_text(version: &str) -> Result<(), AppError> {
+/// Checks a captured version banner against the adapter-pinned release.
+pub(crate) fn verify_version_text(version: &str) -> Result<(), AppError> {
     if version.trim() == SUPPORTED_CODEX_VERSION_OUTPUT {
         Ok(())
     } else {

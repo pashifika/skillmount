@@ -30,9 +30,9 @@ enum CliCommand {
     Claude(SessionArgs),
     /// Inspect and validate a catalog without modifying the filesystem.
     Inspect(InspectArgs),
-    /// Reserved for the later environment-diagnostic change.
+    /// Inspect agent, discovery, link, lock, and transaction health.
     Doctor(DoctorArgs),
-    /// Reserved for the later transaction-recovery change.
+    /// Reconcile transaction-owned residue from durable evidence.
     Cleanup(CleanupArgs),
 }
 
@@ -111,6 +111,14 @@ struct DoctorArgs {
     /// Explicit project root.
     #[arg(long, value_name = "PATH")]
     project_root: Option<PathBuf>,
+
+    /// Explicit Codex executable path; otherwise search PATH.
+    #[arg(long, value_name = "PATH")]
+    codex_bin: Option<PathBuf>,
+
+    /// Explicit Claude Code executable path; otherwise search PATH.
+    #[arg(long, value_name = "PATH")]
+    claude_bin: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -120,7 +128,7 @@ struct CleanupArgs {
     project_root: Option<PathBuf>,
 
     /// Include every recoverable transaction.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "project_root")]
     all: bool,
 }
 
@@ -178,11 +186,19 @@ pub(crate) struct InspectInput {
     pub(crate) validation: ValidationLevel,
 }
 
-/// Utility command reserved for a later change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReservedUtility {
-    Doctor,
-    Cleanup,
+/// Parsed environment-diagnostic values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DoctorInput {
+    pub(crate) project_root: Option<PathBuf>,
+    pub(crate) codex_bin: Option<PathBuf>,
+    pub(crate) claude_bin: Option<PathBuf>,
+}
+
+/// Parsed explicit-recovery values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CleanupInput {
+    pub(crate) project_root: Option<PathBuf>,
+    pub(crate) all: bool,
 }
 
 /// One parsed root command.
@@ -190,7 +206,8 @@ pub(crate) enum ReservedUtility {
 pub(crate) enum ParsedCommand {
     Session(SessionInput),
     Inspect(InspectInput),
-    Reserved(ReservedUtility),
+    Doctor(DoctorInput),
+    Cleanup(CleanupInput),
 }
 
 pub(crate) fn parse_command_from<I, T>(args: I) -> Result<ParsedCommand, clap::Error>
@@ -207,14 +224,15 @@ where
             agent: args.agent,
             validation: args.validation.into(),
         })),
-        CliCommand::Doctor(args) => {
-            let _ = args.project_root;
-            Ok(ParsedCommand::Reserved(ReservedUtility::Doctor))
-        }
-        CliCommand::Cleanup(args) => {
-            let _ = (args.project_root, args.all);
-            Ok(ParsedCommand::Reserved(ReservedUtility::Cleanup))
-        }
+        CliCommand::Doctor(args) => Ok(ParsedCommand::Doctor(DoctorInput {
+            project_root: args.project_root,
+            codex_bin: args.codex_bin,
+            claude_bin: args.claude_bin,
+        })),
+        CliCommand::Cleanup(args) => Ok(ParsedCommand::Cleanup(CleanupInput {
+            project_root: args.project_root,
+            all: args.all,
+        })),
     }
 }
 

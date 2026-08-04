@@ -153,6 +153,23 @@ fn both_executable_names_reject_invalid_invocations_with_usage_status() {
     }
 }
 
+#[test]
+fn clap_errors_escape_line_and_terminal_controls_in_arguments() {
+    let argument = "--unknown\n[PASS] forged\u{1B}]52;clipboard\u{7}";
+    for executable in [ASM, SKILLMOUNT] {
+        let output = run(executable, &[argument]);
+
+        assert_eq!(output.status.code(), Some(64));
+        assert!(output.stdout.is_empty());
+        let rendered = String::from_utf8_lossy(&output.stderr);
+        assert!(rendered.contains("\\u{A}"), "{rendered}");
+        assert!(rendered.contains("\\u{1B}"), "{rendered}");
+        assert!(rendered.contains("\\u{7}"), "{rendered}");
+        assert!(!rendered.contains("\n[PASS] forged"), "{rendered}");
+        assert!(!rendered.contains('\u{1B}'), "{rendered}");
+    }
+}
+
 fn temporary_fixture(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -152,22 +152,59 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn three_source_overrides_count_once_normally_and_list_every_origin_verbose() {
+    let fixture = Fixture::new("three-source-provenance");
+    fixture.skill(&fixture.left, "alpha", "first");
+    fixture.skill(&fixture.right, "alpha", "second");
+    let third = fixture.root.join("third");
+    fs::create_dir(&third).expect("third source");
+    fixture.skill(&third, "alpha", "third winner");
+    let expected_names = std::env::join_paths(["alpha"]).expect("Skill name list");
+
+    let output = fixture
+        .command()
+        .arg("--skills-dir")
+        .arg(&third)
+        .arg("--verbose")
+        .arg("--")
+        .arg("prompt")
+        .env("SKILLMOUNT_FAKE_EXPECT_ADD_DIR_SKILLS", expected_names)
+        .output()
+        .expect("three-source Claude session");
+
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Mounted 1 skill from 3 source arguments for Claude (1 source override)."),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("(different source)").count(),
+        2,
+        "both displaced origins remain visible: {stderr}"
+    );
+    assert!(
+        stderr.contains("[3]"),
+        "the rightmost winner is identified: {stderr}"
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn selected_winners_are_visible_only_in_the_injected_root_then_cleanup_succeeds() {
     let fixture = Fixture::new("happy-path");
     fixture.skill(&fixture.left, "alpha", "left shadow");
     let beta = fixture.skill(&fixture.left, "beta", "left winner");
     let alpha = fixture.skill(&fixture.right, "alpha", "right winner");
-    let project_skill = fixture.skill(
-        &fixture.project.join(".claude/skills"),
-        "project-only",
-        "project",
-    );
+    let project_skill = fixture.skill(&fixture.project.join(".claude/skills"), "rasen", "project");
     let user_skill = fixture.skill(&fixture.home.join(".claude/skills"), "user-only", "user");
     let extra_root = fixture.root.join("extra");
     let extra_skill = fixture.skill(&extra_root.join(".claude/skills"), "extra-only", "extra");
     let watched =
         [&fixture.project, &fixture.home, &extra_root].map(|root| (root.clone(), snapshot(root)));
     let expected_names = std::env::join_paths(["alpha", "beta"]).expect("Skill name list");
+    let expected_existing = std::env::join_paths([&project_skill, &user_skill, &extra_skill])
+        .expect("existing discovery paths");
 
     let output = fixture
         .command()
@@ -178,10 +215,20 @@ fn selected_winners_are_visible_only_in_the_injected_root_then_cleanup_succeeds(
         .arg("sonnet")
         .arg("prompt with spaces")
         .env("SKILLMOUNT_FAKE_EXPECT_ADD_DIR_SKILLS", expected_names)
+        .env("SKILLMOUNT_FAKE_EXPECT_PATHS", expected_existing)
         .output()
         .expect("asm should launch fake Claude");
 
     assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Mounted 2 skills from 2 source arguments for Claude (1 source override)."),
+        "{stderr}"
+    );
+    assert!(stderr.contains("  alpha\n"), "{stderr}");
+    assert!(stderr.contains("  beta\n"), "{stderr}");
+    assert!(stderr.contains("Launching claude..."), "{stderr}");
+    assert!(output.stdout.is_empty());
     let record = fs::read_to_string(&fixture.record).expect("fake Claude launch record");
     let arguments = recorded_os_values(&record, "arg");
     assert_eq!(arguments[0], OsStr::new("--add-dir"));
@@ -210,6 +257,9 @@ fn selected_winners_are_visible_only_in_the_injected_root_then_cleanup_succeeds(
     assert_eq!(
         canonical_recorded_values(&record, "visible-target"),
         [
+            fs::canonicalize(&project_skill).expect("project-owned rasen Skill"),
+            fs::canonicalize(&user_skill).expect("user Skill"),
+            fs::canonicalize(&extra_skill).expect("extra-directory Skill"),
             fs::canonicalize(&alpha).expect("rightmost alpha"),
             fs::canonicalize(&beta).expect("beta winner"),
         ]
@@ -235,6 +285,29 @@ fn selected_winners_are_visible_only_in_the_injected_root_then_cleanup_succeeds(
         assert_eq!(snapshot(&root), before, "{} changed", root.display());
     }
     assert!(project_skill.is_dir() && user_skill.is_dir() && extra_skill.is_dir());
+}
+
+#[test]
+fn machine_readable_claude_stdout_is_not_prefixed_by_wrapper_diagnostics() {
+    let fixture = Fixture::new("machine-readable-stdout");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+
+    let output = fixture
+        .command()
+        .arg("--")
+        .arg("prompt")
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "json")
+        .output()
+        .expect("machine-readable fake Claude session");
+
+    assert_success(&output);
+    assert_eq!(output.stdout, b"{\"type\":\"fixture\"}\n");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is one valid JSON value");
+    assert_eq!(parsed["type"], "fixture");
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostics.contains("Mounted 1 skill"), "{diagnostics}");
+    assert!(diagnostics.contains("Launching claude"), "{diagnostics}");
 }
 
 #[test]
@@ -419,7 +492,10 @@ fn an_invalid_rightmost_claude_winner_never_falls_back_or_launches() {
         .expect("asm should reject the selected winner");
 
     assert_eq!(output.status.code(), Some(65));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid selected Skill"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid selected Skill"), "{stderr}");
+    assert!(stderr.contains("rightmost selected winner"), "{stderr}");
+    assert!(stderr.contains("no selected Skill was mounted"), "{stderr}");
     assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
     assert_eq!(fixture.journal_count(), 0);
     assert!(!fixture.record.exists());
@@ -528,7 +604,7 @@ fn inherited_streams_and_launch_cwd_reach_fake_claude_unchanged() {
     let output = child.wait_with_output().expect("asm should finish");
 
     assert_success(&output);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("fake-stdout:hello claude\n"));
+    assert_eq!(output.stdout, b"fake-stdout:hello claude\n");
     assert!(String::from_utf8_lossy(&output.stderr).contains("fake-stderr:hello claude\n"));
     let record = fs::read_to_string(&fixture.record).expect("fake Claude record");
     assert_eq!(recorded_bytes(&record, "stdin"), b"hello claude\n");

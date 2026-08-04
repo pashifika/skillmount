@@ -43,7 +43,7 @@ use crate::test_support::{TestDir, symlink_dir_or_skip};
 use super::testing::{HookPoint, with_hook};
 use super::windows::{
     SymlinkFailure, classify_symlink_failure, is_privilege_failure, junction_eligibility,
-    link_target,
+    link_target, symlink_privilege_error,
 };
 use super::windows_ffi::{self, Access};
 use super::{reparse, winpath};
@@ -177,6 +177,15 @@ fn only_automatic_mode_meeting_a_privilege_failure_falls_back_to_a_junction() {
         SymlinkFailure::MissingPrivilege,
         "an explicitly requested symbolic link is never silently downgraded"
     );
+    let request = LinkRequest {
+        source: PathBuf::from(r"C:\Skills\source"),
+        staged_path: PathBuf::from(r"C:\Skills\staged"),
+        mode: LinkMode::Symlink,
+    };
+    assert!(matches!(
+        symlink_privilege_error(&request, "missing privilege".to_owned()),
+        LinkError::SymlinkPrivilegeUnavailable { .. }
+    ));
     for other in [ERROR_ACCESS_DENIED, ERROR_DISK_FULL] {
         for mode in [LinkMode::Auto, LinkMode::Symlink] {
             assert_eq!(

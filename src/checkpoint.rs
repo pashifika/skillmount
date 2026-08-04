@@ -35,6 +35,9 @@ pub const HOLD_AT: &str = "SKILLMOUNT_HOLD_AT";
 /// Environment variable giving the pause length in milliseconds.
 pub const HOLD_MS: &str = "SKILLMOUNT_HOLD_MS";
 
+/// Optional path whose appearance releases a paused checkpoint before its deadline.
+pub const HOLD_UNTIL: &str = "SKILLMOUNT_HOLD_UNTIL";
+
 /// A durable boundary the transaction layer passes through.
 ///
 /// The names are part of the test contract, not internal detail: a test names the boundary it
@@ -44,6 +47,8 @@ pub const HOLD_MS: &str = "SKILLMOUNT_HOLD_MS";
 pub enum Checkpoint {
     /// Preliminary discovery is complete and no resource lock has been acquired yet.
     DiscoveryInspected,
+    /// Transaction journals have been scanned but their recorded lock sets are not yet claimed.
+    JournalScanComplete,
     /// The complete plan is durable and nothing has been mutated.
     JournalPlanned,
     /// The transaction is durably marked as mutating.
@@ -68,6 +73,10 @@ pub enum Checkpoint {
     EntryRemoved,
     /// A helper directory has been removed and the journal has not recorded it yet.
     DirectoryRemoved,
+    /// Cleanup is durably complete and the terminal journal has not been retired yet.
+    JournalCompleted,
+    /// The terminal journal has been durably renamed out of the scanner namespace.
+    JournalRetired,
 }
 
 impl Checkpoint {
@@ -76,6 +85,7 @@ impl Checkpoint {
     pub const fn name(self) -> &'static str {
         match self {
             Self::DiscoveryInspected => "discovery-inspected",
+            Self::JournalScanComplete => "journal-scan-complete",
             Self::JournalPlanned => "journal-planned",
             Self::JournalApplying => "journal-applying",
             Self::ActionIntent => "action-intent",
@@ -88,12 +98,15 @@ impl Checkpoint {
             Self::JournalCleaning => "journal-cleaning",
             Self::EntryRemoved => "entry-removed",
             Self::DirectoryRemoved => "directory-removed",
+            Self::JournalCompleted => "journal-completed",
+            Self::JournalRetired => "journal-retired",
         }
     }
 
     /// Every boundary, so a test suite can assert it covers all of them.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 16] = [
         Self::DiscoveryInspected,
+        Self::JournalScanComplete,
         Self::JournalPlanned,
         Self::JournalApplying,
         Self::ActionIntent,
@@ -106,6 +119,8 @@ impl Checkpoint {
         Self::JournalCleaning,
         Self::EntryRemoved,
         Self::DirectoryRemoved,
+        Self::JournalCompleted,
+        Self::JournalRetired,
     ];
 }
 
@@ -120,11 +135,21 @@ pub fn reached(checkpoint: Checkpoint, sequence: u32) {
         let millis = std::env::var_os(HOLD_MS)
             .and_then(|value| value.to_str().and_then(|text| text.parse::<u64>().ok()))
             .unwrap_or(500);
+        let release = std::env::var_os(HOLD_UNTIL).map(std::path::PathBuf::from);
         eprintln!(
             "skillmount: failure injection holding at {} occurrence {sequence} for {millis}ms",
             checkpoint.name()
         );
-        std::thread::sleep(std::time::Duration::from_millis(millis));
+        if let Some(release) = release {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
+            while std::time::Instant::now() < deadline
+                && std::fs::symlink_metadata(&release).is_err()
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(millis));
+        }
     }
     if !selected(STOP_AT, checkpoint, sequence) {
         return;

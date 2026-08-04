@@ -107,6 +107,18 @@ fn validate_explicit_executable(path: &Path) -> Result<PathBuf, AppError> {
     Ok(canonical)
 }
 
+/// Resolves one agent executable for an operator check without invoking it through a shell.
+pub(crate) fn resolve_agent_executable(
+    agent: AgentId,
+    explicit: Option<&Path>,
+    invocation_cwd: &Path,
+) -> Result<PathBuf, AppError> {
+    match explicit {
+        Some(path) => validate_explicit_executable(&absolute_from(invocation_cwd, path)?),
+        None => resolve_path_executable(agent.executable_name(), invocation_cwd),
+    }
+}
+
 fn resolve_path_executable(name: &OsStr, invocation_cwd: &Path) -> Result<PathBuf, AppError> {
     let search_path = std::env::var_os("PATH").ok_or_else(|| AppError::MissingInput {
         path: PathBuf::from(name),
@@ -258,6 +270,67 @@ pub(crate) fn resolve_inspection(
             },
             conflict: crate::domain::ConflictPolicy::Error,
             validation,
+            dry_run: true,
+            keep_mounts: false,
+            no_recover: false,
+            verbosity: 0,
+        },
+    })
+}
+
+/// Resolves the project scope used by operator commands.
+pub(crate) fn resolve_operator_project_root(
+    explicit: Option<&Path>,
+    invocation_cwd: &Path,
+) -> Result<PathBuf, AppError> {
+    let invocation_cwd = canonical_directory(invocation_cwd)?;
+    match explicit {
+        Some(path) => canonical_directory(&absolute_from(&invocation_cwd, path)?),
+        None => Ok(nearest_git_root(&invocation_cwd)?.unwrap_or(invocation_cwd)),
+    }
+}
+
+/// Builds the read-only discovery context used by `doctor` for one agent.
+pub(crate) fn resolve_operator_context(
+    agent: AgentId,
+    project_root: &Path,
+    explicit_agent_bin: Option<&Path>,
+    invocation_cwd: &Path,
+) -> Result<RunContext, AppError> {
+    let invocation_cwd = canonical_directory(invocation_cwd)?;
+    let project_root = canonical_directory(project_root)?;
+    let user_home = agent_user_home(agent)?;
+    let (codex_home, codex_home_override) = if agent == AgentId::Codex {
+        codex_home(&user_home, &invocation_cwd)?
+    } else {
+        (user_home.join(".codex"), None)
+    };
+    let claude_config_dir = claude_config_dir(&user_home, &project_root)?;
+    let agent_bin = resolve_agent_executable(agent, explicit_agent_bin, &invocation_cwd)?;
+
+    Ok(RunContext {
+        agent,
+        invocation_cwd,
+        launch_cwd: project_root.clone(),
+        project_root,
+        user_home,
+        codex_home,
+        codex_home_override,
+        codex_admin_skills: codex_admin_skills(),
+        claude_config_dir,
+        claude_managed_skills: claude_managed_skills(),
+        skill_sources: Vec::new(),
+        session_id: None,
+        agent_bin,
+        passthrough_args: Vec::new(),
+        options: crate::domain::RunOptions {
+            link_mode: crate::domain::LinkMode::Auto,
+            mount_mode: match agent {
+                AgentId::Codex => crate::domain::MountMode::Project,
+                AgentId::Claude => crate::domain::MountMode::Staging,
+            },
+            conflict: crate::domain::ConflictPolicy::Error,
+            validation: crate::domain::ValidationLevel::Basic,
             dry_run: true,
             keep_mounts: false,
             no_recover: false,
