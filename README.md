@@ -76,9 +76,10 @@ clean installation passes on a supported host:
 
 Each package installs exactly one of the two commands and owns only that command's executable,
 shim, and completion files. Installing both packages from one manager is supported. The
-`brew trust` step is one-time per Formula name, not per version: Homebrew refuses to install from
-an untrusted third-party tap, and upgrades never re-prompt. Upgrade, uninstall, and completion
-details per package live in [docs/packaging.md](docs/packaging.md).
+`brew trust` step is required because Homebrew refuses to install from an untrusted third-party
+tap; it persists across upgrades of an installed Formula, but uninstalling one drops its entry, so
+reinstalling needs it again. Upgrade, uninstall, and completion details per package live in
+[docs/packaging.md](docs/packaging.md).
 
 ### Build from source
 

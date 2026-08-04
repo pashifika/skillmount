@@ -644,9 +644,10 @@ package moderation and public listing per package ID. Each publisher runs behind
 GitHub Environment — `homebrew` and `chocolatey` — holding only that channel's credential;
 preflight, generation, and acceptance jobs hold no external credential.
 Homebrew's tap trust state is a further operator-owned boundary: Homebrew refuses to install a
-Formula from an untrusted third-party tap, so each Formula's first install requires a one-time,
-name-keyed operator `brew trust` before `brew install`, and neither the Formulae nor the
-automation may trust a tap on an operator's behalf.
+Formula from an untrusted third-party tap, so an install requires a name-keyed operator
+`brew trust` first. The entry survives upgrades of an installed Formula but is dropped when that
+Formula is uninstalled, so a reinstall needs it again, and neither the Formulae nor the automation
+may trust a tap on an operator's behalf.
 
 Package-channel non-goals: Homebrew Core, casks, bottles, Linuxbrew, macOS Intel, Windows ARM64,
 WinGet, Scoop, and crates.io are out of scope, as are signing, notarization, attestations, editing

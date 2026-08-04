@@ -105,12 +105,14 @@ key. Preflight, generation, and acceptance jobs hold no external credential.
   and requires a new patch version rather than an in-place edit.
 - Chocolatey moderation can delay or reject either package ID independently, and pair eligibility
   must be confirmed with the Community Repository before either public ID exists.
-- The Homebrew install contract is two-step: a one-time, name-keyed
-  `brew trust --formula pashifika/tap/<id>` (or `brew trust pashifika/tap`) precedes the first
-  `brew install`, and upgrades never re-prompt because trust survives Formula rewrites. Homebrew
-  6.0.12 proved the refusal. Documentation must show the trust step wherever it shows an install
-  command, and tap CI and the acceptance harness trust only their own disposable tap — preferring
-  the per-formula form — and restore the prior trust-store state byte-for-byte.
+- The Homebrew install contract is two-step: a name-keyed
+  `brew trust --formula pashifika/tap/<id>` (or `brew trust pashifika/tap`) precedes `brew install`.
+  Homebrew 6.0.12 proved the refusal, and the acceptance run then proved the entry's lifetime: trust
+  survives Formula rewrites and upgrades of an installed Formula, but uninstalling a Formula drops
+  its entry, so reinstalling requires trusting it again. Documentation must show the trust step
+  wherever it shows an install command; the acceptance harness therefore re-asserts trust before
+  every install rather than once per run, and it and tap CI trust only their own disposable tap —
+  preferring the per-formula form — and restore the prior trust-store state byte-for-byte.
 - `docs/packaging.md`, `docs/architecture.md`, `README.md`, the tap source material under
   `packaging/homebrew/tap/`, and the package workflow policy tests changed in the same change.
 

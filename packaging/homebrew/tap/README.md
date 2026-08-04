@@ -39,9 +39,9 @@ in `${XDG_CONFIG_HOME}/homebrew/trust.json`, or in `~/.homebrew/trust.json` when
 is unset.
 
 ```bash
-brew trust --formula pashifika/tap/skillmount        # one-time trust step
+brew trust --formula pashifika/tap/skillmount        # required before install
 brew install pashifika/tap/skillmount                # not yet available
-brew trust --formula pashifika/tap/skillmount-asm    # one-time trust step
+brew trust --formula pashifika/tap/skillmount-asm    # required before install
 brew install pashifika/tap/skillmount-asm            # not yet available
 ```
 

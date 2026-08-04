@@ -210,11 +210,18 @@ removes the other.
 
 Homebrew adds a trust prerequisite to the install path, proven with Homebrew 6.0.12 on `macos-15`:
 `brew install` refuses a Formula from an untrusted third-party tap, while `brew style` and
-`brew audit` accept one. Trust is a one-time step per Formula name, not per version: entries are
+`brew audit` accept one. Trust survives every upgrade of a Formula that stays installed: entries are
 name-keyed plain JSON in `${XDG_CONFIG_HOME}/homebrew/trust.json`, or in `~/.homebrew/trust.json`
-when `XDG_CONFIG_HOME` is unset (verified on Homebrew 6.0.15), so upgrades never re-prompt.
+when `XDG_CONFIG_HOME` is unset (verified on Homebrew 6.0.15).
 `brew trust --formula pashifika/tap/<id>` trusts one Formula; `brew trust pashifika/tap` trusts
 the whole tap, including Formulae added later.
+
+Uninstalling a Formula drops its trust entry. The acceptance harness proved this on `macos-15`:
+after `brew uninstall` removed both Formulae, the read taken immediately before the next install
+no longer listed either reference, and the install was refused. Re-trust before reinstalling a
+Formula you previously removed, which is why every command block below repeats its trust step and
+why the harness re-asserts trust before each install rather than once per run. Trusting the whole
+tap avoids the repetition at the cost of trusting Formulae added later.
 
 ### Homebrew `pashifika/tap/skillmount` — unavailable
 
@@ -222,7 +229,7 @@ Available once the tap's `skillmount` Formula resolves `0.2.0` publicly and its 
 selected-only install passes on Apple Silicon macOS.
 
 ```bash
-brew trust --formula pashifika/tap/skillmount    # one-time trust step
+brew trust --formula pashifika/tap/skillmount    # required before install
 brew install pashifika/tap/skillmount
 brew upgrade pashifika/tap/skillmount
 brew uninstall skillmount
@@ -239,7 +246,7 @@ Available once the tap's `skillmount-asm` Formula resolves `0.2.0` publicly and 
 selected-only install passes on Apple Silicon macOS.
 
 ```bash
-brew trust --formula pashifika/tap/skillmount-asm    # one-time trust step
+brew trust --formula pashifika/tap/skillmount-asm    # required before install
 brew install pashifika/tap/skillmount-asm
 brew upgrade pashifika/tap/skillmount-asm
 brew uninstall skillmount-asm

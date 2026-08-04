@@ -78,9 +78,11 @@ absence of `conflicts_with`.
 
 The tap lives in a separate repository, `pashifika/homebrew-tap`, which Homebrew addresses as the
 tap reference `pashifika/tap`. Homebrew 6 refuses to load a formula from a non-official tap until
-it is trusted, so an install is a tap, trust, install sequence rather than one command. Trust is
-recorded by name in `${XDG_CONFIG_HOME}/homebrew/trust.json`, or `~/.homebrew/trust.json`, so it is
-a one-time step per formula that survives later versions:
+it is trusted, so an install is a trust, install sequence rather than one command. Trust is
+recorded by name in `${XDG_CONFIG_HOME}/homebrew/trust.json`, or `~/.homebrew/trust.json`. It
+survives later versions of an installed formula, but `brew uninstall` drops the entry, so a
+reinstall must trust it again — which is why `homebrew_acceptance.py` re-asserts trust before every
+install:
 
 ```sh
 brew trust --formula pashifika/tap/skillmount pashifika/tap/skillmount-asm
