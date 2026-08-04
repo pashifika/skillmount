@@ -59,6 +59,18 @@ jobs:
           brew tap-info --json=v1 "$TAP" > "$RUNNER_TEMP/tap-info.json"
           ls -1 "$tap_directory/Formula"
 
+      - name: Trust this tap so Homebrew will load its formulae
+        run: |
+          set -euo pipefail
+          # Homebrew 6 refuses to load a formula from a non-official tap until it is trusted:
+          # "Refusing to load formula <tap>/<name> from untrusted tap <tap>." Operators run this
+          # once by hand; CI must do it explicitly so an install failure is never mistaken for a
+          # Formula defect. Trust is recorded per formula rather than for the whole tap so a new
+          # unreviewed file in this tap does not become trusted implicitly.
+          brew trust --formula "$TAP/skillmount" "$TAP/skillmount-asm"
+          brew trust --json v1 > "$RUNNER_TEMP/trust.json"
+          cat "$RUNNER_TEMP/trust.json"
+
       - name: Record toolchain, OS, and shell provenance
         run: |
           set -euo pipefail

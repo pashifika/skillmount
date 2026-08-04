@@ -69,14 +69,16 @@ clean installation passes on a supported host:
 
 | Command | Would install | Status |
 |---|---|---|
-| `brew install pashifika/tap/skillmount` | `skillmount` on Apple Silicon macOS | Not yet available |
-| `brew install pashifika/tap/skillmount-asm` | `asm` on Apple Silicon macOS | Not yet available |
+| `brew trust --formula pashifika/tap/skillmount && brew install pashifika/tap/skillmount` | `skillmount` on Apple Silicon macOS | Not yet available |
+| `brew trust --formula pashifika/tap/skillmount-asm && brew install pashifika/tap/skillmount-asm` | `asm` on Apple Silicon macOS | Not yet available |
 | `choco install skillmount` | `skillmount` on Windows x64/x86 | Not yet available |
 | `choco install skillmount-asm` | `asm` on Windows x64/x86 | Not yet available |
 
 Each package installs exactly one of the two commands and owns only that command's executable,
-shim, and completion files. Installing both packages from one manager is supported. Upgrade,
-uninstall, and completion details per package live in [docs/packaging.md](docs/packaging.md).
+shim, and completion files. Installing both packages from one manager is supported. The
+`brew trust` step is one-time per Formula name, not per version: Homebrew refuses to install from
+an untrusted third-party tap, and upgrades never re-prompt. Upgrade, uninstall, and completion
+details per package live in [docs/packaging.md](docs/packaging.md).
 
 ### Build from source
 

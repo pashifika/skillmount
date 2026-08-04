@@ -71,16 +71,26 @@ and never the pair member's. The pair member's command therefore appears only in
 absence of `conflicts_with`.
 
 The tap lives in a separate repository, `pashifika/homebrew-tap`, which Homebrew addresses as the
-tap reference `pashifika/tap`:
+tap reference `pashifika/tap`. Homebrew 6 refuses to load a formula from a non-official tap until
+it is trusted, so an install is a tap, trust, install sequence rather than one command. Trust is
+recorded by name in `${XDG_CONFIG_HOME}/homebrew/trust.json`, or `~/.homebrew/trust.json`, so it is
+a one-time step per formula that survives later versions:
 
 ```sh
+brew trust --formula pashifika/tap/skillmount pashifika/tap/skillmount-asm
 brew install pashifika/tap/skillmount
 brew install pashifika/tap/skillmount-asm
 ```
 
+`brew trust --formula` only records names, so it needs no prior `brew tap`, and `brew install`
+auto-taps the reference it resolves.
+
+Neither command is available yet; see `docs/packaging.md` for the gating rule.
+
 `homebrew/tap-ci.yml` is that repository's own CI. It is deliberately self-contained — only
 `brew`, `git`, and the system Python — so the tap never depends on a script that lives here. It
-runs `brew style`, `brew audit --strict` for both Formulae, both source builds, both `brew test`,
+runs `brew style`, `brew audit --strict` for both Formulae, an explicit per-formula `brew trust`
+because `brew install` would otherwise refuse the tap, both source builds, both `brew test`,
 selected-only install and uninstall checks, co-installation, cross-uninstall, completion
 ownership, and an upgrade rehearsal from the pull request's base revision.
 

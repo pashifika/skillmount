@@ -32,11 +32,17 @@ macOS Intel, casks, and bottles are not supported.
 
 Not yet available: the tap has not published its first Formula version. Each command below becomes
 available once its Formula resolves version `0.2.0` in this tap and a clean installation passes on
-a supported host.
+a supported host. Homebrew refuses to install a Formula from an untrusted third-party tap, so
+trust each Formula once before its first install — trust is keyed by name, so upgrades never
+re-prompt, and `brew trust pashifika/tap` trusts the whole tap instead. Trusted entries are stored
+in `${XDG_CONFIG_HOME}/homebrew/trust.json`, or in `~/.homebrew/trust.json` when `XDG_CONFIG_HOME`
+is unset.
 
 ```bash
-brew install pashifika/tap/skillmount        # not yet available
-brew install pashifika/tap/skillmount-asm    # not yet available
+brew trust --formula pashifika/tap/skillmount        # one-time trust step
+brew install pashifika/tap/skillmount                # not yet available
+brew trust --formula pashifika/tap/skillmount-asm    # one-time trust step
+brew install pashifika/tap/skillmount-asm            # not yet available
 ```
 
 ## How Formulae change

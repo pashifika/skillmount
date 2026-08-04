@@ -15,16 +15,12 @@ class @FORMULA_CLASS@ < Formula
   license "@LICENSE@"
 
   depends_on "rust" => :build
-  depends_on :macos
   depends_on arch: :arm64
+  depends_on :macos
 
   def install
     system "cargo", "install", "--locked", "--bin", "@CARGO_BIN@", *std_cargo_args
-    generate_completions_from_executable(
-      bin/"@COMMAND@", "completions",
-      base_name: "@COMMAND@",
-      shells: [:bash, :zsh, :fish],
-    )
+    generate_completions_from_executable(bin/"@COMMAND@", "completions", base_name: "@COMMAND@")
   end
 
   test do
@@ -33,14 +29,14 @@ class @FORMULA_CLASS@ < Formula
 
     # SkillMount resolves its product identity from argv[0] and rejects a renamed alias, so
     # this keg must carry exactly one executable and never the paired package's command.
-    refute_predicate bin/"@OTHER_COMMAND@", :exist?
+    refute_path_exists bin/"@OTHER_COMMAND@"
 
-    {
-      bash_completion/"@COMMAND@" => "bash",
-      zsh_completion/"_@COMMAND@" => "zsh",
-      fish_completion/"@COMMAND@.fish" => "fish",
-    }.each do |completion, shell|
-      assert_predicate completion, :exist?, "no #{shell} completion was generated"
+    [
+      [bash_completion/"@COMMAND@", "bash"],
+      [zsh_completion/"_@COMMAND@", "zsh"],
+      [fish_completion/"@COMMAND@.fish", "fish"],
+    ].each do |completion, shell|
+      assert_path_exists completion, "no #{shell} completion was generated"
       contents = completion.read
       assert_match "@COMMAND@", contents
       refute_match(/\b@OTHER_COMMAND@\b/, contents)

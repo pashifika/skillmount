@@ -643,6 +643,10 @@ through a GitHub App token scoped to that repository. The Chocolatey Community R
 package moderation and public listing per package ID. Each publisher runs behind its own protected
 GitHub Environment — `homebrew` and `chocolatey` — holding only that channel's credential;
 preflight, generation, and acceptance jobs hold no external credential.
+Homebrew's tap trust state is a further operator-owned boundary: Homebrew refuses to install a
+Formula from an untrusted third-party tap, so each Formula's first install requires a one-time,
+name-keyed operator `brew trust` before `brew install`, and neither the Formulae nor the
+automation may trust a tap on an operator's behalf.
 
 Package-channel non-goals: Homebrew Core, casks, bottles, Linuxbrew, macOS Intel, Windows ARM64,
 WinGet, Scoop, and crates.io are out of scope, as are signing, notarization, attestations, editing

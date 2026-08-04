@@ -28,6 +28,17 @@ BIN = rf"{CHOCO_ROOT}\bin"
 # The planning store is machine-local and root-ignored, so it is absent from a CI checkout. The
 # scenario-mapping test resolves it lazily and skips rather than failing when it is not present.
 SPEC_GLOB = "rasen/**/chocolatey-distribution/spec.md"
+MANIFEST = f"""[package]
+name = "skillmount"
+version = "{VERSION}"
+edition = "2024"
+
+[dependencies]
+serde = {{ version = "9.9.9" }}
+
+[dependencies.clap]
+version = "8.8.8"
+"""
 
 
 def spec_path() -> Path:
@@ -1282,6 +1293,98 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(result.command, "choco install skillmount")
 
 
+class ReleaseIdentityTests(unittest.TestCase):
+    """Without `--inputs` the candidate's identity comes from the Cargo manifest."""
+
+    def repository(self, root: Path, text: str | None = MANIFEST) -> Path:
+        """Create a repository directory holding one Cargo manifest, or holding none."""
+
+        repository = root / "repository"
+        repository.mkdir()
+        if text is not None:
+            (repository / harness.CARGO_MANIFEST_NAME).write_text(text, encoding="utf-8")
+        return repository
+
+    def test_a_missing_tag_is_derived_from_the_manifest_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            self.assertEqual(
+                harness.local_release_identity(repository, tag=None), (VERSION, TAG)
+            )
+
+    def test_an_explicit_matching_tag_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            self.assertEqual(
+                harness.local_release_identity(repository, tag=TAG), (VERSION, TAG)
+            )
+
+    def test_a_mismatched_tag_names_the_tag_and_the_manifest_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            with self.assertRaises(harness.ChocolateyAcceptanceError) as caught:
+                harness.local_release_identity(repository, tag="v9.9.9")
+        message = str(caught.exception)
+        self.assertIn("v9.9.9", message)
+        self.assertIn(VERSION, message)
+
+    def test_a_missing_manifest_is_named(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary), None)
+            with self.assertRaises(harness.ChocolateyAcceptanceError) as caught:
+                harness.local_release_identity(repository, tag=None)
+        message = str(caught.exception)
+        self.assertIn(str(repository / harness.CARGO_MANIFEST_NAME), message)
+        self.assertIn("missing", message)
+
+    def test_a_dependency_version_is_never_the_package_version(self) -> None:
+        self.assertEqual(harness.cargo_version_from_manifest(MANIFEST), VERSION)
+        reordered = "\n".join(
+            (
+                "[dependencies.clap]",
+                'version = "8.8.8"',
+                "",
+                "[package]",
+                'name = "skillmount"',
+                f'version = "{VERSION}"',
+                "",
+            )
+        )
+        self.assertEqual(harness.cargo_version_from_manifest(reordered), VERSION)
+
+    def test_a_package_table_without_exactly_one_version_is_rejected(self) -> None:
+        for text, expected in (
+            ('[package]\nname = "skillmount"\n', "declares 0 version keys"),
+            (f'[package]\nversion = "{VERSION}"\nversion = "0.3.0"\n', "declares 2 version keys"),
+            ('name = "skillmount"\n', "no [package] table"),
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(harness.ChocolateyAcceptanceError) as caught:
+                    harness.cargo_version_from_manifest(text)
+                self.assertIn(expected, str(caught.exception))
+
+    def test_inputs_is_the_only_source_of_the_release_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / "inputs.json"
+            artifact.write_text("{}\n", encoding="utf-8")
+            for flag, value in (
+                ("--tag", TAG),
+                ("--commit", COMMIT),
+                ("--binary-directory-x64", str(root / "x64")),
+                ("--binary-directory-x86", str(root / "x86")),
+            ):
+                with self.subTest(flag=flag):
+                    options = harness.argument_parser().parse_args(
+                        ["--inputs", str(artifact), flag, value]
+                    )
+                    with self.assertRaises(harness.ChocolateyAcceptanceError) as caught:
+                        harness.resolve_inputs(FakeChannels(), options, root)
+                    message = str(caught.exception)
+                    self.assertIn(flag, message)
+                    self.assertIn("only source", message)
+
+
 class HelpAndRefusalIntegrationTests(unittest.TestCase):
     """The command-line surface stays usable on a host with no Chocolatey."""
 
@@ -1294,12 +1397,42 @@ class HelpAndRefusalIntegrationTests(unittest.TestCase):
         self.assertIn("--binary-directory-x64", stdout.getvalue())
         self.assertIn("--report", stdout.getvalue())
 
-    def test_local_mode_requires_a_tag(self) -> None:
+    def test_local_mode_no_longer_refuses_a_missing_tag(self) -> None:
+        captured: list[object] = []
+
+        def accept(options: object, work: Path) -> dict[str, object]:
+            """Stand in for the whole lifecycle so no Chocolatey boundary is reached."""
+
+            captured.append(options)
+            return {"status": "passed"}
+
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            arguments = [
+                "--binary-directory-x64",
+                str(root / "x64"),
+                "--binary-directory-x86",
+                str(root / "x86"),
+            ]
+            with mock.patch.dict(os.environ, {harness.ACCEPTANCE_VARIABLE: "1"}):
+                with mock.patch.object(harness, "run_acceptance", accept):
+                    with redirect_stdout(stdout):
+                        self.assertEqual(harness.run(arguments), 0)
+        self.assertEqual([getattr(options, "tag") for options in captured], [None])
+
+    def test_the_opt_in_refusal_trips_before_the_lifecycle(self) -> None:
+        def forbidden(*arguments: object, **keywords: object) -> dict[str, object]:
+            """Fail the test if the harness reaches the Chocolatey lifecycle unconsented."""
+
+            raise AssertionError("the lifecycle ran without the opt-in variable")
+
         stderr = io.StringIO()
-        with mock.patch.dict(os.environ, {harness.ACCEPTANCE_VARIABLE: "1"}):
-            with redirect_stderr(stderr):
-                self.assertEqual(harness.main([]), 1)
-        self.assertIn("--tag is required without --inputs", stderr.getvalue())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(harness, "run_acceptance", forbidden):
+                with redirect_stderr(stderr):
+                    self.assertEqual(harness.main([]), 1)
+        self.assertIn(harness.ACCEPTANCE_VARIABLE, stderr.getvalue())
 
     def test_local_mode_requires_both_binary_directories(self) -> None:
         options = harness.argument_parser().parse_args(

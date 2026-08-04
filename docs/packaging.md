@@ -180,6 +180,9 @@ entries, the evidence must contain:
   Chocolatey account and package ID;
 - the workflow run and action revisions, runner labels, and manager/toolchain versions (Homebrew,
   Rust, macOS, and shell versions; Windows, Chocolatey, and PowerShell versions);
+- for a Homebrew entry, the exact `brew trust` invocation that preceded the install and the
+  observed Homebrew version — Homebrew 6.0.12 proved that installing from an untrusted tap is
+  refused, so a transcript without its trust step is not reproducible;
 - the public endpoint response resolving `0.2.0` for that entry;
 - the clean supported-host install transcript showing the selected-only contract: exactly the
   selected executable and shim or keg present, the pair member's command absent, `--version`
@@ -205,12 +208,21 @@ supported host, per the evidence contract above. Until then, install from
 each command owns only its own executable, shim, and completion files, and uninstalling one never
 removes the other.
 
+Homebrew adds a trust prerequisite to the install path, proven with Homebrew 6.0.12 on `macos-15`:
+`brew install` refuses a Formula from an untrusted third-party tap, while `brew style` and
+`brew audit` accept one. Trust is a one-time step per Formula name, not per version: entries are
+name-keyed plain JSON in `${XDG_CONFIG_HOME}/homebrew/trust.json`, or in `~/.homebrew/trust.json`
+when `XDG_CONFIG_HOME` is unset (verified on Homebrew 6.0.15), so upgrades never re-prompt.
+`brew trust --formula pashifika/tap/<id>` trusts one Formula; `brew trust pashifika/tap` trusts
+the whole tap, including Formulae added later.
+
 ### Homebrew `pashifika/tap/skillmount` — unavailable
 
 Available once the tap's `skillmount` Formula resolves `0.2.0` publicly and its clean-host
 selected-only install passes on Apple Silicon macOS.
 
 ```bash
+brew trust --formula pashifika/tap/skillmount    # one-time trust step
 brew install pashifika/tap/skillmount
 brew upgrade pashifika/tap/skillmount
 brew uninstall skillmount
@@ -227,6 +239,7 @@ Available once the tap's `skillmount-asm` Formula resolves `0.2.0` publicly and 
 selected-only install passes on Apple Silicon macOS.
 
 ```bash
+brew trust --formula pashifika/tap/skillmount-asm    # one-time trust step
 brew install pashifika/tap/skillmount-asm
 brew upgrade pashifika/tap/skillmount-asm
 brew uninstall skillmount-asm

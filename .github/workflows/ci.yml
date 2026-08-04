@@ -278,6 +278,11 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - name: Provision Fish so every advertised completion parses in its real shell
+        # Bash and Zsh ship with macOS; Fish does not. Without it the harness records an honest
+        # "unavailable" note instead of proving the Fish script parses, which leaves an evidence
+        # gap the homebrew-distribution spec does not allow.
+        run: brew install --formula fish
       - name: Test acceptance-harness safeguards
         run: python3 -B .github/scripts/test_homebrew_acceptance.py
       - name: Report spec coverage

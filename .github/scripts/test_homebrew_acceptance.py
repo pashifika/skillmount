@@ -68,23 +68,72 @@ class Skillmount < Formula
   license "MIT OR Apache-2.0"
 
   depends_on "rust" => :build
-  depends_on :macos
   depends_on arch: :arm64
+  depends_on :macos
 
   def install
     system "cargo", "install", "--locked", "--bin", "skillmount", *std_cargo_args
+    generate_completions_from_executable(bin/"skillmount", "completions", base_name: "skillmount")
+  end
+
+  test do
+    assert_match "0.2.0", shell_output("#{{bin}}/skillmount --version")
+    assert_match "Usage:", shell_output("#{{bin}}/skillmount --help")
+
+    refute_path_exists bin/"asm"
+
+    [
+      [bash_completion/"skillmount", "bash"],
+      [zsh_completion/"_skillmount", "zsh"],
+      [fish_completion/"skillmount.fish", "fish"],
+    ].each do |completion, shell|
+      assert_path_exists completion, "no #{{shell}} completion was generated"
+      contents = completion.read
+      assert_match "skillmount", contents
+      refute_match(/\\basm\\b/, contents)
+    end
   end
 end
 """
+TRUST_STORE = {
+    "taps": ["beeftornado/rmtree"],
+    "formulae": ["hashicorp/tap/terraform"],
+    "casks": [],
+    "commands": [],
+}
+
+
+def trust_json(**sections: list[str]) -> str:
+    """Return one `brew trust --json v1` document with the named sections replaced."""
+
+    return json.dumps({**TRUST_STORE, **sections})
+
+
+def acceptance_reference(package_id: str) -> str:
+    """Return the tap-qualified reference the harness passes to every `brew` call."""
+
+    return f"{harness.ACCEPTANCE_TAP}/{package_id}"
+
+
+def trusted_name(package_id: str) -> str:
+    """Return the canonical name Homebrew records for one acceptance-tap Formula."""
+
+    return harness.canonical_reference(acceptance_reference(package_id))
 
 
 class ScriptedGateway:
     """Fake command boundary answering only the argv prefixes a test scripts."""
 
-    def __init__(self, responses: dict[tuple[str, ...], tuple[int, str, str]]) -> None:
+    def __init__(
+        self,
+        responses: dict[tuple[str, ...], tuple[int, str, str]],
+        *,
+        environment: dict[str, str] | None = None,
+    ) -> None:
         """Bind one response table and start with an empty call log."""
 
         self.responses = responses
+        self.environment = {} if environment is None else environment
         self.calls: list[tuple[str, ...]] = []
 
     def answer(self, argv: tuple[str, ...]) -> harness.CommandEvidence:
@@ -129,6 +178,7 @@ class ForbiddenGateway:
     def __init__(self) -> None:
         """Start with an empty attempt log."""
 
+        self.environment: dict[str, str] = {}
         self.calls: list[tuple[str, ...]] = []
 
     def record(self, argv: tuple[str, ...]) -> harness.CommandEvidence:
@@ -838,21 +888,27 @@ class SelectionTests(FixtureCase):
         self.assertEqual(harness.expand_phases(None), harness.PHASE_ORDER)
         self.assertEqual(
             harness.expand_phases(["completions"]),
-            ("install-skillmount-alone", "completions", "install-asm-alone"),
+            ("trust", "install-skillmount-alone", "completions", "install-asm-alone"),
         )
         self.assertEqual(
-            harness.expand_phases(["cross-uninstall"]), ("co-install", "cross-uninstall")
+            harness.expand_phases(["cross-uninstall"]),
+            ("trust", "co-install", "cross-uninstall"),
         )
         self.assertEqual(
             harness.expand_phases(["uninstall", "selected-only"]),
             (
+                "trust",
                 "install-skillmount-alone",
                 "selected-only",
                 "uninstall",
                 "install-asm-alone",
             ),
         )
+        self.assertEqual(
+            harness.expand_phases(["upgrade-from-prior"]), ("trust", "upgrade-from-prior")
+        )
         self.assertEqual(harness.expand_phases(["style"]), ("style",))
+        self.assertEqual(harness.expand_phases(["audit"]), ("audit",))
         with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
             harness.expand_phases(["install"])
         self.assertIn("install", str(caught.exception))
@@ -1038,7 +1094,7 @@ class OptionResolutionTests(FixtureCase):
         self.assertEqual(options.formula_ids, ("skillmount-asm",))
         self.assertEqual(
             options.phases,
-            ("install-skillmount-alone", "brew-test", "install-asm-alone"),
+            ("trust", "install-skillmount-alone", "brew-test", "install-asm-alone"),
         )
         self.assertEqual(options.commit, COMMIT)
         self.assertEqual(options.source.url, "https://example.invalid/source.tar.gz")
@@ -1143,6 +1199,12 @@ class ReportTests(FixtureCase):
             ),
             prefix=Path(harness.SUPPORTED_PREFIX),
             environment={"brew": ["Homebrew 5.0.0"], "shells": {"bash": "bash 5.3"}},
+            trust={
+                "argv": [["brew", "trust", "--formula", acceptance_reference("skillmount")]],
+                "brew": ["Homebrew 6.0.12"],
+                "restore": harness.TRUST_RESTORE_MECHANISM,
+                "restored": "brew untrust --formula",
+            },
             phases=phases,
             cleanup=[
                 harness.CommandEvidence(
@@ -1162,6 +1224,12 @@ class ReportTests(FixtureCase):
         self.assertEqual(document["prefix"], harness.SUPPORTED_PREFIX)
         self.assertEqual(document["coverage_gaps"], [])
         self.assertTrue(document["source"]["local"])
+        self.assertEqual(
+            document["trust"]["argv"],
+            [["brew", "trust", "--formula", acceptance_reference("skillmount")]],
+        )
+        self.assertEqual(document["trust"]["brew"], ["Homebrew 6.0.12"])
+        self.assertIn("brew untrust --formula", str(document["trust"]["restore"]))
         text = harness.report_text(document)
         self.assertTrue(text.endswith("\n"))
         self.assertEqual(json.loads(text), document)
@@ -1221,7 +1289,7 @@ class CoverageTests(FixtureCase):
         """Require every phase to prove at least one scenario."""
 
         self.assertEqual(harness.coverage_gaps(), ())
-        self.assertEqual(len(harness.SCENARIO_COVERAGE), 18)
+        self.assertEqual(len(harness.SCENARIO_COVERAGE), 19)
 
     def test_every_spec_scenario_is_mapped(self) -> None:
         """Require the mapping table to name exactly the spec's scenarios."""
@@ -1479,12 +1547,16 @@ class BrewInvocationTests(FixtureCase):
     """The exact `brew` argv this harness is documented to run."""
 
     def harness_for(self, responses: dict[tuple[str, ...], tuple[int, str, str]]):
-        """Return a harness bound to one scripted gateway with a resolved state."""
+        """Return a harness bound to one scripted gateway with a trusted tap."""
 
         gateway = ScriptedGateway(responses)
         subject = harness.Harness(gateway, options_for(self.root))
         subject.prefix = Path(harness.SUPPORTED_PREFIX)
         subject.commands = dict(harness.PACKAGE_TABLE_PINS)
+        subject.trusted = [
+            acceptance_reference(package_id) for package_id in harness.FORMULA_IDS
+        ]
+        subject.added_trust = list(subject.trusted)
         return gateway, subject
 
     def test_install_names_the_formula_and_resolves_its_cellar(self) -> None:
@@ -1699,6 +1771,480 @@ class BrewInvocationTests(FixtureCase):
                 del sys.modules["package_channels"]
             else:
                 sys.modules["package_channels"] = saved_module
+
+
+class TrustingGateway(ScriptedGateway):
+    """Scripted gateway modelling Homebrew's name-keyed trust store on disk."""
+
+    def __init__(
+        self,
+        responses: dict[tuple[str, ...], tuple[int, str, str]],
+        *,
+        environment: dict[str, str],
+        formulae: Sequence[str] = (),
+        trust_status: int = 0,
+        untrust_status: int = 0,
+        store_existed: bool = True,
+    ) -> None:
+        """Bind one fake trust store to the exact file Homebrew would read."""
+
+        super().__init__(responses, environment=environment)
+        self.store: dict[str, list[str]] = {
+            **{section: list(names) for section, names in TRUST_STORE.items()},
+            "formulae": sorted({*TRUST_STORE["formulae"], *formulae}),
+        }
+        self.trust_status = trust_status
+        self.untrust_status = untrust_status
+        self.path = harness.trust_store_path(environment)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if store_existed:
+            self.write()
+
+    def write(self) -> None:
+        """Persist the fake trust store the way Homebrew persists its own."""
+
+        self.path.write_text(json.dumps(self.store, indent=2) + "\n", encoding="utf-8")
+
+    def answer(self, argv: tuple[str, ...]) -> harness.CommandEvidence:
+        """Serve every trust subcommand from the fake store, else use the script."""
+
+        if argv[:3] == ("brew", "trust", "--json"):
+            self.calls.append(argv)
+            return harness.CommandEvidence(
+                argv=argv, returncode=0, stdout=json.dumps(self.store), stderr=""
+            )
+        if argv[:3] == ("brew", "trust", "--formula"):
+            self.calls.append(argv)
+            if self.trust_status != 0:
+                return harness.CommandEvidence(
+                    argv=argv,
+                    returncode=self.trust_status,
+                    stdout="",
+                    stderr=f"Error: {harness.trust_refusal(argv[3])}\n",
+                )
+            name = harness.canonical_reference(argv[3])
+            if name not in self.store["formulae"]:
+                self.store["formulae"] = sorted([*self.store["formulae"], name])
+                self.write()
+            return harness.CommandEvidence(argv=argv, returncode=0, stdout="", stderr="")
+        if argv[:3] == ("brew", "untrust", "--formula"):
+            self.calls.append(argv)
+            if self.untrust_status != 0:
+                return harness.CommandEvidence(
+                    argv=argv, returncode=self.untrust_status, stdout="", stderr="locked\n"
+                )
+            name = harness.canonical_reference(argv[3])
+            self.store["formulae"] = [
+                entry for entry in self.store["formulae"] if entry != name
+            ]
+            self.write()
+            return harness.CommandEvidence(argv=argv, returncode=0, stdout="", stderr="")
+        return super().answer(argv)
+
+
+class TrustTests(FixtureCase):
+    """Homebrew 6 refuses an untrusted third-party tap, so trust is proven and undone."""
+
+    def trust_harness(
+        self,
+        responses: dict[tuple[str, ...], tuple[int, str, str]] | None = None,
+        **keywords: object,
+    ) -> tuple[TrustingGateway, harness.Harness]:
+        """Return a harness whose trust store lives in this test's own HOME."""
+
+        home = self.root / "home"
+        home.mkdir(exist_ok=True)
+        gateway = TrustingGateway(
+            {} if responses is None else responses,
+            environment={"HOME": str(home)},
+            **keywords,
+        )
+        subject = harness.Harness(gateway, options_for(self.root))
+        subject.prefix = Path(harness.SUPPORTED_PREFIX)
+        subject.commands = dict(harness.PACKAGE_TABLE_PINS)
+        subject.tap_root = self.root / "tap"
+        subject.tap_root.mkdir(exist_ok=True)
+        return gateway, subject
+
+    def test_trust_store_path_follows_homebrews_own_rule(self) -> None:
+        """Resolve the trust file from XDG_CONFIG_HOME, else from HOME."""
+
+        self.assertEqual(
+            harness.trust_store_path({"XDG_CONFIG_HOME": "/x/config", "HOME": "/u/me"}),
+            Path("/x/config/homebrew/trust.json"),
+        )
+        self.assertEqual(
+            harness.trust_store_path({"HOME": "/u/me"}), Path("/u/me/.homebrew/trust.json")
+        )
+        self.assertEqual(
+            harness.trust_store_path({"XDG_CONFIG_HOME": "", "HOME": "/u/me"}),
+            Path("/u/me/.homebrew/trust.json"),
+        )
+        for environment in ({}, {"HOME": ""}, {"HOME": "relative"}, {"XDG_CONFIG_HOME": "rel"}):
+            with self.subTest(environment=environment):
+                with self.assertRaises(harness.HomebrewAcceptanceError):
+                    harness.trust_store_path(environment)
+
+    def test_canonical_names_match_homebrews_own_spelling(self) -> None:
+        """Strip the `homebrew-` repository prefix exactly as Homebrew reports it."""
+
+        reference = acceptance_reference("skillmount")
+        self.assertEqual(harness.canonical_reference(reference), trusted_name("skillmount"))
+        self.assertEqual(trusted_name("skillmount"), "skillmount-acceptance/tap/skillmount")
+        self.assertEqual(
+            harness.canonical_tap_name(harness.ACCEPTANCE_TAP), "skillmount-acceptance/tap"
+        )
+        self.assertEqual(harness.canonical_tap_name("pashifika/tap"), "pashifika/tap")
+        self.assertEqual(
+            harness.trust_spellings(reference), (reference, trusted_name("skillmount"))
+        )
+        self.assertEqual(harness.trust_spellings("pashifika/tap/asm"), ("pashifika/tap/asm",))
+        for malformed in ("", "skillmount", "a/b/c/d", "/skillmount", "a//c"):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(harness.HomebrewAcceptanceError):
+                    harness.canonical_reference(malformed)
+
+    def test_refusal_text_is_quoted_verbatim(self) -> None:
+        """Quote Homebrew's own refusal, naming the canonical tap and remedy."""
+
+        self.assertEqual(
+            harness.trust_refusal(acceptance_reference("skillmount")),
+            "Refusing to load formula skillmount-acceptance/tap/skillmount from untrusted tap "
+            "skillmount-acceptance/tap. Run 'brew trust --formula "
+            "skillmount-acceptance/tap/skillmount' or 'brew trust skillmount-acceptance/tap' to "
+            "trust it.",
+        )
+
+    def test_trust_precedes_every_install_with_the_documented_argv(self) -> None:
+        """Trust each Formula by name before the first tap-qualified install."""
+
+        cellar = self.root / "Cellar" / "skillmount"
+        gateway, subject = self.trust_harness(
+            {("brew", "install"): (0, "", ""), ("brew", "--cellar"): (0, f"{cellar}\n", "")}
+        )
+        subject.phase_trust()
+        phase = subject.phases["trust"]
+        self.assertEqual(phase.status, "passed")
+        self.assertTrue(subject.install(subject.phase("install-skillmount-alone"), "skillmount"))
+        self.assertEqual(
+            gateway.calls,
+            [
+                ("brew", "trust", "--json", harness.TRUST_JSON_VERSION),
+                ("brew", "trust", "--formula", acceptance_reference("skillmount")),
+                ("brew", "trust", "--formula", acceptance_reference("skillmount-asm")),
+                ("brew", "trust", "--json", harness.TRUST_JSON_VERSION),
+                (
+                    "brew",
+                    "install",
+                    "--formula",
+                    "--build-from-source",
+                    acceptance_reference("skillmount"),
+                ),
+                ("brew", "--cellar", acceptance_reference("skillmount")),
+            ],
+        )
+        self.assertEqual(
+            subject.added_trust,
+            [acceptance_reference(package_id) for package_id in harness.FORMULA_IDS],
+        )
+        recorded = subject.trust_evidence
+        self.assertEqual(
+            recorded["argv"][1], ["brew", "trust", "--formula", acceptance_reference("skillmount")]
+        )
+        self.assertEqual(recorded["store"]["path"], str(gateway.path))
+        self.assertTrue(recorded["store"]["existed"])
+        self.assertEqual(recorded["trusted"], [trusted_name(name) for name in harness.FORMULA_IDS])
+        self.assertIn("brew untrust --formula", str(recorded["restore"]))
+        joined = " ".join(phase.observations)
+        self.assertIn("keys trust by name", joined)
+        self.assertIn("scoped to the install path", joined)
+
+    def test_a_refused_trust_quotes_homebrews_refusal_and_blocks_the_install(self) -> None:
+        """Fail the trust phase by name and refuse to attempt any install."""
+
+        gateway, subject = self.trust_harness(trust_status=1)
+        subject.phase_trust()
+        phase = subject.phases["trust"]
+        self.assertEqual(phase.status, "failed")
+        joined = " ".join(phase.findings)
+        self.assertIn(
+            "Refusing to load formula skillmount-acceptance/tap/skillmount from untrusted tap",
+            joined,
+        )
+        self.assertIn("brew trust --help", joined)
+        self.assertIn("--formula", joined)
+        self.assertEqual(subject.trusted, [])
+        self.assertEqual(subject.added_trust, [])
+        install_phase = subject.phase("install-skillmount-alone")
+        self.assertFalse(subject.install(install_phase, "skillmount"))
+        self.assertNotIn(
+            (
+                "brew",
+                "install",
+                "--formula",
+                "--build-from-source",
+                acceptance_reference("skillmount"),
+            ),
+            gateway.calls,
+        )
+        self.assertIn("was never trusted", " ".join(install_phase.findings))
+
+    def test_install_without_a_trust_phase_is_a_named_failure(self) -> None:
+        """Refuse to install a reference no trust phase recorded."""
+
+        gateway = ScriptedGateway({})
+        subject = harness.Harness(gateway, options_for(self.root))
+        subject.commands = dict(harness.PACKAGE_TABLE_PINS)
+        phase = subject.phase("install-asm-alone")
+        self.assertFalse(subject.install(phase, "skillmount-asm"))
+        self.assertEqual(gateway.calls, [])
+        finding = " ".join(phase.findings)
+        self.assertIn("was never trusted", finding)
+        self.assertIn("Refusing to load formula skillmount-acceptance/tap/skillmount-asm", finding)
+
+    def test_an_unusable_trust_query_aborts_before_trusting_anything(self) -> None:
+        """Refuse to trust anything without a readable prior trust state."""
+
+        home = self.root / "home"
+        home.mkdir()
+        gateway = ScriptedGateway(
+            {("brew", "trust", "--json"): (1, "", "Error: unknown command: trust\n")},
+            environment={"HOME": str(home)},
+        )
+        subject = harness.Harness(gateway, options_for(self.root))
+        subject.tap_root = self.root
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            subject.phase_trust()
+        message = str(caught.exception)
+        self.assertIn("brew trust --json v1", message)
+        self.assertIn("unknown command: trust", message)
+        self.assertEqual(len(gateway.calls), 1)
+        self.assertIsNone(subject.trust_snapshot)
+        subject.record_failure(caught.exception)
+        self.assertEqual(subject.phases["trust"].status, "failed")
+
+    def test_a_silently_unrecorded_trust_is_a_finding(self) -> None:
+        """Fail when `brew trust` succeeds but records nothing Homebrew will load."""
+
+        gateway, subject = self.trust_harness()
+
+        def swallow(argv: tuple[str, ...]) -> harness.CommandEvidence:
+            gateway.calls.append(argv)
+            return harness.CommandEvidence(argv=argv, returncode=0, stdout="", stderr="")
+
+        original = gateway.answer
+
+        def answer(argv: tuple[str, ...]) -> harness.CommandEvidence:
+            if argv[:3] == ("brew", "trust", "--formula"):
+                return swallow(argv)
+            return original(argv)
+
+        gateway.answer = answer
+        subject.phase_trust()
+        phase = subject.phases["trust"]
+        self.assertEqual(phase.status, "failed")
+        joined = " ".join(phase.findings)
+        self.assertIn("does not list skillmount-acceptance/tap/skillmount", joined)
+        self.assertIn("Refusing to load formula", joined)
+
+    def test_trust_store_bytes_are_restored_when_the_file_existed(self) -> None:
+        """Leave an existing trust file byte-for-byte as it was found."""
+
+        gateway, subject = self.trust_harness()
+        before = gateway.path.read_bytes()
+        subject.phase_trust()
+        self.assertNotEqual(gateway.path.read_bytes(), before)
+        subject.cleanup()
+        self.assertEqual(gateway.path.read_bytes(), before)
+        self.assertEqual(gateway.store["formulae"], list(TRUST_STORE["formulae"]))
+        self.assertEqual(subject.cleanup_findings, [])
+        self.assertEqual(subject.trust_evidence["restored"], "brew untrust --formula")
+        self.assertEqual(
+            [call for call in gateway.calls if call[:2] == ("brew", "untrust")],
+            [
+                ("brew", "untrust", "--formula", acceptance_reference("skillmount-asm")),
+                ("brew", "untrust", "--formula", acceptance_reference("skillmount")),
+            ],
+        )
+
+    def test_trust_store_is_removed_when_it_did_not_exist(self) -> None:
+        """Remove a trust file this harness caused Homebrew to create."""
+
+        gateway, subject = self.trust_harness(store_existed=False)
+        self.assertFalse(gateway.path.exists())
+        subject.phase_trust()
+        self.assertTrue(gateway.path.exists())
+        subject.cleanup()
+        self.assertFalse(gateway.path.exists())
+        self.assertEqual(subject.cleanup_findings, [])
+        self.assertEqual(subject.trust_evidence["restored"], "trust file rewrite")
+
+    def test_trust_is_restored_after_a_failed_lifecycle(self) -> None:
+        """Restore the trust store even when the install that followed failed."""
+
+        gateway, subject = self.trust_harness({("brew", "install"): (1, "", "build failed\n")})
+        before = gateway.path.read_bytes()
+        subject.phase_trust()
+        phase = subject.phase("install-skillmount-alone")
+        self.assertFalse(subject.install(phase, "skillmount"))
+        subject.cleanup()
+        self.assertEqual(gateway.path.read_bytes(), before)
+        self.assertEqual(subject.cleanup_findings, [])
+
+    def test_a_failed_untrust_falls_back_to_the_captured_bytes(self) -> None:
+        """Rewrite the captured bytes when `brew untrust` could not remove an entry."""
+
+        gateway, subject = self.trust_harness(untrust_status=1)
+        before = gateway.path.read_bytes()
+        subject.phase_trust()
+        subject.cleanup()
+        self.assertEqual(gateway.path.read_bytes(), before)
+        self.assertEqual(subject.trust_evidence["restored"], "trust file rewrite")
+        self.assertIn("could not untrust", " ".join(subject.cleanup_findings))
+
+    def test_an_entry_the_harness_did_not_add_is_never_untrusted(self) -> None:
+        """Leave a Formula the operator already trusted exactly as it was found."""
+
+        already = trusted_name("skillmount")
+        gateway, subject = self.trust_harness(formulae=(already,))
+        before = gateway.path.read_bytes()
+        subject.phase_trust()
+        self.assertEqual(subject.phases["trust"].status, "passed")
+        self.assertEqual(
+            subject.trusted,
+            [acceptance_reference(package_id) for package_id in harness.FORMULA_IDS],
+        )
+        self.assertEqual(subject.added_trust, [acceptance_reference("skillmount-asm")])
+        self.assertIn(
+            "was already trusted before this run", " ".join(subject.phases["trust"].observations)
+        )
+        subject.cleanup()
+        self.assertEqual(
+            [call for call in gateway.calls if call[:2] == ("brew", "untrust")],
+            [("brew", "untrust", "--formula", acceptance_reference("skillmount-asm"))],
+        )
+        self.assertIn(already, gateway.store["formulae"])
+        self.assertEqual(gateway.path.read_bytes(), before)
+
+    def test_trust_drift_is_classified_in_both_directions(self) -> None:
+        """Report a lost foreign entry and any addition this harness did not make."""
+
+        reference = acceptance_reference("skillmount")
+        before = {**TRUST_STORE, "formulae": ["hashicorp/tap/terraform"]}
+        self.assertEqual(
+            harness.trust_drift_findings(
+                before,
+                {**before, "formulae": ["hashicorp/tap/terraform", trusted_name("skillmount")]},
+                added=(reference,),
+            ),
+            (),
+        )
+        lost = harness.trust_drift_findings(
+            before, {**before, "formulae": [trusted_name("skillmount")]}, added=(reference,)
+        )
+        self.assertEqual(len(lost), 1)
+        self.assertIn("hashicorp/tap/terraform", lost[0])
+        self.assertIn("must never remove an entry it did not add", lost[0])
+        gained = harness.trust_drift_findings(
+            before,
+            {**before, "formulae": ["hashicorp/tap/terraform", "stranger/tap/thing"]},
+            added=(reference,),
+        )
+        self.assertEqual(len(gained), 1)
+        self.assertIn("stranger/tap/thing", gained[0])
+        widened = harness.trust_drift_findings(
+            before, {**before, "taps": ["beeftornado/rmtree", "stranger/tap"]}, added=(reference,)
+        )
+        self.assertEqual(len(widened), 1)
+        self.assertIn("'taps'", widened[0])
+
+    def test_trust_json_is_parsed_strictly(self) -> None:
+        """Fail closed on any `brew trust --json v1` shape this harness cannot restore."""
+
+        parsed = harness.parse_trust_json(trust_json(formulae=["pashifika/tap/skillmount"]))
+        self.assertEqual(parsed["formulae"], ("pashifika/tap/skillmount",))
+        self.assertEqual(parsed["taps"], ("beeftornado/rmtree",))
+        self.assertEqual(sorted(parsed), sorted(harness.TRUST_SECTIONS))
+        for malformed in (
+            "",
+            "not json",
+            "[]",
+            '{"taps": [], "formulae": [], "casks": []}',
+            '{"taps": [], "formulae": [], "casks": [], "commands": [], "extra": []}',
+            '{"taps": [], "formulae": {}, "casks": [], "commands": []}',
+            '{"taps": [], "formulae": [1], "casks": [], "commands": []}',
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+                    harness.parse_trust_json(malformed)
+                self.assertIn("brew trust --json v1", str(caught.exception))
+
+    def test_a_surviving_tap_is_a_cleanup_failure(self) -> None:
+        """Treat a tap still registered after `brew untap` as a reported leak."""
+
+        gateway, subject = self.trust_harness(
+            {
+                ("brew", "untap"): (0, "Untapped 2 formulae\n", ""),
+                ("brew", "tap"): (0, "homebrew/core\nskillmount-acceptance/tap\n", ""),
+            }
+        )
+        subject.tapped = True
+        subject.cleanup()
+        finding = " ".join(subject.cleanup_findings)
+        self.assertIn("skillmount-acceptance/tap", finding)
+        self.assertIn("does not deregister a tap", finding)
+        self.assertIn(("brew", "untap", harness.ACCEPTANCE_TAP), gateway.calls)
+        self.assertIn(("brew", "tap"), gateway.calls)
+
+    def test_an_untapped_tap_leaves_no_cleanup_finding(self) -> None:
+        """Accept cleanup when `brew tap` no longer lists the disposable tap."""
+
+        gateway, subject = self.trust_harness(
+            {
+                ("brew", "untap"): (0, "Untapped 2 formulae\n", ""),
+                ("brew", "tap"): (0, "homebrew/core\nhomebrew/cask\n", ""),
+            }
+        )
+        subject.tapped = True
+        subject.cleanup()
+        self.assertEqual(subject.cleanup_findings, [])
+        self.assertFalse(subject.tapped)
+        self.assertEqual(harness.parse_tap_list("b/a\na/b\nb/a\n"), ("a/b", "b/a"))
+
+    def test_rendered_templates_keep_the_brew_style_clean_shape(self) -> None:
+        """Pin the tracked templates to the shape `brew style` accepted."""
+
+        directory = Path(__file__).resolve().parents[2] / "packaging" / "homebrew"
+        templates = sorted(directory.glob("*.rb.in"))
+        if not templates:
+            raise unittest.SkipTest(f"{directory} is not in this checkout")
+        self.assertEqual(len(templates), len(harness.FORMULA_IDS))
+        for template in templates:
+            with self.subTest(template=template.name):
+                text = template.read_text(encoding="utf-8")
+                self.assertIn(
+                    '  depends_on "rust" => :build\n'
+                    "  depends_on arch: :arm64\n"
+                    "  depends_on :macos\n",
+                    text,
+                )
+                self.assertIn(
+                    '    generate_completions_from_executable(bin/"@COMMAND@", "completions", '
+                    'base_name: "@COMMAND@")\n',
+                    text,
+                )
+                self.assertEqual(text.count("generate_completions_from_executable"), 1)
+                self.assertNotIn("shells:", text)
+                self.assertIn('    refute_path_exists bin/"@OTHER_COMMAND@"\n', text)
+                self.assertIn("    ].each do |completion, shell|\n", text)
+                self.assertIn("      assert_path_exists completion", text)
+                self.assertNotIn("assert !", text)
+        fixture = FORMULA_TEMPLATE.format(digest=DIGEST)
+        self.assertIn(
+            '  depends_on "rust" => :build\n  depends_on arch: :arm64\n  depends_on :macos\n',
+            fixture,
+        )
+        self.assertEqual(harness.platform_findings(fixture, formula_class="skillmount"), ())
 
 
 if __name__ == "__main__":

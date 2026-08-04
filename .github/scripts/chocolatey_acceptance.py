@@ -46,6 +46,11 @@ INTERRUPTION_MARKER = "skillmount-acceptance-injected-interruption"
 SUCCESS_MARKER = "was successful"
 DOWNLOAD_CHUNK = 1024 * 1024
 
+CARGO_MANIFEST_NAME = "Cargo.toml"
+CARGO_PACKAGE_HEADER = "[package]"
+CARGO_VERSION_PATTERN = re.compile(r'^version = "([^"\n]+)"[ \t]*$', re.MULTILINE)
+CARGO_SECTION_PATTERN = re.compile(r"^\[", re.MULTILINE)
+
 DOS_SIGNATURE = b"MZ"
 PE_SIGNATURE = b"PE\0\0"
 PE_OFFSET_FIELD = 0x3C
@@ -2884,6 +2889,75 @@ def negative_phase(context: Context, selection: PackageSelection, phase: str) ->
     )
 
 
+def cargo_version_from_manifest(text: str) -> str:
+    """Return the `[package]` version declared in a Cargo manifest."""
+
+    start = text.find(CARGO_PACKAGE_HEADER)
+    if start < 0:
+        raise ChocolateyAcceptanceError(
+            f"Cargo manifest has no {CARGO_PACKAGE_HEADER} table; expected exactly one"
+        )
+    body = text[start + len(CARGO_PACKAGE_HEADER) :]
+    next_section = CARGO_SECTION_PATTERN.search(body)
+    if next_section is not None:
+        body = body[: next_section.start()]
+    matches = CARGO_VERSION_PATTERN.findall(body)
+    if len(matches) != 1:
+        raise ChocolateyAcceptanceError(
+            f"Cargo {CARGO_PACKAGE_HEADER} table declares {len(matches)} version keys ({matches}); "
+            "expected exactly 1"
+        )
+    return release.validate_stable_version(matches[0])
+
+
+def manifest_version(repository: Path) -> str:
+    """Return the root package version the locally built executables report."""
+
+    manifest = repository / CARGO_MANIFEST_NAME
+    if not manifest.is_file():
+        raise ChocolateyAcceptanceError(
+            f"{manifest} is missing; expected a Cargo manifest because without --inputs the "
+            "candidate version comes from the manifest the local binaries were built from"
+        )
+    return cargo_version_from_manifest(manifest.read_text(encoding="utf-8"))
+
+
+def local_release_identity(repository: Path, *, tag: str | None) -> tuple[str, str]:
+    """Derive the version and tag a locally built candidate must declare."""
+
+    version = manifest_version(repository)
+    if tag is None:
+        return version, f"v{version}"
+    described = release.stable_version_from_tag(tag)
+    if described != version:
+        raise ChocolateyAcceptanceError(
+            f"--tag {tag!r} describes version {described!r}; expected version {version!r} "
+            f"because {repository / CARGO_MANIFEST_NAME} declares it and the locally built "
+            "binaries report it"
+        )
+    return version, tag
+
+
+def require_single_identity_source(options: argparse.Namespace) -> None:
+    """Refuse to mix a trusted preflight artifact with an operator-supplied identity."""
+
+    conflicting = sorted(
+        name
+        for name, value in (
+            ("--tag", options.tag),
+            ("--commit", options.commit),
+            ("--binary-directory-x64", options.binary_directory_x64),
+            ("--binary-directory-x86", options.binary_directory_x86),
+        )
+        if value is not None
+    )
+    if conflicting:
+        raise ChocolateyAcceptanceError(
+            f"--inputs was passed with {conflicting}; expected --inputs to be the only source "
+            "of the candidate's release identity and archive bytes"
+        )
+
+
 def resolve_inputs(
     channels: Any, options: argparse.Namespace, work: Path
 ) -> tuple[package_channels.PackageInputs, dict[str, LocalArchive]]:
@@ -2891,6 +2965,7 @@ def resolve_inputs(
 
     archives: dict[str, LocalArchive] = {}
     if options.inputs is not None:
+        require_single_identity_source(options)
         try:
             inputs = channels.PackageInputs.from_json(
                 options.inputs.read_text(encoding="utf-8")
@@ -2923,12 +2998,10 @@ def resolve_inputs(
             "without --inputs every Windows architecture must supply already-built binaries; "
             f"missing {tuple(f'--binary-directory-{name}' for name in missing)!r}"
         )
-    tag = options.tag
-    version = release.stable_version_from_tag(tag)
-    commit = options.commit or release.git_output(
-        options.repository_path, "rev-parse", "HEAD"
+    version, tag = local_release_identity(options.repository_path, tag=options.tag)
+    commit = release.validate_commit(
+        options.commit or release.git_output(options.repository_path, "rev-parse", "HEAD")
     )
-    commit = release.validate_commit(commit)
     for architecture, directory in sorted(directories.items()):
         archives[architecture] = build_local_archive(
             repository=options.repository_path,
@@ -3100,8 +3173,6 @@ def run(arguments: Sequence[str]) -> int:
 
     options = argument_parser().parse_args(arguments)
     require_opt_in(dict(os.environ))
-    if options.inputs is None and not options.tag:
-        raise ChocolateyAcceptanceError("--tag is required without --inputs")
     if options.work_directory is not None:
         options.work_directory.mkdir(parents=True, exist_ok=True)
         document = run_acceptance(options, options.work_directory.resolve())

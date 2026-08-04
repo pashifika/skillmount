@@ -9,7 +9,7 @@
 `v0.1.0` shipped as a GitHub-only release, and the release baseline recorded Homebrew, Chocolatey,
 and every other package manager as deferred. Operators on the supported targets asked for native
 package-manager install and upgrade instead of manually placing release archives, so `v0.2.0` adds
-first-party Homebrew and Chocolatey distribution. Three verified constraints shape the decision:
+first-party Homebrew and Chocolatey distribution. Four verified constraints shape the decision:
 
 - The release publisher acts with the repository `GITHUB_TOKEN`, and GitHub suppresses workflow
   events caused by `GITHUB_TOKEN` actions. A `release.published` trigger therefore never fires for
@@ -22,6 +22,14 @@ first-party Homebrew and Chocolatey distribution. Three verified constraints sha
   release archive intentionally contains both executables, but a package installation is a
   user-facing selection boundary, and neither executable may ever be installed, symlinked, or
   shimmed under another name.
+- Homebrew refuses to install a formula from an untrusted third-party tap, proven with Homebrew
+  6.0.12 on a `macos-15` runner: a bare `brew install pashifika/tap/<id>` cannot succeed until the
+  operator runs `brew trust --formula pashifika/tap/<id>` (or `brew trust pashifika/tap` for the
+  whole tap). Trust is keyed by name, not content, and lives as plain JSON name lists in
+  `${XDG_CONFIG_HOME}/homebrew/trust.json`, or `~/.homebrew/trust.json` when `XDG_CONFIG_HOME` is
+  unset (verified on Homebrew 6.0.15). Only the install path enforces it — `brew style` and
+  `brew audit --strict` accept an untrusted tap — and trusting a tap is an operator security
+  decision that automation must never make on the operator's behalf.
 
 ## Decision
 
@@ -97,6 +105,12 @@ key. Preflight, generation, and acceptance jobs hold no external credential.
   and requires a new patch version rather than an in-place edit.
 - Chocolatey moderation can delay or reject either package ID independently, and pair eligibility
   must be confirmed with the Community Repository before either public ID exists.
+- The Homebrew install contract is two-step: a one-time, name-keyed
+  `brew trust --formula pashifika/tap/<id>` (or `brew trust pashifika/tap`) precedes the first
+  `brew install`, and upgrades never re-prompt because trust survives Formula rewrites. Homebrew
+  6.0.12 proved the refusal. Documentation must show the trust step wherever it shows an install
+  command, and tap CI and the acceptance harness trust only their own disposable tap — preferring
+  the per-formula form — and restore the prior trust-store state byte-for-byte.
 - `docs/packaging.md`, `docs/architecture.md`, `README.md`, the tap source material under
   `packaging/homebrew/tap/`, and the package workflow policy tests changed in the same change.
 

@@ -71,6 +71,7 @@ HOMEBREW_PINS = {
 PHASE_ORDER = (
     "style",
     "audit",
+    "trust",
     "install-skillmount-alone",
     "selected-only",
     "completions",
@@ -88,6 +89,10 @@ PHASE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "brew-test": ("install-skillmount-alone", "install-asm-alone"),
     "uninstall": ("install-skillmount-alone", "install-asm-alone"),
     "cross-uninstall": ("co-install",),
+    "install-skillmount-alone": ("trust",),
+    "install-asm-alone": ("trust",),
+    "co-install": ("trust",),
+    "upgrade-from-prior": ("trust",),
 }
 PACKAGE_TABLE_PINS = {
     "skillmount": ("skillmount", "asm"),
@@ -104,6 +109,35 @@ LOCAL_SOURCE_AUDIT_ALLOWANCES = (
     re.compile(r"(?i)\bhttps\b"),
     re.compile(r"(?i)\bsecure\b.*\burl\b"),
     re.compile(r"(?i)\bunversioned\b|\bstable url\b|\bversion\b.*\bdetected from url\b"),
+)
+TRUST_JSON_VERSION = "v1"
+TRUST_SECTIONS = ("casks", "commands", "formulae", "taps")
+TRUST_STORE_UNDER_XDG = "homebrew/trust.json"
+TRUST_STORE_UNDER_HOME = ".homebrew/trust.json"
+TRUST_REFUSAL_TEMPLATE = (
+    "Refusing to load formula {reference} from untrusted tap {tap}. Run "
+    "'brew trust --formula {reference}' or 'brew trust {tap}' to trust it."
+)
+TRUST_HELP_NOTICE = (
+    "`brew trust --help` must still document `--formula`, and `brew untrust --help` must still "
+    "document `--formula`; Homebrew 6 refuses to load any third-party tap formula until it is "
+    "trusted by name, and this harness owns a disposable tap"
+)
+TRUST_SCOPE_NOTICE = (
+    "notice: `brew style` and `brew audit --strict --formula` load an untrusted third-party tap "
+    "without complaint, so trust is scoped to the install path: `brew install`, `brew test`, "
+    "`brew upgrade`, and `brew uninstall`"
+)
+TRUST_NAME_NOTICE = (
+    "notice: Homebrew keys trust by name, never by content, so one `brew trust --formula` "
+    "survives every later rewrite of the same Formula file; the upgrade rehearsal reuses it and "
+    "an operator trusts a tap formula once rather than once per release"
+)
+TRUST_RESTORE_MECHANISM = (
+    "`brew untrust --formula <reference>` removes exactly the names this harness added, so an "
+    "entry the operator trusted before the run is never touched; when the store still differs "
+    "from the captured state, cleanup rewrites that one plain JSON file with the exact bytes "
+    "observed before trusting, or removes the file when it did not exist"
 )
 
 
@@ -252,6 +286,33 @@ class UpgradeDecision:
 
 
 @dataclass(frozen=True)
+class TrustStore:
+    """Homebrew's trust file and its parsed sections at one observed moment."""
+
+    path: Path
+    existed: bool
+    content: bytes
+    sections: Mapping[str, tuple[str, ...]]
+
+    @property
+    def digest(self) -> str | None:
+        """Return the SHA-256 of the observed file, or `None` when it was absent."""
+
+        return hashlib.sha256(self.content).hexdigest() if self.existed else None
+
+    def to_json_object(self) -> dict[str, object]:
+        """Return the JSON shape recorded in the report, naming no unrelated tap."""
+
+        return {
+            "path": str(self.path),
+            "existed": self.existed,
+            "bytes": len(self.content),
+            "sha256": self.digest,
+            "trusted_formulae": len(self.sections.get("formulae", ())),
+        }
+
+
+@dataclass(frozen=True)
 class HarnessOptions:
     """Fully resolved, immutable harness inputs."""
 
@@ -281,6 +342,20 @@ SCENARIO_COVERAGE: tuple[ScenarioCoverage, ...] = (
         phases=("install-asm-alone", "selected-only"),
         kind="direct",
         note="Installs the tap-resolved skillmount-asm Formula and proves only asm lands.",
+    ),
+    ScenarioCoverage(
+        requirement="An upstream tap owns two selectable SkillMount Formulae",
+        scenario="Untrusted tap is refused",
+        phases=("trust",),
+        kind="analogue",
+        note=(
+            "Homebrew 6 refuses to load a third-party tap formula until it is trusted by name. "
+            "The harness records the prior trust store, trusts only its own disposable tap "
+            "formulae with `brew trust --formula`, refuses to install any reference it did not "
+            "trust so nothing builds, and untrusts exactly what it added; the refusal itself is "
+            "Homebrew's, quoted verbatim in the failure message rather than provoked by a real "
+            "untrusted install."
+        ),
     ),
     ScenarioCoverage(
         requirement="An upstream tap owns two selectable SkillMount Formulae",
@@ -916,6 +991,193 @@ def audit_findings(output: str, *, local_source: bool) -> tuple[str, ...]:
     return tuple(findings)
 
 
+def canonical_tap_name(tap: str) -> str:
+    """Return the `user/name` tap Homebrew reports for a `user/homebrew-name` repository."""
+
+    user, separator, repository = tap.partition("/")
+    if not user or not separator or not repository or "/" in repository:
+        raise HomebrewAcceptanceError(
+            f"tap {tap!r} is not a `user/repository` pair; expected exactly one `/`"
+        )
+    return f"{user}/{repository.removeprefix('homebrew-')}"
+
+
+def canonical_reference(reference: str) -> str:
+    """Return the tap-qualified formula name Homebrew records in its trust store."""
+
+    tap, separator, name = reference.rpartition("/")
+    if not tap or not separator or not name:
+        raise HomebrewAcceptanceError(
+            f"formula reference {reference!r} is not `user/repository/formula`; expected two `/`"
+        )
+    return f"{canonical_tap_name(tap)}/{name}"
+
+
+def trust_spellings(reference: str) -> tuple[str, ...]:
+    """Return every spelling Homebrew may store for one tap-qualified formula."""
+
+    canonical = canonical_reference(reference)
+    return (reference,) if canonical == reference else (reference, canonical)
+
+
+def trust_refusal(reference: str) -> str:
+    """Return the exact refusal Homebrew prints for an untrusted third-party tap."""
+
+    canonical = canonical_reference(reference)
+    tap, _, _ = canonical.rpartition("/")
+    return TRUST_REFUSAL_TEMPLATE.format(reference=canonical, tap=tap)
+
+
+def require_absolute(value: str, *, label: str) -> Path:
+    """Return one environment path that Homebrew resolves its trust store under."""
+
+    path = Path(value)
+    if not path.is_absolute():
+        raise HomebrewAcceptanceError(
+            f"{label} is {value!r}; expected an absolute path because Homebrew resolves its "
+            "trust store under it"
+        )
+    return path
+
+
+def trust_store_path(environment: Mapping[str, str]) -> Path:
+    """Return the trust file Homebrew reads, honouring `XDG_CONFIG_HOME`."""
+
+    configuration = environment.get("XDG_CONFIG_HOME", "").strip()
+    if configuration:
+        return require_absolute(configuration, label="XDG_CONFIG_HOME") / TRUST_STORE_UNDER_XDG
+    home = environment.get("HOME", "").strip()
+    if not home:
+        raise HomebrewAcceptanceError(
+            "neither XDG_CONFIG_HOME nor HOME is set; expected one because Homebrew stores "
+            f"trusted entries in ${{XDG_CONFIG_HOME}}/{TRUST_STORE_UNDER_XDG} or "
+            f"~/{TRUST_STORE_UNDER_HOME}"
+        )
+    return require_absolute(home, label="HOME") / TRUST_STORE_UNDER_HOME
+
+
+def read_trust_file(path: Path) -> tuple[bool, bytes]:
+    """Return whether Homebrew's trust file exists and the exact bytes it holds."""
+
+    try:
+        return True, path.read_bytes()
+    except FileNotFoundError:
+        return False, b""
+    except OSError as error:
+        raise HomebrewAcceptanceError(
+            f"{path} could not be read ({error}); this harness refuses to trust anything without "
+            "a restorable copy of the prior trust store"
+        ) from error
+
+
+def parse_trust_json(text: str) -> dict[str, tuple[str, ...]]:
+    """Parse `brew trust --json v1` into its four name lists, failing closed on drift."""
+
+    stripped = text.strip()
+    try:
+        document = json.loads(stripped)
+    except json.JSONDecodeError as error:
+        raise HomebrewAcceptanceError(
+            f"`brew trust --json {TRUST_JSON_VERSION}` printed {bounded_text(stripped)!r}, which "
+            f"is not JSON: {error}"
+        ) from error
+    if not isinstance(document, dict) or sorted(document) != sorted(TRUST_SECTIONS):
+        observed = sorted(document) if isinstance(document, dict) else type(document).__name__
+        raise HomebrewAcceptanceError(
+            f"`brew trust --json {TRUST_JSON_VERSION}` reported {observed}; expected exactly the "
+            f"sections {sorted(TRUST_SECTIONS)}"
+        )
+    parsed: dict[str, tuple[str, ...]] = {}
+    for section in TRUST_SECTIONS:
+        values = document[section]
+        if not isinstance(values, list) or not all(isinstance(name, str) for name in values):
+            raise HomebrewAcceptanceError(
+                f"`brew trust --json {TRUST_JSON_VERSION}` section {section!r} is {values!r}; "
+                "expected a list of names"
+            )
+        parsed[section] = tuple(values)
+    return parsed
+
+
+def parse_tap_list(output: str) -> tuple[str, ...]:
+    """Parse `brew tap` output into sorted tap names."""
+
+    return tuple(sorted(set(output.split())))
+
+
+def trust_sections_match(
+    expected: Mapping[str, Sequence[str]], observed: Mapping[str, Sequence[str]]
+) -> bool:
+    """Return whether two trust snapshots hold the same names in every section."""
+
+    return all(
+        set(expected.get(section, ())) == set(observed.get(section, ()))
+        for section in TRUST_SECTIONS
+    )
+
+
+def trust_query_failure(evidence: CommandEvidence) -> str:
+    """Return the named failure an unusable `brew trust --json` query produces."""
+
+    return (
+        f"{' '.join(evidence.argv)} exited {evidence.returncode}; this harness must observe the "
+        "prior trust state before it trusts anything so cleanup can restore exactly what it "
+        f"added. {TRUST_HELP_NOTICE}: "
+        f"{bounded_text(evidence.stderr or evidence.stdout).strip()}"
+    )
+
+
+def trust_failure(evidence: CommandEvidence, *, reference: str) -> str:
+    """Return the named failure a refused or renamed `brew trust` produces."""
+
+    return (
+        f"{' '.join(evidence.argv)} exited {evidence.returncode}; expected 0 because Homebrew "
+        f'refuses an untrusted third-party tap with "{trust_refusal(reference)}". '
+        f"{TRUST_HELP_NOTICE}: "
+        f"{bounded_text(evidence.stderr or evidence.stdout).strip()}"
+    )
+
+
+def untrusted_install_finding(reference: str) -> str:
+    """Return the named failure an install attempted before trusting produces."""
+
+    return (
+        f"{reference} was never trusted, so Homebrew would refuse the install with "
+        f'"{trust_refusal(reference)}"; the trust phase must record it before any install'
+    )
+
+
+def trust_drift_findings(
+    before: Mapping[str, Sequence[str]],
+    after: Mapping[str, Sequence[str]],
+    *,
+    added: Sequence[str],
+) -> tuple[str, ...]:
+    """Require the trust store to differ from its prior state only by *added* formulae."""
+
+    permitted: set[str] = set()
+    for reference in added:
+        permitted.update(trust_spellings(reference))
+    findings: list[str] = []
+    for section in TRUST_SECTIONS:
+        prior = set(before.get(section, ()))
+        current = set(after.get(section, ()))
+        lost = sorted(prior.difference(current))
+        if lost:
+            findings.append(
+                f"trust section {section!r} lost {lost}; this harness must never remove an entry "
+                "it did not add"
+            )
+        allowed = permitted if section == "formulae" else set()
+        gained = sorted(current.difference(prior).difference(allowed))
+        if gained:
+            findings.append(
+                f"trust section {section!r} gained {gained}; expected only {sorted(allowed)} to "
+                "appear"
+            )
+    return tuple(findings)
+
+
 def coverage_gaps() -> tuple[str, ...]:
     """Return every phase or scenario mapping inconsistency in this module."""
 
@@ -956,6 +1218,7 @@ def build_report(
     source: SourceArchive | None,
     prefix: Path | None,
     environment: Mapping[str, object],
+    trust: Mapping[str, object],
     phases: Sequence[Phase],
     cleanup: Sequence[CommandEvidence],
     cleanup_findings: Sequence[str],
@@ -976,6 +1239,7 @@ def build_report(
         "require_upgrade": options.require_upgrade,
         "source": source.to_json_object() if source is not None else None,
         "environment": dict(environment),
+        "trust": dict(trust),
         "phases": [phase.to_json_object() for phase in phases],
         "cleanup": {
             "commands": [evidence.to_json_object() for evidence in cleanup],
@@ -1088,6 +1352,9 @@ def run_command(
 class CommandGateway(Protocol):
     """The only boundary through which this harness reaches the machine."""
 
+    environment: Mapping[str, str]
+    """The environment every command sees, and which locates Homebrew's trust store."""
+
     def brew(self, *arguments: str, timeout: int = DEFAULT_TIMEOUT) -> CommandEvidence:
         """Run one `brew` subcommand."""
 
@@ -1164,6 +1431,10 @@ class Harness:
         self.source: SourceArchive | None = None
         self.tap_root: Path | None = None
         self.tapped = False
+        self.trusted: list[str] = []
+        self.added_trust: list[str] = []
+        self.trust_snapshot: TrustStore | None = None
+        self.trust_evidence: dict[str, object] = {}
         self.installed: dict[str, Path] = {}
         self.commands: dict[str, tuple[str, str]] = {}
         self.formula_paths: dict[str, Path] = {}
@@ -1474,8 +1745,173 @@ class Harness:
             self.installed.pop(package_id, None)
         return evidence
 
+    def read_trust(self, *, phase: Phase | None) -> dict[str, tuple[str, ...]]:
+        """Return Homebrew's four trust sections, retaining the query as evidence."""
+
+        evidence = self.gateway.brew("trust", "--json", TRUST_JSON_VERSION)
+        if phase is not None:
+            phase.record(evidence)
+        else:
+            self.cleanup_commands.append(evidence)
+        if evidence.returncode != 0:
+            raise HomebrewAcceptanceError(trust_query_failure(evidence))
+        return parse_trust_json(evidence.stdout)
+
+    def capture_trust(self, phase: Phase) -> TrustStore:
+        """Record the trust store exactly as it was before this harness trusted anything."""
+
+        sections = self.read_trust(phase=phase)
+        path = trust_store_path(self.gateway.environment)
+        existed, content = read_trust_file(path)
+        store = TrustStore(path=path, existed=existed, content=content, sections=sections)
+        self.trust_snapshot = store
+        phase.note(
+            f"captured the prior trust store {path} (existed={existed}, "
+            f"{len(sections['formulae'])} trusted formulae) so cleanup can restore it"
+        )
+        return store
+
+    def observed_brew_version(self) -> list[str]:
+        """Return the `brew --version` lines this run observed."""
+
+        observed = self.environment_evidence.get("brew")
+        return [str(line) for line in observed] if isinstance(observed, list) else []
+
+    def phase_trust(self) -> None:
+        """Trust exactly the disposable tap's Formulae so Homebrew will load them."""
+
+        if not self.enabled("trust"):
+            return
+        phase = self.phase("trust")
+        if self.tap_root is None:
+            raise HomebrewAcceptanceError("the disposable tap was never created")
+        before = self.capture_trust(phase)
+        for package_id in self.options.formula_ids:
+            reference = self.formula_reference(package_id)
+            evidence = phase.record(self.gateway.brew("trust", "--formula", reference))
+            if evidence.returncode != 0:
+                phase.add((trust_failure(evidence, reference=reference),))
+                continue
+            self.trusted.append(reference)
+            if set(trust_spellings(reference)).isdisjoint(before.sections["formulae"]):
+                self.added_trust.append(reference)
+                phase.note(f"trusted {reference} with `{' '.join(evidence.argv)}`")
+            else:
+                phase.note(
+                    f"{reference} was already trusted before this run, so cleanup leaves that "
+                    "entry exactly as it found it"
+                )
+        after = self.read_trust(phase=phase)
+        phase.add(trust_drift_findings(before.sections, after, added=self.added_trust))
+        for reference in self.trusted:
+            if set(trust_spellings(reference)).isdisjoint(after["formulae"]):
+                phase.add(
+                    (
+                        f"`brew trust --formula {reference}` succeeded but `brew trust --json "
+                        f"{TRUST_JSON_VERSION}` does not list {canonical_reference(reference)}; "
+                        "expected Homebrew to record it so `brew install` does not fail with "
+                        f'"{trust_refusal(reference)}"',
+                    )
+                )
+        phase.note(TRUST_SCOPE_NOTICE)
+        phase.note(TRUST_NAME_NOTICE)
+        self.trust_evidence = {
+            "argv": [list(evidence.argv) for evidence in phase.commands],
+            "brew": self.observed_brew_version(),
+            "store": before.to_json_object(),
+            "trusted": [canonical_reference(reference) for reference in self.trusted],
+            "added": [canonical_reference(reference) for reference in self.added_trust],
+            "restore": TRUST_RESTORE_MECHANISM,
+            "restored": None,
+        }
+        phase.settle()
+
+    def rewrite_trust_file(self, snapshot: TrustStore) -> str:
+        """Rewrite Homebrew's trust file with the exact bytes captured before trusting."""
+
+        try:
+            if snapshot.existed:
+                snapshot.path.parent.mkdir(parents=True, exist_ok=True)
+                snapshot.path.write_bytes(snapshot.content)
+            else:
+                snapshot.path.unlink(missing_ok=True)
+            existed, content = read_trust_file(snapshot.path)
+        except (OSError, HomebrewAcceptanceError) as error:
+            self.cleanup_findings.append(
+                f"cleanup could not restore the trust store {snapshot.path}: {error}; untrust "
+                f"{[canonical_reference(name) for name in self.added_trust]} by hand with "
+                "`brew untrust --formula <reference>`"
+            )
+            return "failed"
+        if (existed, content) != (snapshot.existed, snapshot.content):
+            self.cleanup_findings.append(
+                f"the trust store {snapshot.path} still differs from the state observed before "
+                f"trusting (existed={existed}, {len(content)} bytes); expected "
+                f"existed={snapshot.existed} and {len(snapshot.content)} bytes"
+            )
+            return "failed"
+        return "trust file rewrite"
+
+    def restore_trust(self) -> None:
+        """Leave Homebrew's trust store holding exactly what it held before this run."""
+
+        snapshot = self.trust_snapshot
+        if snapshot is None:
+            return
+        self.trust_snapshot = None
+        for reference in reversed(self.added_trust):
+            evidence = self.gateway.brew("untrust", "--formula", reference)
+            self.cleanup_commands.append(evidence)
+            if evidence.returncode != 0:
+                self.cleanup_findings.append(
+                    f"cleanup could not untrust {reference}: "
+                    f"{bounded_text(evidence.stderr or evidence.stdout).strip()}"
+                )
+        try:
+            observed: Mapping[str, Sequence[str]] | None = self.read_trust(phase=None)
+        except HomebrewAcceptanceError as error:
+            self.cleanup_findings.append(
+                f"cleanup could not re-read the trust store after untrusting: {error}"
+            )
+            observed = None
+        if observed is not None and trust_sections_match(snapshot.sections, observed):
+            # `brew untrust` removes names, never the file, so a store Homebrew created for this
+            # run still has to go even when its remaining names already match.
+            try:
+                existed, _ = read_trust_file(snapshot.path)
+            except HomebrewAcceptanceError:
+                existed = not snapshot.existed
+            if existed == snapshot.existed:
+                self.trust_evidence["restored"] = (
+                    "brew untrust --formula" if self.added_trust else "nothing was trusted"
+                )
+                return
+        self.trust_evidence["restored"] = self.rewrite_trust_file(snapshot)
+
+    def require_untapped(self) -> None:
+        """Require the disposable tap to be gone from `brew tap` after untapping."""
+
+        listing = self.gateway.brew("tap")
+        self.cleanup_commands.append(listing)
+        if listing.returncode != 0:
+            self.cleanup_findings.append(
+                f"cleanup could not list taps after untapping {ACCEPTANCE_TAP}: "
+                f"{bounded_text(listing.stderr or listing.stdout).strip()}"
+            )
+            return
+        canonical = canonical_tap_name(ACCEPTANCE_TAP)
+        surviving = sorted(
+            set(parse_tap_list(listing.stdout)).intersection((ACCEPTANCE_TAP, canonical))
+        )
+        if surviving:
+            self.cleanup_findings.append(
+                f"`brew untap {ACCEPTANCE_TAP}` reported success but `brew tap` still lists "
+                f"{surviving}; removing the tap directory does not deregister a tap, so remove "
+                f"it with `brew untap {canonical}` before rerunning this harness"
+            )
+
     def cleanup(self) -> None:
-        """Undo every install and the disposable tap, whatever else happened."""
+        """Undo every install, the disposable tap, and every trust entry it added."""
 
         for package_id in list(self.installed):
             evidence = self.uninstall(package_id)
@@ -1494,6 +1930,8 @@ class Harness:
                 )
             else:
                 self.tapped = False
+                self.require_untapped()
+        self.restore_trust()
 
     # Sentinels.
 
@@ -1607,6 +2045,9 @@ class Harness:
         """Build and install one Formula from source, recording the attempt."""
 
         reference = self.formula_reference(package_id)
+        if reference not in self.trusted:
+            phase.add((untrusted_install_finding(reference),))
+            return False
         evidence = self.gateway.brew(
             "install", "--formula", "--build-from-source", reference, timeout=BUILD_TIMEOUT
         )
@@ -2041,6 +2482,7 @@ class Harness:
         self.place_formulae(rendered)
         self.phase_style()
         self.phase_audit(rendered)
+        self.phase_trust()
         self.stage_alone(FORMULA_IDS[0], "install-skillmount-alone")
         self.stage_alone(FORMULA_IDS[1], "install-asm-alone")
         self.stage_co_install()
@@ -2081,6 +2523,7 @@ class Harness:
             source=self.source,
             prefix=self.prefix,
             environment=environment,
+            trust=self.trust_evidence,
             phases=[self.phases[name] for name in PHASE_ORDER],
             cleanup=self.cleanup_commands,
             cleanup_findings=self.cleanup_findings,
