@@ -1,0 +1,269 @@
+# Packaging SkillMount
+
+This runbook is for repository maintainers operating the Homebrew and Chocolatey package channels.
+It continues where [docs/releasing.md](releasing.md) ends: package publication starts only after a
+stable GitHub release is published and verified, and nothing in this runbook may delete, rewrite,
+or change the success state of that release, its tag, assets, notes, or checksums.
+[ADR 0030](adr/0030-publish-selectable-packages-through-isolated-post-release-channels.md) records
+the channel decisions; [docs/architecture.md](architecture.md) records the resulting baseline.
+
+## Channel and identity contract
+
+Both channels publish a pair of one-executable packages built from the same immutable release
+identity. Every entry below is reconciled separately and reported separately:
+
+| Public identity | Channel | Installs | Exposes | Distribution model |
+|---|---|---|---|---|
+| `pashifika/tap/skillmount` | Homebrew | Cargo binary `skillmount` | `skillmount` | Source build of the tag tarball |
+| `pashifika/tap/skillmount-asm` | Homebrew | Cargo binary `asm` | `asm` | Source build of the tag tarball |
+| `skillmount` | Chocolatey | `skillmount.exe` | `skillmount` shim | Checked x86/x64 release archive |
+| `skillmount-asm` | Chocolatey | `asm.exe` | `asm` shim | Checked x86/x64 release archive |
+
+Neither pair member installs, depends on, aliases, or conflicts with the other. Installing both
+members of a pair is supported, and each command owns only its own executable, shim, and completion
+files. The supported package targets are Apple Silicon macOS for Homebrew and Windows x64 and x86
+for Chocolatey. Homebrew Core, casks, bottles, Linux, macOS Intel, Windows ARM64, WinGet, Scoop,
+and crates.io are out of scope.
+
+Current state: no Homebrew tap repository exists, no Chocolatey package ID is reserved, `v0.2.0`
+is not released, and the Cargo version is still `0.1.0`. Every install command in this document is
+therefore unavailable and documented as such.
+
+## The package workflow
+
+`.github/workflows/package.yml` runs from the default branch. It is triggered by successful
+completion of the `Release` workflow (`workflow_run`) or by manual dispatch with an exact stable
+tag, a channel selection (`both`, `homebrew`, or `chocolatey`), and a `verification_only` flag that
+defaults to `true`. The `release.published` event is intentionally unused because publication with
+the repository `GITHUB_TOKEN` suppresses it.
+
+| Job | Runner | Credentials | Responsibility |
+|---|---|---|---|
+| `preflight` | `ubuntu-24.04` | none | Trigger policy, tag/ancestry/version/asset/checksum revalidation, immutable `package-inputs` artifact |
+| `generate` | `ubuntu-24.04` | none | Renders both Formulae and both Chocolatey source trees, inspects the pairs, uploads `package-candidates` |
+| `homebrew-acceptance` | `macos-15` | none | Native isolated-tap lifecycle harness (`homebrew_acceptance.py`) |
+| `chocolatey-acceptance` | `windows-2025` | none | Native Chocolatey lifecycle harness (`chocolatey_acceptance.py`), packs and inspects both nupkgs |
+| `homebrew-publish` | `ubuntu-24.04` | `homebrew` environment | Proposes the paired tap pull request through the tap-scoped GitHub App token |
+| `chocolatey-publish` | `windows-2025` | `chocolatey` environment | Reconciles both package IDs against the Community Repository with the API key |
+| `summary` | `ubuntu-24.04` | none | Per-entry status table; fails only on a non-publish predecessor failure |
+
+Preflight treats every triggering-run and release value as untrusted until independently
+revalidated: exact stable tag, annotated-tag dereference, `main` ancestry, `Cargo.toml` and
+`Cargo.lock` version agreement, release identity, the exact three-archive-plus-`SHA256SUMS` asset
+set, every digest, and the dual-binary archive layout. No job holding an external credential checks
+out or executes triggering-tag code, extracts an archive, or runs a downloaded binary. Neither
+publish job depends on the other, and each uses a non-cancelling per-version concurrency group.
+
+## Run verification-only mode
+
+Rehearse the complete package path without production credentials. Verification-only runs execute
+preflight, generation, structural pair inspection, and both native acceptance harnesses while both
+publish jobs are skipped and both environments remain unreachable:
+
+```bash
+gh workflow run package.yml --ref main \
+  -f tag=v0.2.0 -f channels=both -f verification_only=true
+gh run list --workflow package.yml --limit 1
+gh run watch <run-id> --exit-status
+```
+
+A malformed tag, branch name, commit, or prerelease is rejected by preflight before any environment
+approval is requested. Keep the run's `package-inputs`, `package-candidates`, and
+`chocolatey-nupkgs` artifacts with the release evidence.
+
+## Approve a production publication
+
+Both publish jobs wait on protected GitHub Environments with required reviewers. Approve them
+independently; approving one channel never publishes the other. Before approving either
+environment, require:
+
+1. a successful `preflight` for the exact intended tag, with `verification_only` reported `false`;
+2. successful `generate` and the channel's acceptance job for the same run;
+3. the recorded `inputs_sha256` matching between the run outputs and the retained artifact.
+
+The `homebrew` environment exposes only the tap-scoped GitHub App credentials
+(`HOMEBREW_TAP_APP_ID`, `HOMEBREW_TAP_APP_PRIVATE_KEY`). The `chocolatey` environment exposes only
+`CHOCOLATEY_API_KEY`. A workflow run that requests any other secret, or a secret from the wrong
+job, fails the tracked workflow policy check.
+
+## Review the paired tap pull request
+
+The Homebrew publisher never pushes the tap's protected default branch. It writes both rendered
+Formulae to branch `skillmount/<version>` in `pashifika/homebrew-tap` and opens one pull request
+for the pair. Before merging, require:
+
+- both `Formula/skillmount.rb` and `Formula/skillmount-asm.rb` updated together, with identical
+  source URL, SHA-256, version, license, and platform requirements;
+- each Formula selecting only its own Cargo binary and command, with the pair member's command
+  appearing only inside the `test do` block;
+- the tap CI checks green: `brew style`, `brew audit --strict` for both Formulae, both source
+  builds, both `brew test` runs, selected-only install, co-installation, cross-uninstall, and
+  completion-ownership checks;
+- provenance comments naming the expected tag and commit from the run's `package-inputs`.
+
+A retried run that finds the branch or pull request already correct resumes it instead of creating
+a duplicate; it never force-pushes, closes, or merges an existing pull request.
+
+## Chocolatey moderation and pair eligibility
+
+Before either public package ID exists, confirm with the Chocolatey Community Repository that the
+`skillmount` plus `skillmount-asm` pair — two packages with distinct installed executables but
+behaviorally equivalent entrypoints — is eligible rather than prohibited duplicate packaging. A
+refusal blocks Chocolatey publication entirely; automation must not fall back to one package that
+installs both commands, because that denies the selection contract.
+
+After a push is accepted, each package ID is moderated independently. Record `pending` per ID;
+pending is upload acceptance, not public availability. A package ID's install command becomes
+advertisable only after moderation approves and lists it, its public endpoint resolves `0.2.0`,
+and a clean-host selected-only installation passes. One approved member never implies the other.
+
+## Retry a partially published pair
+
+Retry through manual dispatch with the same exact tag and the affected channel. Reconciliation is
+pair-aware and idempotent:
+
+- an existing member identical to the expected provenance (source URL, digest, version, selected
+  executable) is left unchanged and reported as an idempotent success or status check;
+- only an absent member receives creation work, and only when the existing member matches;
+- nothing is pushed twice for one ID in one run, and the GitHub release is never touched.
+
+A **conflict** means an existing external version — a tap branch, pull request, Formula, or
+Community Repository package — carries different immutable metadata than preflight expects. The
+channel job then fails, reports the expected and observed identities for the complete pair, and
+performs no write. A conflict is a stop-for-human-review signal: someone or something else owns
+that version. Never resolve it by overwriting, unlisting, or repushing; if the published bytes are
+wrong, release a new patch version through the normal flow.
+
+## Read per-entry channel status
+
+The `summary` job writes a per-entry table to the run summary. Interpret the states as:
+
+| State | Meaning |
+|---|---|
+| `created` | The entry was written or pushed for the first time by this run. |
+| `resumed` | An existing partial branch or pull request was safely continued. |
+| `unchanged` | The entry already matched the expected provenance; nothing was written. |
+| `pending` | Chocolatey accepted the upload; moderation has not approved or listed it. |
+| `listed` | The Community Repository publicly resolves the approved package version. |
+
+GitHub Release state, the paired tap pull request, each Formula's clean install, each Chocolatey
+package's upload/moderation/clean install, and pair co-installation are reported separately. A
+failed or pending entry never rewrites another entry's state, and one channel's failure never marks
+the other channel's outcome.
+
+## Credential rotation and revocation
+
+Never print, echo, or paste a secret value into a log, issue, or evidence file; reference secrets
+by name and rotation date only.
+
+- **Homebrew (tap-scoped GitHub App).** The App is installed only on `pashifika/homebrew-tap`.
+  Rotate by generating a new private key in the App settings, updating
+  `HOMEBREW_TAP_APP_PRIVATE_KEY` in the `homebrew` environment, and deleting the old key. Revoke by
+  deleting the key or suspending/uninstalling the App installation; either action disables only the
+  Homebrew lane.
+- **Chocolatey (API key).** Rotate from the Chocolatey account's API-key page, update
+  `CHOCOLATEY_API_KEY` in the `chocolatey` environment, then invalidate the old key. Revoke the key
+  immediately on suspected compromise; the Homebrew lane and the GitHub release are unaffected.
+
+Record every rotation and revocation (date, actor, reason, affected environment) with the release
+evidence. Environment reviewer lists are part of the credential boundary: review them whenever
+maintainers change.
+
+## Clean-host acceptance evidence
+
+An install command may be advertised only with retained clean-host evidence. For each of the four
+entries, the evidence must contain:
+
+- the exact package version, tag, commit, source or archive URLs, and SHA-256 values, plus the
+  Formula file or nupkg digest;
+- the external identities involved: tap repository and pull request, GitHub App installation,
+  Chocolatey account and package ID;
+- the workflow run and action revisions, runner labels, and manager/toolchain versions (Homebrew,
+  Rust, macOS, and shell versions; Windows, Chocolatey, and PowerShell versions);
+- the public endpoint response resolving `0.2.0` for that entry;
+- the clean supported-host install transcript showing the selected-only contract: exactly the
+  selected executable and shim or keg present, the pair member's command absent, `--version`
+  reporting the expected version, and command-specific completion ownership;
+- co-installation and cross-uninstall results for the pair, and the observed cleanup state.
+
+## Accepted risk: source tarball recompression
+
+Both Formulae pin GitHub's generated source tarball, `archive/refs/tags/<tag>.tar.gz`, by SHA-256.
+GitHub has historically re-compressed generated tarballs, which changes their bytes without
+changing the tag. Preflight validates the digest at publication time, so publication itself fails
+closed; the accepted residual risk is that a later upstream re-compression invalidates the digest
+in an already-published Formula. If that happens, do not edit the published Formula's digest in
+place: release a new patch version so the tap history keeps one auditable digest per version.
+
+## Operator guidance (not yet available)
+
+None of the four install commands below works today. Each becomes available only when its own
+public endpoint resolves version `0.2.0` and a clean selected-only installation passes on a
+supported host, per the evidence contract above. Until then, install from
+[GitHub Releases](https://github.com/pashifika/skillmount/releases) as described in the
+[README](../README.md). Installing both Formulae or both Chocolatey packages together is supported;
+each command owns only its own executable, shim, and completion files, and uninstalling one never
+removes the other.
+
+### Homebrew `pashifika/tap/skillmount` — unavailable
+
+Available once the tap's `skillmount` Formula resolves `0.2.0` publicly and its clean-host
+selected-only install passes on Apple Silicon macOS.
+
+```bash
+brew install pashifika/tap/skillmount
+brew upgrade pashifika/tap/skillmount
+brew uninstall skillmount
+```
+
+Installs only the `skillmount` command, built from source. The Formula generates Bash, Zsh, and
+Fish completions by running `skillmount completions <shell>` at install time and places them in
+Homebrew-managed completion directories; they register only `skillmount`, and uninstalling removes
+only them. No user profile is edited.
+
+### Homebrew `pashifika/tap/skillmount-asm` — unavailable
+
+Available once the tap's `skillmount-asm` Formula resolves `0.2.0` publicly and its clean-host
+selected-only install passes on Apple Silicon macOS.
+
+```bash
+brew install pashifika/tap/skillmount-asm
+brew upgrade pashifika/tap/skillmount-asm
+brew uninstall skillmount-asm
+```
+
+Installs only the `asm` command, built from source. Bash, Zsh, and Fish completions are generated
+through `asm completions <shell>`, register only `asm`, and are owned and removed by this Formula
+alone. No user profile is edited.
+
+### Chocolatey `skillmount` — unavailable
+
+Available once the Community Repository approves, lists, and publicly resolves `skillmount 0.2.0`
+and its clean-host selected-only install passes on supported Windows.
+
+```powershell
+choco install skillmount
+choco upgrade skillmount
+choco uninstall skillmount
+```
+
+Downloads and checksum-verifies the matching x86 or x64 release archive, retains only
+`skillmount.exe`, and exposes only the ordinary `skillmount` shim. The package installs no
+completion files and never edits a PowerShell profile; generate PowerShell completion manually with
+`skillmount completions powershell` and dot-source the saved file from your own profile.
+
+### Chocolatey `skillmount-asm` — unavailable
+
+Available once the Community Repository approves, lists, and publicly resolves
+`skillmount-asm 0.2.0` and its clean-host selected-only install passes on supported Windows.
+
+```powershell
+choco install skillmount-asm
+choco upgrade skillmount-asm
+choco uninstall skillmount-asm
+```
+
+Downloads and checksum-verifies the matching x86 or x64 release archive, retains only `asm.exe`,
+and exposes only the ordinary `asm` shim. The package installs no completion files and never edits
+a PowerShell profile; generate PowerShell completion manually with `asm completions powershell`
+and dot-source the saved file from your own profile.

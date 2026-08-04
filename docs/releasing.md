@@ -4,6 +4,10 @@ This runbook is for repository maintainers. SkillMount publishes stable binary r
 an existing `vMAJOR.MINOR.PATCH` tag whose commit is contained in `main`. The release workflow never
 creates, moves, or deletes a tag.
 
+After a stable release is published and verified, Homebrew and Chocolatey package-channel
+publication chains from this workflow's successful completion. That separate post-release process
+is operated through [docs/packaging.md](packaging.md).
+
 ## Reviewed platform and action contract
 
 The release dependencies below were checked against current official sources on 2026-08-04. Every
@@ -227,5 +231,9 @@ For every release, retain:
 - workflow artifact names and final archive SHA-256 values;
 - release ID, draft/retry outcome, final asset listing, generated-notes confirmation, and parity smoke;
 - tag-ruleset ID/payload/readback and exact-ref rule-suite evaluation;
-- explicit scope note that signing, notarization, crates.io, Homebrew, Chocolatey, and other
-  package-manager publication remain deferred.
+- explicit scope note that signing, notarization, crates.io, WinGet, Scoop, and other
+  package-manager publication beyond Homebrew and Chocolatey remain deferred.
+
+Homebrew and Chocolatey publication is no longer deferred. It runs in the separate `Package`
+workflow after this release completes, and its own evidence requirements live in
+[docs/packaging.md](packaging.md). A package-channel failure never changes this release's outcome.

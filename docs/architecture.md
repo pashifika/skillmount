@@ -12,9 +12,11 @@ as current only after it exists in the tracked source and can be traced to repos
 Status: static shell-completion generation, catalog resolution, discovery inspection, read-only
 planning, cross-platform link primitives, resource locking, durable transactions, cleanup, stale
 recovery, the generic child process supervisor, the Codex and Claude session adapters, operator
-diagnosis and explicit recovery, the repository evidence workflow, and versioned release packaging
-and publication are implemented. Executed live-agent compatibility certification and the remaining
-transaction-lifetime hardening named under [Reserved work](#reserved-work) are not implemented.
+diagnosis and explicit recovery, the repository evidence workflow, versioned release packaging
+and publication, and the Homebrew and Chocolatey package-channel contract are implemented.
+Executed live-agent compatibility certification, external package-channel publication, and the
+remaining transaction-lifetime hardening named under [Reserved work](#reserved-work) are not
+implemented.
 
 ## Product definition
 
@@ -585,6 +587,67 @@ The following are product rules rather than style preferences:
 Tests enforce the observable parts of these rules. Local comments retain the narrower preconditions
 needed to preserve them inside an implementation.
 
+## Release and package distribution
+
+Distribution starts at the immutable GitHub release described in [docs/releasing.md](releasing.md)
+and, beginning with `v0.2.0`, continues into two package channels operated through
+[docs/packaging.md](packaging.md).
+[ADR 0030](adr/0030-publish-selectable-packages-through-isolated-post-release-channels.md) records
+the channel decisions. The release asset set and the dual-binary archive layout are unchanged by
+packaging: the channels consume the published release and never add, remove, or rewrite an asset.
+
+The release-to-package flow chains from workflow completion rather than from a release event,
+because publication with the repository `GITHUB_TOKEN` suppresses `release.published`:
+
+```text
+tag push -> Release workflow -> immutable GitHub release
+  -> workflow_run: credential-free preflight revalidates tag, ancestry, Cargo version, release
+     identity, the exact asset set, every checksum, and the dual-binary archive layout
+  -> Formula/package generation + structural pair inspection
+  -> native acceptance harnesses (Apple Silicon macOS, Windows x64/x86), still credential-free
+  -> independent homebrew-publish and chocolatey-publish lanes -> per-entry status summary
+```
+
+The package workflow introduces new trust and dependency seams. A `workflow_run` workflow is
+privileged, so `.github/workflows/package.yml` uses only default-branch workflow and package logic,
+treats every triggering-run and release value as untrusted data until preflight independently
+revalidates it, and never checks out, extracts, or executes triggering-tag code or downloaded
+product binaries in a job holding an external credential. A tracked workflow policy checker
+(`.github/scripts/package_workflow_policy.py`) enforces action pinning, cache absence, permission
+and secret scoping, publish-lane independence, and the verification-only gate. Manual dispatch
+defaults to verification-only, which exercises preflight, generation, inspection, and both native
+acceptance harnesses while both publish jobs are unreachable.
+
+The supported selectable installation targets are a package-manager selection layer over the
+existing release targets, and each installs exactly one of the two product executables:
+
+| Public identity | Platform | Installs | Model |
+|---|---|---|---|
+| `pashifika/tap/skillmount` | Apple Silicon macOS | `skillmount` | Source-built Homebrew Formula |
+| `pashifika/tap/skillmount-asm` | Apple Silicon macOS | `asm` | Source-built Homebrew Formula |
+| Chocolatey `skillmount` | Windows x64/x86 | `skillmount.exe` | Checksum-verified release archive |
+| Chocolatey `skillmount-asm` | Windows x64/x86 | `asm.exe` | Checksum-verified release archive |
+
+Both members of a channel pair pin the same immutable source or release identity, may be
+co-installed, and own only their selected executable, shim, and command-specific completion files.
+Because `src/cli.rs` resolves the product identity from `argv[0]` and rejects a renamed alias, no
+package may install, symlink, or shim either executable under another name. Publication is
+pair-aware but not atomic: an identical existing member is an idempotent success, only absent
+members are created, and any member with mismatched immutable metadata blocks the pair fail-closed
+for human review.
+
+The channels also introduce external state and credential boundaries. The separately managed and
+protected `pashifika/homebrew-tap` repository owns the published Formulae, their CI, and their
+history; it is never nested in this repository, and automation only proposes paired pull requests
+through a GitHub App token scoped to that repository. The Chocolatey Community Repository owns
+package moderation and public listing per package ID. Each publisher runs behind its own protected
+GitHub Environment — `homebrew` and `chocolatey` — holding only that channel's credential;
+preflight, generation, and acceptance jobs hold no external credential.
+
+Package-channel non-goals: Homebrew Core, casks, bottles, Linuxbrew, macOS Intel, Windows ARM64,
+WinGet, Scoop, and crates.io are out of scope, as are signing, notarization, attestations, editing
+shell or PowerShell profiles, and running SkillMount release binaries in credentialed jobs.
+
 ## Implementation status
 
 ### Implemented
@@ -627,6 +690,13 @@ needed to preserve them inside an implementation.
   publication with main-ancestry and workflow-tree parity rechecks
   ([ADR 0028](adr/0028-require-workflow-tree-parity-for-github-token-releases.md)), plus
   immutable-action policy tests and reviewed tag-protection/runbook material;
+- the package-channel publication contract for Homebrew and Chocolatey, implemented and CI-verified
+  on this branch: shared credential-free release preflight and identity model, deterministic
+  Formula and Chocolatey package generation with structural pair inspection, pair-aware fail-closed
+  tap and Community Repository publishers, the isolated `workflow_run` package workflow with its
+  tracked policy checker, native selected-only lifecycle acceptance harnesses for both channels,
+  tap repository source material, and the packaging runbook
+  ([ADR 0030](adr/0030-publish-selectable-packages-through-isolated-post-release-channels.md));
 - crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
 
 ### Reserved work
@@ -637,6 +707,11 @@ needed to preserve them inside an implementation.
 - lock-file reclamation;
 - binding a public transaction's lifetime to the lock guard validated when it is opened or adopted;
 - rejecting pre-existing links in application-state directory paths before creation or permission changes;
+- external package-channel publication, reserved pending external account creation and the `v0.2.0`
+  release: creation, protection, and registration of `pashifika/homebrew-tap`, the tap-scoped
+  GitHub App installation, the Chocolatey account with both public package IDs and pair-eligibility
+  confirmation, both protected environments with their credentials, and the four publicly resolved,
+  clean-host-verified install commands;
 
 Both session adapters use the supervisor in the product application path, but real-agent and
 Windows-junction certification remain non-blocking compatibility evidence gaps rather than claims
