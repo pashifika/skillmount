@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::cli::CleanupInput;
 use crate::error::{AppError, ExitCategory};
 use crate::paths::resolve_operator_project_root;
-use crate::render::{os_value, path_value};
+use crate::render::{os_value, path_value, text_value};
 use crate::transaction::recover::{ExplicitCleanupReport, cleanup_explicit};
 
 use super::CommandOutcome;
@@ -98,6 +98,14 @@ fn render_report(project_root: Option<&Path>, report: &ExplicitCleanupReport) ->
 }
 
 fn render_cleanup_outcomes(output: &mut String, report: &ExplicitCleanupReport) {
+    for rejected in &report.unreadable {
+        let _ = writeln!(
+            output,
+            "[CORRUPT] {}: {}; every still-existing journal and every recorded path was left untouched, and no valid neighbor was cleaned",
+            path_value(&rejected.path, true),
+            text_value(&rejected.reason)
+        );
+    }
     if report.unreadable.is_empty() {
         for entry in &report.reconciled {
             let count = entry.report.removed.len();
@@ -116,11 +124,11 @@ fn render_cleanup_outcomes(output: &mut String, report: &ExplicitCleanupReport) 
                     output,
                     "  retained {}: {}",
                     path_value(&retained.path, true),
-                    retained.reason
+                    text_value(&retained.reason)
                 );
             }
             for error in &entry.report.errors {
-                let _ = writeln!(output, "  cleanup error: {error}");
+                let _ = writeln!(output, "  cleanup error: {}", text_value(error));
             }
             if let Some(retention) = &entry.report.journal_retained {
                 let _ = writeln!(
@@ -130,40 +138,31 @@ fn render_cleanup_outcomes(output: &mut String, report: &ExplicitCleanupReport) 
                 );
             }
         }
-        for active in &report.active {
-            let _ = writeln!(
-                output,
-                "[ACTIVE] transaction {} at {}: {}",
-                active.transaction,
-                path_value(&active.journal, true),
-                active.contention.describe()
-            );
-        }
-        for failure in &report.failures {
-            let _ = writeln!(
-                output,
-                "[FAILED] transaction {} at {}: {}; its journal and unverified entries were retained",
-                failure.transaction,
-                path_value(&failure.journal, true),
-                failure.error
-            );
-        }
-        for completed in &report.completed {
-            let _ = writeln!(
-                output,
-                "[TERMINAL] {} is completed and owns no pending cleanup; it was left unchanged",
-                path_value(completed, true)
-            );
-        }
-    } else {
-        for rejected in &report.unreadable {
-            let _ = writeln!(
-                output,
-                "[CORRUPT] {}: {}; every journal and recorded path was retained, and no valid neighbor was cleaned",
-                path_value(&rejected.path, true),
-                rejected.reason
-            );
-        }
+    }
+    for active in &report.active {
+        let _ = writeln!(
+            output,
+            "[ACTIVE] transaction {} at {}: {}",
+            active.transaction,
+            path_value(&active.journal, true),
+            text_value(&active.contention.describe())
+        );
+    }
+    for failure in &report.failures {
+        let _ = writeln!(
+            output,
+            "[FAILED] transaction {} at {}: {}; its journal and unverified entries were retained",
+            failure.transaction,
+            path_value(&failure.journal, true),
+            text_value(&failure.error.to_string())
+        );
+    }
+    for completed in &report.completed {
+        let _ = writeln!(
+            output,
+            "[TERMINAL] {} is completed and owns no pending cleanup; it was left unchanged",
+            path_value(completed, true)
+        );
     }
 }
 

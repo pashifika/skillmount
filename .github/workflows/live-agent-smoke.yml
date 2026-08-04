@@ -30,21 +30,27 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install pinned agents
-        run: npm install --global @openai/codex@0.146.0 @anthropic-ai/claude-code@2.1.220
+      - name: Fetch integrity-locked native agents
+        run: >-
+          python3 .github/scripts/prepare_live_agents.py
+          --platform macos-arm64
+          --output-dir "${{ runner.temp }}/live-agents"
       - name: Build native SkillMount
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           cargo build --locked --bin asm
       - name: Run real-agent discovery smoke
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: >-
           python3 .github/scripts/live_agent_smoke.py
           --asm target/debug/asm
           --link-mode symlink
           --wrapper-target aarch64-apple-darwin
+          --codex-bin "${{ runner.temp }}/live-agents/codex/bin/codex"
+          --claude-bin "${{ runner.temp }}/live-agents/claude/claude"
+          --agent-manifest "${{ runner.temp }}/live-agents/manifest.json"
           --evidence-dir "${{ runner.temp }}/live-agent-evidence"
       - name: Upload evidence
         if: ${{ always() }}
@@ -72,28 +78,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install pinned native agents
+      - name: Fetch integrity-locked native agents
         shell: pwsh
         run: |
-          npm install --global @openai/codex@0.146.0
-          & ([scriptblock]::Create((Invoke-RestMethod https://claude.ai/install.ps1))) 2.1.220
-      - name: Locate native agent executables
-        id: agents
-        shell: pwsh
-        run: |
-          $npmRoot = (& npm root --global).Trim()
-          $codex = Get-ChildItem -Path $npmRoot -Filter codex.exe -File -Recurse |
-            Where-Object { $_.FullName -like '*x86_64-pc-windows-msvc*bin*codex.exe' } |
-            Select-Object -First 1
-          if ($null -eq $codex) {
-            throw "The pinned Codex package did not contain its native x64 executable"
-          }
-          $claude = Join-Path $env:USERPROFILE '.local/bin/claude.exe'
-          if (-not (Test-Path -PathType Leaf $claude)) {
-            throw "The pinned Claude installer did not create $claude"
-          }
-          "codex=$($codex.FullName)" >> $env:GITHUB_OUTPUT
-          "claude=$claude" >> $env:GITHUB_OUTPUT
+          python .github/scripts/prepare_live_agents.py `
+            --platform windows-x64 `
+            --output-dir "$env:RUNNER_TEMP/live-agents"
       - name: Build native SkillMount target
         shell: bash
         run: |
@@ -102,15 +92,16 @@ jobs:
           cargo build --locked --target "${{ matrix.target }}" --bin asm
       - name: Run real-agent discovery smoke
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: >-
           python .github/scripts/live_agent_smoke.py
           --asm "target/${{ matrix.target }}/debug/asm.exe"
           --link-mode junction
           --wrapper-target "${{ matrix.target }}"
-          --codex-bin "${{ steps.agents.outputs.codex }}"
-          --claude-bin "${{ steps.agents.outputs.claude }}"
+          --codex-bin "${{ runner.temp }}/live-agents/codex/bin/codex.exe"
+          --claude-bin "${{ runner.temp }}/live-agents/claude/claude.exe"
+          --agent-manifest "${{ runner.temp }}/live-agents/manifest.json"
           --evidence-dir "${{ runner.temp }}/live-agent-evidence"
       - name: Upload evidence
         if: ${{ always() }}

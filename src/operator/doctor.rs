@@ -28,6 +28,18 @@ enum FindingSeverity {
     Unverified,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeFailureKind {
+    SymlinkPrivilegeUnavailable,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeCleanupOutcome {
+    VerifiedRemoved,
+    UnverifiedOrRetained,
+}
+
 impl FindingSeverity {
     const fn label(self) -> &'static str {
         match self {
@@ -150,6 +162,7 @@ fn probe_link_capability(mode: LinkMode, component: &str) -> DoctorFinding {
                 mode,
                 component,
                 &format!("cannot identify the isolated source directory: {error}"),
+                ProbeFailureKind::Other,
                 &cleanup,
             );
         }
@@ -162,12 +175,21 @@ fn probe_link_capability(mode: LinkMode, component: &str) -> DoctorFinding {
     }) {
         Ok(created) => Some(created),
         Err(error) => {
+            let failure = if matches!(
+                &error,
+                crate::error::LinkError::SymlinkPrivilegeUnavailable { .. }
+            ) {
+                ProbeFailureKind::SymlinkPrivilegeUnavailable
+            } else {
+                ProbeFailureKind::Other
+            };
             let cleanup =
                 cleanup_probe(&root, Some(&source), Some(&sentinel_path), None, &sentinel);
             return probe_failure(
                 mode,
                 component,
                 &format!("the isolated link probe failed: {error}"),
+                failure,
                 &cleanup,
             );
         }
@@ -197,6 +219,7 @@ fn probe_link_capability(mode: LinkMode, component: &str) -> DoctorFinding {
             mode,
             component,
             "the isolated link was created but verified cleanup did not complete",
+            ProbeFailureKind::Other,
             &cleanup,
         )
     }
@@ -227,6 +250,7 @@ fn create_probe_directories(
             mode,
             component,
             &format!("cannot restrict the isolated probe directory to its owner: {error}"),
+            ProbeFailureKind::Other,
             &cleanup,
         ));
     }
@@ -240,6 +264,7 @@ fn create_probe_directories(
                 mode,
                 component,
                 &format!("cannot create the isolated probe source: {error}"),
+                ProbeFailureKind::Other,
                 &cleanup,
             ));
         }
@@ -268,6 +293,7 @@ fn create_probe_sentinel(
                 mode,
                 component,
                 &format!("cannot create the isolated source sentinel: {error}"),
+                ProbeFailureKind::Other,
                 &cleanup,
             ));
         }
@@ -279,6 +305,7 @@ fn create_probe_sentinel(
             mode,
             component,
             &format!("cannot write the isolated source sentinel: {error}"),
+            ProbeFailureKind::Other,
             &cleanup,
         ));
     }
@@ -289,6 +316,7 @@ fn create_probe_sentinel(
             mode,
             component,
             &format!("cannot restrict the isolated source sentinel to its owner: {error}"),
+            ProbeFailureKind::Other,
             &cleanup,
         ));
     }
@@ -402,19 +430,21 @@ fn probe_failure(
     mode: LinkMode,
     component: &str,
     reason: &str,
+    failure: ProbeFailureKind,
     cleanup: &ProbeCleanup,
 ) -> DoctorFinding {
-    let severity = if cfg!(windows) && mode == LinkMode::Symlink && !cleanup.retained_root {
-        FindingSeverity::Warning
+    let cleanup_outcome = if cleanup.errors.is_empty() && !cleanup.retained_root {
+        ProbeCleanupOutcome::VerifiedRemoved
     } else {
-        FindingSeverity::Failure
+        ProbeCleanupOutcome::UnverifiedOrRetained
     };
+    let severity = probe_failure_severity(cfg!(windows), mode, failure, cleanup_outcome);
     let cleanup_detail = if cleanup.errors.is_empty() {
         "all verified probe entries were removed".to_owned()
     } else {
         cleanup.errors.join("; ")
     };
-    let next_action = if cfg!(windows) && mode == LinkMode::Symlink {
+    let next_action = if severity == FindingSeverity::Warning {
         "SkillMount will not elevate privileges; use an evidenced junction policy or enable symlink capability outside SkillMount"
     } else {
         "inspect any retained probe path before removing it manually"
@@ -424,6 +454,23 @@ fn probe_failure(
         component,
         format!("{reason}; {cleanup_detail}; {next_action}"),
     )
+}
+
+fn probe_failure_severity(
+    windows: bool,
+    mode: LinkMode,
+    failure: ProbeFailureKind,
+    cleanup: ProbeCleanupOutcome,
+) -> FindingSeverity {
+    if windows
+        && mode == LinkMode::Symlink
+        && failure == ProbeFailureKind::SymlinkPrivilegeUnavailable
+        && cleanup == ProbeCleanupOutcome::VerifiedRemoved
+    {
+        FindingSeverity::Warning
+    } else {
+        FindingSeverity::Failure
+    }
 }
 
 fn check_agent(
@@ -543,6 +590,14 @@ fn check_discovery(
             ));
             discovery_observations(&component, &snapshot, findings);
             check_resource_locks(&component, &snapshot, findings);
+            findings.push(DoctorFinding::new(
+                FindingSeverity::Unverified,
+                format!("{} live compatibility", context.agent.label()),
+                format!(
+                    "filesystem inspection does not prove that an authenticated pinned {} process loads mounted Skills; run the live-agent smoke workflow and record the result in docs/compatibility.md",
+                    context.agent.label()
+                ),
+            ));
         }
         Err(error) => findings.push(DoctorFinding::new(
             FindingSeverity::Failure,
@@ -759,8 +814,8 @@ fn render_report(project_root: &Path, findings: &[DoctorFinding]) -> String {
             output,
             "[{}] {}: {}",
             finding.severity.label(),
-            finding.component,
-            finding.message
+            crate::render::text_value(&finding.component),
+            crate::render::text_value(&finding.message)
         );
     }
     let count = |severity| {
@@ -778,4 +833,55 @@ fn render_report(project_root: &Path, findings: &[DoctorFinding]) -> String {
         count(FindingSeverity::Unverified)
     );
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FindingSeverity, ProbeCleanupOutcome, ProbeFailureKind, probe_failure_severity};
+    use crate::domain::LinkMode;
+
+    #[test]
+    fn only_a_clean_windows_symlink_privilege_refusal_is_a_warning() {
+        assert_eq!(
+            probe_failure_severity(
+                true,
+                LinkMode::Symlink,
+                ProbeFailureKind::SymlinkPrivilegeUnavailable,
+                ProbeCleanupOutcome::VerifiedRemoved,
+            ),
+            FindingSeverity::Warning
+        );
+
+        for (windows, mode, failure, cleanup) in [
+            (
+                false,
+                LinkMode::Symlink,
+                ProbeFailureKind::SymlinkPrivilegeUnavailable,
+                ProbeCleanupOutcome::VerifiedRemoved,
+            ),
+            (
+                true,
+                LinkMode::Junction,
+                ProbeFailureKind::SymlinkPrivilegeUnavailable,
+                ProbeCleanupOutcome::VerifiedRemoved,
+            ),
+            (
+                true,
+                LinkMode::Symlink,
+                ProbeFailureKind::Other,
+                ProbeCleanupOutcome::VerifiedRemoved,
+            ),
+            (
+                true,
+                LinkMode::Symlink,
+                ProbeFailureKind::SymlinkPrivilegeUnavailable,
+                ProbeCleanupOutcome::UnverifiedOrRetained,
+            ),
+        ] {
+            assert_eq!(
+                probe_failure_severity(windows, mode, failure, cleanup),
+                FindingSeverity::Failure
+            );
+        }
+    }
 }

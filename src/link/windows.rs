@@ -150,7 +150,7 @@ impl LinkBackend for WindowsBackend {
                 check_junction_eligibility(self, request, &source_canonical)?;
                 Self::create_junction(request, &source_canonical)
             }
-            SymlinkFailure::MissingPrivilege => Err(create_error(
+            SymlinkFailure::MissingPrivilege => Err(symlink_privilege_error(
                 request,
                 format!(
                     "creating a directory symbolic link needs Developer Mode or an elevated \
@@ -784,6 +784,14 @@ fn inspect_error(path: &Path, error: &io::Error) -> LinkError {
 
 fn create_error(request: &LinkRequest, reason: String) -> LinkError {
     LinkError::Create {
+        destination: request.staged_path.clone(),
+        source: request.source.clone(),
+        reason,
+    }
+}
+
+pub(super) fn symlink_privilege_error(request: &LinkRequest, reason: String) -> LinkError {
+    LinkError::SymlinkPrivilegeUnavailable {
         destination: request.staged_path.clone(),
         source: request.source.clone(),
         reason,

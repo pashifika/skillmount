@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
 
@@ -13,6 +13,7 @@ struct Fixture {
     project: PathBuf,
     home: PathBuf,
     state: PathBuf,
+    sources: PathBuf,
 }
 
 impl Fixture {
@@ -28,7 +29,8 @@ impl Fixture {
         let project = root.join("project");
         let home = root.join("home");
         let state = root.join("state");
-        for path in [&project, &home, &root.join("codex-home")] {
+        let sources = root.join("sources");
+        for path in [&project, &home, &sources, &root.join("codex-home")] {
             fs::create_dir_all(path).expect("operator fixture directory");
         }
         Self {
@@ -36,6 +38,7 @@ impl Fixture {
             project,
             home,
             state,
+            sources,
         }
     }
 
@@ -85,6 +88,42 @@ impl Fixture {
         command
     }
 
+    fn skill(&self, name: &str) {
+        let directory = self.sources.join(name);
+        fs::create_dir_all(&directory).expect("operator Skill fixture");
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {name} fixture\n---\n"),
+        )
+        .expect("operator Skill metadata");
+    }
+
+    fn session_command(&self, extra: &[&str]) -> Command {
+        let mut command = self.command();
+        command
+            .arg("codex")
+            .arg("--skills-dir")
+            .arg(&self.sources)
+            .arg("--project-root")
+            .arg(&self.project)
+            .arg("--cwd")
+            .arg(&self.project)
+            .arg("--agent-bin")
+            .arg(ASM)
+            .args(extra)
+            .arg("--")
+            .arg("exec")
+            .arg("fixture");
+        command
+    }
+
+    fn run_stopping_at(&self, boundary: &str, extra: &[&str]) -> Output {
+        self.session_command(extra)
+            .env("SKILLMOUNT_STOP_AT", boundary)
+            .output()
+            .expect("checkpoint session should run")
+    }
+
     fn path_agent_directory(&self) -> PathBuf {
         let directory = self.root.join("agent-path");
         fs::create_dir(&directory).expect("agent PATH fixture");
@@ -119,6 +158,9 @@ fn healthy_doctor_reports_versions_and_leaves_project_and_state_untouched() {
     assert!(rendered.contains("codex-cli 0.146.0"));
     assert!(rendered.contains("[PASS] claude executable"));
     assert!(rendered.contains("2.1.220 (Claude Code)"));
+    assert!(rendered.contains("[UNVERIFIED] codex live compatibility"));
+    assert!(rendered.contains("[UNVERIFIED] claude live compatibility"));
+    assert!(rendered.contains("docs/compatibility.md"));
     #[cfg(not(windows))]
     {
         assert!(rendered.contains("[PASS] symlink capability"));
@@ -294,6 +336,151 @@ fn corrupt_transaction_state_is_a_failing_read_only_doctor_finding() {
     assert!(!fixture.state.join("locks").exists());
 }
 
+#[test]
+fn doctor_classifies_free_transaction_states_without_mutation() {
+    struct Case<'a> {
+        label: &'a str,
+        boundary: Option<&'a str>,
+        extra: &'a [&'a str],
+        expected_severity: &'a str,
+        expected_action: &'a str,
+    }
+    let cases = [
+        Case {
+            label: "planned",
+            boundary: Some("journal-planned"),
+            extra: &[],
+            expected_severity: "[WARN] transaction state",
+            expected_action: "transaction is incomplete",
+        },
+        Case {
+            label: "supervising",
+            boundary: Some("journal-supervising"),
+            extra: &[],
+            expected_severity: "[UNVERIFIED] transaction state",
+            expected_action: "child process domain may still use these mounts",
+        },
+        Case {
+            label: "completed",
+            boundary: Some("journal-completed"),
+            extra: &[],
+            expected_severity: "[WARN] transaction state",
+            expected_action: "terminal completed journal remains",
+        },
+        Case {
+            label: "kept",
+            boundary: None,
+            extra: &["--keep-mounts"],
+            expected_severity: "[WARN] transaction state",
+            expected_action: "mounts were intentionally kept",
+        },
+    ];
+
+    for case in cases {
+        let Case {
+            label,
+            boundary,
+            extra,
+            expected_severity,
+            expected_action,
+        } = case;
+        let fixture = Fixture::new(&format!("doctor-{label}-journal"));
+        fixture.skill("alpha");
+        let session = boundary.map_or_else(
+            || {
+                fixture
+                    .session_command(extra)
+                    .output()
+                    .expect("kept session should run")
+            },
+            |boundary| fixture.run_stopping_at(boundary, extra),
+        );
+        assert!(
+            !session.status.success(),
+            "fixture child or checkpoint must stop"
+        );
+        let before = snapshot(&fixture.root);
+
+        let output = fixture.doctor();
+
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let rendered = String::from_utf8_lossy(&output.stdout);
+        assert!(rendered.contains(expected_severity), "{label}: {rendered}");
+        assert!(
+            rendered.contains(&format!(" is {label}:")),
+            "{label}: {rendered}"
+        );
+        assert!(rendered.contains(expected_action), "{label}: {rendered}");
+        assert_eq!(
+            snapshot(&fixture.root),
+            before,
+            "doctor mutated the {label} fixture"
+        );
+    }
+}
+
+#[test]
+fn doctor_reports_a_lock_held_active_transaction_without_mutation() {
+    let fixture = Fixture::new("doctor-active-journal");
+    fixture.skill("alpha");
+    let hold_log = fixture.root.join("hold.log");
+    let release = fixture.root.join("release");
+    let stderr = fs::File::create(&hold_log).expect("hold log");
+    let mut holder = fixture
+        .session_command(&[])
+        .env("SKILLMOUNT_HOLD_AT", "journal-active")
+        .env("SKILLMOUNT_HOLD_MS", "15000")
+        .env("SKILLMOUNT_HOLD_UNTIL", &release)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .expect("active fixture session");
+    wait_for(|| {
+        fs::read_to_string(&hold_log).is_ok_and(|text| {
+            text.split_inclusive('\n').any(|line| {
+                line.ends_with('\n') && line.contains("failure injection holding at journal-active")
+            })
+        })
+    });
+    let before = snapshot(&fixture.root);
+
+    let output = fixture.doctor();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("[WARN] transaction state"), "{rendered}");
+    assert!(
+        rendered.contains(" is active and its OS advisory lock is held"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("session is active and was left alone"),
+        "{rendered}"
+    );
+    assert_eq!(
+        snapshot(&fixture.root),
+        before,
+        "doctor mutated the active fixture"
+    );
+
+    fs::write(&release, b"release\n").expect("release active fixture");
+    let status = holder.wait().expect("active fixture should finish");
+    assert_eq!(
+        status.code(),
+        Some(64),
+        "{}",
+        fs::read_to_string(&hold_log).unwrap_or_default()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn doctor_renders_a_non_unicode_agent_path_reversibly() {
@@ -324,6 +511,58 @@ fn doctor_renders_a_non_unicode_agent_path_reversibly() {
     assert!(rendered.contains("\\xFF"));
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_escapes_line_and_terminal_controls_in_link_targets() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("doctor-control-target");
+    fs::create_dir(fixture.project.join(".agents")).expect(".agents fixture");
+    let target = OsString::from_vec(b"missing\n[PASS] forged\x1b]52;clipboard\x07".to_vec());
+    symlink(&target, fixture.project.join(".agents/skills"))
+        .expect("control-character discovery symlink");
+
+    let output = fixture.doctor();
+
+    assert_eq!(output.status.code(), Some(65));
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("\\u{A}"), "{rendered}");
+    assert!(rendered.contains("\\u{1B}"), "{rendered}");
+    assert!(rendered.contains("\\u{7}"), "{rendered}");
+    assert!(!rendered.contains("\n[PASS] forged"), "{rendered}");
+    assert!(!rendered.contains('\u{1B}'), "{rendered}");
+}
+
+#[test]
+fn top_level_doctor_errors_escape_controls_in_user_supplied_paths() {
+    let fixture = Fixture::new("doctor-control-project-error");
+    let missing = fixture
+        .root
+        .join("missing\n[PASS] forged\u{1B}]52;clipboard\u{7}");
+
+    let output = fixture
+        .command()
+        .arg("doctor")
+        .arg("--project-root")
+        .arg(missing)
+        .arg("--codex-bin")
+        .arg(ASM)
+        .arg("--claude-bin")
+        .arg(ASM)
+        .output()
+        .expect("doctor with an unavailable controlled path should run");
+
+    assert_eq!(output.status.code(), Some(66));
+    let rendered = String::from_utf8_lossy(&output.stderr);
+    assert!(rendered.contains("\\u{A}"), "{rendered}");
+    assert!(rendered.contains("\\u{1B}"), "{rendered}");
+    assert!(rendered.contains("\\u{7}"), "{rendered}");
+    assert!(!rendered.contains("\n[PASS] forged"), "{rendered}");
+    assert!(!rendered.contains('\u{1B}'), "{rendered}");
+}
+
 fn install_agent_alias(directory: &Path, name: &str) {
     #[cfg(unix)]
     std::os::unix::fs::symlink(ASM, directory.join(name)).expect("agent executable symlink");
@@ -332,6 +571,17 @@ fn install_agent_alias(directory: &Path, name: &str) {
     {
         fs::copy(ASM, directory.join(format!("{name}.exe"))).expect("agent executable copy");
     }
+}
+
+fn wait_for(condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if condition() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the spawned session did not reach its checkpoint");
 }
 
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, String> {

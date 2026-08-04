@@ -38,6 +38,10 @@ where
     if args.len() == 1 {
         args.push(OsString::from("--help"));
     }
+    let diagnostic_args = args
+        .iter()
+        .map(|argument| OsString::from(render::os_value(argument, true)))
+        .collect::<Vec<_>>();
     let invocation_cwd = match std::env::current_dir() {
         Ok(path) => path,
         Err(error) => {
@@ -49,7 +53,13 @@ where
 
     let command = match parse_command_from(args) {
         Ok(command) => command,
-        Err(error) => return report_clap_error(&error),
+        Err(error) => {
+            let original_kind = error.kind();
+            let Err(diagnostic_error) = parse_command_from(diagnostic_args) else {
+                return report_clap_fallback(original_kind);
+            };
+            return report_clap_error(&diagnostic_error, original_kind);
+        }
     };
     match execute(command, &invocation_cwd) {
         Ok(code) => ExitCode::from(code),
@@ -256,11 +266,11 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
         }
         return Err(error);
     }
-    if let Err(error) = emit(&session_output) {
+    if let Err(error) = emit_diagnostic(&session_output) {
         match transaction.cleanup_required() {
             Ok(report) => warn(&report.describe()),
             Err(cleanup_error) => warn(&[format!(
-                "writing the session summary failed and cleanup also failed: {cleanup_error}"
+                "writing the session diagnostics failed and cleanup also failed: {cleanup_error}"
             )]),
         }
         return Err(error);
@@ -432,16 +442,20 @@ fn report_supervision_diagnostics(decision: &crate::process::ExitDecision) {
         let _ = writeln!(
             io::stderr().lock(),
             "error: {}",
-            describe_supervision_diagnostic(primary)
+            render_supervision_diagnostic(primary)
         );
     }
     for secondary in &decision.secondary {
         let _ = writeln!(
             io::stderr().lock(),
             "warning: {}",
-            describe_supervision_diagnostic(secondary)
+            render_supervision_diagnostic(secondary)
         );
     }
+}
+
+fn render_supervision_diagnostic(diagnostic: &SupervisionDiagnostic) -> String {
+    render::text_value(&describe_supervision_diagnostic(diagnostic))
 }
 
 fn describe_supervision_diagnostic(diagnostic: &SupervisionDiagnostic) -> String {
@@ -536,14 +550,27 @@ fn reconcile_incomplete_transactions(
         return Err(unreadable_journals_error(&report.unreadable));
     }
     if !report.quarantined.is_empty() {
-        let recovery = cleanup_recovery_arguments(&context.project_root)
+        let recovery = report
+            .quarantined
             .iter()
             .enumerate()
-            .map(|(index, argument)| {
-                format!(
-                    "recovery argv[{index}] = {}",
-                    render::os_value(argument, true)
-                )
+            .flat_map(|(recovery_index, quarantined)| {
+                let mut lines = vec![format!(
+                    "recovery[{recovery_index}] journal = {}",
+                    render::path_value(&quarantined.journal, true)
+                )];
+                lines.extend(
+                    cleanup_recovery_arguments(&quarantined.project_root)
+                        .into_iter()
+                        .enumerate()
+                        .map(move |(argument_index, argument)| {
+                            format!(
+                                "recovery[{recovery_index}] argv[{argument_index}] = {}",
+                                render::os_value(&argument, true)
+                            )
+                        }),
+                );
+                lines
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -565,9 +592,9 @@ fn reconcile_incomplete_transactions(
 fn unreadable_journals_error(rejected: &[RejectedJournal]) -> AppError {
     AppError::Temporary(format!(
         "cannot start a mutating session while transaction state is unreadable or uses an \
-         unsupported schema; every journal was retained and no new plan was applied:\n{}\n\
-         inspect these files and account for every recorded path before moving or removing them, \
-         then retry",
+         unsupported schema; no cleanup was attempted and no new plan was applied:\n{}\n\
+         account for every recorded path that may belong to each reported journal before moving \
+         or removing any remaining state, then retry",
         rejected
             .iter()
             .map(|rejected| {
@@ -664,15 +691,30 @@ fn emit(text: &str) -> Result<(), AppError> {
     }
 }
 
+/// Writes wrapper-owned session diagnostics to stderr, preserving child stdout as a data stream.
+fn emit_diagnostic(text: &str) -> Result<(), AppError> {
+    match io::stderr().lock().write_all(text.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(AppError::Internal(format!(
+            "cannot write session diagnostics to standard error: {error}"
+        ))),
+    }
+}
+
 fn warn(messages: &[String]) {
     for message in messages {
-        let _ = writeln!(io::stderr().lock(), "warning: {message}");
+        let _ = writeln!(
+            io::stderr().lock(),
+            "warning: {}",
+            render::text_value(message)
+        );
     }
 }
 
 fn inform(messages: &[String]) {
     for message in messages {
-        let _ = writeln!(io::stderr().lock(), "info: {message}");
+        let _ = writeln!(io::stderr().lock(), "info: {}", render::text_value(message));
     }
 }
 
@@ -686,9 +728,9 @@ fn destination_stores(context: &crate::domain::RunContext) -> Vec<PathBuf> {
     }
 }
 
-fn report_clap_error(error: &clap::Error) -> ExitCode {
+fn report_clap_error(error: &clap::Error, original_kind: ErrorKind) -> ExitCode {
     let success = matches!(
-        error.kind(),
+        original_kind,
         ErrorKind::DisplayHelp
             | ErrorKind::DisplayVersion
             | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
@@ -706,9 +748,36 @@ fn report_clap_error(error: &clap::Error) -> ExitCode {
     }
 }
 
+fn report_clap_fallback(original_kind: ErrorKind) -> ExitCode {
+    let success = matches!(
+        original_kind,
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    );
+    let message = if success {
+        "command help could not be rendered safely"
+    } else {
+        "invalid command-line arguments could not be rendered safely"
+    };
+    let stream = if success {
+        &mut io::stdout().lock() as &mut dyn Write
+    } else {
+        &mut io::stderr().lock() as &mut dyn Write
+    };
+    if writeln!(stream, "{message}").is_err() {
+        return ExitCode::from(ExitCategory::Internal.code());
+    }
+    if success {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(ExitCategory::Usage.code())
+    }
+}
+
 fn report_error(error: &AppError) -> ExitCode {
     let mut stderr = io::stderr().lock();
-    let _ = writeln!(stderr, "error: {error}");
+    let _ = writeln!(stderr, "error: {}", render::text_value(&error.to_string()));
     for line in error_guidance(error) {
         let _ = writeln!(stderr, "{line}");
     }
@@ -734,7 +803,9 @@ fn error_guidance(error: &AppError) -> Vec<&'static str> {
             "state: the reported destination was not replaced; an ownership-checked rollback completed if mutation had already begun",
             "safe next action: inspect and account for the reported discovery entry before repairing it and retrying",
         ],
-        AppError::Link(LinkError::Create { .. }) => vec![
+        AppError::Link(
+            LinkError::Create { .. } | LinkError::SymlinkPrivilegeUnavailable { .. },
+        ) => vec![
             "state: the final destination was not replaced; the attempt may have written private transaction state or retained an unverified staged path for recovery",
             "safe next action: run asm doctor; on Windows, use --link-mode=junction only with passing compatibility evidence for this agent/version, or make symbolic links available without elevation",
         ],
@@ -747,7 +818,7 @@ fn error_guidance(error: &AppError) -> Vec<&'static str> {
             "safe next action: run asm doctor and account for every recorded path; do not edit or delete journal state merely to bypass the failure",
         ],
         AppError::MissingInput { .. } => vec![
-            "state: no selected Skill was mounted and no existing destination was replaced",
+            "state: the agent was not launched; if an earlier diagnostic names a retained path or journal, that mount may still exist",
             "safe next action: restore or correct the named input path, then retry",
         ],
         AppError::Filesystem(_) => vec![
@@ -762,11 +833,13 @@ fn error_guidance(error: &AppError) -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::{error_guidance, junction_policy_warning};
+    use super::{error_guidance, junction_policy_warning, render_supervision_diagnostic};
     use crate::domain::{AgentId, LinkMode};
     use crate::error::{AppError, LinkError};
+    use crate::process::{CleanupFailure, SupervisionDiagnostic};
 
     #[test]
     fn only_automatic_junction_fallback_emits_the_unverified_compatibility_warning() {
@@ -796,5 +869,39 @@ mod tests {
         assert!(guidance.contains("without elevation"));
         assert!(!guidance.contains("sudo"));
         assert!(!guidance.contains("runas"));
+    }
+
+    #[test]
+    fn missing_input_guidance_never_denies_a_preceding_cleanup_failure() {
+        let error = AppError::MissingInput {
+            path: PathBuf::from("agent"),
+            reason: "disappeared before spawn".to_owned(),
+        };
+
+        let guidance = error_guidance(&error).join("\n");
+
+        assert!(guidance.contains("the agent was not launched"));
+        assert!(guidance.contains("retained path or journal"));
+        assert!(!guidance.contains("no selected Skill was mounted"));
+    }
+
+    #[test]
+    fn supervision_diagnostics_escape_line_and_terminal_controls() {
+        let diagnostic = SupervisionDiagnostic::Cleanup(CleanupFailure {
+            reason: "cleanup failed\n[PASS] forged\u{1B}]52;clipboard\u{7}".to_owned(),
+            failed_paths: vec![PathBuf::from("mount\n[PASS] path")],
+            retained_journal: Some(PathBuf::from("journal\u{202E}txt")),
+            recovery_command: vec![OsString::from("cleanup\n[PASS] argv")],
+        });
+
+        let rendered = render_supervision_diagnostic(&diagnostic);
+
+        assert!(rendered.contains("\\u{A}"), "{rendered}");
+        assert!(rendered.contains("\\u{1B}"), "{rendered}");
+        assert!(rendered.contains("\\u{7}"), "{rendered}");
+        assert!(rendered.contains("\\u{202E}"), "{rendered}");
+        assert!(!rendered.contains("\n[PASS]"), "{rendered}");
+        assert!(!rendered.contains('\u{1B}'), "{rendered}");
+        assert!(!rendered.contains('\u{202E}'), "{rendered}");
     }
 }

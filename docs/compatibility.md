@@ -15,12 +15,12 @@ green CI job.
 |---|---|---|---|---|---|---|---|
 | Codex CLI | 0.146.0 | macOS / Apple Silicon | n/a | `codex --version` reports the adapter-pinned release | 2026-08-03 | observed | Local command output: `codex-cli 0.146.0` |
 | Claude Code | 2.1.220 | macOS / Apple Silicon | n/a | `claude --version` reports the adapter-pinned release | 2026-08-03 | observed | Local command output: `2.1.220 (Claude Code)` |
-| Codex CLI | 0.146.0 | macOS / Apple Silicon | directory symlink | Selected external Skill is discoverable in a real authenticated session | 2026-08-03 | unverified | Live smoke has not run |
-| Claude Code | 2.1.220 | macOS / Apple Silicon | directory symlink | Selected external Skill is discoverable in a real authenticated session | 2026-08-03 | unverified | Live smoke has not run |
-| Codex CLI | 0.146.0 | Windows / x86_64 | junction | Ordered overlay is discoverable after automatic junction fallback | 2026-08-03 | unverified | No native live-agent run recorded |
-| Codex CLI | 0.146.0 | Windows / i686 | junction | Ordered overlay is discoverable after automatic junction fallback | 2026-08-03 | unverified | No native live-agent run recorded |
-| Claude Code | 2.1.220 | Windows / x86_64 | junction | Ordered overlay is discoverable through the injected staging root | 2026-08-03 | unverified | No native live-agent run recorded |
-| Claude Code | 2.1.220 | Windows / i686 | junction | Ordered overlay is discoverable through the injected staging root | 2026-08-03 | unverified | No native live-agent run recorded |
+| Codex CLI | 0.146.0 | macOS / Apple Silicon | directory symlink | Rightmost overlay and non-shadowed base Skills are discoverable in a real authenticated session | 2026-08-03 | unverified | Live smoke has not run |
+| Claude Code | 2.1.220 | macOS / Apple Silicon | directory symlink | Rightmost overlay and non-shadowed base Skills are discoverable in a real authenticated session | 2026-08-03 | unverified | Live smoke has not run |
+| Codex CLI | 0.146.0 | Windows / x86_64 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-03 | unverified | No native live-agent run recorded |
+| Codex CLI | 0.146.0 | Windows / i686 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-03 | unverified | No native live-agent run recorded |
+| Claude Code | 2.1.220 | Windows / x86_64 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through the injected staging root | 2026-08-03 | unverified | No native live-agent run recorded |
+| Claude Code | 2.1.220 | Windows / i686 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through the injected staging root | 2026-08-03 | unverified | No native live-agent run recorded |
 
 ## Documentation review
 
@@ -40,11 +40,23 @@ documented behavior:
 The documentation does not establish real Windows junction discovery for either pinned agent.
 Those rows remain `unverified` until the manual smoke workflow records a native run.
 
-The manual workflow uses exact pinned releases. On Windows it passes the native x64 `codex.exe`
-contained in the pinned platform package and the exact-version native `claude.exe` installer
-result. npm `.cmd` shims are deliberately rejected because they would require implicit `cmd.exe`
-execution. The i686 row runs the 32-bit SkillMount wrapper against those native agents on the x64
-Windows runner; it does not claim a 32-bit agent build.
+The manual workflow fetches exact native npm platform packages with lifecycle scripts disabled,
+checks each archive against a committed SHA-512 SRI value, extracts only allowlisted regular-file
+runtime members, and binds the primary binary's SHA-256 digest into the evidence. On Windows it
+passes the native x64 `codex.exe` and `claude.exe` directly; npm `.cmd` shims are rejected because
+they would require implicit `cmd.exe` execution. The i686 row runs the 32-bit SkillMount wrapper
+against those native agents on the x64 Windows runner; it does not claim a 32-bit agent build.
+
+The harness removes credentials from version and doctor probes, gives Codex and Claude only their
+respective provider credential, and maps the repository's `OPENAI_API_KEY` secret to the
+non-interactive Codex `CODEX_API_KEY` child variable. It redacts every retained stream before
+writing it and scans the artifact for inherited secret values. It disables agent auto-updates and
+rechecks each native binary hash immediately before its credential-bearing launch. A timeout
+terminates the wrapper process tree through a Unix session boundary or a Windows kill-on-close Job
+Object, including when the wrapper parent has already exited. Missing or rejected authentication
+is `unverified`, not evidence that Skill discovery failed. The summary records the workflow run,
+repository revision, runner, binary hashes, exact versions, requested link kind, machine-output
+validity, winner/base observations, displaced-token absence, and journal residue count.
 
 ## Automatic junction policy
 

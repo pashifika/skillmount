@@ -162,6 +162,23 @@ pub fn load(path: &Path) -> Result<TransactionJournal, AppError> {
     decode(path, &document)
 }
 
+/// Reads and validates one journal when it still exists.
+///
+/// Recovery calls this only after taking the lock set recorded by an earlier scan. Another
+/// recovery may have retired or an external actor may have removed the journal before those locks
+/// were acquired. The caller must classify that absence without adopting stale actions; recovery
+/// treats it as unknown ownership and fails closed.
+///
+/// # Errors
+///
+/// Returns the same errors as [`load`] when the file exists but cannot be read or interpreted.
+pub fn load_if_exists(path: &Path) -> Result<Option<TransactionJournal>, AppError> {
+    let Some(document) = read_bounded_if_exists(path)? else {
+        return Ok(None);
+    };
+    decode(path, &document).map(Some)
+}
+
 /// Removes a journal whose transaction has reached a terminal state.
 ///
 /// # Errors
@@ -316,7 +333,31 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, AppError> {
             reason: error.to_string(),
         })
     };
-    let mut file = File::open(path).map_err(|error| unreadable(&error))?;
+    let file = File::open(path).map_err(|error| unreadable(&error))?;
+    read_opened_bounded(path, file)
+}
+
+fn read_bounded_if_exists(path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::Journal(JournalError::Unreadable {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            }));
+        }
+    };
+    read_opened_bounded(path, file).map(Some)
+}
+
+fn read_opened_bounded(path: &Path, mut file: File) -> Result<Vec<u8>, AppError> {
+    let unreadable = |error: &std::io::Error| {
+        AppError::Journal(JournalError::Unreadable {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        })
+    };
     let length = file.metadata().map_err(|error| unreadable(&error))?.len();
     if length > MAX_JOURNAL_BYTES {
         return Err(AppError::Journal(JournalError::Corrupt {

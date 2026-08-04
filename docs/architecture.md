@@ -71,8 +71,8 @@ behavior.
 | Session with `--keep-mounts` | After a child reaches the supervision boundary, records terminal kept state instead of removing owned entries. A pre-spawn compatibility or supervision-intent failure overrides the request and removes every verified owned entry. |
 | Session with `--no-recover` | Refuses when incomplete state requires reconciliation; otherwise continues through the normal mutating path. |
 | Session encountering a free `supervising` journal | Refuses with category 75 and retains every recorded mount because wrapper-lock release does not prove child-domain death. |
-| `asm doctor` | Resolves both pinned agents, inspects discovery links, visible-name conflicts, lock liveness, and journals, and runs isolated link-capability probes without SkillMount-owned mutation of project, agent, lock, or journal state. Version capture executes each selected trusted agent with literal `--version`; any failed check exits with category 65. |
-| `asm cleanup --project-root <path>` | Reconciles every non-terminal journal for the canonical project after taking that journal's complete recorded lock set. A `supervising` or kept journal is eligible only because invoking this command is the operator's assertion that its process domain is dead or its retained mounts may be released. |
+| `asm doctor` | Resolves both pinned agents, inspects discovery links, visible-name conflicts, lock liveness, and journals, and runs isolated link-capability probes without SkillMount-owned mutation of project, agent, lock, or journal state. Version capture executes each selected trusted agent with literal `--version`; authenticated real-agent loading remains an `unverified` finding until live evidence exists, and any failed check exits with category 65. |
+| `asm cleanup --project-root <path>` | Reconciles every structurally valid, non-completed journal for the canonical project after taking that journal's complete recorded lock set. A `supervising` or kept journal is eligible only because invoking this command is the operator's assertion that its process domain is dead or its retained mounts may be released. |
 | `asm cleanup --all` | Applies the same journal-by-journal engine across the bounded state store. Corrupt state blocks all mutation; live locks retain their journals and produce category 75; an ownership or filesystem failure takes category 73 precedence. |
 
 A mutating agent invocation returns the child's ordinary status after successful cleanup. A spawn
@@ -81,6 +81,12 @@ with category 73 and remains secondary evidence behind a failed child. Ordinary 
 to release every owned entry, while `--keep-mounts` retains them intentionally after the child
 boundary. A compatibility or supervision-intent failure before spawn forces verified cleanup;
 anything cleanup cannot prove safe to remove remains reported and journal-backed.
+
+Session stdout is exclusively the inherited child data stream. Wrapper-owned session summaries,
+warnings, informational lines, errors, and cleanup diagnostics use stderr, so Codex JSONL, Claude
+JSON, and ordinary pipelines receive no SkillMount prefix. Read-only plans and explicit operator
+reports remain stdout data. [ADR 0026](adr/0026-reserve-session-stdout-for-child-data.md) records
+this public stream boundary.
 
 ## Execution architecture
 
@@ -123,13 +129,18 @@ path:
 
 ```text
 bounded journal scan -> reject the whole operation on corrupt state -> canonical scope filter
-  -> per journal: acquire the complete recorded lock set -> adopt -> shared verified cleanup
+  -> per journal: claim missing keys into one shared complete lock set
+  -> reload and verify immutable fields
+  -> fail closed on disappearance or drift; otherwise classify the refreshed status
+  -> dependency-ordered adopt -> shared verified cleanup
 ```
 
 The command never trusts PID-looking holder text as liveness evidence and never treats a free lock
 as proof that a child is dead. Invoking explicit cleanup supplies that otherwise unavailable
 operator assertion for `supervising` journals. [ADR 0025](adr/0025-share-operator-inspection-and-recovery-engines.md)
-records these public contracts.
+records these public contracts. The scan is candidate discovery rather than mutation evidence:
+automatic and explicit recovery both reload each journal under its recorded locks before acting,
+as required by [ADR 0027](adr/0027-reload-recovery-journals-under-lock.md).
 
 The mutating path deliberately does not build a complete plan before locking:
 
@@ -517,7 +528,8 @@ The following are product rules rather than style preferences:
    plan, while the sealed platform backend executes only the link primitives it is asked for.
 11. Product behavior never edits Git state, escalates privileges, or weakens agent permissions.
 12. Child launch never uses a shell string, never reorders or duplicates injected/passthrough
-    arguments, and never replaces inherited standard streams with product-owned pipes.
+    arguments, and never replaces inherited standard streams with product-owned pipes. Session
+    stdout is reserved for child data; every wrapper-owned session diagnostic uses stderr.
 13. Exactly one orderly cleanup operation runs when no child was spawned or the managed process
     domain is proven dead. Uncertain liveness defers cleanup and preserves recovery evidence. A
     cleanup failure replaces only child success; otherwise it remains structured secondary
@@ -534,8 +546,11 @@ The following are product rules rather than style preferences:
     is run with literal `--version`; its own behavior is outside this non-mutation guarantee.
 16. Explicit cleanup scans only the bounded journal store, rejects the whole operation before
     mutation when any journal is corrupt, acquires each eligible journal's complete lock set, and
-    uses the same ownership-checked reverse-order cleanup as sessions and automatic recovery. A
-    live lock always wins over holder text; an ownership mismatch is retained and reported.
+    reloads and validates that journal under those locks before using the same ownership-checked
+    reverse-order cleanup as sessions and automatic recovery. Overlapping journals share one
+    claimed lock set and clean descendant owners before shared helper-directory owners. A journal
+    absent after its complete locks are held is unknown ownership and blocks mutation. A live lock
+    always wins over holder text; an ownership mismatch is retained and reported.
 
 Tests enforce the observable parts of these rules. Local comments retain the narrower preconditions
 needed to preserve them inside an implementation.
@@ -548,8 +563,9 @@ needed to preserve them inside an implementation.
 - catalog discovery, overlay selection, selected-winner validation, and provenance;
 - Codex and Claude discovery inspection and deterministic read-only planning;
 - `inspect`, `--dry-run`, concise/verbose plan rendering, and read-only regression tests;
-- normal session summaries, verbose scope/link/provenance and cleanup diagnostics, reversible
-  recovery arguments, and retained-path reporting;
+- normal session summaries on stderr, child-data-only session stdout, verbose
+  scope/link/provenance and cleanup diagnostics, reversible recovery arguments, and retained-path
+  reporting;
 - Unix/macOS symbolic-link and Windows symbolic-link/junction backends;
 - no-follow link-chain resolution, evidence-bearing atomic no-replace placement, Windows
   handle-bound mutation after initial observation, Unix ownership-checked pathname mutation under
@@ -571,7 +587,8 @@ needed to preserve them inside an implementation.
 - project-scoped and bounded all-state explicit cleanup through shared recovery and ownership
   engines, including active, corrupt, supervising, kept, replaced, missing, and mixed outcomes;
 - operator quick-start, lifecycle, recovery, safety, compatibility, and manual smoke-test
-  documentation, plus a dispatch-only native real-agent evidence workflow;
+  documentation, plus a dispatch-only native real-agent evidence workflow with integrity-locked
+  agent packages, provider-scoped credentials, redacted artifacts, and process-tree timeouts;
 - crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
 
 ### Reserved work
@@ -585,8 +602,9 @@ needed to preserve them inside an implementation.
 - versioned release packaging and publication.
 
 Both session adapters use the supervisor in the product application path, but real-agent and
-Windows-junction certification remain release-hardening gates rather than claims of fake-agent
-coverage. The manual workflow records evidence but does not update the compatibility table
+Windows-junction certification remain non-blocking compatibility evidence gaps rather than claims
+of fake-agent coverage. The deterministic fake-agent and native filesystem suites remain the
+release gate. The manual workflow records evidence but does not update the compatibility table
 automatically. Lock files still accumulate for distinct logical and physical lock keys. Owner
 sidecars are removed on ordinary release but may remain after a crash or failed removal; neither
 file's presence blocks or proves a live session.

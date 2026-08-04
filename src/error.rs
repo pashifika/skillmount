@@ -236,6 +236,20 @@ pub enum LinkError {
         /// Operating-system or eligibility failure.
         reason: String,
     },
+    /// Windows refused an explicitly requested directory symlink because the process lacks the
+    /// operating-system privilege required to create it.
+    ///
+    /// This remains distinct from an ordinary creation failure so operator diagnostics can offer
+    /// a non-elevating capability warning without weakening unrelated ACL, disk, or cleanup
+    /// failures into warnings.
+    SymlinkPrivilegeUnavailable {
+        /// Path the link was being created at.
+        destination: PathBuf,
+        /// Directory the link was to refer to.
+        source: PathBuf,
+        /// Original operating-system failure and capability guidance.
+        reason: String,
+    },
     /// A staged entry could not be placed at its destination.
     Place {
         /// Transaction-unique staged entry.
@@ -279,6 +293,11 @@ impl fmt::Display for LinkError {
                 write!(formatter, "cannot inspect {}: {reason}", path.display())
             }
             Self::Create {
+                destination,
+                source,
+                reason,
+            }
+            | Self::SymlinkPrivilegeUnavailable {
                 destination,
                 source,
                 reason,

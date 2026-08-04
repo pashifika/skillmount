@@ -431,8 +431,9 @@ pub trait LinkBackend: sealed::Sealed + Send + Sync {
     /// # Errors
     ///
     /// Returns [`LinkError::Create`] when the requested implementation is unavailable, ineligible,
-    /// or rejected by the host, and [`LinkError::Unsupported`] when the requested implementation
-    /// does not exist on this platform.
+    /// or rejected by the host, [`LinkError::SymlinkPrivilegeUnavailable`] when Windows denies the
+    /// privilege for an explicitly requested symbolic link, and [`LinkError::Unsupported`] when
+    /// the requested implementation does not exist on this platform.
     fn create_directory_link(&self, request: &LinkRequest) -> Result<CreatedLink, LinkError>;
 
     /// Creates one empty directory at `path`, which must not already exist.

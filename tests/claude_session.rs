@@ -173,20 +173,21 @@ fn three_source_overrides_count_once_normally_and_list_every_origin_verbose() {
         .expect("three-source Claude session");
 
     assert_success(&output);
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("Mounted 1 skill from 3 source arguments for Claude (1 source override)."),
-        "{stdout}"
+        stderr.contains("Mounted 1 skill from 3 source arguments for Claude (1 source override)."),
+        "{stderr}"
     );
     assert_eq!(
-        stdout.matches("(different source)").count(),
+        stderr.matches("(different source)").count(),
         2,
-        "both displaced origins remain visible: {stdout}"
+        "both displaced origins remain visible: {stderr}"
     );
     assert!(
-        stdout.contains("[3]"),
-        "the rightmost winner is identified: {stdout}"
+        stderr.contains("[3]"),
+        "the rightmost winner is identified: {stderr}"
     );
+    assert!(output.stdout.is_empty());
 }
 
 #[test]
@@ -219,14 +220,15 @@ fn selected_winners_are_visible_only_in_the_injected_root_then_cleanup_succeeds(
         .expect("asm should launch fake Claude");
 
     assert_success(&output);
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("Mounted 2 skills from 2 source arguments for Claude (1 source override)."),
-        "{stdout}"
+        stderr.contains("Mounted 2 skills from 2 source arguments for Claude (1 source override)."),
+        "{stderr}"
     );
-    assert!(stdout.contains("  alpha\n"), "{stdout}");
-    assert!(stdout.contains("  beta\n"), "{stdout}");
-    assert!(stdout.contains("Launching claude..."), "{stdout}");
+    assert!(stderr.contains("  alpha\n"), "{stderr}");
+    assert!(stderr.contains("  beta\n"), "{stderr}");
+    assert!(stderr.contains("Launching claude..."), "{stderr}");
+    assert!(output.stdout.is_empty());
     let record = fs::read_to_string(&fixture.record).expect("fake Claude launch record");
     let arguments = recorded_os_values(&record, "arg");
     assert_eq!(arguments[0], OsStr::new("--add-dir"));
@@ -283,6 +285,29 @@ fn selected_winners_are_visible_only_in_the_injected_root_then_cleanup_succeeds(
         assert_eq!(snapshot(&root), before, "{} changed", root.display());
     }
     assert!(project_skill.is_dir() && user_skill.is_dir() && extra_skill.is_dir());
+}
+
+#[test]
+fn machine_readable_claude_stdout_is_not_prefixed_by_wrapper_diagnostics() {
+    let fixture = Fixture::new("machine-readable-stdout");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+
+    let output = fixture
+        .command()
+        .arg("--")
+        .arg("prompt")
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "json")
+        .output()
+        .expect("machine-readable fake Claude session");
+
+    assert_success(&output);
+    assert_eq!(output.stdout, b"{\"type\":\"fixture\"}\n");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is one valid JSON value");
+    assert_eq!(parsed["type"], "fixture");
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostics.contains("Mounted 1 skill"), "{diagnostics}");
+    assert!(diagnostics.contains("Launching claude"), "{diagnostics}");
 }
 
 #[test]
@@ -579,7 +604,7 @@ fn inherited_streams_and_launch_cwd_reach_fake_claude_unchanged() {
     let output = child.wait_with_output().expect("asm should finish");
 
     assert_success(&output);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("fake-stdout:hello claude\n"));
+    assert_eq!(output.stdout, b"fake-stdout:hello claude\n");
     assert!(String::from_utf8_lossy(&output.stderr).contains("fake-stderr:hello claude\n"));
     let record = fs::read_to_string(&fixture.record).expect("fake Claude record");
     assert_eq!(recorded_bytes(&record, "stdin"), b"hello claude\n");

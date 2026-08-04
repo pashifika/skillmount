@@ -96,6 +96,10 @@ A mutating session performs these observable phases:
 6. After process-domain death is proved, remove entries in reverse order only when live kind,
    target, platform identity, and directory contents still match the journal.
 
+During a session, stdout is the child's data stream without a SkillMount prefix. Human-readable
+mount summaries, warnings, errors, and cleanup diagnostics use stderr, so agent JSON/JSONL output
+can be consumed directly.
+
 Successful ordinary cleanup is silent unless `--verbose` is requested. `--keep-mounts` reaches a
 terminal kept state instead. A crash before child exposure is recovered under the recorded locks;
 a journal that reached `supervising` is quarantined because wrapper death does not prove that an
@@ -110,11 +114,11 @@ asm doctor --project-root path/to/project \
 ```
 
 Doctor reports pass, warning, failure, and unverified findings for pinned agent versions,
-discovery layouts and link chains, visible conflicts, advisory locks, journals, and isolated link
-capability probes. Probe entries are created only in a unique owner-restricted temporary directory
-and never removed recursively. Links and directories require matching platform identity; the
-create-new source sentinel requires its regular-file kind and transaction-unique recorded bytes.
-Retained residue is always named.
+discovery layouts and link chains, visible conflicts, advisory locks, journals, isolated link
+capability probes, and the remaining authenticated real-agent compatibility gap. Probe entries are
+created only in a unique owner-restricted temporary directory and never removed recursively. Links
+and directories require matching platform identity; the create-new source sentinel requires its
+regular-file kind and transaction-unique recorded bytes. Retained residue is always named.
 
 Version capture starts the explicit or `PATH`-resolved agent directly with only `--version` and no
 shell. Treat that executable as trusted code: SkillMount does not change project state during its
@@ -154,11 +158,15 @@ matrix contains passing real-agent junction evidence for the pinned release, tha
 compatibility warning. Use `--link-mode symlink` to fail instead of falling back; SkillMount never
 elevates itself.
 
-The manual `Live agent smoke` workflow installs the pinned agents, runs three-source ordered
-overlay discovery on macOS symlinks and Windows x64/x86 junctions, and uploads versioned evidence.
-It requires external credentials, is not a pull-request gate, and never turns an absent run into a
-compatibility claim. Windows jobs resolve native `.exe` files explicitly; command shims that would
-need `cmd.exe` are not accepted.
+The manual `Live agent smoke` workflow verifies committed SHA-512 package integrity before
+extracting an allowlist of pinned native runtime files, then tests a three-source ordered overlay
+and a non-shadowed base Skill on macOS symlinks and explicit Windows x64/x86 junctions. It gives
+each agent only its own external credential, redacts retained output, kills the whole process tree
+on timeout even if the wrapper has already exited, and uploads versioned evidence with binary
+hashes and workflow provenance. The repository's OpenAI secret is exposed to the Codex child only
+as its non-interactive `CODEX_API_KEY`. The workflow is not a pull-request
+gate and never turns an absent or authentication-blocked run into a compatibility claim. Windows
+jobs use native `.exe` files; command shims that would need `cmd.exe` are not accepted.
 
 ## Development verification
 

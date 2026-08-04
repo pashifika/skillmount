@@ -63,6 +63,7 @@ fn run() -> io::Result<ExitCode> {
     let behavior = env::var(BEHAVIOR_ENV).unwrap_or_else(|_| "exit".to_owned());
     match behavior.as_str() {
         "exit" => recorder.event("ready")?,
+        "json" => write_json_line(&recorder)?,
         "streams" => use_inherited_streams(&recorder)?,
         "wait" => wait_for_interrupt(&recorder, Some(1))?,
         "ignore-first" => wait_for_interrupt(&recorder, Some(2))?,
@@ -100,6 +101,13 @@ fn run() -> io::Result<ExitCode> {
         .parse::<u8>()
         .map_err(invalid_data)?;
     Ok(ExitCode::from(code))
+}
+
+fn write_json_line(recorder: &Recorder) -> io::Result<()> {
+    recorder.event("ready")?;
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(b"{\"type\":\"fixture\"}\n")?;
+    stdout.flush()
 }
 
 fn report_version() -> io::Result<ExitCode> {

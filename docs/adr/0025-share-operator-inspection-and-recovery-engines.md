@@ -30,14 +30,18 @@ does not mutate the project while diagnosing it, but an operator-selected execut
 trusted code whose own side effects SkillMount cannot sandbox or characterize.
 
 `asm cleanup` SHALL enumerate only validated journal files from SkillMount's transaction state,
-take every recorded resource lock in the existing sorted order, and adopt the journal into the
-ordinary transaction cleanup path. A scoped invocation selects the canonical recorded project;
-`--all` is an explicit mutually exclusive global scope. Invoking cleanup is the operator's explicit
-assertion that selected `supervising` process domains should be dead and that selected `kept`
-mounts should be released; free locks are still required and PID text is never authority. Because
-every product transaction has at least one mutable discovery resource, a current-schema journal
-with no recorded locks is an impossible state and is rejected as corrupt rather than treating the
-empty set as proof that all locks are held.
+claim every recorded resource lock through immediate, internally sorted attempts, and adopt the
+journal into the ordinary transaction cleanup path. Immediate attempts never wait while an
+accumulated key is held. One invocation keeps successfully claimed keys in a shared set so
+overlapping journals never contend with locks that invocation already owns. It derives batch
+cleanup order from recorded ownership: a transaction owning a descendant entry is reconciled
+before the transaction owning its shared helper directory. A scoped invocation selects the
+canonical recorded project; `--all` is an explicit mutually exclusive global scope. Invoking
+cleanup is the operator's explicit assertion that selected `supervising` process domains should be
+dead and that selected `kept` mounts should be released; free locks are still required and PID text
+is never authority. Because every product transaction has at least one mutable discovery resource,
+a current-schema journal with no recorded locks is an impossible state and is rejected as corrupt
+rather than treating the empty set as proof that all locks are held.
 
 Unreadable journals remain a global fail-closed condition and prevent every cleanup mutation.
 Active or unreadable state returns temporary status 75, ownership-retained or filesystem cleanup
@@ -67,6 +71,8 @@ command string.
 - A single corrupt journal blocks cleanup of unrelated valid state until it is accounted for. This
   is deliberately less available than partial cleanup and preserves the existing unknown-ownership
   invariant.
+- Multiple valid kept journals that share discovery helpers are claimed as one lock batch and
+  converge in one cleanup pass without misclassifying this invocation's own lock as active.
 - Doctor can create temporary probe entries outside the project. It must report any residue it
   cannot ownership-verify and never remove recursively.
 - Doctor's own observation and probes are non-destructive to the project, but version capture runs
@@ -82,8 +88,8 @@ command string.
 - `src/lock/tests.rs::advisory_observation_is_read_only_and_uses_the_kernel_lock_as_liveness`
   proves doctor lock observation creates no files and ignores stale lock-file existence.
 - `tests/transaction.rs` exercises scoped/all cleanup, active locks, kept and supervising journals,
-  corrupt-state fail-closed behavior, ownership mismatches, and project boundaries through real
-  `asm` processes.
+  overlapping kept journals and helper ownership, corrupt-state fail-closed behavior, ownership
+  mismatches, and project boundaries through real `asm` processes.
 - `rasen/changes/add-operator-diagnostics-and-hardening/evidence/test-matrix-audit.md` maps the
   remaining source-design and platform evidence, including native tests that cannot be inferred
   from a portable run.

@@ -301,15 +301,16 @@ fn selected_skills_stay_mounted_while_fake_codex_runs_then_cleanup_succeeds() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("Mounted 1 skill from 1 source argument for Codex (0 source overrides)."),
-        "{stdout}"
+        stderr.contains("Mounted 1 skill from 1 source argument for Codex (0 source overrides)."),
+        "{stderr}"
     );
-    assert!(stdout.contains("  alpha\n"), "{stdout}");
-    assert!(stdout.contains("Launching codex..."), "{stdout}");
+    assert!(stderr.contains("  alpha\n"), "{stderr}");
+    assert!(stderr.contains("Launching codex..."), "{stderr}");
+    assert!(output.stdout.is_empty(), "child stdout stays data-only");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("discovery does not grant sandbox access"),
+        stderr.contains("discovery does not grant sandbox access"),
         "external bundled-resource access must be explained"
     );
     let record = fs::read_to_string(&fixture.record).expect("fake Codex launch record");
@@ -383,6 +384,27 @@ fn selected_skills_stay_mounted_while_fake_codex_runs_then_cleanup_succeeds() {
 }
 
 #[test]
+fn machine_readable_codex_stdout_is_not_prefixed_by_wrapper_diagnostics() {
+    let fixture = Fixture::new("machine-readable-stdout");
+    fixture.skill("alpha");
+
+    let output = fixture
+        .command()
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "json")
+        .output()
+        .expect("machine-readable fake Codex session");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"{\"type\":\"fixture\"}\n");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is one valid JSON value");
+    assert_eq!(parsed["type"], "fixture");
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostics.contains("Mounted 1 skill"), "{diagnostics}");
+    assert!(diagnostics.contains("Launching codex"), "{diagnostics}");
+}
+
+#[test]
 fn three_source_codex_overlay_mounts_the_rightmost_winner_and_lists_every_origin() {
     let fixture = Fixture::new("three-source-overlay");
     fixture.skill_in(&fixture.sources, "alpha", "first");
@@ -411,13 +433,14 @@ fn three_source_codex_overlay_mounts_the_rightmost_winner_and_lists_every_origin
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("Mounted 1 skill from 3 source arguments for Codex (1 source override)."),
-        "{stdout}"
+        stderr.contains("Mounted 1 skill from 3 source arguments for Codex (1 source override)."),
+        "{stderr}"
     );
-    assert_eq!(stdout.matches("(different source)").count(), 2, "{stdout}");
-    assert!(stdout.contains("[3]"), "{stdout}");
+    assert_eq!(stderr.matches("(different source)").count(), 2, "{stderr}");
+    assert!(stderr.contains("[3]"), "{stderr}");
+    assert!(output.stdout.is_empty());
     let record = fs::read_to_string(&fixture.record).expect("fake Codex launch record");
     assert_eq!(
         fs::canonicalize(PathBuf::from(recorded_os(&record, "visible-target")))
@@ -459,11 +482,11 @@ fn current_discovery_link_and_project_owned_skill_are_preserved() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("link[0]"), "{stdout}");
-    assert!(stdout.contains("terminal"), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("link[0]"), "{stderr}");
+    assert!(stderr.contains("terminal"), "{stderr}");
     assert!(stderr.contains("info: cleanup removed"), "{stderr}");
+    assert!(output.stdout.is_empty());
     let discovery_after = backend
         .inspect_no_follow(&discovery)
         .expect("reinspect fixture discovery link");
@@ -806,7 +829,7 @@ fn a_supervising_journal_is_quarantined_while_an_orphan_descendant_remains_alive
         stderr.contains("quarantined mounts were not changed and remain journal-backed"),
         "{stderr}"
     );
-    assert!(stderr.contains("recovery argv[1] = cleanup"), "{stderr}");
+    assert!(stderr.contains("recovery[0] argv[1] = cleanup"), "{stderr}");
     assert!(
         exists(&mounted),
         "automatic recovery must not remove the live mount"
