@@ -442,6 +442,135 @@ class PackageFolderTests(unittest.TestCase):
             empty.mkdir()
             self.assertEqual(harness.listing(empty), ())
 
+    def test_a_download_sidecar_is_chocolatey_bookkeeping(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = package_folder(
+                Path(temporary), SKILLMOUNT, extra=("release-archive.zip.txt",)
+            )
+            findings = harness.package_folder_findings(
+                harness.listing(folder), SKILLMOUNT, version=VERSION
+            )
+            self.assertEqual([item.check for item in findings if not item.ok], [])
+
+    def test_only_a_root_archive_sidecar_counts_as_bookkeeping(self) -> None:
+        self.assertEqual(
+            harness.download_sidecar_names(
+                (
+                    "release-archive.zip.txt",
+                    "skillmount-v0.2.0.tar.gz.txt",
+                    "tools/release-archive.zip.txt",
+                    "notes.txt",
+                    "release-archive.zip",
+                )
+            ),
+            ("release-archive.zip.txt", "skillmount-v0.2.0.tar.gz.txt"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = package_folder(Path(temporary), SKILLMOUNT, extra=("notes.txt",))
+            findings = harness.package_folder_findings(
+                harness.listing(folder), SKILLMOUNT, version=VERSION
+            )
+            detail = next(item.detail for item in findings if item.check == "package-file-set")
+            self.assertIn("notes.txt", detail)
+
+
+class DownloadProvenanceTests(unittest.TestCase):
+    """The extraction sidecar states which architecture's archive was really installed."""
+
+    X64_ROOT = release.asset_stem(TAG, harness.windows_target("x64"))
+    X86_ROOT = release.asset_stem(TAG, harness.windows_target("x86"))
+
+    def listing_text(self, root: str) -> str:
+        """Return an extraction listing shaped like `Get-ChocolateyUnzip` writes it."""
+
+        staging = r"C:\Users\runner\AppData\Local\Temp\chocolatey\skillmount-staging\extracted"
+        return "".join(
+            f"{staging}\\{root}\\{member}\n"
+            for member in ("asm.exe", "skillmount.exe", "LICENSE-MIT", "VERSION")
+        )
+
+    def judge(
+        self, sidecars: tuple[tuple[str, str], ...], *, architecture: str = "x64"
+    ) -> tuple[harness.Finding, ...]:
+        """Judge one sidecar set for one requested architecture."""
+
+        expected = self.X64_ROOT if architecture == "x64" else self.X86_ROOT
+        other = self.X86_ROOT if architecture == "x64" else self.X64_ROOT
+        return harness.download_provenance_findings(
+            sidecars,
+            architecture=architecture,
+            expected_reference=expected,
+            other_reference=other,
+        )
+
+    def test_the_expected_architecture_archive_satisfies_both_checks(self) -> None:
+        findings = self.judge(
+            (("release-archive.zip.txt", self.listing_text(self.X64_ROOT)),)
+        )
+        self.assertEqual([item.check for item in findings if not item.ok], [])
+        self.assertEqual(
+            [item.check for item in findings],
+            ["download-provenance", "download-provenance-architecture"],
+        )
+
+    def test_the_pair_architecture_archive_is_rejected(self) -> None:
+        findings = self.judge(
+            (("release-archive.zip.txt", self.listing_text(self.X86_ROOT)),)
+        )
+        failed = {item.check for item in findings if not item.ok}
+        self.assertEqual(failed, {"download-provenance", "download-provenance-architecture"})
+        self.assertIn(self.X86_ROOT, next(item.detail for item in findings if not item.ok))
+
+    def test_an_x86_selection_requires_the_x86_archive(self) -> None:
+        good = self.judge(
+            (("release-archive.zip.txt", self.listing_text(self.X86_ROOT)),), architecture="x86"
+        )
+        self.assertEqual([item.check for item in good if not item.ok], [])
+        bad = self.judge(
+            (("release-archive.zip.txt", self.listing_text(self.X64_ROOT)),), architecture="x86"
+        )
+        self.assertEqual(
+            {item.check for item in bad if not item.ok},
+            {"download-provenance", "download-provenance-architecture"},
+        )
+
+    def test_an_unrelated_archive_fails_the_provenance_check_alone(self) -> None:
+        findings = self.judge(
+            (("release-archive.zip.txt", self.listing_text("skillmount-v0.2.0-tampered")),)
+        )
+        self.assertEqual(
+            {item.check for item in findings if not item.ok}, {"download-provenance"}
+        )
+
+    def test_a_missing_or_empty_sidecar_records_an_explicit_skip(self) -> None:
+        for sidecars in ((), (("release-archive.zip.txt", "\n"),)):
+            with self.subTest(sidecars=sidecars):
+                findings = self.judge(sidecars)
+                self.assertEqual(len(findings), 1)
+                self.assertTrue(findings[0].ok)
+                self.assertIn("skipped", findings[0].detail)
+                self.assertIn(self.X64_ROOT, findings[0].detail)
+
+    def test_sidecar_text_is_read_from_the_package_folder_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = package_folder(
+                Path(temporary),
+                SKILLMOUNT,
+                extra=("release-archive.zip.txt", "tools/release-archive.zip.txt"),
+            )
+            names = harness.listing(folder)
+            self.assertEqual(
+                harness.read_download_sidecars(folder, names),
+                (("release-archive.zip.txt", "release-archive.zip.txt\n"),),
+            )
+            self.assertEqual(harness.read_download_sidecars(folder, None), ())
+
+    def test_the_paired_architecture_is_named_in_every_message(self) -> None:
+        self.assertEqual(harness.other_architecture("x64"), "x86")
+        self.assertEqual(harness.other_architecture("x86"), "x64")
+        with self.assertRaisesRegex(harness.ChocolateyAcceptanceError, "unsupported architecture"):
+            harness.other_architecture("arm64")
+
 
 class VersionMetadataTests(unittest.TestCase):
     """The retained release metadata proves which build the package kept."""
@@ -459,6 +588,32 @@ class VersionMetadataTests(unittest.TestCase):
         )
         failed = {item.check for item in findings if not item.ok}
         self.assertEqual(failed, {"version-metadata", "version-metadata-not-stale"})
+
+    def test_staleness_is_asserted_only_against_a_different_prior_release(self) -> None:
+        self.assertEqual(
+            harness.staleness_markers(
+                prior_version=VERSION, prior_tag=TAG, version=VERSION, tag=TAG
+            ),
+            (),
+        )
+        markers = harness.staleness_markers(
+            prior_version="0.1.0", prior_tag="v0.1.0", version=VERSION, tag=TAG
+        )
+        self.assertEqual(markers, ("0.1.0", "v0.1.0"))
+        target = harness.windows_target("x64")
+        expected = release.version_metadata(VERSION, TAG, target, COMMIT)
+        checks = [
+            item.check for item in harness.version_file_findings(expected, expected=expected)
+        ]
+        self.assertNotIn("version-metadata-not-stale", checks)
+        stale = harness.version_file_findings(
+            release.version_metadata("0.1.0", "v0.1.0", target, COMMIT),
+            expected=expected,
+            forbidden=markers,
+        )
+        self.assertIn(
+            "version-metadata-not-stale", {item.check for item in stale if not item.ok}
+        )
 
     def test_an_absent_metadata_file_fails_closed(self) -> None:
         findings = harness.version_file_findings(None, expected=b"x")
@@ -564,19 +719,18 @@ class ShimResolutionTests(unittest.TestCase):
             failed, {"shim-resolves-once", "shim-directory", "shim-target-inside-package"}
         )
 
-    def test_a_pair_command_shim_owned_by_this_package_is_rejected(self) -> None:
-        findings = harness.shim_findings(
-            SKILLMOUNT,
-            selected_where=f"{BIN}\\skillmount.exe\n",
-            other_where=f"{LIB}\\skillmount\\tools\\asm.exe\n",
-            shim_target=rf"{LIB}\skillmount\tools\skillmount.exe",
-            package_folder=rf"{LIB}\skillmount",
-            shim_directory=BIN,
+    def test_product_shims_enumerate_only_the_command_directory(self) -> None:
+        self.assertEqual(
+            harness.product_shims(
+                SKILLMOUNT,
+                selected_where=f"{BIN}\\skillmount.exe\nC:\\tools\\skillmount.exe\n",
+                other_where=f"{BIN}\\asm.exe\n{BIN.lower()}\\ASM.EXE\n",
+                shim_directory=BIN,
+            ),
+            (rf"{BIN}\asm.exe", rf"{BIN}\skillmount.exe"),
         )
-        failed = {item.check for item in findings if not item.ok}
-        self.assertEqual(failed, {"pair-command-not-owned"})
 
-    def test_a_pair_command_owned_by_its_own_package_is_accepted(self) -> None:
+    def test_a_foreign_pair_member_shim_is_rejected(self) -> None:
         findings = harness.shim_findings(
             SKILLMOUNT,
             selected_where=f"{BIN}\\skillmount.exe\n",
@@ -585,7 +739,61 @@ class ShimResolutionTests(unittest.TestCase):
             package_folder=rf"{LIB}\skillmount",
             shim_directory=BIN,
         )
+        failed = {item.check for item in findings if not item.ok}
+        self.assertEqual(failed, set(harness.EXTRA_SHIM_REJECTIONS))
+        detail = next(item.detail for item in findings if item.check == "pair-shim-absent")
+        self.assertIn(repr(rf"{BIN}\asm.exe"), detail)
+        self.assertIn("only the skillmount package is installed", detail)
+
+    def test_a_foreign_pair_member_shim_is_rejected_for_either_package(self) -> None:
+        findings = harness.shim_findings(
+            ASM,
+            selected_where=f"{BIN}\\asm.exe\n",
+            other_where=f"{BIN}\\skillmount.exe\n",
+            shim_target=rf"{LIB}\skillmount-asm\tools\asm.exe",
+            package_folder=rf"{LIB}\skillmount-asm",
+            shim_directory=BIN,
+        )
+        failed = {item.check for item in findings if not item.ok}
+        self.assertEqual(failed, set(harness.EXTRA_SHIM_REJECTIONS))
+
+    def test_a_shim_target_outside_the_owning_package_is_rejected(self) -> None:
+        findings = harness.shim_findings(
+            SKILLMOUNT,
+            selected_where=f"{BIN}\\skillmount.exe\n",
+            other_where="INFO: Could not find files for the given pattern(s).\n",
+            shim_target=rf"{LIB}\skillmount-asm\tools\skillmount.exe",
+            package_folder=rf"{LIB}\skillmount",
+            shim_directory=BIN,
+        )
+        failed = {item.check for item in findings if not item.ok}
+        self.assertEqual(failed, {"shim-target-inside-package"})
+
+    def test_a_co_installed_pair_may_expose_both_commands(self) -> None:
+        findings = harness.shim_findings(
+            SKILLMOUNT,
+            selected_where=f"{BIN}\\skillmount.exe\n",
+            other_where=f"{BIN}\\asm.exe\n",
+            shim_target=rf"{LIB}\skillmount\tools\skillmount.exe",
+            package_folder=rf"{LIB}\skillmount",
+            shim_directory=BIN,
+            pair_installed=True,
+        )
         self.assertEqual([item.check for item in findings if not item.ok], [])
+        self.assertNotIn("pair-shim-absent", {item.check for item in findings})
+
+    def test_a_co_installed_pair_missing_one_command_is_rejected(self) -> None:
+        findings = harness.shim_findings(
+            SKILLMOUNT,
+            selected_where=f"{BIN}\\skillmount.exe\n",
+            other_where="INFO: Could not find files for the given pattern(s).\n",
+            shim_target=rf"{LIB}\skillmount\tools\skillmount.exe",
+            package_folder=rf"{LIB}\skillmount",
+            shim_directory=BIN,
+            pair_installed=True,
+        )
+        failed = {item.check for item in findings if not item.ok}
+        self.assertEqual(failed, {"product-shim-count"})
 
     def test_an_unresolvable_shim_target_fails_closed(self) -> None:
         findings = harness.shim_findings(
@@ -632,8 +840,22 @@ class ShimResolutionTests(unittest.TestCase):
         self.assertFalse(missing[0].ok)
 
 
+HELP_OUTPUT = (
+    f"{release.PRODUCT_NAME} — session-scoped Agent Skills catalog resolver and CLI launcher\n"
+    "\n"
+    "Usage: <asm|skillmount> <COMMAND>\n"
+    "\n"
+    "Commands:\n"
+    "  codex        Run a Codex session with the selected Skills\n"
+    "  claude       Resolve Skills for a future Claude Code session\n"
+    "\n"
+    "Options:\n"
+    "  -h, --help     Print help\n"
+)
+
+
 class CommandOutputTests(unittest.TestCase):
-    """Version and help output prove which command the package installed."""
+    """Version and help output prove the installed version, never the invoked file name."""
 
     def test_exactly_one_version_is_required(self) -> None:
         self.assertEqual(harness.parse_reported_version("skillmount 0.2.0\n"), "0.2.0")
@@ -642,26 +864,32 @@ class CommandOutputTests(unittest.TestCase):
             with self.assertRaises(harness.ChocolateyAcceptanceError):
                 harness.parse_reported_version(text)
 
-    def test_command_mentions_respect_word_boundaries(self) -> None:
-        self.assertTrue(harness.mentions_command("skillmount 0.2.0", "skillmount"))
-        self.assertFalse(harness.mentions_command("skillmount-asm 0.2.0", "skillmount"))
-        self.assertFalse(harness.mentions_command("skillmount-asm 0.2.0", "asm"))
-        self.assertTrue(harness.mentions_command("Usage: asm [OPTIONS]", "asm"))
+    def test_the_product_name_version_line_satisfies_both_packages(self) -> None:
+        for selection in (SKILLMOUNT, ASM):
+            with self.subTest(package_id=selection.package_id):
+                findings = harness.version_findings(
+                    harness.CommandResult(
+                        (selection.command, "--version"),
+                        0,
+                        f"{release.PRODUCT_NAME} {VERSION}\n",
+                    ),
+                    selection,
+                    expected_version=VERSION,
+                )
+                self.assertEqual([item.check for item in findings if not item.ok], [])
+                self.assertEqual(
+                    [item.check for item in findings], ["version-status", "reported-version"]
+                )
 
-    def test_version_findings_judge_status_value_and_command(self) -> None:
-        good = harness.version_findings(
-            harness.CommandResult(("asm", "--version"), 0, "asm 0.2.0\n"),
-            ASM,
-            expected_version=VERSION,
-        )
-        self.assertEqual([item.check for item in good if not item.ok], [])
+    def test_version_findings_judge_status_and_the_reported_version(self) -> None:
         wrong = harness.version_findings(
-            harness.CommandResult(("asm", "--version"), 0, "skillmount 0.1.0\n"),
+            harness.CommandResult(("asm", "--version"), 0, f"{release.PRODUCT_NAME} 0.1.0\n"),
             ASM,
             expected_version=VERSION,
         )
         failed = {item.check for item in wrong if not item.ok}
-        self.assertEqual(failed, {"reported-version", "reported-command"})
+        self.assertEqual(failed, {"reported-version"})
+        self.assertIn("0.1.0", next(item.detail for item in wrong if not item.ok))
         broken = harness.version_findings(
             harness.CommandResult(("asm", "--version"), 9, "boom\n"), ASM, expected_version=VERSION
         )
@@ -669,17 +897,196 @@ class CommandOutputTests(unittest.TestCase):
             [item.check for item in broken if not item.ok], ["version-status", "reported-version"]
         )
 
-    def test_help_findings_require_the_selected_command_alone(self) -> None:
-        good = harness.help_findings(
-            harness.CommandResult(("skillmount", "--help"), 0, "Usage: skillmount [OPTIONS]\n"),
-            SKILLMOUNT,
+    def test_the_shared_usage_line_is_derived_from_the_command_pair(self) -> None:
+        self.assertEqual(harness.shared_usage_line(SKILLMOUNT), "Usage: <asm|skillmount> <COMMAND>")
+        self.assertEqual(harness.shared_usage_line(ASM), harness.shared_usage_line(SKILLMOUNT))
+        self.assertEqual(harness.help_commands(HELP_OUTPUT), ("codex", "claude"))
+        self.assertEqual(harness.help_commands("Usage: x\n"), ())
+
+    def test_help_naming_both_commands_satisfies_every_check(self) -> None:
+        for selection in (SKILLMOUNT, ASM):
+            with self.subTest(package_id=selection.package_id):
+                findings = harness.help_findings(
+                    harness.CommandResult((selection.command, "--help"), 0, HELP_OUTPUT), selection
+                )
+                self.assertEqual([item.check for item in findings if not item.ok], [])
+                self.assertEqual(
+                    [item.check for item in findings],
+                    ["help-status", "help-usage-line", "help-command-list", "help-equivalent"],
+                )
+                skipped = next(item for item in findings if item.check == "help-equivalent")
+                self.assertIn("skipped", skipped.detail)
+                self.assertIn(selection.other_command, skipped.detail)
+
+    def test_the_pair_members_help_output_must_be_equivalent(self) -> None:
+        equivalent = harness.help_findings(
+            harness.CommandResult(("asm", "--help"), 0, HELP_OUTPUT),
+            ASM,
+            pair_output=HELP_OUTPUT.replace("\n", "\r\n"),
         )
-        self.assertEqual([item.check for item in good if not item.ok], [])
-        leaked = harness.help_findings(
+        self.assertEqual([item.check for item in equivalent if not item.ok], [])
+        divergent = harness.help_findings(
+            harness.CommandResult(("asm", "--help"), 0, HELP_OUTPUT),
+            ASM,
+            pair_output=HELP_OUTPUT.replace("  claude ", "  gemini "),
+        )
+        failed = {item.check for item in divergent if not item.ok}
+        self.assertEqual(failed, {"help-equivalent"})
+
+    def test_help_output_missing_its_usage_line_or_command_list_is_rejected(self) -> None:
+        findings = harness.help_findings(
             harness.CommandResult(("skillmount", "--help"), 1, "run asm instead\n"), SKILLMOUNT
         )
-        failed = {item.check for item in leaked if not item.ok}
-        self.assertEqual(failed, {"help-status", "help-names-command", "help-omits-pair-command"})
+        failed = {item.check for item in findings if not item.ok}
+        self.assertEqual(failed, {"help-status", "help-usage-line", "help-command-list"})
+        wrapped = harness.help_findings(
+            harness.CommandResult(
+                ("skillmount", "--help"), 0, HELP_OUTPUT.replace("<asm|skillmount>", "skillmount")
+            ),
+            SKILLMOUNT,
+        )
+        self.assertEqual(
+            {item.check for item in wrapped if not item.ok}, {"help-usage-line"}
+        )
+
+
+class FakeGateway:
+    """The Chocolatey boundary one phase judge touches, with recorded command output."""
+
+    def __init__(self, outputs: dict[str, str]) -> None:
+        self.root = Path(CHOCO_ROOT)
+        self.outputs = outputs
+        self.invoked: list[tuple[str, ...]] = []
+
+    def command_output(self, executable: Path, arguments: tuple[str, ...]) -> harness.CommandResult:
+        """Return the recorded output for one installed product command."""
+
+        argv = (str(executable), *arguments)
+        self.invoked.append(argv)
+        return harness.CommandResult(argv, 0, self.outputs[Path(executable).name])
+
+
+@dataclass(frozen=True)
+class PhaseInputs:
+    """The package-inputs fields a phase judge reads."""
+
+    version: str = VERSION
+    tag: str = TAG
+    commit: str = COMMIT
+
+
+def phase_context(gateway: FakeGateway, *, work: Path) -> harness.Context:
+    """Build the run context a phase judge reads, on a host with no Chocolatey."""
+
+    return harness.Context(
+        gateway=gateway,
+        channels=FakeChannels(),
+        inputs=PhaseInputs(),
+        identities={},
+        repository_path=work,
+        template_directory=work,
+        work=work,
+        sources={},
+        nupkgs={},
+        nupkg_digests={},
+        candidates=work / "candidates",
+        archives={},
+        prior_version="0.1.0",
+        residue_targets=harness.ResidueTargets(
+            profiles=(),
+            project_sentinel=work / "project.json",
+            skill_sentinel=work / "skill.md",
+            state_directory=work / "state",
+        ),
+        residue_before={},
+        help_outputs={},
+    )
+
+
+def install_evidence(folder: Path) -> harness.InstallEvidence:
+    """Return install evidence for one package folder on disk, deciding nothing."""
+
+    names = harness.listing(folder)
+    return harness.InstallEvidence(
+        package_folder=folder,
+        names=names,
+        version_bytes=None,
+        executable_header=b"",
+        selected_where="",
+        other_where="",
+        shim_path=folder,
+        shim_target=None,
+        shim_metadata="",
+        sidecars=harness.read_download_sidecars(folder, names),
+    )
+
+
+class PhaseWiringTests(unittest.TestCase):
+    """Phases hand the pure judges the architecture and the pair member's help output."""
+
+    def sidecar_folder(self, root: Path, architecture: str) -> Path:
+        """Materialize a package folder whose sidecar records one architecture's extraction."""
+
+        folder = package_folder(root, SKILLMOUNT, extra=("release-archive.zip.txt",))
+        stem = release.asset_stem(TAG, harness.windows_target(architecture))
+        (folder / "release-archive.zip.txt").write_text(
+            rf"C:\Temp\staging\extracted\{stem}\skillmount.exe" + "\n", encoding="utf-8"
+        )
+        return folder
+
+    def test_the_second_help_phase_compares_the_pair_members_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            gateway = FakeGateway({"skillmount.exe": HELP_OUTPUT, "asm.exe": HELP_OUTPUT})
+            context = phase_context(gateway, work=work)
+            first = harness.help_phase(context, SKILLMOUNT, architecture="x64")
+            second = harness.help_phase(context, ASM, architecture="x64")
+            self.assertTrue(first.ok)
+            self.assertTrue(second.ok)
+            self.assertIn(
+                "skipped",
+                next(item.detail for item in first.findings if item.check == "help-equivalent"),
+            )
+            self.assertNotIn(
+                "skipped",
+                next(item.detail for item in second.findings if item.check == "help-equivalent"),
+            )
+            self.assertEqual(len(gateway.invoked), 2)
+
+    def test_a_pair_whose_help_output_diverges_fails_the_second_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            context = phase_context(
+                FakeGateway(
+                    {
+                        "skillmount.exe": HELP_OUTPUT,
+                        "asm.exe": HELP_OUTPUT.replace("  codex ", "  kodex "),
+                    }
+                ),
+                work=Path(temporary),
+            )
+            harness.help_phase(context, SKILLMOUNT, architecture="x64")
+            second = harness.help_phase(context, ASM, architecture="x64")
+            self.assertFalse(second.ok)
+            self.assertEqual(
+                {item.check for item in second.findings if not item.ok}, {"help-equivalent"}
+            )
+
+    def test_folder_findings_judge_the_installed_architectures_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            context = phase_context(FakeGateway({}), work=work)
+            evidence = install_evidence(self.sidecar_folder(work / "lib", "x64"))
+            selected = harness.folder_findings_or_absence(
+                context, SKILLMOUNT, evidence, moment="install", architecture="x64"
+            )
+            self.assertEqual([item.check for item in selected if not item.ok], [])
+            mismatched = harness.folder_findings_or_absence(
+                context, SKILLMOUNT, evidence, moment="install", architecture="x86"
+            )
+            self.assertEqual(
+                {item.check for item in mismatched if not item.ok},
+                {"download-provenance", "download-provenance-architecture"},
+            )
 
 
 class FailureModeTests(unittest.TestCase):
@@ -1268,6 +1675,7 @@ class ReportTests(unittest.TestCase):
             shim_path=Path(rf"{BIN}\skillmount.exe"),
             shim_target=rf"{LIB}\skillmount\tools\skillmount.exe",
             shim_metadata="noop",
+            sidecars=(("release-archive.zip.txt", "extracted\n"),),
         )
         recorded = dict(harness.install_evidence_pairs(evidence))
         self.assertEqual(recorded["shim_target"], rf"{LIB}\skillmount\tools\skillmount.exe")
@@ -1283,6 +1691,7 @@ class ReportTests(unittest.TestCase):
                 shim_path=Path(rf"{BIN}\skillmount.exe"),
                 shim_target=None,
                 shim_metadata="",
+                sidecars=(),
             )
         )
         self.assertEqual(dict(unresolved)["shim_target"], "")

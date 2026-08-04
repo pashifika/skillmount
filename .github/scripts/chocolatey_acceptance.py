@@ -63,6 +63,9 @@ MACHINE_ARCHITECTURES = {machine: name for name, machine in ARCHITECTURE_MACHINE
 IGNORE_SUFFIX = ".ignore"
 PENDING_MARKER = ".chocolateypending"
 ARCHIVE_SUFFIXES = (".zip", ".tar.gz", ".tgz", ".7z")
+# `Get-ChocolateyUnzip` records every extracted path in `<downloaded-archive-name>.txt` inside the
+# package folder, so a completed install legitimately leaves one manager-owned sidecar behind.
+DOWNLOAD_SIDECAR_SUFFIX = ".txt"
 ABSENT = "absent"
 PATH_SCOPES = ("Process", "User", "Machine")
 
@@ -95,6 +98,9 @@ NEGATIVE_PHASES = (
 PHASES = POSITIVE_PHASES + NEGATIVE_PHASES
 X64_SESSION_PHASES = ("install-x64", "selected-only", "shim", "version", "help")
 X86_SESSION_PHASES = ("install-x86",)
+# The shim checks an injected foreign product shim must fail, so the `extra-shim` phase names the
+# rejection it requires instead of accepting any failure at all.
+EXTRA_SHIM_REJECTIONS = ("product-shim-count", "pair-shim-absent")
 
 
 class ChocolateyAcceptanceError(RuntimeError):
@@ -407,6 +413,13 @@ def architecture_machine(architecture: str) -> int:
         ) from error
 
 
+def other_architecture(architecture: str) -> str:
+    """Return the Windows architecture one requested architecture is not."""
+
+    architecture_machine(architecture)
+    return "x86" if architecture == "x64" else "x64"
+
+
 def machine_finding(header: bytes, *, architecture: str, label: str) -> Finding:
     """Judge a retained executable's COFF machine type against the requested architecture."""
 
@@ -483,6 +496,25 @@ def optional_package_files(selection: PackageSelection, version: str) -> tuple[s
     )
 
 
+def download_sidecar_names(names: Sequence[str]) -> tuple[str, ...]:
+    """Return every `Get-ChocolateyUnzip` extraction sidecar a package folder carries.
+
+    Chocolatey writes `<downloaded-archive-name>.txt` beside the package's own bookkeeping to
+    record what it extracted, exactly like `<id>.nupkg`, so the sidecar is manager-owned content
+    rather than something the package installed.
+    """
+
+    return tuple(
+        sorted(
+            name
+            for name in names
+            if "/" not in name
+            and name.casefold().endswith(DOWNLOAD_SIDECAR_SUFFIX)
+            and PureWindowsPath(name).stem.casefold().endswith(ARCHIVE_SUFFIXES)
+        )
+    )
+
+
 def package_folder_findings(
     names: Sequence[str], selection: PackageSelection, *, version: str
 ) -> tuple[Finding, ...]:
@@ -491,8 +523,10 @@ def package_folder_findings(
     indexed = listing_index(names)
     observed = tuple(sorted(indexed.values()))
     required = required_package_files(selection)
+    sidecars = download_sidecar_names(tuple(indexed.values()))
     allowed = {
-        entry.casefold() for entry in (*required, *optional_package_files(selection, version))
+        entry.casefold()
+        for entry in (*required, *optional_package_files(selection, version), *sidecars)
     }
     missing = tuple(entry for entry in required if entry.casefold() not in indexed)
     unexpected = tuple(value for folded, value in sorted(indexed.items()) if folded not in allowed)
@@ -559,6 +593,70 @@ def package_folder_findings(
         )
     )
     return tuple(findings)
+
+
+def download_provenance_findings(
+    sidecars: Sequence[tuple[str, str]],
+    *,
+    architecture: str,
+    expected_reference: str,
+    other_reference: str,
+) -> tuple[Finding, ...]:
+    """Judge which architecture's release archive the extraction sidecars say was installed.
+
+    `Get-ChocolateyUnzip` lists every extracted path, so each sidecar names the archive root
+    directory the downloaded archive carries. That root is the archive's own name without its
+    suffix, which makes the sidecar the manager's independent statement of which architecture the
+    install actually downloaded.
+    """
+
+    recorded = tuple((name, text) for name, text in sidecars if text.strip())
+    if not recorded:
+        return (
+            Finding(
+                "download-provenance",
+                True,
+                "skipped the download-provenance check: Chocolatey recorded no extraction sidecar "
+                f"content, so nothing names the {architecture} archive {expected_reference!r}; "
+                f"observed {tuple(name for name, _ in sidecars)!r}",
+            ),
+        )
+    unproven = tuple(
+        name for name, text in recorded if expected_reference.casefold() not in text.casefold()
+    )
+    foreign = tuple(
+        name for name, text in recorded if other_reference.casefold() in text.casefold()
+    )
+    return (
+        Finding(
+            "download-provenance",
+            not unproven,
+            f"expected every extraction sidecar to name the {architecture} archive "
+            f"{expected_reference!r}; sidecars naming something else {unproven!r}; "
+            f"observed {recorded!r}",
+        ),
+        Finding(
+            "download-provenance-architecture",
+            not foreign,
+            f"expected no extraction sidecar to name the {other_architecture(architecture)} "
+            f"archive {other_reference!r}; observed {foreign!r}",
+        ),
+    )
+
+
+def staleness_markers(
+    *, prior_version: str, prior_tag: str, version: str, tag: str
+) -> tuple[str, ...]:
+    """Return the prior-release markers an upgraded VERSION file must no longer mention.
+
+    A rehearsal can only prove replaced metadata when the prior release differs from the
+    candidate; an identical prior version yields no marker, and the caller records that skip
+    instead of asserting a condition the candidate's own metadata contradicts.
+    """
+
+    if prior_version == version or prior_tag == tag:
+        return ()
+    return (prior_version, prior_tag)
 
 
 def version_file_findings(
@@ -672,6 +770,23 @@ def windows_path_inside(child: str, parent: str) -> bool:
     return child_parts[: len(parent_parts)] == parent_parts
 
 
+def product_shims(
+    selection: PackageSelection, *, selected_where: str, other_where: str, shim_directory: str
+) -> tuple[str, ...]:
+    """Return every product-command shim resolved inside the Chocolatey command directory."""
+
+    found: dict[str, str] = {}
+    for where_output, command in (
+        (selected_where, selection.command),
+        (other_where, selection.other_command),
+    ):
+        for path in resolved_shims(where_output, command):
+            if windows_path_inside(path, shim_directory):
+                pure = str(PureWindowsPath(path))
+                found.setdefault(pure.casefold(), pure)
+    return tuple(sorted(found.values(), key=str.casefold))
+
+
 def shim_findings(
     selection: PackageSelection,
     *,
@@ -680,8 +795,14 @@ def shim_findings(
     shim_target: str | None,
     package_folder: str,
     shim_directory: str,
+    pair_installed: bool = False,
 ) -> tuple[Finding, ...]:
-    """Judge Chocolatey command-path ownership for one installed package."""
+    """Judge Chocolatey command-path ownership for one installed package.
+
+    A shim always lives in the Chocolatey command directory rather than inside the package folder,
+    so ownership is judged from which product commands the command directory exposes: a lone
+    install must expose exactly its own, and only a co-installed pair may expose both.
+    """
 
     selected = resolved_shims(selected_where, selection.command)
     findings = [
@@ -717,19 +838,39 @@ def shim_findings(
                 f"expected the shim target inside {package_folder!r}; observed {shim_target!r}",
             )
         )
-    intruding = tuple(
-        path
-        for path in resolved_shims(other_where, selection.other_command)
-        if windows_path_inside(path, package_folder)
+    exposed = product_shims(
+        selection,
+        selected_where=selected_where,
+        other_where=other_where,
+        shim_directory=shim_directory,
+    )
+    expected_count = 2 if pair_installed else 1
+    installed_packages = (
+        "both command packages are" if pair_installed else f"only {selection.package_id} is"
     )
     findings.append(
         Finding(
-            "pair-command-not-owned",
-            not intruding,
-            f"expected the {selection.package_id} package to own no {selection.other_command} "
-            f"shim; observed {intruding!r}",
+            "product-shim-count",
+            len(exposed) == expected_count,
+            f"expected exactly {expected_count} product shim(s) under {shim_directory!r} while "
+            f"{installed_packages} installed; observed {exposed!r}",
         )
     )
+    if not pair_installed:
+        expected_pair_shim = f"{selection.other_command}.exe".casefold()
+        intruding = tuple(
+            path
+            for path in exposed
+            if PureWindowsPath(path).name.casefold() == expected_pair_shim
+        )
+        findings.append(
+            Finding(
+                "pair-shim-absent",
+                not intruding,
+                f"expected no {selection.other_command} shim under {shim_directory!r} while only "
+                f"the {selection.package_id} package is installed; observed {intruding!r}",
+            )
+        )
     return tuple(findings)
 
 
@@ -784,16 +925,15 @@ def parse_reported_version(text: str) -> str:
     return found[0]
 
 
-def mentions_command(text: str, command: str) -> bool:
-    """Return whether text names one product command as a whole word."""
-
-    return re.search(rf"(?<![0-9A-Za-z_-]){re.escape(command)}(?![0-9A-Za-z_-])", text) is not None
-
-
 def version_findings(
     result: CommandResult, selection: PackageSelection, *, expected_version: str
 ) -> tuple[Finding, ...]:
-    """Judge one installed command's version output."""
+    """Judge one installed command's version output.
+
+    `src/cli.rs` reports the product name, never the invoked file name, so the version line proves
+    the version and nothing about which command was invoked. Command identity is proved instead by
+    the retained executable and the resolved shim target that `shim_findings` judges.
+    """
 
     findings = [
         Finding(
@@ -812,43 +952,95 @@ def version_findings(
         Finding(
             "reported-version",
             observed == expected_version,
-            f"expected {selection.command} to report {expected_version!r}; observed {observed!r}",
-        )
-    )
-    findings.append(
-        Finding(
-            "reported-command",
-            mentions_command(result.output, selection.command)
-            and not mentions_command(result.output, selection.other_command),
-            f"expected version output to name {selection.command!r} and not "
-            f"{selection.other_command!r}; observed {result.output.strip()!r}",
+            f"expected {selection.command} to report the package version {expected_version!r}; "
+            f"observed {observed!r} in {result.output.strip()!r}",
         )
     )
     return tuple(findings)
 
 
-def help_findings(result: CommandResult, selection: PackageSelection) -> tuple[Finding, ...]:
-    """Judge one installed command's help output."""
+HELP_USAGE_TEMPLATE = "Usage: <{commands}> <COMMAND>"
+HELP_COMMANDS_HEADER = "Commands:"
 
-    return (
+
+def shared_usage_line(selection: PackageSelection) -> str:
+    """Return the name-agnostic usage line both product commands print.
+
+    `src/cli.rs` declares one `bin_name` for both executables, so help names the command pair
+    instead of the invoked file name. Help output therefore never distinguishes the packages, and
+    the pair's completion scripts, not its help text, are where a leaked name would matter.
+    """
+
+    return HELP_USAGE_TEMPLATE.format(
+        commands="|".join(sorted((selection.command, selection.other_command)))
+    )
+
+
+def help_commands(text: str) -> tuple[str, ...]:
+    """Return the command names one help output lists under its `Commands:` heading."""
+
+    listed: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not inside:
+            inside = stripped == HELP_COMMANDS_HEADER
+            continue
+        if not stripped:
+            continue
+        if line[:1] not in (" ", "\t"):
+            break
+        listed.append(stripped.split()[0])
+    return tuple(dict.fromkeys(listed))
+
+
+def help_findings(
+    result: CommandResult, selection: PackageSelection, *, pair_output: str | None = None
+) -> tuple[Finding, ...]:
+    """Judge one installed command's help output, and its equivalence to the pair member's."""
+
+    usage = shared_usage_line(selection)
+    listed = help_commands(result.output)
+    findings = [
         Finding(
             "help-status",
             result.returncode == 0,
             f"expected {result.command} to succeed; observed status {result.returncode}",
         ),
         Finding(
-            "help-names-command",
-            mentions_command(result.output, selection.command),
-            f"expected help output to name {selection.command!r}; "
-            f"observed {result.output.strip()[:200]!r}",
+            "help-usage-line",
+            usage in collapse(result.output),
+            f"expected help output to report {usage!r}; "
+            f"observed {collapse(result.output)[:200]!r}",
         ),
         Finding(
-            "help-omits-pair-command",
-            not mentions_command(result.output, selection.other_command),
-            f"expected help output to omit {selection.other_command!r}; "
-            f"observed {result.output.strip()[:200]!r}",
+            "help-command-list",
+            bool(listed),
+            f"expected help output to list commands under {HELP_COMMANDS_HEADER!r}; "
+            f"observed {listed!r} in {collapse(result.output)[:200]!r}",
         ),
-    )
+    ]
+    if pair_output is None:
+        findings.append(
+            Finding(
+                "help-equivalent",
+                True,
+                f"skipped the pair-equivalence check: no {selection.other_command} help output was "
+                f"recorded before {selection.command} ran, so equivalence is judged when the pair "
+                "member runs",
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                "help-equivalent",
+                collapse(result.output) == collapse(pair_output),
+                f"expected {selection.command} help output to equal {selection.other_command} "
+                f"help output; observed {collapse(result.output)[:200]!r} and "
+                f"{collapse(pair_output)[:200]!r}",
+            )
+        )
+    return tuple(findings)
 
 
 def installed_version_finding(
@@ -1778,6 +1970,7 @@ class Context:
     prior_version: str
     residue_targets: ResidueTargets
     residue_before: dict[str, str]
+    help_outputs: dict[str, str]
 
     @property
     def version(self) -> str:
@@ -1827,6 +2020,22 @@ class InstallEvidence:
     shim_path: Path
     shim_target: str | None
     shim_metadata: str
+    sidecars: tuple[tuple[str, str], ...]
+
+
+def read_download_sidecars(
+    folder: Path, names: Sequence[str] | None
+) -> tuple[tuple[str, str], ...]:
+    """Read every extraction sidecar a package folder carries, in listing order."""
+
+    if names is None:
+        return ()
+    contents: list[tuple[str, str]] = []
+    for name in download_sidecar_names(tuple(listing_index(names).values())):
+        path = folder / PureWindowsPath(name)
+        if path.is_file():
+            contents.append((name, path.read_text(encoding="utf-8", errors="replace")))
+    return tuple(contents)
 
 
 def collect_install_evidence(context: Context, selection: PackageSelection) -> InstallEvidence:
@@ -1857,6 +2066,7 @@ def collect_install_evidence(context: Context, selection: PackageSelection) -> I
         shim_path=shim,
         shim_target=target,
         shim_metadata=metadata,
+        sidecars=read_download_sidecars(folder, names),
     )
 
 
@@ -1871,8 +2081,23 @@ def install_evidence_pairs(evidence: InstallEvidence) -> tuple[tuple[str, str], 
     )
 
 
+def archive_reference(context: Context, architecture: str) -> str:
+    """Return the archive-root name one architecture's release archive carries.
+
+    The root is the archive's own name without its suffix, so it identifies the archive both in a
+    download URL and in an extraction listing.
+    """
+
+    return release.asset_stem(context.tag, windows_target(architecture))
+
+
 def folder_findings_or_absence(
-    context: Context, selection: PackageSelection, evidence: InstallEvidence, *, moment: str
+    context: Context,
+    selection: PackageSelection,
+    evidence: InstallEvidence,
+    *,
+    moment: str,
+    architecture: str,
 ) -> tuple[Finding, ...]:
     """Judge a package folder's contents, or report that it does not exist at all."""
 
@@ -1884,7 +2109,16 @@ def folder_findings_or_absence(
                 f"expected {evidence.package_folder} to exist after {moment}",
             ),
         )
-    return package_folder_findings(evidence.names, selection, version=context.version)
+    findings = list(package_folder_findings(evidence.names, selection, version=context.version))
+    findings.extend(
+        download_provenance_findings(
+            evidence.sidecars,
+            architecture=architecture,
+            expected_reference=archive_reference(context, architecture),
+            other_reference=archive_reference(context, other_architecture(architecture)),
+        )
+    )
+    return tuple(findings)
 
 
 @contextlib.contextmanager
@@ -2063,7 +2297,7 @@ def install_phase(
 ) -> PhaseResult:
     """Judge one architecture's install: status, selection, retained bytes, and machine type."""
 
-    other = windows_target("x86" if architecture == "x64" else "x64")
+    other = windows_target(other_architecture(architecture))
     other_url = context.inputs.archive(other.triple).url
     findings = [
         Finding(
@@ -2098,7 +2332,11 @@ def install_phase(
             label=f"{selection.package_id} tools/{selection.selected_executable}",
         )
     )
-    findings.extend(folder_findings_or_absence(context, selection, evidence, moment="install"))
+    findings.extend(
+        folder_findings_or_absence(
+            context, selection, evidence, moment="install", architecture=architecture
+        )
+    )
     return PhaseResult(
         name=f"install-{architecture}",
         package_id=selection.package_id,
@@ -2117,7 +2355,11 @@ def selected_only_phase(
 ) -> PhaseResult:
     """Judge that the package retains and exposes exactly its selected executable."""
 
-    findings = list(folder_findings_or_absence(context, selection, evidence, moment="install"))
+    findings = list(
+        folder_findings_or_absence(
+            context, selection, evidence, moment="install", architecture=architecture
+        )
+    )
     findings.extend(
         version_file_findings(
             evidence.version_bytes,
@@ -2193,14 +2435,18 @@ def version_phase(
 
 
 def help_phase(context: Context, selection: PackageSelection, *, architecture: str) -> PhaseResult:
-    """Judge the installed command's help output."""
+    """Judge the installed command's help output against the pair member's, when observed."""
 
     result = context.gateway.command_output(context.shim(selection.command), ["--help"])
+    findings = help_findings(
+        result, selection, pair_output=context.help_outputs.get(selection.other_command)
+    )
+    context.help_outputs[selection.command] = result.output
     return PhaseResult(
         name="help",
         package_id=selection.package_id,
         architecture=architecture,
-        findings=help_findings(result, selection),
+        findings=findings,
         evidence=(("output", collapse(result.output)[:400]),),
     )
 
@@ -2406,16 +2652,37 @@ def upgrade_phase(context: Context, selection: PackageSelection) -> PhaseResult:
             )
         )
         evidence = collect_install_evidence(context, selection)
-        findings.extend(folder_findings_or_absence(context, selection, evidence, moment="upgrade"))
+        findings.extend(
+            folder_findings_or_absence(
+                context, selection, evidence, moment="upgrade", architecture="x64"
+            )
+        )
+        markers = staleness_markers(
+            prior_version=prior_version,
+            prior_tag=prior_tag,
+            version=context.version,
+            tag=context.tag,
+        )
         findings.extend(
             version_file_findings(
                 evidence.version_bytes,
                 expected=context.expected_metadata(
                     "x64", tag=context.tag, version=context.version
                 ),
-                forbidden=(prior_version, prior_tag),
+                forbidden=markers,
             )
         )
+        if not markers:
+            findings.append(
+                Finding(
+                    "version-metadata-staleness-skipped",
+                    True,
+                    "skipped the stale-metadata check: the rehearsed prior release "
+                    f"{prior_version!r} (tag {prior_tag!r}) equals the candidate release "
+                    f"{context.version!r} (tag {context.tag!r}), so no marker can distinguish "
+                    "replaced metadata from retained metadata",
+                )
+            )
         findings.append(
             machine_finding(
                 evidence.executable_header,
@@ -2480,10 +2747,13 @@ def co_install_phase(
                 shim_target=item.shim_target,
                 package_folder=str(item.package_folder),
                 shim_directory=context.shim_directory(),
+                pair_installed=True,
             )
         )
         findings.extend(
-            folder_findings_or_absence(context, selection, item, moment="co-installation")
+            folder_findings_or_absence(
+                context, selection, item, moment="co-installation", architecture="x64"
+            )
         )
         findings.extend(
             version_findings(
@@ -2770,12 +3040,14 @@ def invalid_install_findings(
         shim_directory=context.shim_directory(),
     )
     rejected = {item.check for item in judged if not item.ok}
+    required = set(EXTRA_SHIM_REJECTIONS)
     return (
         Finding(
             "corruption-detected",
-            "pair-command-not-owned" in rejected,
-            f"expected shim validation to reject a {selection.other_command} shim owned by the "
-            f"{selection.package_id} package; failed checks {tuple(sorted(rejected))!r}",
+            required <= rejected,
+            f"expected shim validation to reject the extra {selection.other_command} shim the "
+            f"{selection.package_id} package installed; expected failed checks "
+            f"{tuple(sorted(required))!r}; observed failed checks {tuple(sorted(rejected))!r}",
         ),
     )
 
@@ -2817,7 +3089,11 @@ def repeated_install_findings(
         )
     )
     evidence = collect_install_evidence(context, selection)
-    findings.extend(folder_findings_or_absence(context, selection, evidence, moment="reinstall"))
+    findings.extend(
+        folder_findings_or_absence(
+            context, selection, evidence, moment="reinstall", architecture=case.architecture
+        )
+    )
     findings.extend(
         shim_findings(
             selection,
@@ -3102,6 +3378,7 @@ def run_acceptance(options: argparse.Namespace, work: Path) -> dict[str, Any]:
         residue_before=residue_snapshot(
             residue_targets, path_values=collect_path_values(gateway, residue_targets)
         ),
+        help_outputs={},
     )
 
     phases: list[PhaseResult] = []
