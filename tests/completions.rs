@@ -1,6 +1,8 @@
 //! Shipped-binary contract tests for static shell completion generation.
 
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,6 +41,19 @@ fn run(binary: &str, arguments: &[&str], current_dir: &Path) -> Output {
         .current_dir(current_dir)
         .output()
         .expect("completion command should run")
+}
+
+#[cfg(unix)]
+fn command_with_argv0(binary: &str, argv0: &Path) -> Command {
+    let mut command = Command::new(binary);
+    command.arg0(argv0);
+    command
+}
+
+#[cfg(windows)]
+fn command_with_argv0(binary: &str, argv0: &Path) -> Command {
+    fs::copy(binary, argv0).expect("renamed executable fixture should be copied");
+    Command::new(argv0)
 }
 
 fn successful_script(binary: &str, shell: &str, current_dir: &Path) -> Vec<u8> {
@@ -158,8 +173,7 @@ fn completion_usage_failures_have_stable_categories() {
     } else {
         "renamed-skillmount"
     });
-    fs::copy(ASM, &renamed).expect("renamed executable fixture should be copied");
-    let output = Command::new(&renamed)
+    let output = command_with_argv0(ASM, &renamed)
         .args(["completions", "bash"])
         .current_dir(&fixture.root)
         .output()
