@@ -255,6 +255,92 @@ jobs:
           --target "${{ matrix.target }}"
           --shell powershell
 
+  package-homebrew-macos:
+    name: package-homebrew-macos
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      HOMEBREW_NO_ANALYTICS: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+      # The harness builds both Formulae from a local `git archive` tarball, so it proves the
+      # complete selected-only lifecycle without the external tap or a published v0.2.0.
+      SKILLMOUNT_HOMEBREW_ACCEPTANCE: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - name: Test acceptance-harness safeguards
+        run: python3 -B .github/scripts/test_homebrew_acceptance.py
+      - name: Report spec coverage
+        run: python3 -B .github/scripts/homebrew_acceptance.py --print-coverage
+      - name: Exercise the isolated paired Formula lifecycle
+        env:
+          REPORT_FILE: ${{ runner.temp }}/homebrew-acceptance.json
+        run: >-
+          python3 -B .github/scripts/homebrew_acceptance.py
+          --report "$REPORT_FILE"
+      - name: Upload Homebrew acceptance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: homebrew-acceptance-report
+          path: ${{ runner.temp }}/homebrew-acceptance.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  package-chocolatey-windows:
+    name: package-chocolatey-windows
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      # The harness builds both Windows archives locally and serves them over file:// URLs, so it
+      # proves the complete selected-only lifecycle without a published v0.2.0.
+      SKILLMOUNT_CHOCOLATEY_ACCEPTANCE: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Install pinned Rust toolchain and both Windows targets
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup target add --toolchain "$RUST_TOOLCHAIN" x86_64-pc-windows-msvc
+          rustup target add --toolchain "$RUST_TOOLCHAIN" i686-pc-windows-msvc
+      - name: Test acceptance-harness safeguards
+        run: python -B .github/scripts/test_chocolatey_acceptance.py
+      - name: Build both product executables for both architectures
+        shell: bash
+        run: |
+          cargo build --locked --release --target x86_64-pc-windows-msvc --bin asm --bin skillmount
+          cargo build --locked --release --target i686-pc-windows-msvc --bin asm --bin skillmount
+      - name: Exercise both package lifecycles under x64 and x86 selection
+        env:
+          BINARY_DIRECTORY_X64: ${{ github.workspace }}/target/x86_64-pc-windows-msvc/release
+          BINARY_DIRECTORY_X86: ${{ github.workspace }}/target/i686-pc-windows-msvc/release
+          REPORT_FILE: ${{ runner.temp }}/chocolatey-acceptance.json
+        run: >-
+          python -B .github/scripts/chocolatey_acceptance.py
+          --binary-directory-x64 "$env:BINARY_DIRECTORY_X64"
+          --binary-directory-x86 "$env:BINARY_DIRECTORY_X86"
+          --report "$env:REPORT_FILE"
+      - name: Upload Chocolatey acceptance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chocolatey-acceptance-report
+          path: ${{ runner.temp }}/chocolatey-acceptance.json
+          if-no-files-found: warn
+          retention-days: 7
+
   gate:
     name: gate
     if: ${{ always() }}
@@ -264,6 +350,8 @@ jobs:
       - test
       - shell-completions-macos
       - shell-completions-windows
+      - package-homebrew-macos
+      - package-chocolatey-windows
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -274,13 +362,17 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           SHELL_COMPLETIONS_MACOS_RESULT: ${{ needs.shell-completions-macos.result }}
           SHELL_COMPLETIONS_WINDOWS_RESULT: ${{ needs.shell-completions-windows.result }}
+          PACKAGE_HOMEBREW_MACOS_RESULT: ${{ needs.package-homebrew-macos.result }}
+          PACKAGE_CHOCOLATEY_WINDOWS_RESULT: ${{ needs.package-chocolatey-windows.result }}
         run: |
           if [[ "$BRANCH_POLICY_RESULT" != "success" || \
                 "$QUALITY_RESULT" != "success" || \
                 "$TEST_RESULT" != "success" || \
                 "$SHELL_COMPLETIONS_MACOS_RESULT" != "success" || \
-                "$SHELL_COMPLETIONS_WINDOWS_RESULT" != "success" ]]; then
-            echo "::error::Required job results: branch-policy=$BRANCH_POLICY_RESULT quality=$QUALITY_RESULT test=$TEST_RESULT shell-completions-macos=$SHELL_COMPLETIONS_MACOS_RESULT shell-completions-windows=$SHELL_COMPLETIONS_WINDOWS_RESULT"
+                "$SHELL_COMPLETIONS_WINDOWS_RESULT" != "success" || \
+                "$PACKAGE_HOMEBREW_MACOS_RESULT" != "success" || \
+                "$PACKAGE_CHOCOLATEY_WINDOWS_RESULT" != "success" ]]; then
+            echo "::error::Required job results: branch-policy=$BRANCH_POLICY_RESULT quality=$QUALITY_RESULT test=$TEST_RESULT shell-completions-macos=$SHELL_COMPLETIONS_MACOS_RESULT shell-completions-windows=$SHELL_COMPLETIONS_WINDOWS_RESULT package-homebrew-macos=$PACKAGE_HOMEBREW_MACOS_RESULT package-chocolatey-windows=$PACKAGE_CHOCOLATEY_WINDOWS_RESULT"
             exit 1
           fi
           echo "All required CI jobs succeeded."
