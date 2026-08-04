@@ -11,7 +11,7 @@ use crate::agent::claude::ClaudeAdapter;
 use crate::agent::codex::CodexAdapter;
 use crate::agent::{AgentAdapter, DiscoverySnapshot};
 use crate::catalog::{CatalogRequest, resolve_catalog};
-use crate::cli::{InspectAgent, ParsedCommand, parse_command_from};
+use crate::cli::{CompletionInput, InspectAgent, ParsedCommand, parse_command_from};
 use crate::domain::{AgentId, LinkMode, MountMode, RunContext, SkillCatalog};
 use crate::error::{AppError, CatalogError, ExitCategory, LinkError, PlanError};
 use crate::journal::store::RejectedJournal;
@@ -42,14 +42,6 @@ where
         .iter()
         .map(|argument| OsString::from(render::os_value(argument, true)))
         .collect::<Vec<_>>();
-    let invocation_cwd = match std::env::current_dir() {
-        Ok(path) => path,
-        Err(error) => {
-            return report_error(&AppError::Internal(format!(
-                "cannot capture invocation CWD: {error}"
-            )));
-        }
-    };
 
     let command = match parse_command_from(args) {
         Ok(command) => command,
@@ -61,14 +53,46 @@ where
             return report_clap_error(&diagnostic_error, original_kind);
         }
     };
+    let command = match command {
+        ParsedCommand::Completions(input) => {
+            let mut stdout = io::stdout().lock();
+            return match execute_completion(input, &mut stdout) {
+                Ok(code) => ExitCode::from(code),
+                Err(error) => report_error(&error),
+            };
+        }
+        command => command,
+    };
+
+    let invocation_cwd = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            return report_error(&AppError::Internal(format!(
+                "cannot capture invocation CWD: {error}"
+            )));
+        }
+    };
     match execute(command, &invocation_cwd) {
         Ok(code) => ExitCode::from(code),
         Err(error) => report_error(&error),
     }
 }
 
+fn execute_completion(input: CompletionInput, writer: &mut dyn Write) -> Result<u8, AppError> {
+    match crate::completion::generate(input, writer) {
+        Ok(()) => Ok(0),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(0),
+        Err(error) => Err(AppError::Internal(format!(
+            "failed to write completion output: {error}"
+        ))),
+    }
+}
+
 fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError> {
     match command {
+        ParsedCommand::Completions(_) => Err(AppError::Internal(
+            "completion request reached path-dependent command dispatch".to_owned(),
+        )),
         ParsedCommand::Session(input) => {
             let dry_run = input.options.dry_run;
             let context = resolve_session(input, invocation_cwd)?;
@@ -834,12 +858,66 @@ fn error_guidance(error: &AppError) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::io::{self, Write};
     use std::path::PathBuf;
 
-    use super::{error_guidance, junction_policy_warning, render_supervision_diagnostic};
+    use super::{
+        error_guidance, execute_completion, junction_policy_warning, render_supervision_diagnostic,
+    };
+    use crate::cli::{CompletionInput, CompletionShell, ProductBinary};
     use crate::domain::{AgentId, LinkMode};
-    use crate::error::{AppError, LinkError};
+    use crate::error::{AppError, ExitCategory, LinkError};
     use crate::process::{CleanupFailure, SupervisionDiagnostic};
+
+    struct ErrorWriter {
+        kind: io::ErrorKind,
+    }
+
+    impl Write for ErrorWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.kind, "injected completion failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const fn completion_input() -> CompletionInput {
+        CompletionInput {
+            shell: CompletionShell::Bash,
+            product: ProductBinary::Asm,
+        }
+    }
+
+    #[test]
+    fn broken_pipe_during_completion_is_success() {
+        let mut writer = ErrorWriter {
+            kind: io::ErrorKind::BrokenPipe,
+        };
+
+        let code =
+            execute_completion(completion_input(), &mut writer).expect("broken pipe is successful");
+
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn non_broken_pipe_completion_failure_uses_internal_category() {
+        let mut writer = ErrorWriter {
+            kind: io::ErrorKind::PermissionDenied,
+        };
+
+        let error = execute_completion(completion_input(), &mut writer)
+            .expect_err("other write failures should fail");
+
+        assert_eq!(error.category(), ExitCategory::Internal);
+        assert!(
+            error
+                .to_string()
+                .contains("failed to write completion output")
+        );
+    }
 
     #[test]
     fn only_automatic_junction_fallback_emits_the_unverified_compatibility_warning() {

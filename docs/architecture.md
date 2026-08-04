@@ -9,11 +9,11 @@ state tables, failure scenarios, algorithms, and platform call contracts stay in
 architecture decision records (ADRs), or the code closest to the behavior. A behavior appears here
 as current only after it exists in the tracked source and can be traced to repository evidence.
 
-Status: catalog resolution, discovery inspection, read-only planning, cross-platform link
-primitives, resource locking, durable transactions, cleanup, stale recovery, the generic child
-process supervisor, the Codex and Claude session adapters, operator diagnosis and explicit
-recovery, the repository evidence workflow, and versioned release packaging and publication are
-implemented. Executed live-agent compatibility certification and the remaining
+Status: static shell-completion generation, catalog resolution, discovery inspection, read-only
+planning, cross-platform link primitives, resource locking, durable transactions, cleanup, stale
+recovery, the generic child process supervisor, the Codex and Claude session adapters, operator
+diagnosis and explicit recovery, the repository evidence workflow, and versioned release packaging
+and publication are implemented. Executed live-agent compatibility certification and the remaining
 transaction-lifetime hardening named under [Reserved work](#reserved-work) are not implemented.
 
 ## Product definition
@@ -39,6 +39,11 @@ The initial release targets are:
 - `x86_64-pc-windows-msvc`;
 - `aarch64-apple-darwin`.
 
+Native completion acceptance covers Bash, Zsh, and Fish on Apple Silicon macOS and PowerShell on
+both native Windows release architectures. Generation itself is portable and state-free, but a
+shell is not added to the supported set without syntax and representative exact-candidate behavior
+evidence on its claimed native host.
+
 Windows mutation requires Windows 10 version 1709 or later so verified entries can be unlinked with
 POSIX handle disposition even while unrelated inspect handles remain open. [ADR 0016](adr/0016-require-posix-handle-disposition-on-windows.md)
 records that runtime baseline.
@@ -63,6 +68,7 @@ behavior.
 | Surface | Current behavior |
 |---|---|
 | `asm inspect` | Resolves catalogs and both agents' discovery layouts without mutation. |
+| `asm completions <bash\|zsh\|fish\|powershell>` | Rebuilds the shared CLI graph and writes one deterministic static script bound to `asm`; `skillmount completions` binds only `skillmount`. Generation stops before project, catalog, agent, state, lock, journal, recovery, or process work. Wrapper completion stops at a session `--` before the active cursor. Filesystem candidates are emitted as literal shell argument text, and executable hints admit only directories and executable files. |
 | `asm codex --dry-run -- exec ...` or `-- review ...` | Produces the bounded Codex plan without directories, links, locks, journals, recovery, or child launch. |
 | `asm claude --dry-run` | Produces the isolated Claude staging plan under the same read-only contract. |
 | `asm claude --mount-mode=project` | Uses the project's `.claude/skills` namespace instead of isolated staging; `--dry-run` keeps that plan read-only. |
@@ -84,11 +90,22 @@ anything cleanup cannot prove safe to remove remains reported and journal-backed
 
 Session stdout is exclusively the inherited child data stream. Wrapper-owned session summaries,
 warnings, informational lines, errors, and cleanup diagnostics use stderr, so Codex JSONL, Claude
-JSON, and ordinary pipelines receive no SkillMount prefix. Read-only plans and explicit operator
-reports remain stdout data. [ADR 0026](adr/0026-reserve-session-stdout-for-child-data.md) records
-this public stream boundary.
+JSON, and ordinary pipelines receive no SkillMount prefix. Read-only plans, explicit operator
+reports, and requested completion scripts remain stdout data. Completion generation treats
+BrokenPipe as success and maps another output failure to category 70.
+[ADR 0026](adr/0026-reserve-session-stdout-for-child-data.md) records the session stream boundary;
+[ADR 0029](adr/0029-generate-static-completions-from-the-shared-cli-graph.md) records the static
+completion boundary.
 
 ## Execution architecture
+
+Completion generation branches at the CLI boundary and never enters path or product-state
+resolution:
+
+```text
+argv -> CLI parsing + recognized product identity -> fresh shared clap graph
+     -> fixed-shell static generator + opaque-passthrough guard -> stdout
+```
 
 The read-only path is a strict composition of pure observation and planning:
 
@@ -171,6 +188,7 @@ conflict until recovery removes it. This ordering is the accepted decision in
 | Module | Responsibility |
 |---|---|
 | `src/cli.rs` | Shared `clap` contract and conversion into typed commands. |
+| `src/completion.rs` | Static Bash, Zsh, Fish, and PowerShell generation from the shared command graph, exact product-name binding, literal filesystem candidates, executable filtering, and cold-start opaque-passthrough guards. |
 | `src/paths.rs` | Invocation CWD, launch CWD, project root, source occurrence, and executable resolution. |
 | `src/catalog/` | No-follow source discovery, ordered overlay selection, and selected-winner validation. |
 | `src/agent/` | Codex and Claude discovery inspection and declarative plan construction. |
@@ -188,6 +206,11 @@ conflict until recovery removes it. This ordering is the accepted decision in
 | `src/diagnostic.rs` | Non-fatal structured observations returned by lower layers. |
 | `src/operator/` | Typed `doctor` observations, isolated capability probes, and explicit-cleanup presentation over shared lower-layer engines. |
 | `src/app.rs` | The only top-level orchestration of read-only and mutating flows. |
+
+The completion module depends on the shared CLI command factory, `clap_complete`, and an injected
+`Write` target only. It cannot call the application path or any catalog, adapter, state, lock,
+journal, transaction, link, or process module. `src/app.rs` dispatches the typed completion command
+before constructing any of those contexts.
 
 ### Dependency and mutation boundaries
 
@@ -551,6 +574,13 @@ The following are product rules rather than style preferences:
     claimed lock set and clean descendant owners before shared helper-directory owners. A journal
     absent after its complete locks are held is unknown ownership and blocks mutation. A live lock
     always wins over holder text; an ownership mismatch is retained and reported.
+17. `completions` accepts only the owned Bash, Zsh, Fish, and PowerShell values, binds output only
+    to the recognized platform-native invoked product name, stops wrapper candidates after a `--`
+    before the active cursor starting with the first completion, emits filesystem candidates as
+    literal shell argument text, never falls back to unrelated files from constrained wrapper
+    states, limits directory hints to directories and executable hints to directories and
+    executable files, and performs no project, catalog, agent, state, lock, journal, recovery,
+    link, or process work.
 
 Tests enforce the observable parts of these rules. Local comments retain the narrower preconditions
 needed to preserve them inside an implementation.
@@ -560,6 +590,9 @@ needed to preserve them inside an implementation.
 ### Implemented
 
 - shared CLI parsing, path resolution, stable exit categories, and equivalent binary entry points;
+- deterministic static Bash, Zsh, Fish, and PowerShell completion generation for both recognized
+  product names, with graph-derived values and path hints, opaque-passthrough guards, stdout-only
+  output, read-only regression coverage, and native shell acceptance;
 - catalog discovery, overlay selection, selected-winner validation, and provenance;
 - Codex and Claude discovery inspection and deterministic read-only planning;
 - `inspect`, `--dry-run`, concise/verbose plan rendering, and read-only regression tests;
