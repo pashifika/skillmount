@@ -187,6 +187,14 @@ jobs:
           --shell bash
           --shell zsh
           --shell fish
+      - name: Exercise system Bash completions
+        run: >-
+          env PATH="/bin:/usr/bin" "$(command -v python3)"
+          .github/scripts/shell_completion_acceptance.py
+          --asm target/release/asm
+          --skillmount target/release/skillmount
+          --target aarch64-apple-darwin
+          --shell bash
 
   shell-completions-windows:
     name: shell-completions-windows (${{ matrix.target }})

@@ -31,15 +31,57 @@ SHELL_ORDER = ("bash", "zsh", "fish", "powershell")
 CASE_ORDER = (
     "syntax",
     "subcommands",
+    "invalid-subcommand-prefix",
     "options",
     "wrapper-enums",
+    "wrapper-enum-prefix",
+    "invalid-enum-prefix",
     "directory-hint",
+    "non-directory-hint",
     "executable-hint",
+    "executable-scope",
+    "non-executable-hint",
     "opaque-passthrough",
+)
+BASH_CASE_ORDER = CASE_ORDER + ("literal-executable",)
+POWERSHELL_CASE_ORDER = CASE_ORDER + (
+    "empty-passthrough",
+    "quoted-directory-hint",
+    "quoted-passthrough",
+    "cursor-before-passthrough",
 )
 ANSI_ESCAPE = re.compile(
     rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[@-_])"
 )
+ENUM_CANDIDATES = (
+    "auto",
+    "symlink",
+    "junction",
+    "project",
+    "staging",
+    "error",
+    "skip",
+    "basic",
+    "strict",
+    "none",
+)
+SESSION_OPTION_CANDIDATES = (
+    "--skills-dir",
+    "--cwd",
+    "--project-root",
+    "--agent-bin",
+    "--link-mode",
+    "--mount-mode",
+    "--conflict",
+    "--validation",
+    "--dry-run",
+    "--keep-mounts",
+    "--no-recover",
+    "--verbose",
+    "--help",
+    "--version",
+)
+SHELL_ERROR_MARKERS = ("unknown match specification", "compopt:")
 
 
 class AcceptanceError(RuntimeError):
@@ -52,6 +94,10 @@ class CompletionCase:
     line: str
     expected: tuple[str, ...]
     forbidden: tuple[str, ...] = ()
+    cursor_position: int | None = None
+    tabs: int = 2
+    completed: str | None = None
+    required: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -77,8 +123,15 @@ class Fixture:
         for name in ("alpha-directory", "alpha-second-directory"):
             (self.work / name).mkdir()
         (self.work / "alpha-file").write_text("not a directory\n", encoding="utf-8")
+        (self.work / "agent-nested").mkdir()
+        (self.work / "agent-data.txt").write_text("not executable\n", encoding="utf-8")
+        (self.work / "--link-mode").write_text("opaque agent value\n", encoding="utf-8")
+        if shell == "bash":
+            dangerous = self.work / "danger;id"
+            dangerous.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            dangerous.chmod(0o755)
         executable_names = (
-            ("agent-probe.exe", "agent-second.exe")
+            ("agent-probe.exe", "agent-second.exe", "agent-;literal.exe")
             if shell == "powershell"
             else ("agent-probe", "agent-second")
         )
@@ -99,38 +152,156 @@ def completion_cases(
     product: str, shell: str, work: Path | None = None
 ) -> tuple[CompletionCase, ...]:
     executable_names = (
-        ("agent-probe.exe", "agent-second.exe")
+        ("agent-probe.exe", "agent-second.exe", "agent-`;literal.exe")
         if shell == "powershell"
         else ("agent-probe", "agent-second")
     )
+    executable_names += ("agent-nested",)
+    executable_forbidden = ("agent-data.txt",)
+    if shell == "powershell":
+        executable_forbidden += ("agent-;literal.exe",)
+    non_executable_prefix = (Path(".") if work is None else work) / "agent-data"
     executable_prefix = (Path(".") if work is None else work) / "agent-"
-    return (
+    executable_scope_names = (
+        executable_names
+        + ("alpha-directory", "alpha-second-directory")
+        + (("danger;id",) if shell == "bash" else ())
+    )
+    no_match_required = ("alpha-f",) if shell == "powershell" else ()
+    cases = (
         CompletionCase(
             "subcommands",
             f"{product} c",
             ("claude", "cleanup", "codex", "completions"),
         ),
-        CompletionCase("options", f"{product} codex --pro", ("--project-root",)),
+        CompletionCase(
+            "invalid-subcommand-prefix",
+            f"{product} alpha-f",
+            (),
+            ("alpha-file",),
+            required=no_match_required,
+        ),
+        CompletionCase(
+            "options",
+            f"{product} codex --pro",
+            ("--project-root",),
+            tabs=1,
+            completed=(
+                f"{product} codex --project-root="
+                if shell == "zsh"
+                else f"{product} codex --project-root "
+            ),
+        ),
         CompletionCase(
             "wrapper-enums",
             f"{product} codex --skills-dir alpha-directory --link-mode ",
             ("auto", "junction", "symlink"),
+            tuple(
+                value
+                for value in ENUM_CANDIDATES
+                if value not in {"auto", "junction", "symlink"}
+            ),
+        ),
+        CompletionCase(
+            "wrapper-enum-prefix",
+            f"{product} codex --skills-dir alpha-directory --link-mode s",
+            ("symlink",),
+            forbidden=tuple(
+                value for value in ENUM_CANDIDATES if value != "symlink"
+            ),
+            tabs=1,
+            completed=(
+                f"{product} codex --skills-dir alpha-directory --link-mode symlink "
+            ),
+        ),
+        CompletionCase(
+            "invalid-enum-prefix",
+            f"{product} codex --link-mode alpha-f",
+            (),
+            ("alpha-file",),
+            required=no_match_required,
         ),
         CompletionCase(
             "directory-hint",
             f"{product} codex --skills-dir alpha-",
             ("alpha-directory", "alpha-second-directory"),
+            ("alpha-file",),
+        ),
+        CompletionCase(
+            "non-directory-hint",
+            f"{product} codex --skills-dir alpha-f",
+            (),
+            ("alpha-file",),
+            required=no_match_required,
         ),
         CompletionCase(
             "executable-hint",
             f"{product} codex --agent-bin {executable_prefix}",
             executable_names,
+            executable_forbidden,
+        ),
+        CompletionCase(
+            "executable-scope",
+            f"{product} codex --agent-bin ",
+            executable_scope_names,
+            executable_forbidden + ("printf",),
+        ),
+        CompletionCase(
+            "non-executable-hint",
+            f"{product} codex --agent-bin {non_executable_prefix}",
+            (),
+            ("agent-data.txt",),
+            required=(str(non_executable_prefix),) if shell == "powershell" else (),
         ),
         CompletionCase(
             "opaque-passthrough",
-            f"{product} codex --skills-dir alpha-directory -- --li",
+            f"{product} codex -- --",
+            (),
+            SESSION_OPTION_CANDIDATES,
+            required=("--",) if shell == "powershell" else (),
+        ),
+    )
+    if shell == "bash":
+        return cases + (
+            CompletionCase(
+                "literal-executable",
+                f"{product} codex --agent-bin danger",
+                (r"danger\;id",),
+                ("danger;id",),
+                tabs=1,
+                completed=f"{product} codex --agent-bin danger\\;id ",
+            ),
+        )
+    if shell != "powershell":
+        return cases
+
+    before_passthrough = f"{product} codex --pro"
+    return cases + (
+        CompletionCase(
+            "empty-passthrough",
+            f"{product} codex -- ",
+            (),
+            SESSION_OPTION_CANDIDATES,
+            required=(" \n",),
+        ),
+        CompletionCase(
+            "quoted-directory-hint",
+            f"{product} codex --skills-dir 'alpha",
+            ("alpha-directory", "alpha-second-directory"),
+            ("alpha-file",),
+        ),
+        CompletionCase(
+            "quoted-passthrough",
+            f'{product} codex "--" --li',
             (),
             ("--link-mode",),
+            required=("--li",),
+        ),
+        CompletionCase(
+            "cursor-before-passthrough",
+            f"{before_passthrough} -- --later",
+            ("--project-root",),
+            cursor_position=len(before_passthrough),
         ),
     )
 
@@ -372,10 +543,10 @@ def _collect_completion(master: int) -> bytes:
 
 
 def interactive_completion(
-    installation: ShellInstallation, fixture: Fixture, line: str
+    installation: ShellInstallation, fixture: Fixture, line: str, tabs: int
 ) -> str:
     master, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 60, 120, 0, 0))
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 60, 512, 0, 0))
 
     def configure_controlling_terminal() -> None:
         os.setsid()
@@ -394,7 +565,7 @@ def interactive_completion(
     os.close(slave)
     try:
         _wait_for_prompt(master, process)
-        os.write(master, line.encode() + b"\t\t")
+        os.write(master, line.encode() + b"\t" * tabs)
         return normalized_terminal_output(_collect_completion(master))
     finally:
         if process.poll() is None:
@@ -441,15 +612,23 @@ $ErrorActionPreference = 'Stop'
 . $env:SKILLMOUNT_COMPLETION_SCRIPT
 Set-Location -LiteralPath $env:SKILLMOUNT_COMPLETION_WORK
 $line = $env:SKILLMOUNT_COMPLETION_LINE
+$cursorPosition = if ($env:SKILLMOUNT_COMPLETION_CURSOR) {
+    [int]$env:SKILLMOUNT_COMPLETION_CURSOR
+} else {
+    $line.Length
+}
 $completion = [System.Management.Automation.CommandCompletion]::CompleteInput(
-    $line, $line.Length, $null
+    $line, $cursorPosition, $null
 )
 $completion.CompletionMatches | ForEach-Object { $_.CompletionText }
 """
 
 
 def powershell_completion(
-    installation: ShellInstallation, fixture: Fixture, line: str
+    installation: ShellInstallation,
+    fixture: Fixture,
+    line: str,
+    cursor_position: int | None = None,
 ) -> str:
     environment = installation.environment.copy()
     environment.update(
@@ -457,6 +636,9 @@ def powershell_completion(
             "SKILLMOUNT_COMPLETION_SCRIPT": str(installation.script),
             "SKILLMOUNT_COMPLETION_WORK": str(fixture.work),
             "SKILLMOUNT_COMPLETION_LINE": line,
+            "SKILLMOUNT_COMPLETION_CURSOR": (
+                "" if cursor_position is None else str(cursor_position)
+            ),
         }
     )
     result = subprocess.run(
@@ -474,15 +656,106 @@ def powershell_completion(
     return decode(result.stdout)
 
 
-def verify_case(case: CompletionCase, observed: str) -> list[str]:
-    missing = [candidate for candidate in case.expected if candidate not in observed]
-    forbidden = [candidate for candidate in case.forbidden if candidate in observed]
-    if missing or forbidden:
+def normalize_candidate(value: str) -> str:
+    candidate = value.split("\t", 1)[0].rstrip("\r\n")
+    if candidate == " ":
+        return candidate
+    candidate = candidate.strip().removesuffix("*").rstrip("/\\")
+    if "/" in candidate:
+        candidate = candidate.rsplit("/", 1)[-1]
+    elif re.match(r"^(?:[A-Za-z]:\\|\\\\)", candidate):
+        candidate = candidate.rsplit("\\", 1)[-1]
+    return candidate
+
+
+def machine_candidates(observed: str) -> set[str]:
+    return {
+        candidate
+        for line in observed.splitlines()
+        if (candidate := normalize_candidate(line))
+    }
+
+
+def menu_candidates(observed: str, product: str) -> set[str]:
+    blocks: list[list[str]] = []
+    block: list[str] = []
+    for line in observed.splitlines():
+        if line.strip():
+            block.append(line)
+        elif block:
+            blocks.append(block)
+            block = []
+    if block:
+        blocks.append(block)
+    if len(blocks) < 2:
+        return set()
+
+    candidates: set[str] = set()
+    for candidate_block in blocks[1:]:
+        for line in candidate_block:
+            if (
+                line == product
+                or line.startswith(f"{product} ")
+                or line.startswith(PROMPT)
+            ):
+                continue
+            candidate_text = line.split(" -- ", 1)[0]
+            for value in candidate_text.split():
+                if candidate := normalize_candidate(value):
+                    candidates.add(candidate)
+    return candidates
+
+
+def verify_case(shell: str, case: CompletionCase, observed: str) -> list[str]:
+    expected = {normalize_candidate(candidate) for candidate in case.expected}
+    required = {normalize_candidate(text) for text in case.required}
+    diagnostics = [marker for marker in SHELL_ERROR_MARKERS if marker in observed]
+
+    if shell == "fish" or shell == "powershell":
+        actual = machine_candidates(observed)
+        missing = sorted(expected - actual)
+        missing_required = sorted(required - actual)
+        unexpected = sorted(actual - expected - required)
+    elif not expected:
+        actual = set()
+        missing = []
+        missing_required = [
+            text for text in case.required if text not in observed
+        ]
+        unexpected = [] if observed == case.line else [observed]
+    elif len(expected) == 1 and case.tabs == 1:
+        if case.completed is None:
+            raise AcceptanceError(
+                f"case {case.name!r} omitted its exact completed command line"
+            )
+        candidate = next(iter(expected))
+        actual = {candidate} if observed == case.completed else set()
+        missing = sorted(expected - actual)
+        missing_required = [
+            text for text in case.required if text not in observed
+        ]
+        unexpected = [] if observed == case.completed else [observed]
+    else:
+        actual = menu_candidates(observed, case.line.split(" ", 1)[0])
+        missing = sorted(expected - actual)
+        missing_required = [
+            text for text in case.required if text not in observed
+        ]
+        unexpected = sorted(actual - expected)
+
+    normalized_forbidden = {normalize_candidate(value) for value in case.forbidden}
+    forbidden = sorted(
+        (actual & normalized_forbidden)
+        | {value for value in case.forbidden if value in observed}
+    )
+    if missing or missing_required or unexpected or forbidden or diagnostics:
         raise AcceptanceError(
-            f"case {case.name!r} failed: missing={missing!r} forbidden={forbidden!r} "
-            f"observed={observed!r}"
+            f"case {case.name!r} failed: missing={missing!r} "
+            f"missing_required={missing_required!r} unexpected={unexpected!r} "
+            f"forbidden={forbidden!r} diagnostics={diagnostics!r} "
+            f"actual={sorted(actual)!r} observed={observed!r}"
         )
-    return [candidate for candidate in case.expected if candidate in observed]
+    return sorted(actual)
 
 
 def verify_binary(binary: Path) -> tuple[Path, str]:
@@ -523,10 +796,14 @@ def run_shell(binary: Path, product: str, shell: str) -> None:
             if shell == "fish":
                 observed = fish_completion(installation, fixture, case.line)
             elif shell == "powershell":
-                observed = powershell_completion(installation, fixture, case.line)
+                observed = powershell_completion(
+                    installation, fixture, case.line, case.cursor_position
+                )
             else:
-                observed = interactive_completion(installation, fixture, case.line)
-            candidates = verify_case(case, observed)
+                observed = interactive_completion(
+                    installation, fixture, case.line, case.tabs
+                )
+            candidates = verify_case(shell, case, observed)
             emit(observation_record(shell, product, case.name, candidates))
 
 

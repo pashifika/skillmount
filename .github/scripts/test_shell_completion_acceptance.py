@@ -12,7 +12,10 @@ from pathlib import Path
 from unittest import mock
 
 from shell_completion_acceptance import (
+    BASH_CASE_ORDER,
     CASE_ORDER,
+    POWERSHELL_CASE_ORDER,
+    CompletionCase,
     AcceptanceError,
     Fixture,
     completion_cases,
@@ -20,16 +23,23 @@ from shell_completion_acceptance import (
     install_completion,
     observation_record,
     require_interpreter,
+    verify_case,
     main,
 )
 
 
 class ShellCompletionAcceptanceTests(unittest.TestCase):
     def test_case_order_and_observation_output_are_deterministic(self) -> None:
-        names = ("syntax",) + tuple(
-            case.name for case in completion_cases("asm", "bash")
-        )
-        self.assertEqual(names, CASE_ORDER)
+        for shell, expected in (
+            ("bash", BASH_CASE_ORDER),
+            ("zsh", CASE_ORDER),
+            ("powershell", POWERSHELL_CASE_ORDER),
+        ):
+            with self.subTest(shell=shell):
+                names = ("syntax",) + tuple(
+                    case.name for case in completion_cases("asm", shell)
+                )
+                self.assertEqual(names, expected)
 
         first = io.StringIO()
         second = io.StringIO()
@@ -45,6 +55,37 @@ class ShellCompletionAcceptanceTests(unittest.TestCase):
             json.loads(first.getvalue())["candidates"],
             ["auto", "junction", "symlink"],
         )
+
+    def test_unexpected_candidates_and_shell_diagnostics_fail(self) -> None:
+        case = CompletionCase(
+            "prefix",
+            "asm codex --link-mode s",
+            ("symlink",),
+            ("auto", "junction"),
+        )
+        with self.assertRaisesRegex(AcceptanceError, "forbidden=.*auto"):
+            verify_case("powershell", case, "symlink\nauto\n")
+        with self.assertRaisesRegex(AcceptanceError, "unexpected=.*garbage"):
+            verify_case("powershell", case, "symlink\ngarbage\n")
+        with self.assertRaisesRegex(AcceptanceError, "unknown match specification"):
+            verify_case(
+                "powershell", case, "symlink\nunknown match specification character\n"
+            )
+
+    def test_single_candidate_completion_requires_the_exact_command_buffer(self) -> None:
+        case = CompletionCase(
+            "option-prefix",
+            "asm codex --pro",
+            ("--project-root",),
+            tabs=1,
+            completed="asm codex --project-root ",
+        )
+        self.assertEqual(
+            verify_case("bash", case, "asm codex --project-root "),
+            ["--project-root"],
+        )
+        with self.assertRaisesRegex(AcceptanceError, "unexpected=.*project-root-bogus"):
+            verify_case("bash", case, "asm codex --project-root-bogus ")
 
     def test_every_installed_file_stays_inside_the_isolated_home(self) -> None:
         for shell in ("bash", "zsh", "fish", "powershell"):

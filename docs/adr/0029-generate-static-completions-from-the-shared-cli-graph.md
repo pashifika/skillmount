@@ -24,12 +24,18 @@ the shared command graph from `src/cli.rs`, binds it only to the recognized prod
 invoked, and emits a static script to stdout before project, catalog, agent, state, lock, journal,
 recovery, or process work can begin.
 
-Bash, Zsh, and Fish use the exactly pinned stable `clap_complete` ahead-of-time generators plus a
-narrow static guard that suppresses wrapper completion after `--`. PowerShell uses a
-SkillMount-owned static generator over the same `clap::Command` graph because the pinned upstream
-generator cannot preserve the required enum and path metadata. The supported-shell enum remains
-SkillMount-owned and closed; no generated completer invokes SkillMount, an agent, or another
-process.
+Bash, Zsh, and Fish use the exactly pinned stable `clap_complete` ahead-of-time generators plus
+narrow static compatibility code. Every shell suppresses wrapper completion after `--`. Bash
+disables Readline's default filename fallback, owns directory and executable-path filtering, and
+asks Readline to quote filename metacharacters. Zsh replaces the upstream directory and executable
+file completers with strict path-only helpers and keeps an owned guard bound across the pinned
+generator's autoload bootstrap. Fish replaces the upstream unfiltered executable hint with an
+owned helper that admits only directories and executable files. PowerShell uses a
+SkillMount-owned static generator over the same `clap::Command` graph
+because the pinned upstream generator cannot preserve the required enum and path metadata. It
+derives state only from command elements before the active cursor and escapes filesystem candidates
+as literal PowerShell argument text. The supported-shell enum remains SkillMount-owned and closed;
+no generated completer invokes SkillMount, an agent, or another process.
 
 ## Alternatives
 
@@ -72,10 +78,11 @@ process.
   and process sentinels without changing any watched path.
 - `src/app.rs` injected-writer tests enforce successful BrokenPipe handling and category 70 for other
   output failures.
-- `.github/scripts/shell_completion_acceptance.py` and its self-tests exercise syntax, visible
-  commands and options, possible values, directory and executable hints, the `--` boundary,
-  isolated-home containment, deterministic observations, owned cleanup, and unavailable-shell
-  failure.
-- `.github/workflows/ci.yml` runs Bash, Zsh, and Fish on pinned Apple Silicon macOS shell formulae and
-  PowerShell for both supported Windows target binaries, with every job required by the aggregate
-  gate.
+- `.github/scripts/shell_completion_acceptance.py` and its self-tests exercise syntax, exact visible
+  candidate sets, completed and invalid prefixes, directory and executable hints (including quoted
+  prefixes, strict type filtering, traversal, no-match behavior, and literal metacharacters),
+  cold-start and cursor-relative `--` handling, isolated-home containment, deterministic
+  observations, owned cleanup, and unavailable-shell failure.
+- `.github/workflows/ci.yml` runs Bash, Zsh, and Fish on pinned Apple Silicon macOS shell formulae,
+  repeats Bash coverage with the system Bash 3.2, and runs PowerShell for both supported Windows
+  target binaries, with every job required by the aggregate gate.

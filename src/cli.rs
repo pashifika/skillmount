@@ -1,6 +1,8 @@
 //! Shared command-line parser for both executable shims.
 
 use std::ffi::{OsStr, OsString};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -195,18 +197,38 @@ impl ProductBinary {
     }
 
     fn from_argv0(argv0: &OsStr) -> Option<Self> {
-        match Path::new(argv0).file_name() {
-            Some(name) if name == OsStr::new("asm") || name == OsStr::new("asm.exe") => {
+        let name = Path::new(argv0).file_name()?;
+        #[cfg(windows)]
+        {
+            if windows_ascii_name_eq(name, b"asm") || windows_ascii_name_eq(name, b"asm.exe") {
                 Some(Self::Asm)
-            }
-            Some(name)
-                if name == OsStr::new("skillmount") || name == OsStr::new("skillmount.exe") =>
+            } else if windows_ascii_name_eq(name, b"skillmount")
+                || windows_ascii_name_eq(name, b"skillmount.exe")
             {
                 Some(Self::Skillmount)
+            } else {
+                None
             }
-            _ => None,
+        }
+        #[cfg(not(windows))]
+        {
+            match name {
+                name if name == OsStr::new("asm") => Some(Self::Asm),
+                name if name == OsStr::new("skillmount") => Some(Self::Skillmount),
+                _ => None,
+            }
         }
     }
+}
+#[cfg(windows)]
+fn windows_ascii_name_eq(value: &OsStr, expected_lowercase: &[u8]) -> bool {
+    value
+        .encode_wide()
+        .map(|unit| match unit {
+            0x41..=0x5a => unit + 0x20,
+            _ => unit,
+        })
+        .eq(expected_lowercase.iter().copied().map(u16::from))
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -555,13 +577,25 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn completion_product_identity_recognizes_windows_suffixes() {
-        assert_eq!(completion("asm.exe", "bash").product, ProductBinary::Asm);
-        assert_eq!(
-            completion("skillmount.exe", "bash").product,
-            ProductBinary::Skillmount
-        );
+    fn completion_product_identity_recognizes_windows_names_case_insensitively() {
+        for (name, expected) in [
+            ("asm.exe", ProductBinary::Asm),
+            ("ASM.EXE", ProductBinary::Asm),
+            ("SkillMount", ProductBinary::Skillmount),
+            ("SKILLMOUNT.ExE", ProductBinary::Skillmount),
+        ] {
+            assert_eq!(completion(name, "bash").product, expected);
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn completion_product_identity_rejects_windows_suffixes() {
+        let error = parse_command_from(["asm.exe", "completions", "bash"])
+            .expect_err("Windows executable suffix should be rejected off Windows");
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
     }
 
     #[test]

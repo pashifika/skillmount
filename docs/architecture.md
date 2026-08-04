@@ -41,8 +41,8 @@ The initial release targets are:
 
 Native completion acceptance covers Bash, Zsh, and Fish on Apple Silicon macOS and PowerShell on
 both native Windows release architectures. Generation itself is portable and state-free, but a
-shell is not added to the supported set without syntax and representative behavior evidence on its
-claimed native host.
+shell is not added to the supported set without syntax and representative exact-candidate behavior
+evidence on its claimed native host.
 
 Windows mutation requires Windows 10 version 1709 or later so verified entries can be unlinked with
 POSIX handle disposition even while unrelated inspect handles remain open. [ADR 0016](adr/0016-require-posix-handle-disposition-on-windows.md)
@@ -68,7 +68,7 @@ behavior.
 | Surface | Current behavior |
 |---|---|
 | `asm inspect` | Resolves catalogs and both agents' discovery layouts without mutation. |
-| `asm completions <bash\|zsh\|fish\|powershell>` | Rebuilds the shared CLI graph and writes one deterministic static script bound to `asm`; `skillmount completions` binds only `skillmount`. Generation stops before project, catalog, agent, state, lock, journal, recovery, or process work, and wrapper completion stops at the session `--` delimiter. |
+| `asm completions <bash\|zsh\|fish\|powershell>` | Rebuilds the shared CLI graph and writes one deterministic static script bound to `asm`; `skillmount completions` binds only `skillmount`. Generation stops before project, catalog, agent, state, lock, journal, recovery, or process work. Wrapper completion stops at a session `--` before the active cursor. Filesystem candidates are emitted as literal shell argument text, and executable hints admit only directories and executable files. |
 | `asm codex --dry-run -- exec ...` or `-- review ...` | Produces the bounded Codex plan without directories, links, locks, journals, recovery, or child launch. |
 | `asm claude --dry-run` | Produces the isolated Claude staging plan under the same read-only contract. |
 | `asm claude --mount-mode=project` | Uses the project's `.claude/skills` namespace instead of isolated staging; `--dry-run` keeps that plan read-only. |
@@ -188,7 +188,7 @@ conflict until recovery removes it. This ordering is the accepted decision in
 | Module | Responsibility |
 |---|---|
 | `src/cli.rs` | Shared `clap` contract and conversion into typed commands. |
-| `src/completion.rs` | Static Bash, Zsh, Fish, and PowerShell generation from the shared command graph, exact product-name binding, and opaque-passthrough guards. |
+| `src/completion.rs` | Static Bash, Zsh, Fish, and PowerShell generation from the shared command graph, exact product-name binding, literal filesystem candidates, executable filtering, and cold-start opaque-passthrough guards. |
 | `src/paths.rs` | Invocation CWD, launch CWD, project root, source occurrence, and executable resolution. |
 | `src/catalog/` | No-follow source discovery, ordered overlay selection, and selected-winner validation. |
 | `src/agent/` | Codex and Claude discovery inspection and declarative plan construction. |
@@ -575,8 +575,12 @@ The following are product rules rather than style preferences:
     absent after its complete locks are held is unknown ownership and blocks mutation. A live lock
     always wins over holder text; an ownership mismatch is retained and reported.
 17. `completions` accepts only the owned Bash, Zsh, Fish, and PowerShell values, binds output only
-    to the recognized invoked product name, stops wrapper candidates after `--`, and performs no
-    project, catalog, agent, state, lock, journal, recovery, link, or process work.
+    to the recognized platform-native invoked product name, stops wrapper candidates after a `--`
+    before the active cursor starting with the first completion, emits filesystem candidates as
+    literal shell argument text, never falls back to unrelated files from constrained wrapper
+    states, limits directory hints to directories and executable hints to directories and
+    executable files, and performs no project, catalog, agent, state, lock, journal, recovery,
+    link, or process work.
 
 Tests enforce the observable parts of these rules. Local comments retain the narrower preconditions
 needed to preserve them inside an implementation.
