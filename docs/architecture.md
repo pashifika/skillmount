@@ -12,9 +12,9 @@ as current only after it exists in the tracked source and can be traced to repos
 Status: catalog resolution, discovery inspection, read-only planning, cross-platform link
 primitives, resource locking, durable transactions, cleanup, stale recovery, the generic child
 process supervisor, the Codex and Claude session adapters, operator diagnosis and explicit
-recovery, and the repository evidence workflow are implemented. Release automation, executed
-live-agent compatibility certification, and the remaining transaction-lifetime hardening named
-under [Reserved work](#reserved-work) are not implemented.
+recovery, the repository evidence workflow, and versioned release packaging and publication are
+implemented. Executed live-agent compatibility certification and the remaining
+transaction-lifetime hardening named under [Reserved work](#reserved-work) are not implemented.
 
 ## Product definition
 
@@ -589,6 +589,11 @@ needed to preserve them inside an implementation.
 - operator quick-start, lifecycle, recovery, safety, compatibility, and manual smoke-test
   documentation, plus a dispatch-only native real-agent evidence workflow with integrity-locked
   agent packages, provider-scoped credentials, redacted artifacts, and process-tree timeouts;
+- stable-tag and read-only manual release preflight, fixed native target builds, deterministic
+  dual-binary archives, complete-set SHA-256 verification, and least-privilege marker-owned draft
+  publication with main-ancestry and workflow-tree parity rechecks
+  ([ADR 0028](adr/0028-require-workflow-tree-parity-for-github-token-releases.md)), plus
+  immutable-action policy tests and reviewed tag-protection/runbook material;
 - crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
 
 ### Reserved work
@@ -599,7 +604,6 @@ needed to preserve them inside an implementation.
 - lock-file reclamation;
 - binding a public transaction's lifetime to the lock guard validated when it is opened or adopted;
 - rejecting pre-existing links in application-state directory paths before creation or permission changes;
-- versioned release packaging and publication.
 
 Both session adapters use the supervisor in the product application path, but real-agent and
 Windows-junction certification remain non-blocking compatibility evidence gaps rather than claims

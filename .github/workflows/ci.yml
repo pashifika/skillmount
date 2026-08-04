@@ -41,6 +41,10 @@ jobs:
         run: python .github/scripts/test_branch_policy.py
       - name: Test live-smoke harness safeguards
         run: python .github/scripts/test_live_agent_smoke.py
+      - name: Test release preparation safeguards
+        run: python -B .github/scripts/test_release.py
+      - name: Test release publication safeguards
+        run: python -B .github/scripts/test_release_publish.py
       - name: Validate pull-request branch flow
         if: github.event_name == 'pull_request'
         env:
