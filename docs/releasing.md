@@ -25,10 +25,11 @@ Rust host, or requested target differs from the fixed matrix. Artifact download 
 as an error. Workflow permissions default to `contents: read`; only the final tag-push publication
 job overrides that scope with `contents: write`.
 
-GitHub's release-creation API rejects the Actions `GITHUB_TOKEN` when the release commit changes any
-file under `.github/workflows` relative to the current default branch. Tag-push preflight therefore
-also requires that workflow tree to match `origin/main`; `main` may advance through changes outside
-that tree. Do not merge workflow changes between creating a release tag and publication.
+GitHub's release-creation and update APIs reject the Actions `GITHUB_TOKEN` when the release commit
+changes any file under `.github/workflows` relative to the current default branch. Tag-push preflight
+therefore requires that workflow tree to match `origin/main`, and the publish job fetches and
+rechecks current `main` immediately before Release interaction; `main` may advance through changes
+outside that tree. Do not merge workflow changes between creating a release tag and publication.
 
 Primary references:
 
@@ -86,10 +87,11 @@ git merge-base --is-ancestor <commit> origin/main
 cargo metadata --locked --no-deps --format-version 1
 ```
 
-A zero status from `git merge-base` is required. The release workflow repeats these checks from a
-full checkout and also compares `.github/workflows` with `origin/main` before exposing version,
-target matrix, or commit outputs. If that tree differs, do not move the tag: promote the intended
-workflow state and release a new patch version.
+A zero status from `git merge-base` is required. Preflight repeats these checks from a full checkout
+and compares `.github/workflows` with `origin/main` before exposing version, target matrix, or commit
+outputs. The publish job fetches and rechecks both conditions after asset verification. If that tree
+differs at either boundary, do not move the tag: promote the intended workflow state and release a
+new patch version.
 
 ## Rehearse without publication
 
@@ -153,8 +155,9 @@ git push origin refs/tags/<tag>
 The broad `v*` trigger is intentional because GitHub tag filters are globs. Preflight then applies
 the anchored stable-version grammar, compares Cargo metadata, resolves the tag to a commit, fetches
 `origin/main`, proves ancestry, and checks the workflow tree required by GitHub's `GITHUB_TOKEN`
-release restriction. Malformed or prerelease tags, version mismatches, off-main tags, and workflow
-divergence stop before builds and publication.
+release restriction. The publish job repeats the remote-main checks immediately before Release
+interaction. Malformed or prerelease tags, version mismatches, off-main tags, and workflow
+divergence stop before publication.
 
 Watch the tag run:
 
@@ -197,6 +200,7 @@ The release boundary is deliberately asymmetric:
 | Failure | Required outcome |
 |---|---|
 | Preflight, target build, smoke, package, aggregate, or checksum failure | No GitHub Release interaction occurs. Fix through a new commit and, if a version tag already exists, use a new patch version rather than moving it. |
+| `.github/workflows` differs from current `main` at preflight or publication | Stop before Release interaction. Never move the tag; promote the intended workflow state and use a new patch version. |
 | Upload interruption after draft creation | A marker-bound draft remains. Rerun the failed same-tag workflow job while its workflow artifacts are retained. |
 | Matching workflow draft with an absent asset | Upload only the missing asset, then redownload and verify the complete set. |
 | Matching workflow draft with an `open` incomplete asset | Delete only that incomplete asset and retry its upload. |

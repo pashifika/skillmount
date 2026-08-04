@@ -117,6 +117,37 @@ fn release_workflow_is_manual_safe_and_least_privilege() {
         field(concurrency, "cancel-in-progress").as_bool(),
         Some(false)
     );
+
+    let steps = field(publish, "steps")
+        .as_sequence()
+        .expect("publish steps must be a sequence");
+    let checkout = mapping(&steps[0]);
+    assert_eq!(
+        string_field(checkout, "name"),
+        "Check out validated publication code"
+    );
+    let checkout_options = mapping(field(checkout, "with"));
+    assert_eq!(field(checkout_options, "fetch-depth").as_i64(), Some(0));
+    assert_eq!(
+        field(checkout_options, "persist-credentials").as_bool(),
+        Some(false)
+    );
+    let step_names = steps
+        .iter()
+        .map(|step| string_field(mapping(step), "name"))
+        .collect::<Vec<_>>();
+    let source_check = step_names
+        .iter()
+        .position(|name| *name == "Revalidate current main publication compatibility")
+        .expect("publish must revalidate current main");
+    let publisher = step_names
+        .iter()
+        .position(|name| *name == "Create or resume and publish verified release")
+        .expect("publish must invoke the controlled publisher");
+    assert!(source_check < publisher);
+    assert!(
+        string_field(mapping(&steps[source_check]), "run").contains("verify-publication-source")
+    );
 }
 
 #[test]

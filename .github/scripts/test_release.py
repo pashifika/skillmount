@@ -180,14 +180,18 @@ class ReleaseTests(unittest.TestCase):
             '"target":"aarch64-apple-darwin"}]}'
         )
 
-    def test_real_git_ancestry_and_workflow_tree_checks_are_independent(self) -> None:
-        """Allow unrelated main movement while rejecting workflow divergence."""
+    def test_real_git_publication_source_rechecks_current_main(self) -> None:
+        """Allow unrelated main movement while rejecting later workflow drift."""
 
+        remote = self.root / "remote.git"
+        remote.mkdir()
+        self.run_git(remote, "init", "--bare")
         repository = self.root / "git-repository"
         repository.mkdir()
         self.run_git(repository, "init", "-b", "main")
         self.run_git(repository, "config", "user.name", "Release Test")
         self.run_git(repository, "config", "user.email", "release@example.invalid")
+        self.run_git(repository, "remote", "add", "origin", str(remote))
         tracked = repository / "tracked.txt"
         tracked.write_text("base\n", encoding="utf-8")
         workflow = repository / ".github" / "workflows" / "release.yml"
@@ -199,9 +203,24 @@ class ReleaseTests(unittest.TestCase):
         tracked.write_text("main\n", encoding="utf-8")
         self.run_git(repository, "commit", "-am", "main")
         main_tip = self.run_git(repository, "rev-parse", "HEAD")
+        self.run_git(repository, "push", "--set-upstream", "origin", "main")
+
+        self.run_git(repository, "switch", "--detach", base)
+        release.verify_publication_source(repository, base)
+
+        self.run_git(repository, "switch", "main")
+        workflow.write_text("name: Updated release\n", encoding="utf-8")
+        self.run_git(repository, "commit", "-am", "workflow")
+        workflow_main_tip = self.run_git(repository, "rev-parse", "HEAD")
+        self.run_git(repository, "push", "origin", "main")
+        self.run_git(repository, "switch", "--detach", base)
+        with self.assertRaisesRegex(
+            release.ReleaseError, "changes .github/workflows"
+        ):
+            release.verify_publication_source(repository, base)
+
         self.run_git(repository, "switch", "-c", "topic", base)
         tracked.write_text("topic\n", encoding="utf-8")
-        workflow.write_text("name: Diverged release\n", encoding="utf-8")
         self.run_git(repository, "commit", "-am", "topic")
         topic_tip = self.run_git(repository, "rev-parse", "HEAD")
 
@@ -214,7 +233,7 @@ class ReleaseTests(unittest.TestCase):
         )
         self.assertFalse(
             release.git_paths_match(
-                repository, topic_tip, main_tip, ".github/workflows"
+                repository, base, workflow_main_tip, ".github/workflows"
             )
         )
 

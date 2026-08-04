@@ -590,8 +590,10 @@ needed to preserve them inside an implementation.
   documentation, plus a dispatch-only native real-agent evidence workflow with integrity-locked
   agent packages, provider-scoped credentials, redacted artifacts, and process-tree timeouts;
 - stable-tag and read-only manual release preflight, fixed native target builds, deterministic
-  dual-binary archives, complete-set SHA-256 verification, least-privilege marker-owned draft
-  publication, immutable-action policy tests, and reviewed tag-protection/runbook material;
+  dual-binary archives, complete-set SHA-256 verification, and least-privilege marker-owned draft
+  publication with main-ancestry and workflow-tree parity rechecks
+  ([ADR 0028](adr/0028-require-workflow-tree-parity-for-github-token-releases.md)), plus
+  immutable-action policy tests and reviewed tag-protection/runbook material;
 - crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
 
 ### Reserved work

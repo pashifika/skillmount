@@ -350,6 +350,42 @@ def git_paths_match(
     raise ReleaseError(f"git diff failed with status {completed.returncode}: {stderr}")
 
 
+def verify_publication_source(repository: Path, commit: str) -> None:
+    """Revalidate the checked-out commit against the current remote main."""
+
+    repository = repository.resolve()
+    commit = validate_commit(commit)
+    checked_out = validate_commit(
+        git_output(repository, "rev-parse", "HEAD^{commit}")
+    )
+    if checked_out != commit:
+        raise ReleaseError(
+            f"checked-out commit {checked_out} does not match validated commit {commit}"
+        )
+    run_checked(
+        (
+            "git",
+            "fetch",
+            "--no-tags",
+            "--force",
+            "origin",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ),
+        cwd=repository,
+    )
+    if not git_is_ancestor(repository, commit, "origin/main"):
+        raise ReleaseError(
+            f"tag commit {commit} is not an ancestor of the fetched origin/main"
+        )
+    if not git_paths_match(
+        repository, commit, "origin/main", ".github/workflows"
+    ):
+        raise ReleaseError(
+            "tag commit changes .github/workflows relative to origin/main; "
+            "GitHub Releases rejects the Actions GITHUB_TOKEN in this state"
+        )
+
+
 def preflight(
     repository: Path,
     *,
@@ -378,21 +414,9 @@ def preflight(
         tag_commit = validate_commit(
             git_output(repository, "rev-parse", f"refs/tags/{ref_name}^{{commit}}")
         )
-        run_checked(
-            (
-                "git",
-                "fetch",
-                "--no-tags",
-                "--force",
-                "origin",
-                "+refs/heads/main:refs/remotes/origin/main",
-            ),
-            cwd=repository,
-        )
-        main_contains_commit = git_is_ancestor(repository, commit, "origin/main")
-        workflow_files_match_main = git_paths_match(
-            repository, commit, "origin/main", ".github/workflows"
-        )
+        verify_publication_source(repository, commit)
+        main_contains_commit = True
+        workflow_files_match_main = True
 
     return evaluate_preflight(
         event_name=event_name,
@@ -968,6 +992,10 @@ def argument_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument("--event-sha", required=True)
     preflight_parser.add_argument("--github-output", type=Path, required=True)
 
+    source_parser = subparsers.add_parser("verify-publication-source")
+    source_parser.add_argument("--repository", type=Path, default=Path.cwd())
+    source_parser.add_argument("--commit", required=True)
+
     runner_parser = subparsers.add_parser("verify-runner")
     runner_parser.add_argument("--repository", type=Path, default=Path.cwd())
     runner_parser.add_argument("--toolchain", required=True)
@@ -1024,6 +1052,10 @@ def run(arguments: Sequence[str]) -> int:
             f"Validated {result.tag} at {result.commit}; "
             f"publish={str(result.publish).lower()}"
         )
+        return 0
+    if options.command == "verify-publication-source":
+        verify_publication_source(options.repository, options.commit)
+        print(f"Validated current main publication compatibility for {options.commit}")
         return 0
     if options.command == "verify-runner":
         evidence = rustc_runner_evidence(
