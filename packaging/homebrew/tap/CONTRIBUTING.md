@@ -24,6 +24,20 @@ provenance generated from a verified release, and a hand edit breaks the pair-co
 the publisher runs before every write. If a published version's bytes are wrong, the fix is a new
 SkillMount patch release, never an in-place digest edit.
 
+## Repository bootstrap
+
+The tap starts with one reviewed infrastructure change containing this file, `README.md`,
+`SECURITY.md`, and `.github/workflows/tap.yml`, before any Formula exists. In that never-published
+state the `formulae` job records an explicit bootstrap notice and skips package-manager lifecycle
+work. The classifier accepts that skip only while the complete maintainer baseline is present and
+no Formula exists anywhere in the checked-out history. A partial pair, an unrelated Formula, or
+deletion after publication fails.
+
+After the bootstrap push passes, protect `main` and require the `formulae` job and review before
+merging. Do not install the publisher's GitHub App until those protections are active. This is the
+only pre-protection repository change; every Formula change follows the normal required-check
+contract below.
+
 ## Required checks
 
 Every pull request must pass the tap CI workflow on Apple Silicon macOS before merge:
