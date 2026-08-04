@@ -10,8 +10,8 @@ external Agent Skills into one Codex CLI or Claude Code session; the product its
 
 ## What the tap publishes
 
-One product, two selectable Formulae. Each Formula builds SkillMount from the same immutable
-release source tag and installs exactly one of the product's two equivalent commands:
+One product, two selectable Formulae. Each Formula consumes the same checked Apple Silicon release
+archive and installs exactly one of the product's two equivalent commands:
 
 | Formula | Installs | Completions installed for |
 |---|---|---|
@@ -25,8 +25,8 @@ other. Completions are generated at install time by running the installed comman
 
 ## Supported platform
 
-Apple Silicon macOS only, built from source with the Rust toolchain Homebrew provides. Linuxbrew,
-macOS Intel, casks, and bottles are not supported.
+Apple Silicon macOS only, installed from the protected GitHub Release archive. Linuxbrew, macOS
+Intel, casks, and bottles are not supported.
 
 ## Install
 
@@ -48,18 +48,19 @@ brew install pashifika/tap/skillmount-asm            # not yet available
 ## How Formulae change
 
 Formula updates are proposed by SkillMount's release automation, which opens one pull request per
-version updating both Formulae together from the same verified source tag and SHA-256. Automation
-authenticates as a GitHub App installed only on this repository and never pushes the protected
-default branch. Every pull request must pass the tap CI checks — `brew style`, `brew audit
---strict` for both Formulae, both source builds, both `brew test` runs, selected-only install,
-co-installation, cross-uninstall, and completion-ownership checks — before merge. See
+version updating both Formulae together from the same verified release archive and SHA-256.
+Automation authenticates as a GitHub App installed only on this repository and never pushes the
+protected default branch. Every pull request must pass the tap CI checks — `brew style`,
+`brew audit --strict` for both Formulae, both archive installs, both `brew test` runs,
+selected-only install, co-installation, cross-uninstall, completion-ownership checks, and an
+upgrade rehearsal from the base revision — before merge. See
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Reporting a problem
 
-- A Formula problem — the build fails, `brew install`/`upgrade`/`uninstall` misbehaves, a
-  completion file is wrong or misplaced, or Formula metadata is incorrect — belongs in this
-  repository's issue tracker.
+- A Formula problem — the archive cannot be installed, `brew install`/`upgrade`/`uninstall`
+  misbehaves, a completion file is wrong or misplaced, or Formula metadata is incorrect — belongs
+  in this repository's issue tracker.
 - A product bug — an installed `asm` or `skillmount` command behaves incorrectly — belongs in
   [pashifika/skillmount issues](https://github.com/pashifika/skillmount/issues).
 - A security concern of either kind follows [SECURITY.md](SECURITY.md).

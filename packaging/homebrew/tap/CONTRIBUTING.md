@@ -19,9 +19,9 @@ never force-pushes, and never closes or merges an existing pull request; a retri
 matching branch and stops on any mismatch.
 
 Human changes are limited to tap infrastructure: CI, documentation, and repository policy. Do not
-hand-edit a Formula's version, source URL, digest, or selected binary; those values are provenance
-generated from a verified release, and a hand edit breaks the pair-consistency checks the
-publisher runs before every write. If a published version's bytes are wrong, the fix is a new
+hand-edit a Formula's version, release-archive URL, digest, or selected binary; those values are
+provenance generated from a verified release, and a hand edit breaks the pair-consistency checks
+the publisher runs before every write. If a published version's bytes are wrong, the fix is a new
 SkillMount patch release, never an in-place digest edit.
 
 ## Required checks
@@ -29,23 +29,26 @@ SkillMount patch release, never an in-place digest edit.
 Every pull request must pass the tap CI workflow on Apple Silicon macOS before merge:
 
 - `brew style` and `brew audit --strict` for both Formulae;
-- a from-source build of each Formula;
+- an install of each Formula from its checked release archive;
 - `brew test` for each Formula;
 - selected-only installation: each Formula's keg contains exactly its own command and never the
   pair member's executable;
 - co-installation of both Formulae, then cross-uninstall, proving each command keeps working while
   its own Formula remains installed;
 - completion ownership: each shell has exactly one Formula-owned completion file per installed
-  Formula, registering only that Formula's command.
+  Formula, registering only that Formula's command;
+- an upgrade rehearsal: both Formulae install at the base revision's version and `brew upgrade`
+  reaches this pull request's version. It self-skips with a notice when the base branch has no
+  published pair yet or the version is unchanged.
 
 ## Review expectations
 
 For a version pull request, confirm before merging that:
 
-1. both Formulae changed together and share the identical source URL, SHA-256, version, license,
-   and platform requirements;
-2. each Formula names only its own Cargo binary and command, with the pair member's command
-   appearing only inside the `test do` block;
+1. both Formulae changed together and share the identical release-archive URL, SHA-256, version,
+   license, and platform requirements;
+2. each Formula names only its own release archive member and command, with the pair member's
+   command appearing only inside the `test do` block;
 3. the provenance comment names the expected release tag and commit;
 4. every required check above is green.
 

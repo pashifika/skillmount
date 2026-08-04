@@ -33,11 +33,13 @@ HEX64_PATTERN = re.compile(r"[0-9a-f]{64}")
 FORMULA_URL_PATTERN = re.compile(r'^\s*url\s+"([^"\n]+)"', re.MULTILINE)
 FORMULA_SHA256_PATTERN = re.compile(r'^\s*sha256\s+"([^"\n]+)"', re.MULTILINE)
 FORMULA_VERSION_PATTERN = re.compile(r'^\s*version\s+"([^"\n]+)"', re.MULTILINE)
-FORMULA_CARGO_BIN_PATTERN = re.compile(r'"--bin"\s*,\s*"([^"\n]+)"')
+FORMULA_INSTALLED_BINARY_PATTERN = re.compile(
+    r'^\s*bin\.install\s+"([^"\n]+)"', re.MULTILINE
+)
 FORMULA_COMMAND_PATTERN = re.compile(
     r'generate_completions_from_executable\(\s*bin\s*/\s*"([^"\n]+)"'
 )
-SOURCE_TAG_PATTERN = re.compile(r"/archive/refs/tags/(v[^/\s]+)\.tar\.gz\Z")
+RELEASE_TAG_PATTERN = re.compile(r"/releases/download/(v[^/\s]+)/[^/\s]+\Z")
 ODATA_NAMESPACES = {
     "atom": "http://www.w3.org/2005/Atom",
     "m": "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata",
@@ -90,10 +92,10 @@ def normalized_package_hash(value: object) -> str | None:
 class FormulaIdentity:
     """Immutable Formula provenance compared before any tap write."""
 
-    source_url: str | None
-    source_sha256: str | None
+    archive_url: str | None
+    archive_sha256: str | None
     version: str | None
-    cargo_bin: str | None
+    installed_binary: str | None
     command: str | None
 
     @property
@@ -103,10 +105,10 @@ class FormulaIdentity:
         return all(
             value is not None
             for value in (
-                self.source_url,
-                self.source_sha256,
+                self.archive_url,
+                self.archive_sha256,
                 self.version,
-                self.cargo_bin,
+                self.installed_binary,
                 self.command,
             )
         )
@@ -115,10 +117,10 @@ class FormulaIdentity:
         """Render every comparable field, naming unresolved ones explicitly."""
 
         return (
-            f"url={self.source_url or 'unparsed'} "
-            f"sha256={self.source_sha256 or 'unparsed'} "
+            f"url={self.archive_url or 'unparsed'} "
+            f"sha256={self.archive_sha256 or 'unparsed'} "
             f"version={self.version or 'unparsed'} "
-            f"bin={self.cargo_bin or 'unparsed'} "
+            f"installed={self.installed_binary or 'unparsed'} "
             f"command={self.command or 'unparsed'}"
         )
 
@@ -126,20 +128,20 @@ class FormulaIdentity:
 def formula_identity(text: str) -> FormulaIdentity:
     """Extract one Formula's comparable provenance from its Ruby source."""
 
-    source_url = unique_match(FORMULA_URL_PATTERN, text)
+    archive_url = unique_match(FORMULA_URL_PATTERN, text)
     version = unique_match(FORMULA_VERSION_PATTERN, text)
-    if version is None and source_url is not None:
-        tag_match = SOURCE_TAG_PATTERN.search(source_url)
+    if version is None and archive_url is not None:
+        tag_match = RELEASE_TAG_PATTERN.search(archive_url)
         if tag_match is not None:
             try:
                 version = release_assets.stable_version_from_tag(tag_match.group(1))
             except release_assets.ReleaseError:
                 version = None
     return FormulaIdentity(
-        source_url=source_url,
-        source_sha256=unique_match(FORMULA_SHA256_PATTERN, text),
+        archive_url=archive_url,
+        archive_sha256=unique_match(FORMULA_SHA256_PATTERN, text),
         version=version,
-        cargo_bin=unique_match(FORMULA_CARGO_BIN_PATTERN, text),
+        installed_binary=unique_match(FORMULA_INSTALLED_BINARY_PATTERN, text),
         command=unique_match(FORMULA_COMMAND_PATTERN, text),
     )
 
@@ -149,11 +151,12 @@ def expected_formula_identity(
 ) -> FormulaIdentity:
     """Return the provenance every generated Formula in this pair must declare."""
 
+    archive = inputs.archive(channels.MACOS_ARM64.triple)
     return FormulaIdentity(
-        source_url=inputs.source_url,
-        source_sha256=inputs.source_sha256,
+        archive_url=archive.url,
+        archive_sha256=archive.sha256,
         version=inputs.version,
-        cargo_bin=identity.cargo_bin,
+        installed_binary=identity.command,
         command=identity.command,
     )
 
@@ -301,12 +304,14 @@ def formula_commit_message(
 ) -> str:
     """Return the reviewable commit message for one Formula update."""
 
+    archive = inputs.archive(channels.MACOS_ARM64.triple)
     return (
         f"{identity.package_id}: {inputs.version}\n\n"
         f"Tag: {inputs.tag}\n"
         f"Commit: {inputs.commit}\n"
-        f"Source: {inputs.source_url}\n"
-        f"Source SHA-256: {inputs.source_sha256}\n"
+        f"Release archive: {archive.url}\n"
+        f"Archive SHA-256: {archive.sha256}\n"
+        f"Installed binary: {identity.command}\n"
         f"Selected command: {identity.command}\n"
     )
 
@@ -322,25 +327,26 @@ def pull_request_body(
 ) -> str:
     """Return a reviewable body naming the shared provenance and both members."""
 
+    archive = inputs.archive(channels.MACOS_ARM64.triple)
     lines = [
         f"Generated from {inputs.repository} {inputs.tag} ({inputs.commit}).",
         "",
         f"Release: {inputs.release_url}",
-        f"Source: {inputs.source_url}",
-        f"Source SHA-256: {inputs.source_sha256}",
+        f"Release archive: {archive.url}",
+        f"Archive SHA-256: {archive.sha256}",
         "",
-        "| Formula | selected command | cargo bin | state |",
+        "| Formula | installed archive member | selected command | state |",
         "| --- | --- | --- | --- |",
     ]
     for member in members:
         lines.append(
             f"| `{member.identity.formula_path}` | `{member.identity.command}` "
-            f"| `{member.identity.cargo_bin}` | {member.publication_state} |"
+            f"| `{member.identity.command}` | {member.publication_state} |"
         )
     lines.extend(
         (
             "",
-            "Merge only after tap CI proves style, audit, both source builds, both "
+            "Merge only after tap CI proves style, audit, both archive installs, both "
             "Formula tests, selected-only install, co-installation, cross-uninstall, "
             "and completion ownership.",
         )

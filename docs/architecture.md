@@ -593,7 +593,9 @@ Distribution starts at the immutable GitHub release described in [docs/releasing
 and, beginning with `v0.2.0`, continues into two package channels operated through
 [docs/packaging.md](packaging.md).
 [ADR 0030](adr/0030-publish-selectable-packages-through-isolated-post-release-channels.md) records
-the channel decisions. The release asset set and the dual-binary archive layout are unchanged by
+the channel and isolation decisions, and
+[ADR 0031](adr/0031-use-release-archives-for-homebrew-formulae.md) records the Homebrew
+release-archive decision. The release asset set and dual-binary archive layout are unchanged by
 packaging: the channels consume the published release and never add, remove, or rewrite an asset.
 
 The release-to-package flow chains from workflow completion rather than from a release event,
@@ -623,13 +625,13 @@ existing release targets, and each installs exactly one of the two product execu
 
 | Public identity | Platform | Installs | Model |
 |---|---|---|---|
-| `pashifika/tap/skillmount` | Apple Silicon macOS | `skillmount` | Source-built Homebrew Formula |
-| `pashifika/tap/skillmount-asm` | Apple Silicon macOS | `asm` | Source-built Homebrew Formula |
+| `pashifika/tap/skillmount` | Apple Silicon macOS | `skillmount` | Checksum-verified release archive |
+| `pashifika/tap/skillmount-asm` | Apple Silicon macOS | `asm` | Checksum-verified release archive |
 | Chocolatey `skillmount` | Windows x64/x86 | `skillmount.exe` | Checksum-verified release archive |
 | Chocolatey `skillmount-asm` | Windows x64/x86 | `asm.exe` | Checksum-verified release archive |
 
-Both members of a channel pair pin the same immutable source or release identity, may be
-co-installed, and own only their selected executable, shim, and command-specific completion files.
+Both members of a channel pair pin the same immutable release identity, may be co-installed, and
+own only their selected executable, shim, and command-specific completion files.
 Because `src/cli.rs` resolves the product identity from `argv[0]` and rejects a renamed alias, no
 package may install, symlink, or shim either executable under another name. Publication is
 pair-aware but not atomic: an identical existing member is an idempotent success, only absent
@@ -697,11 +699,12 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
   immutable-action policy tests and reviewed tag-protection/runbook material;
 - the package-channel publication contract for Homebrew and Chocolatey, implemented and CI-verified
   on this branch: shared credential-free release preflight and identity model, deterministic
-  Formula and Chocolatey package generation with structural pair inspection, pair-aware fail-closed
-  tap and Community Repository publishers, the isolated `workflow_run` package workflow with its
-  tracked policy checker, native selected-only lifecycle acceptance harnesses for both channels,
-  tap repository source material, and the packaging runbook
-  ([ADR 0030](adr/0030-publish-selectable-packages-through-isolated-post-release-channels.md));
+  release-archive Formula and Chocolatey package generation with structural pair inspection,
+  pair-aware fail-closed tap and Community Repository publishers, the isolated `workflow_run`
+  package workflow with its tracked policy checker, native selected-only lifecycle acceptance
+  harnesses for both channels, tap repository source material, and the packaging runbook
+  ([ADR 0030](adr/0030-publish-selectable-packages-through-isolated-post-release-channels.md),
+  [ADR 0031](adr/0031-use-release-archives-for-homebrew-formulae.md));
 - crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
 
 ### Reserved work

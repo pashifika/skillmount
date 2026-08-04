@@ -27,7 +27,7 @@ SkillMount ships two behaviourally identical executables, `asm` (primary) and `s
 alias. A package manager must therefore install exactly one of them under exactly its own name,
 never a shim or symlink under another name.
 
-| package id | cargo `--bin` | command | Windows executable | formula |
+| package id | release archive member | command | Windows executable | formula |
 | --- | --- | --- | --- | --- |
 | `skillmount` | `skillmount` | `skillmount` | `skillmount.exe` | `Formula/skillmount.rb` |
 | `skillmount-asm` | `asm` | `asm` | `asm.exe` | `Formula/skillmount-asm.rb` |
@@ -45,7 +45,7 @@ independently, so drift is caught before a workflow ever runs.
 
 | template | tokens |
 | --- | --- |
-| `homebrew/<id>.rb.in` | `FORMULA_CLASS`, `PACKAGE_ID`, `DESCRIPTION`, `HOMEPAGE`, `SOURCE_URL`, `SOURCE_SHA256`, `VERSION`, `LICENSE`, `CARGO_BIN`, `COMMAND`, `OTHER_COMMAND`, `TAG`, `COMMIT` |
+| `homebrew/<id>.rb.in` | `FORMULA_CLASS`, `PACKAGE_ID`, `DESCRIPTION`, `HOMEPAGE`, `ARCHIVE_URL`, `ARCHIVE_SHA256`, `VERSION`, `LICENSE`, `COMMAND`, `OTHER_COMMAND`, `TAG`, `COMMIT` |
 | `chocolatey/<id>/<id>.nuspec.in` | `PACKAGE_ID`, `VERSION`, `TITLE`, `SUMMARY`, `DESCRIPTION`, `PROJECT_URL`, `PROJECT_SOURCE_URL`, `LICENSE_URL`, `RELEASE_NOTES_URL`, `COMMAND`, `TAG` |
 | `chocolatey/<id>/tools/chocolateyinstall.ps1.in` | `PACKAGE_ID`, `VERSION`, `TAG`, `COMMAND`, `SELECTED_EXECUTABLE`, `OTHER_EXECUTABLE`, `URL_X86`, `SHA256_X86`, `URL_X64`, `SHA256_X64`, `ARCHIVE_ROOT_X86`, `ARCHIVE_ROOT_X64` |
 
@@ -53,28 +53,27 @@ independently, so drift is caught before a workflow ever runs.
 
 ## Homebrew
 
-Each Formula builds from the GitHub source tarball for one exact tag, requires macOS on arm64,
-and installs one binary:
+Each Formula consumes the same checked Apple Silicon GitHub Release archive for one exact tag,
+requires macOS on arm64, and installs only its selected archive member:
 
 ```ruby
-system "cargo", "install", "--bin", "@CARGO_BIN@", *std_cargo_args
+bin.install "@COMMAND@"
+pkgshare.install "LICENSE-APACHE", "LICENSE-MIT", "VERSION"
 ```
 
-Do not add `--locked` to that call. `std_cargo_args` already expands to
-`--locked --root=<keg> --path=.`, and Cargo rejects a repeated flag with
-`error: the argument '--locked' cannot be used multiple times`, which fails the install after
-Homebrew has already poured every build dependency. The lock file is still honoured, by
-`std_cargo_args`.
+The Formulae declare the dual license through Homebrew's supported
+`license any_of: ["MIT", "Apache-2.0"]` DSL. They do not invoke Cargo or install a Rust build
+dependency; the protected Release workflow has already built and validated these bytes.
 
-`generate_completions_from_executable` is called with an explicit `base_name:`. Homebrew
-otherwise defaults `base_name:` to the formula name, which would make the `skillmount-asm`
-formula register completions for the command `skillmount-asm`, a name the product rejects.
+`generate_completions_from_executable` is called with an explicit `base_name:`. Homebrew otherwise
+defaults `base_name:` to the formula name, which would make the `skillmount-asm` Formula register
+completions for the command `skillmount-asm`, a name the product rejects.
 
-`test do` asserts the reported version, that `--help` succeeds, that the pair member's
-executable is absent from `bin`, and that each generated completion names this package's command
-and never the pair member's. The pair member's command therefore appears only inside `test do`;
+`test do` asserts the reported version, that `--help` succeeds, that the pair member's executable
+is absent from `bin`, and that each generated completion names this package's command and never the
+pair member's. The pair member's command therefore appears only inside `test do`;
 `package_channels.inspect_formulae` enforces that, along with the exact `depends_on` set and the
-absence of `conflicts_with`.
+absence of `conflicts_with`, Cargo invocations, and a Rust dependency.
 
 The tap lives in a separate repository, `pashifika/homebrew-tap`, which Homebrew addresses as the
 tap reference `pashifika/tap`. Homebrew 6 refuses to load a formula from a non-official tap until
@@ -98,9 +97,9 @@ Neither command is available yet; see `docs/packaging.md` for the gating rule.
 `homebrew/tap-ci.yml` is that repository's own CI. It is deliberately self-contained — only
 `brew`, `git`, and the system Python — so the tap never depends on a script that lives here. It
 runs `brew style`, `brew audit --strict` for both Formulae, an explicit per-formula `brew trust`
-because `brew install` would otherwise refuse the tap, both source builds, both `brew test`,
-selected-only install and uninstall checks, co-installation, cross-uninstall, completion
-ownership, and an upgrade rehearsal from the pull request's base revision.
+because `brew install` would otherwise refuse the tap, both release-archive installs, both
+`brew test` runs, selected-only install and uninstall checks, co-installation, cross-uninstall,
+completion ownership, and an upgrade rehearsal from the pull request's base revision.
 
 ## Chocolatey
 

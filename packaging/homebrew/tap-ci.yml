@@ -71,13 +71,10 @@ jobs:
           brew trust --json v1 > "$RUNNER_TEMP/trust.json"
           cat "$RUNNER_TEMP/trust.json"
 
-      - name: Record toolchain, OS, and shell provenance
+      - name: Record Homebrew, OS, and shell provenance
         run: |
           set -euo pipefail
           brew --version
-          brew install --formula rust
-          "$(brew --prefix rust)/bin/rustc" --version
-          if command -v rustc > /dev/null 2>&1; then rustc --version; fi
           sw_vers
           sw_vers -buildVersion
           uname -srm
@@ -207,24 +204,24 @@ jobs:
           brew audit --strict --formula "$TAP/skillmount"
           brew audit --strict --formula "$TAP/skillmount-asm"
 
-      - name: Build, test, and verify skillmount from source
+      - name: Install, test, and verify skillmount
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/tap-checks.sh"
-          brew install --build-from-source --formula "$TAP/skillmount"
-          brew test --formula "$TAP/skillmount"
+          brew install --formula "$TAP/skillmount"
+          brew test "$TAP/skillmount"
           require_selected_only "$TAP/skillmount" skillmount asm
           require_completion_ownership "$TAP/skillmount" skillmount asm
           require_reports_version skillmount "$(formula_version "$TAP/skillmount")"
           brew uninstall --formula "$TAP/skillmount"
           require_absent skillmount
 
-      - name: Build, test, and verify skillmount-asm from source
+      - name: Install, test, and verify skillmount-asm
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/tap-checks.sh"
-          brew install --build-from-source --formula "$TAP/skillmount-asm"
-          brew test --formula "$TAP/skillmount-asm"
+          brew install --formula "$TAP/skillmount-asm"
+          brew test "$TAP/skillmount-asm"
           require_selected_only "$TAP/skillmount-asm" asm skillmount
           require_completion_ownership "$TAP/skillmount-asm" asm skillmount
           require_reports_version asm "$(formula_version "$TAP/skillmount-asm")"
@@ -233,7 +230,7 @@ jobs:
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/tap-checks.sh"
-          brew install --build-from-source --formula "$TAP/skillmount"
+          brew install --formula "$TAP/skillmount"
           require_installed skillmount
           require_installed asm
           require_selected_only "$TAP/skillmount" skillmount asm
@@ -295,12 +292,12 @@ jobs:
           fi
 
           git checkout --quiet "$base" -- Formula/skillmount.rb Formula/skillmount-asm.rb
-          brew install --build-from-source --formula "$TAP/skillmount" "$TAP/skillmount-asm"
+          brew install --formula "$TAP/skillmount" "$TAP/skillmount-asm"
           require_reports_version skillmount "$base_skillmount"
           require_reports_version asm "$base_asm"
 
           git checkout --quiet "$head_revision" -- Formula/skillmount.rb Formula/skillmount-asm.rb
-          brew upgrade --build-from-source --formula "$TAP/skillmount" "$TAP/skillmount-asm"
+          brew upgrade --formula "$TAP/skillmount" "$TAP/skillmount-asm"
 
           require_reports_version skillmount "$head_skillmount"
           require_reports_version asm "$head_asm"

@@ -5,17 +5,19 @@ It continues where [docs/releasing.md](releasing.md) ends: package publication s
 stable GitHub release is published and verified, and nothing in this runbook may delete, rewrite,
 or change the success state of that release, its tag, assets, notes, or checksums.
 [ADR 0030](adr/0030-publish-selectable-packages-through-isolated-post-release-channels.md) records
-the channel decisions; [docs/architecture.md](architecture.md) records the resulting baseline.
+the channel and isolation decisions;
+[ADR 0031](adr/0031-use-release-archives-for-homebrew-formulae.md) records the Homebrew
+release-archive decision; [docs/architecture.md](architecture.md) records the resulting baseline.
 
 ## Channel and identity contract
 
-Both channels publish a pair of one-executable packages built from the same immutable release
+Both channels publish a pair of one-executable packages that consume the same immutable release
 identity. Every entry below is reconciled separately and reported separately:
 
 | Public identity | Channel | Installs | Exposes | Distribution model |
 |---|---|---|---|---|
-| `pashifika/tap/skillmount` | Homebrew | Cargo binary `skillmount` | `skillmount` | Source build of the tag tarball |
-| `pashifika/tap/skillmount-asm` | Homebrew | Cargo binary `asm` | `asm` | Source build of the tag tarball |
+| `pashifika/tap/skillmount` | Homebrew | release member `skillmount` | `skillmount` | Checked Apple Silicon release archive |
+| `pashifika/tap/skillmount-asm` | Homebrew | release member `asm` | `asm` | Checked Apple Silicon release archive |
 | `skillmount` | Chocolatey | `skillmount.exe` | `skillmount` shim | Checked x86/x64 release archive |
 | `skillmount-asm` | Chocolatey | `asm.exe` | `asm` shim | Checked x86/x64 release archive |
 
@@ -93,12 +95,13 @@ Formulae to branch `skillmount/<version>` in `pashifika/homebrew-tap` and opens 
 for the pair. Before merging, require:
 
 - both `Formula/skillmount.rb` and `Formula/skillmount-asm.rb` updated together, with identical
-  source URL, SHA-256, version, license, and platform requirements;
-- each Formula selecting only its own Cargo binary and command, with the pair member's command
+  release-archive URL, SHA-256, version, license, and platform requirements;
+- each Formula installing only its named archive member and command, with the pair member's command
   appearing only inside the `test do` block;
-- the tap CI checks green: `brew style`, `brew audit --strict` for both Formulae, both source
-  builds, both `brew test` runs, selected-only install, co-installation, cross-uninstall, and
-  completion-ownership checks;
+- the tap CI checks green: `brew style`, `brew audit --strict` for both Formulae, both archive
+  installs, both `brew test` runs, selected-only install, co-installation, cross-uninstall,
+  completion-ownership checks, and the upgrade rehearsal from the base revision, which self-skips
+  with a notice on a first publication;
 - provenance comments naming the expected tag and commit from the run's `package-inputs`.
 
 A retried run that finds the branch or pull request already correct resumes it instead of creating
@@ -122,8 +125,8 @@ and a clean-host selected-only installation passes. One approved member never im
 Retry through manual dispatch with the same exact tag and the affected channel. Reconciliation is
 pair-aware and idempotent:
 
-- an existing member identical to the expected provenance (source URL, digest, version, selected
-  executable) is left unchanged and reported as an idempotent success or status check;
+- an existing member identical to the expected provenance (release-archive URL, digest, version,
+  selected executable) is left unchanged and reported as an idempotent success or status check;
 - only an absent member receives creation work, and only when the existing member matches;
 - nothing is pushed twice for one ID in one run, and the GitHub release is never touched.
 
@@ -174,12 +177,12 @@ maintainers change.
 An install command may be advertised only with retained clean-host evidence. For each of the four
 entries, the evidence must contain:
 
-- the exact package version, tag, commit, source or archive URLs, and SHA-256 values, plus the
-  Formula file or nupkg digest;
+- the exact package version, tag, commit, release/archive URLs, and SHA-256 values, plus the Formula
+  file or nupkg digest;
 - the external identities involved: tap repository and pull request, GitHub App installation,
   Chocolatey account and package ID;
-- the workflow run and action revisions, runner labels, and manager/toolchain versions (Homebrew,
-  Rust, macOS, and shell versions; Windows, Chocolatey, and PowerShell versions);
+- the workflow run and action revisions, runner labels, and manager/platform versions (Homebrew,
+  macOS, and shell versions; Windows, Chocolatey, and PowerShell versions);
 - for a Homebrew entry, the exact `brew trust` invocation that preceded the install and the
   observed Homebrew version — Homebrew 6.0.12 proved that installing from an untrusted tap is
   refused, so a transcript without its trust step is not reproducible;
@@ -189,14 +192,14 @@ entries, the evidence must contain:
   reporting the expected version, and command-specific completion ownership;
 - co-installation and cross-uninstall results for the pair, and the observed cleanup state.
 
-## Accepted risk: source tarball recompression
+## Release-archive integrity
 
-Both Formulae pin GitHub's generated source tarball, `archive/refs/tags/<tag>.tar.gz`, by SHA-256.
-GitHub has historically re-compressed generated tarballs, which changes their bytes without
-changing the tag. Preflight validates the digest at publication time, so publication itself fails
-closed; the accepted residual risk is that a later upstream re-compression invalidates the digest
-in an already-published Formula. If that happens, do not edit the published Formula's digest in
-place: release a new patch version so the tap history keeps one auditable digest per version.
+Both Formulae pin the protected `aarch64-apple-darwin` GitHub Release archive by exact URL and
+SHA-256. Package preflight requires the digest published in `SHA256SUMS`, GitHub's asset digest, and
+the downloaded bytes to agree before rendering either Formula. Homebrew therefore consumes the same
+immutable release bytes as the other package channel; it does not depend on GitHub's generated tag
+tarball, a Homebrew Rust toolchain, or a second build. A mismatch blocks publication. Never repair
+published metadata or bytes in place; publish a new patch release through the normal flow.
 
 ## Operator guidance (not yet available)
 
@@ -235,10 +238,10 @@ brew upgrade pashifika/tap/skillmount
 brew uninstall skillmount
 ```
 
-Installs only the `skillmount` command, built from source. The Formula generates Bash, Zsh, and
-Fish completions by running `skillmount completions <shell>` at install time and places them in
-Homebrew-managed completion directories; they register only `skillmount`, and uninstalling removes
-only them. No user profile is edited.
+Installs only the `skillmount` command from the checked Apple Silicon release archive. The Formula
+generates Bash, Zsh, and Fish completions by running `skillmount completions <shell>` at install
+time and places them in Homebrew-managed completion directories; they register only `skillmount`,
+and uninstalling removes only them. No user profile is edited.
 
 ### Homebrew `pashifika/tap/skillmount-asm` — unavailable
 
@@ -252,9 +255,9 @@ brew upgrade pashifika/tap/skillmount-asm
 brew uninstall skillmount-asm
 ```
 
-Installs only the `asm` command, built from source. Bash, Zsh, and Fish completions are generated
-through `asm completions <shell>`, register only `asm`, and are owned and removed by this Formula
-alone. No user profile is edited.
+Installs only the `asm` command from the checked Apple Silicon release archive. Bash, Zsh, and Fish
+completions are generated through `asm completions <shell>`, register only `asm`, and are owned and
+removed by this Formula alone. No user profile is edited.
 
 ### Chocolatey `skillmount` — unavailable
 

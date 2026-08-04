@@ -40,7 +40,7 @@ CHOCOLATEY_ROOT_VARIABLE = "ChocolateyInstall"
 DEFAULT_CHOCOLATEY_ROOT = r"C:\ProgramData\chocolatey"
 DEFAULT_REPOSITORY = "pashifika/skillmount"
 DEFAULT_TEMPLATE_DIRECTORY = Path("packaging/chocolatey")
-REPORT_SCHEMA = 1
+REPORT_SCHEMA = 2
 PRIOR_VERSION = "0.1.0"
 INTERRUPTION_MARKER = "skillmount-acceptance-injected-interruption"
 SUCCESS_MARKER = "was successful"
@@ -1333,8 +1333,6 @@ def inputs_summary(inputs: package_channels.PackageInputs) -> dict[str, Any]:
         "tag": inputs.tag,
         "commit": inputs.commit,
         "release_url": inputs.release_url,
-        "source_url": inputs.source_url,
-        "source_sha256": inputs.source_sha256,
         "archives": {
             archive.triple: {
                 "name": archive.name,
@@ -1547,28 +1545,6 @@ def build_local_archive(
     )
 
 
-def build_source_archive(
-    repository: Path, *, tag: str, commit: str, output_directory: Path
-) -> tuple[Path, str]:
-    """Build and digest the exact source tarball a release would publish for one commit."""
-
-    output_directory.mkdir(parents=True, exist_ok=True)
-    archive = output_directory / f"skillmount-{tag}.tar.gz"
-    release.run_checked(
-        [
-            "git",
-            "archive",
-            "--format=tar.gz",
-            f"--prefix=skillmount-{tag}/",
-            "--output",
-            str(archive),
-            commit,
-        ],
-        cwd=repository,
-    )
-    return archive, release.sha256_file(archive)
-
-
 def local_inputs(
     channels: Any,
     *,
@@ -1576,10 +1552,8 @@ def local_inputs(
     tag: str,
     commit: str,
     archives: Sequence[LocalArchive],
-    source_archive: Path,
-    source_sha256: str,
 ) -> package_channels.PackageInputs:
-    """Assemble package inputs from locally built archives and `file:///` URLs."""
+    """Assemble package inputs from locally built release archives and `file:///` URLs."""
 
     if not archives:
         raise ChocolateyAcceptanceError(
@@ -1605,8 +1579,6 @@ def local_inputs(
         tag=tag,
         commit=commit,
         release_url=f"https://github.com/{repository}/releases/tag/{tag}",
-        source_url=file_url(source_archive),
-        source_sha256=source_sha256,
         archives=identities,
     )
 
@@ -2557,20 +2529,12 @@ def rehearse_prior_package(
         )
     if not archives:
         return "no verified archive is available to rehearse a prior package"
-    source_archive, source_sha256 = build_source_archive(
-        context.repository_path,
-        tag=prior_tag,
-        commit=context.inputs.commit,
-        output_directory=root / "source",
-    )
     inputs = local_inputs(
         context.channels,
         repository=context.inputs.repository,
         tag=prior_tag,
         commit=context.inputs.commit,
         archives=archives,
-        source_archive=source_archive,
-        source_sha256=source_sha256,
     )
     rendered = render_sources(
         context.channels,
@@ -3288,17 +3252,12 @@ def resolve_inputs(
             tag=tag,
             commit=commit,
         )
-    source_archive, source_sha256 = build_source_archive(
-        options.repository_path, tag=tag, commit=commit, output_directory=work / "source"
-    )
     inputs = local_inputs(
         channels,
         repository=options.repository,
         tag=tag,
         commit=commit,
         archives=tuple(archives.values()),
-        source_archive=source_archive,
-        source_sha256=source_sha256,
     )
     return inputs, archives
 

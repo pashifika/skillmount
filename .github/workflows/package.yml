@@ -189,8 +189,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Full history and tags: the harness builds source tarballs with git archive from the
-      # validated commit and from the prior release tag, so no network source is needed.
+      # Full history and tags let the harness evaluate upgrade eligibility; candidate bytes come
+      # only from the validated release archive, and a prior archive is fetched when available.
       - name: Check out the default branch with history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

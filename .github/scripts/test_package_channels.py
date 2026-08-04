@@ -27,23 +27,22 @@ OTHER_COMMIT = "c" * 40
 RELEASE_URL = f"https://github.com/{REPOSITORY}/releases/tag/{TAG}"
 ANNOTATED_TAG_OBJECT = "51f06711667411cdaea8c7755032645d61e695a4"
 ANNOTATED_TAG_COMMIT = "6814cddcbf70a8d6006a4d3ce96c9280ad73a076"
-SOURCE_BYTES = b"source tarball fixture\n"
 RUN_ID = 4242
 
 FORMULA_TEMPLATE = '''# @PACKAGE_ID@ generated from tag @TAG@ at commit @COMMIT@
 class @FORMULA_CLASS@ < Formula
   desc "@DESCRIPTION@"
   homepage "@HOMEPAGE@"
-  url "@SOURCE_URL@"
-  sha256 "@SOURCE_SHA256@"
-  license "@LICENSE@"
+  url "@ARCHIVE_URL@"
+  sha256 "@ARCHIVE_SHA256@"
+  license @LICENSE@
 
-  depends_on "rust" => :build
   depends_on :macos
   depends_on arch: :arm64
 
   def install
-    system "cargo", "install", "--bin", "@CARGO_BIN@", *std_cargo_args
+    bin.install "@COMMAND@"
+    pkgshare.install "LICENSE-APACHE", "LICENSE-MIT", "VERSION"
     generate_completions_from_executable(
       bin/"@COMMAND@", "completions", base_name: "@COMMAND@", shells: [:bash, :zsh, :fish]
     )
@@ -173,8 +172,6 @@ def canonical_inputs() -> channels.PackageInputs:
         tag=TAG,
         commit=COMMIT,
         release_url=RELEASE_URL,
-        source_url=channels.source_url(REPOSITORY, TAG),
-        source_sha256=hashlib.sha256(SOURCE_BYTES).hexdigest(),
         archives=tuple(
             archive_identity(target)
             for target in sorted(release.TARGETS, key=lambda item: item.triple)
@@ -330,9 +327,8 @@ def workflow_run_payload(**overrides: Any) -> dict[str, Any]:
 class FakeGateway:
     """In-memory read-only GitHub boundary over a real local release fixture."""
 
-    def __init__(self, assets: Path, source: Path) -> None:
+    def __init__(self, assets: Path) -> None:
         self.assets = assets
-        self.source = source
         self.commit = COMMIT
         self.contained = True
         self.files = {
@@ -373,9 +369,6 @@ class FakeGateway:
     def download(self, url: str, destination: Path) -> None:
         self.downloads.append(url)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if url == channels.source_url(REPOSITORY, TAG):
-            shutil.copyfile(self.source, destination)
-            return
         prefix = f"https://github.com/{REPOSITORY}/releases/download/{TAG}/"
         if not url.startswith(prefix):
             raise AssertionError(f"unexpected download {url}")
@@ -428,8 +421,7 @@ class IdentityTests(unittest.TestCase):
             ["skillmount", "skillmount-asm"],
         )
         first, second = channels.PACKAGES
-        self.assertEqual((first.cargo_bin, first.command), ("skillmount", "skillmount"))
-        self.assertEqual((second.cargo_bin, second.command), ("asm", "asm"))
+        self.assertEqual((first.command, second.command), ("skillmount", "asm"))
         self.assertEqual(first.formula_path, "Formula/skillmount.rb")
         self.assertEqual(second.formula_path, "Formula/skillmount-asm.rb")
         self.assertEqual(first.windows_executable, "skillmount.exe")
@@ -460,12 +452,13 @@ class IdentityTests(unittest.TestCase):
         lines = channels.selection_map_lines()
         self.assertEqual(lines, channels.selection_map_lines())
         self.assertEqual(len(lines), 2)
-        self.assertTrue(lines[0].startswith("skillmount cargo-bin=skillmount"))
-        self.assertTrue(lines[1].startswith("skillmount-asm cargo-bin=asm"))
+        self.assertTrue(lines[0].startswith("skillmount command=skillmount"))
+        self.assertTrue(lines[1].startswith("skillmount-asm command=asm"))
 
-    def test_windows_targets_are_taken_from_the_release_matrix(self) -> None:
-        """Derive both Windows triples from release.TARGETS instead of restating them."""
+    def test_release_targets_are_taken_from_the_release_matrix(self) -> None:
+        """Derive package targets from release.TARGETS instead of restating them."""
 
+        self.assertIn(channels.MACOS_ARM64, release.TARGETS)
         self.assertIn(channels.WINDOWS_X64, release.TARGETS)
         self.assertIn(channels.WINDOWS_X86, release.TARGETS)
         self.assertNotEqual(channels.WINDOWS_X64.triple, channels.WINDOWS_X86.triple)
@@ -485,6 +478,18 @@ class PackageInputsTests(unittest.TestCase):
         self.assertEqual(json.loads(document)["schema"], channels.INPUTS_SCHEMA)
         self.assertEqual(channels.PackageInputs.from_json(document), inputs)
         self.assertEqual(channels.PackageInputs.from_json(document).to_json(), document)
+    def test_serialized_inputs_contain_only_the_validated_release_identity(self) -> None:
+        """Do not retain a second generated-source artifact beside the release assets."""
+
+        document = json.loads(canonical_inputs().to_json())
+        self.assertEqual(document["schema"], 2)
+        self.assertNotIn("source_url", document)
+        self.assertNotIn("source_sha256", document)
+        self.assertEqual(
+            [archive["triple"] for archive in document["archives"]],
+            sorted(target.triple for target in release.TARGETS),
+        )
+
 
     def test_archive_lookup_names_recorded_targets(self) -> None:
         """Return the requested archive and refuse an unrecorded target."""
@@ -496,7 +501,7 @@ class PackageInputsTests(unittest.TestCase):
             inputs.archive("x86_64-unknown-linux-gnu")
 
     def test_partial_archive_sets_are_constructible_for_local_harnesses(self) -> None:
-        """Allow an in-process Windows-only fixture while keeping ordering strict."""
+        """Allow in-process target fixtures while keeping artifact completeness strict."""
 
         windows = tuple(
             archive_identity(target)
@@ -510,29 +515,25 @@ class PackageInputsTests(unittest.TestCase):
             tag=TAG,
             commit=COMMIT,
             release_url=RELEASE_URL,
-            source_url="file:///tmp/skillmount-v0.2.0.tar.gz",
-            source_sha256="d" * 64,
             archives=windows,
         )
         self.assertEqual(len(inputs.archives), 2)
         with self.assertRaises(channels.ChannelError):
             channels.PackageInputs.from_json(inputs.to_json())
 
-        sourceless = channels.PackageInputs(
+        empty = channels.PackageInputs(
             repository=REPOSITORY,
             version=VERSION,
             tag=TAG,
             commit=COMMIT,
             release_url=RELEASE_URL,
-            source_url="file:///tmp/skillmount-v0.2.0.tar.gz",
-            source_sha256="d" * 64,
             archives=(),
         )
-        self.assertEqual(sourceless.archives, ())
+        self.assertEqual(empty.archives, ())
         with self.assertRaises(channels.ChannelError):
-            sourceless.archive(channels.WINDOWS_X64.triple)
+            empty.archive(channels.WINDOWS_X64.triple)
         with self.assertRaises(channels.ChannelError):
-            channels.PackageInputs.from_json(sourceless.to_json())
+            channels.PackageInputs.from_json(empty.to_json())
 
     def test_structural_construction_failures(self) -> None:
         """Reject a structurally impossible identity at construction time."""
@@ -543,9 +544,7 @@ class PackageInputsTests(unittest.TestCase):
             "version": {"version": "0.2"},
             "tag": {"tag": "v0.3.0"},
             "commit": {"commit": "b" * 39},
-            "digest": {"source_sha256": "A" * 64},
             "empty release url": {"release_url": ""},
-            "spaced source url": {"source_url": "https://example.test/a b"},
             "duplicate triples": {"archives": (base.archives[0], base.archives[0])},
             "unsorted archives": {"archives": tuple(reversed(base.archives))},
             "unsupported triple": {
@@ -577,8 +576,6 @@ class PackageInputsTests(unittest.TestCase):
                     "tag": base.tag,
                     "commit": base.commit,
                     "release_url": base.release_url,
-                    "source_url": base.source_url,
-                    "source_sha256": base.source_sha256,
                     "archives": base.archives,
                 }
                 values.update(replacement)
@@ -616,17 +613,16 @@ class PackageInputsTests(unittest.TestCase):
             "not json": "{",
             "not an object": "[]",
             "missing schema": without("schema"),
-            "wrong schema": replace(schema=2),
+            "wrong schema": replace(schema=1),
             "missing commit": without("commit"),
             "extra key": replace(published="yes"),
+            "stale source identity": replace(source_url="https://example.test/source.tar.gz"),
             "non-string tag": replace(tag=2),
             "non-string commit": replace(commit=None),
             "malformed tag": replace(tag="0.2.0", version="0.2.0"),
             "prerelease tag": replace(tag="v0.2.0-rc.1"),
             "short commit": replace(commit="b" * 39),
             "uppercase commit": replace(commit="B" * 40),
-            "uppercase source digest": replace(source_sha256="A" * 64),
-            "short source digest": replace(source_sha256="a" * 63),
             "archives not a list": replace(archives={}),
             "foreign release url": replace(release_url=f"{foreign}/releases/tag/{TAG}"),
             "release url outside releases": replace(
@@ -634,12 +630,6 @@ class PackageInputsTests(unittest.TestCase):
             ),
             "insecure release url": replace(
                 release_url=f"http://github.com/{REPOSITORY}/releases/tag/{TAG}"
-            ),
-            "foreign source url": replace(
-                source_url=f"{foreign}/archive/refs/tags/{TAG}.tar.gz"
-            ),
-            "source url for another tag": replace(
-                source_url=channels.source_url(REPOSITORY, "v0.1.0")
             ),
             "missing archive": with_archives(lambda archives: archives.pop()),
             "duplicate archive": with_archives(
@@ -657,6 +647,9 @@ class PackageInputsTests(unittest.TestCase):
             "archive digest tampered": with_archives(
                 lambda archives: archives[0].update({"sha256": "z" * 64})
             ),
+            "uppercase archive digest": with_archives(
+                lambda archives: archives[0].update({"sha256": "A" * 64})
+            ),
             "archive entry extra key": with_archives(
                 lambda archives: archives[0].update({"signed": "no"})
             ),
@@ -672,13 +665,9 @@ class PackageInputsTests(unittest.TestCase):
                 with self.assertRaises(channels.ChannelError):
                     channels.PackageInputs.from_json(text)
 
-    def test_source_and_asset_urls_are_pinned_to_the_tag(self) -> None:
+    def test_asset_and_license_urls_are_pinned_to_the_tag(self) -> None:
         """Build only immutable tag-scoped GitHub URLs."""
 
-        self.assertEqual(
-            channels.source_url(REPOSITORY, TAG),
-            f"https://github.com/{REPOSITORY}/archive/refs/tags/{TAG}.tar.gz",
-        )
         self.assertEqual(
             channels.asset_download_url(REPOSITORY, TAG, "a.zip"),
             f"https://github.com/{REPOSITORY}/releases/download/{TAG}/a.zip",
@@ -687,10 +676,6 @@ class PackageInputsTests(unittest.TestCase):
             channels.license_url(REPOSITORY, TAG),
             f"https://github.com/{REPOSITORY}/blob/{TAG}/LICENSE-MIT",
         )
-        for tag in ("main", "v0.2.0-rc.1", "0.2.0", ""):
-            with self.subTest(tag=tag):
-                with self.assertRaises(channels.ChannelError):
-                    channels.source_url(REPOSITORY, tag)
         with self.assertRaises(channels.ChannelError):
             channels.asset_download_url(REPOSITORY, TAG, "tools/a.zip")
 
@@ -947,15 +932,12 @@ class PreflightTests(unittest.TestCase):
     """Cover ordered release verification against a real local asset fixture."""
 
     def setUp(self) -> None:
-        """Build the complete release set, source tarball, and fake boundary."""
+        """Build the complete release set and fake read-only boundary."""
 
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.assets = build_release_assets(self.root)
-        self.source = self.root / "source" / f"skillmount-{TAG}.tar.gz"
-        self.source.parent.mkdir(parents=True)
-        self.source.write_bytes(SOURCE_BYTES)
-        self.gateway = FakeGateway(self.assets, self.source)
+        self.gateway = FakeGateway(self.assets)
         self.work = self.root / "work"
 
     def tearDown(self) -> None:
@@ -986,10 +968,6 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(inputs.repository, REPOSITORY)
         self.assertEqual((inputs.version, inputs.tag, inputs.commit), (VERSION, TAG, COMMIT))
         self.assertEqual(inputs.release_url, RELEASE_URL)
-        self.assertEqual(inputs.source_url, channels.source_url(REPOSITORY, TAG))
-        self.assertEqual(
-            inputs.source_sha256, hashlib.sha256(SOURCE_BYTES).hexdigest()
-        )
         self.assertEqual(
             [archive.triple for archive in inputs.archives],
             sorted(target.triple for target in release.TARGETS),
@@ -1003,7 +981,11 @@ class PreflightTests(unittest.TestCase):
                     archive.url,
                     channels.asset_download_url(REPOSITORY, TAG, archive.name),
                 )
-        self.assertEqual(len(self.gateway.downloads), len(release.TARGETS) + 2)
+        self.assertEqual(len(self.gateway.downloads), len(release.TARGETS) + 1)
+        self.assertTrue(
+            all("/releases/download/" in url for url in self.gateway.downloads),
+            self.gateway.downloads,
+        )
         self.assertEqual(channels.PackageInputs.from_json(inputs.to_json()), inputs)
 
     def test_commit_outside_the_default_branch_stops_before_download(self) -> None:
@@ -1296,11 +1278,10 @@ class RenderTests(TemplateFixture):
                     "PACKAGE_ID",
                     "DESCRIPTION",
                     "HOMEPAGE",
-                    "SOURCE_URL",
-                    "SOURCE_SHA256",
+                    "ARCHIVE_URL",
+                    "ARCHIVE_SHA256",
                     "VERSION",
                     "LICENSE",
-                    "CARGO_BIN",
                     "COMMAND",
                     "OTHER_COMMAND",
                     "TAG",
@@ -1367,7 +1348,7 @@ class RenderTests(TemplateFixture):
             self.generate_formulae()
 
         formula.write_text(
-            FORMULA_TEMPLATE.replace('license "@LICENSE@"\n', ""), encoding="utf-8"
+            FORMULA_TEMPLATE.replace("license @LICENSE@\n", ""), encoding="utf-8"
         )
         with self.assertRaisesRegex(channels.ChannelError, "omits"):
             self.generate_formulae()
@@ -1375,11 +1356,25 @@ class RenderTests(TemplateFixture):
 
 class HomebrewGenerationTests(TemplateFixture):
     """Cover Formula generation and paired structural inspection."""
+    def test_formula_tokens_select_the_validated_macos_archive(self) -> None:
+        """Render Homebrew only from the checked Apple Silicon release asset."""
+
+        identity = channels.PACKAGES[0]
+        archive = self.inputs.archive(channels.MACOS_ARM64.triple)
+        tokens = channels.formula_tokens(self.inputs, identity)
+        self.assertEqual(tokens["ARCHIVE_URL"], archive.url)
+        self.assertEqual(tokens["ARCHIVE_SHA256"], archive.sha256)
+        self.assertEqual(tokens["LICENSE"], channels.HOMEBREW_LICENSE_EXPRESSION)
+        self.assertNotIn("SOURCE_URL", tokens)
+        self.assertNotIn("SOURCE_SHA256", tokens)
+        self.assertNotIn("CARGO_BIN", tokens)
+
 
     def test_generated_pair_passes_inspection(self) -> None:
         """Render both Formulae at the expected paths and verify the pair."""
 
         formulae = self.generate_formulae()
+        archive = self.inputs.archive(channels.MACOS_ARM64.triple)
         self.assertEqual(sorted(formulae), ["skillmount", "skillmount-asm"])
         for identity in channels.PACKAGES:
             path = formulae[identity.package_id]
@@ -1388,8 +1383,12 @@ class HomebrewGenerationTests(TemplateFixture):
             )
             text = path.read_text(encoding="utf-8")
             self.assertIn(f"class {identity.formula_class} < Formula", text)
-            self.assertIn(f'"--bin", "{identity.cargo_bin}"', text)
-            self.assertIn(self.inputs.source_sha256, text)
+            self.assertIn(f'bin.install "{identity.command}"', text)
+            self.assertIn(archive.sha256, text)
+            self.assertIn('license any_of: ["MIT", "Apache-2.0"]', text)
+            self.assertIn('pkgshare.install "LICENSE-APACHE", "LICENSE-MIT", "VERSION"', text)
+            self.assertNotIn('system "cargo"', text)
+            self.assertNotIn('depends_on "rust"', text)
             self.assertNotIn("@", text.replace("#{", ""))
         channels.inspect_formulae(formulae, self.inputs)
 
@@ -1406,26 +1405,27 @@ class HomebrewGenerationTests(TemplateFixture):
     def test_formula_failure_modes(self) -> None:
         """Reject every observable Formula defect the specs name."""
 
+        archive = self.inputs.archive(channels.MACOS_ARM64.triple)
         mutations = {
             "wrong class": (
                 "class Skillmount < Formula",
                 "class Other < Formula",
                 "Formula class 'Other'",
             ),
-            "wrong source url": (
-                self.inputs.source_url,
+            "wrong archive url": (
+                archive.url,
                 "https://attacker.test/x.tar.gz",
                 "declares url",
             ),
-            "wrong digest": (self.inputs.source_sha256, "0" * 64, "declares sha256"),
+            "wrong digest": (archive.sha256, "0" * 64, "declares sha256"),
             "wrong homepage": (
                 channels.HOMEPAGE,
                 "https://attacker.test",
                 "declares homepage",
             ),
             "wrong license": (
-                channels.LICENSE_EXPRESSION,
-                "Proprietary",
+                channels.HOMEBREW_LICENSE_EXPRESSION,
+                '"Proprietary"',
                 "declares license",
             ),
             "wrong description": (
@@ -1453,10 +1453,20 @@ class HomebrewGenerationTests(TemplateFixture):
                 '  depends_on :macos\n  conflicts_with "skillmount-asm"\n',
                 "conflicts_with",
             ),
-            "wrong cargo binary": (
-                '"--bin", "skillmount"',
-                '"--bin", "asm"',
-                r"builds Cargo binaries \['asm'\]",
+            "wrong installed binary": (
+                'bin.install "skillmount"',
+                'bin.install "asm"',
+                r"installs binaries \['asm'\]",
+            ),
+            "missing package data": (
+                '    pkgshare.install "LICENSE-APACHE", "LICENSE-MIT", "VERSION"\n',
+                "",
+                "installs package data",
+            ),
+            "Cargo invocation": (
+                '    bin.install "skillmount"',
+                '    system "cargo", "install"\n    bin.install "skillmount"',
+                "invokes Cargo",
             ),
             "missing commit provenance": (
                 COMMIT,
@@ -1464,8 +1474,8 @@ class HomebrewGenerationTests(TemplateFixture):
                 "does not record the released commit",
             ),
             "pair command in install": (
-                '    system "cargo"',
-                '    # also probes asm\n    system "cargo"',
+                '    bin.install "skillmount"',
+                '    # also probes asm\n    bin.install "skillmount"',
                 "names the pair member command 'asm' outside its test block",
             ),
             "missing test block": (

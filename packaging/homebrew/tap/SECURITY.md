@@ -15,22 +15,22 @@ suspending its installation disables automated Formula updates without affecting
 
 ## What the tap distributes
 
-The tap distributes Formula text only. Each Formula pins one immutable SkillMount release source
-tarball (`archive/refs/tags/<tag>.tar.gz`) by SHA-256 and builds it from source on the user's
-machine; the tap hosts no binaries, no bottles, and no install scripts beyond the Formula itself.
-A Formula never edits shell profiles and installs completions only for its own selected command.
+The tap distributes Formula text only. Each Formula pins the immutable Apple Silicon SkillMount
+GitHub Release archive by SHA-256 and installs exactly one named executable from it; the tap hosts
+no binaries, no bottles, and no install scripts beyond the Formula itself. A Formula never edits
+shell profiles and installs completions only for its own selected command.
 
-The pinned digest is validated against the released source at publication time. If GitHub later
-re-compresses a generated tarball, an already-published digest stops matching; the remedy is a new
-SkillMount patch version with a freshly validated digest, never an in-place edit of a published
-Formula.
+Package preflight validates the pinned digest against `SHA256SUMS`, GitHub's asset digest, and the
+downloaded release bytes before proposing the Formula. A later mismatch is therefore a compromise
+or release-integrity signal, not metadata to repair in place; the remedy is a new protected
+SkillMount patch release and reviewed Formula update.
 
 ## Reporting
 
 - A vulnerability in SkillMount itself — the `asm`/`skillmount` executables or their behavior —
   follows the product repository's security process at
   [pashifika/skillmount](https://github.com/pashifika/skillmount).
-- A vulnerability in the tap — a Formula whose source URL or digest does not match the
+- A vulnerability in the tap — a Formula whose release-archive URL or digest does not match the
   corresponding SkillMount release, an unexpected Formula change, or a compromise of tap CI or the
   publishing App — should be reported privately to the tap maintainers through this repository's
   GitHub security advisory form. Include the Formula file, the observed URL and digest, and the

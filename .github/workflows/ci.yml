@@ -266,8 +266,8 @@ jobs:
       HOMEBREW_NO_ANALYTICS: "1"
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_FROM_API: "1"
-      # The harness builds both Formulae from a local `git archive` tarball, so it proves the
-      # complete selected-only lifecycle without the external tap or a published v0.2.0.
+      # The harness compiles both binaries once and packages the same deterministic release
+      # archive the Formulae consume, without requiring an external tap or published v0.2.0.
       SKILLMOUNT_HOMEBREW_ACCEPTANCE: "1"
     steps:
       - name: Check out repository

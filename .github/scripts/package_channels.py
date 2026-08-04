@@ -22,7 +22,8 @@ PRODUCT_NAME = "SkillMount"
 DEFAULT_REPOSITORY = "pashifika/skillmount"
 HOMEPAGE = "https://github.com/pashifika/skillmount"
 LICENSE_EXPRESSION = "MIT OR Apache-2.0"
-INPUTS_SCHEMA = 1
+HOMEBREW_LICENSE_EXPRESSION = 'any_of: ["MIT", "Apache-2.0"]'
+INPUTS_SCHEMA = 2
 RELEASE_WORKFLOW_NAME = "Release"
 RELEASE_WORKFLOW_PATH = ".github/workflows/release.yml"
 TEMPLATE_SUFFIX = ".in"
@@ -34,6 +35,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*")
 DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 DIGEST_PREFIX = "sha256:"
+MACOS_ARM64_TARGET_NAME = "macos-arm64"
 WINDOWS_X64_TARGET_NAME = "windows-x64"
 WINDOWS_X86_TARGET_NAME = "windows-x86"
 APACHE_LICENSE_FILE, MIT_LICENSE_FILE = release.LICENSE_FILES
@@ -56,20 +58,18 @@ FORMULA_SCALAR_PATTERNS = {
     "homepage": re.compile(r'^\s*homepage "([^"]*)"\s*$', re.MULTILINE),
     "url": re.compile(r'^\s*url "([^"]*)"\s*$', re.MULTILINE),
     "sha256": re.compile(r'^\s*sha256 "([^"]*)"\s*$', re.MULTILINE),
-    "license": re.compile(r'^\s*license "([^"]*)"\s*$', re.MULTILINE),
+    "license": re.compile(r"^\s*license (.+?)\s*$", re.MULTILINE),
 }
 FORMULA_SHARED_FACTS = ("dependencies", "homepage", "license", "sha256", "url")
-FORMULA_DEPENDENCIES = tuple(
-    sorted(('depends_on "rust" => :build', "depends_on :macos", "depends_on arch: :arm64"))
-)
+FORMULA_DEPENDENCIES = tuple(sorted(("depends_on :macos", "depends_on arch: :arm64")))
 DEPENDS_ON_PATTERN = re.compile(r"^\s*(depends_on .+?)\s*$", re.MULTILINE)
-CARGO_BIN_PATTERN = re.compile(r'"--bin",\s*"([A-Za-z0-9_.-]+)"')
+BIN_INSTALL_PATTERN = re.compile(r'^\s*bin\.install "([^"]+)"\s*$', re.MULTILINE)
+PKGSHARE_INSTALL_PATTERN = re.compile(r"^\s*pkgshare\.install (.+?)\s*$", re.MULTILINE)
 TEST_BLOCK_PATTERN = re.compile(r"^\s*test do\s*$", re.MULTILINE)
 ERROR_PREFERENCE_PATTERN = re.compile(r"\$ErrorActionPreference\s*=\s*['\"]Stop['\"]")
 STRICT_MODE_PATTERN = re.compile(r"Set-StrictMode\s+-Version\s+2")
 FORMULA_SELECTION_ALIASES = {
     "PACKAGE_ID": "SELECTION",
-    "CARGO_BIN": "SELECTION",
     "COMMAND": "SELECTION",
     "FORMULA_CLASS": "SELECTION_CLASS",
     "OTHER_COMMAND": "OTHER",
@@ -99,6 +99,7 @@ def target_named(name: str) -> release.Target:
     return matches[0]
 
 
+MACOS_ARM64 = target_named(MACOS_ARM64_TARGET_NAME)
 WINDOWS_X64 = target_named(WINDOWS_X64_TARGET_NAME)
 WINDOWS_X86 = target_named(WINDOWS_X86_TARGET_NAME)
 
@@ -108,7 +109,6 @@ class PackageIdentity:
     """One publishable package identity and the product executable it selects."""
 
     package_id: str
-    cargo_bin: str
     command: str
     formula_class: str
     title: str
@@ -142,7 +142,6 @@ class PackageIdentity:
 PACKAGES: tuple[PackageIdentity, PackageIdentity] = (
     PackageIdentity(
         package_id="skillmount",
-        cargo_bin="skillmount",
         command="skillmount",
         formula_class="Skillmount",
         title="SkillMount",
@@ -151,7 +150,6 @@ PACKAGES: tuple[PackageIdentity, PackageIdentity] = (
     ),
     PackageIdentity(
         package_id="skillmount-asm",
-        cargo_bin="asm",
         command="asm",
         formula_class="SkillmountAsm",
         title="SkillMount (asm)",
@@ -217,14 +215,6 @@ def require_stable_tag(tag: Any, label: str) -> str:
     return tag
 
 
-def source_url(repository: str, tag: str) -> str:
-    """GitHub source tarball URL for an exact tag."""
-
-    validate_repository(repository)
-    require_stable_tag(tag, "source tag")
-    return f"https://github.com/{repository}/archive/refs/tags/{tag}.tar.gz"
-
-
 def asset_download_url(repository: str, tag: str, name: str) -> str:
     """Immutable GitHub Release asset download URL for one asset name."""
 
@@ -262,8 +252,6 @@ class PackageInputs:
     tag: str
     commit: str
     release_url: str
-    source_url: str
-    source_sha256: str
     archives: tuple[ArchiveIdentity, ...]
 
     def __post_init__(self) -> None:
@@ -271,7 +259,7 @@ class PackageInputs:
 
         Completeness of the archive set and the `https://github.com/<repository>/` URL policy
         are enforced by `from_json` and `preflight`, so a native acceptance harness may build
-        a partial local-source identity in process while a downstream artifact cannot.
+        a partial local release-archive identity in process while a downstream artifact cannot.
         """
 
         validate_repository(self.repository)
@@ -283,8 +271,6 @@ class PackageInputs:
             )
         require_release_value(release.validate_commit, self.commit)
         validate_url(self.release_url, "release URL")
-        validate_url(self.source_url, "source URL")
-        validate_digest(self.source_sha256, "source archive digest")
         triples = [archive.triple for archive in self.archives]
         if triples != sorted(set(triples)):
             raise ChannelError(
@@ -322,8 +308,6 @@ class PackageInputs:
             "tag": self.tag,
             "commit": self.commit,
             "release_url": self.release_url,
-            "source_url": self.source_url,
-            "source_sha256": self.source_sha256,
             "archives": [
                 {
                     "triple": archive.triple,
@@ -351,15 +335,7 @@ class PackageInputs:
         schema = document.get("schema")
         if schema != INPUTS_SCHEMA:
             raise ChannelError(f"package inputs schema is {schema!r}; expected {INPUTS_SCHEMA}")
-        scalar_names = (
-            "repository",
-            "version",
-            "tag",
-            "commit",
-            "release_url",
-            "source_url",
-            "source_sha256",
-        )
+        scalar_names = ("repository", "version", "tag", "commit", "release_url")
         expected_keys = {"schema", "archives", *scalar_names}
         if set(document) != expected_keys:
             raise ChannelError(
@@ -400,8 +376,6 @@ class PackageInputs:
             tag=scalars["tag"],
             commit=scalars["commit"],
             release_url=scalars["release_url"],
-            source_url=scalars["source_url"],
-            source_sha256=scalars["source_sha256"],
             archives=tuple(archives),
         )
         expected_triples = tuple(sorted(target.triple for target in release.TARGETS))
@@ -410,11 +384,6 @@ class PackageInputs:
             raise ChannelError(
                 f"package inputs cover archives {observed_triples!r}; "
                 f"expected {expected_triples!r}"
-            )
-        expected_source = source_url(inputs.repository, inputs.tag)
-        if inputs.source_url != expected_source:
-            raise ChannelError(
-                f"source URL is {inputs.source_url!r}; expected {expected_source!r}"
             )
         release_prefix = f"https://github.com/{inputs.repository}/releases/"
         if not inputs.release_url.startswith(release_prefix):
@@ -914,9 +883,6 @@ def preflight(
         commit=commit,
         work_directory=work_directory,
     )
-    resolved_source_url = source_url(repository, tag)
-    source_archive = work_directory / f"source-{tag}.tar.gz"
-    gateway.download(resolved_source_url, source_archive)
     archives = tuple(
         ArchiveIdentity(
             triple=target.triple,
@@ -932,8 +898,6 @@ def preflight(
         tag=tag,
         commit=commit,
         release_url=release_html_url(payload, repository=repository, tag=tag),
-        source_url=resolved_source_url,
-        source_sha256=release.sha256_file(source_archive),
         archives=archives,
     )
 
@@ -963,16 +927,16 @@ def render_template(text: str, values: Mapping[str, str]) -> str:
 def formula_tokens(inputs: PackageInputs, identity: PackageIdentity) -> dict[str, str]:
     """Return the exact token set the Homebrew Formula template requires."""
 
+    archive = inputs.archive(MACOS_ARM64.triple)
     return {
         "FORMULA_CLASS": identity.formula_class,
         "PACKAGE_ID": identity.package_id,
         "DESCRIPTION": identity.description,
         "HOMEPAGE": HOMEPAGE,
-        "SOURCE_URL": inputs.source_url,
-        "SOURCE_SHA256": inputs.source_sha256,
+        "ARCHIVE_URL": archive.url,
+        "ARCHIVE_SHA256": archive.sha256,
         "VERSION": inputs.version,
-        "LICENSE": LICENSE_EXPRESSION,
-        "CARGO_BIN": identity.cargo_bin,
+        "LICENSE": HOMEBREW_LICENSE_EXPRESSION,
         "COMMAND": identity.command,
         "OTHER_COMMAND": identity.other.command,
         "TAG": inputs.tag,
@@ -1186,7 +1150,6 @@ def mask_shared_identity(text: str, inputs: PackageInputs) -> str:
     """Blank every shared repository, product, and package name from a probe."""
 
     names = [
-        inputs.source_url,
         inputs.release_url,
         HOMEPAGE,
         inputs.repository,
@@ -1253,12 +1216,13 @@ def formula_facts(
                 f"{path} declares {len(found)} {name!r} values; expected exactly one"
             )
         scalars[name] = found[0]
+    archive = inputs.archive(MACOS_ARM64.triple)
     for name, expected in (
         ("desc", identity.description),
         ("homepage", HOMEPAGE),
-        ("url", inputs.source_url),
-        ("sha256", inputs.source_sha256),
-        ("license", LICENSE_EXPRESSION),
+        ("url", archive.url),
+        ("sha256", archive.sha256),
+        ("license", HOMEBREW_LICENSE_EXPRESSION),
     ):
         if scalars[name] != expected:
             raise ChannelError(f"{path} declares {name} {scalars[name]!r}; expected {expected!r}")
@@ -1279,11 +1243,25 @@ def formula_facts(
         raise ChannelError(
             f"{path} declares conflicts_with; independently selectable Formulae must not conflict"
         )
-    binaries = tuple(sorted(set(CARGO_BIN_PATTERN.findall(text))))
-    if binaries != (identity.cargo_bin,):
+    binaries = tuple(BIN_INSTALL_PATTERN.findall(text))
+    if binaries != (identity.command,):
         raise ChannelError(
-            f"{path} builds Cargo binaries {list(binaries)!r}; expected [{identity.cargo_bin!r}]"
+            f"{path} installs binaries {list(binaries)!r}; expected [{identity.command!r}]"
         )
+    package_data = PKGSHARE_INSTALL_PATTERN.findall(text)
+    expected_data = (*release.LICENSE_FILES, release.VERSION_FILE)
+    observed_data = () if len(package_data) != 1 else tuple(re.findall(r'"([^"]+)"', package_data[0]))
+    if observed_data != expected_data:
+        raise ChannelError(
+            f"{path} installs package data {list(observed_data)!r}; "
+            f"expected {list(expected_data)!r}"
+        )
+    for forbidden in ('system "cargo"', "std_cargo_args"):
+        if forbidden in text:
+            raise ChannelError(
+                f"{path} invokes Cargo through {forbidden!r}; "
+                "binary Formulae must install only validated release members"
+            )
     require_selected_command_only(text, path, inputs, identity)
     scalars["dependencies"] = " | ".join(dependencies)
     return scalars
@@ -1624,7 +1602,7 @@ def selection_map_lines() -> tuple[str, ...]:
     """Return the immutable package selection map in publication order."""
 
     return tuple(
-        f"{identity.package_id} cargo-bin={identity.cargo_bin} command={identity.command} "
+        f"{identity.package_id} command={identity.command} "
         f"windows-executable={identity.windows_executable} formula={identity.formula_path} "
         f"formula-class={identity.formula_class}"
         for identity in PACKAGES

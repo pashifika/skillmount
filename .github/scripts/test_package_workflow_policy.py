@@ -942,14 +942,14 @@ class TemplateTokenTests(unittest.TestCase):
     TOKEN = re.compile(r"@([A-Z][A-Z0-9_]*)@")
     EXPECTED = {
         "homebrew/skillmount.rb.in": {
-            "FORMULA_CLASS", "PACKAGE_ID", "DESCRIPTION", "HOMEPAGE", "SOURCE_URL",
-            "SOURCE_SHA256", "VERSION", "LICENSE", "CARGO_BIN", "COMMAND", "OTHER_COMMAND",
-            "TAG", "COMMIT",
+            "FORMULA_CLASS", "PACKAGE_ID", "DESCRIPTION", "HOMEPAGE", "ARCHIVE_URL",
+            "ARCHIVE_SHA256", "VERSION", "LICENSE", "COMMAND", "OTHER_COMMAND", "TAG",
+            "COMMIT",
         },
         "homebrew/skillmount-asm.rb.in": {
-            "FORMULA_CLASS", "PACKAGE_ID", "DESCRIPTION", "HOMEPAGE", "SOURCE_URL",
-            "SOURCE_SHA256", "VERSION", "LICENSE", "CARGO_BIN", "COMMAND", "OTHER_COMMAND",
-            "TAG", "COMMIT",
+            "FORMULA_CLASS", "PACKAGE_ID", "DESCRIPTION", "HOMEPAGE", "ARCHIVE_URL",
+            "ARCHIVE_SHA256", "VERSION", "LICENSE", "COMMAND", "OTHER_COMMAND", "TAG",
+            "COMMIT",
         },
         "chocolatey/skillmount/skillmount.nuspec.in": {
             "PACKAGE_ID", "VERSION", "TITLE", "SUMMARY", "DESCRIPTION", "PROJECT_URL",
@@ -1007,13 +1007,26 @@ class TemplateTokenTests(unittest.TestCase):
 
         text = (self.PACKAGING / "homebrew/skillmount.rb.in").read_text(encoding="utf-8")
         self.assertNotIn("conflicts_with", text)
+        self.assertNotIn('depends_on "rust"', text)
+        self.assertNotIn('system "cargo"', text)
         self.assertEqual(
             sorted(line.strip() for line in text.splitlines() if "depends_on" in line),
-            ['depends_on "rust" => :build', "depends_on :macos", "depends_on arch: :arm64"],
+            ["depends_on :macos", "depends_on arch: :arm64"],
         )
+        self.assertIn('bin.install "@COMMAND@"', text)
         before, _, test_block = text.partition("  test do")
         self.assertNotIn("@OTHER_COMMAND@", before)
         self.assertIn("@OTHER_COMMAND@", test_block)
+
+    def test_tap_ci_exercises_binary_formulae_without_a_build_toolchain(self) -> None:
+        """Keep tap validation on the same release-archive install path operators use."""
+
+        text = (self.PACKAGING / "homebrew/tap-ci.yml").read_text(encoding="utf-8")
+        self.assertNotIn("--build-from-source", text)
+        self.assertNotIn("brew install --formula rust", text)
+        self.assertNotIn("brew test --formula", text)
+        self.assertIn('brew install --formula "$TAP/skillmount"', text)
+        self.assertIn('brew install --formula "$TAP/skillmount-asm"', text)
 
     def test_install_templates_never_reference_the_unselected_executable_after_selection(
         self,

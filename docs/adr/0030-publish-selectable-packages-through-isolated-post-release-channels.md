@@ -1,6 +1,6 @@
 # ADR 0030: Publish Selectable Packages Through Isolated Post-Release Channels
 
-- **Status:** Accepted
+- **Status:** Accepted; Homebrew source-build decision superseded by ADR 0031
 - **Date:** 2026-08-04
 - **Supersedes:** _none_
 

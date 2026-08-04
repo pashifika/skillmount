@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol, Sequence
@@ -25,15 +27,15 @@ ACCEPTANCE_TAP = "skillmount-acceptance/homebrew-tap"
 SUPPORTED_PREFIX = "/opt/homebrew"
 FORMULA_IDS = ("skillmount", "skillmount-asm")
 PRIOR_TAG = "v0.1.0"
-REPORT_SCHEMA = 1
+REPORT_SCHEMA = 2
 EVIDENCE_LIMIT = 4000
 DEFAULT_TIMEOUT = 900
 BUILD_TIMEOUT = 5400
 SENTINEL_CONTENT = b"skillmount homebrew acceptance sentinel; unrelated to any Formula\n"
-BUILD_DEPENDENCY_NOTICE = (
-    "notice: both Formulae build from source, so Homebrew may install their declared build "
-    "dependency `rust`; this harness never uninstalls a Formula it did not install, so an "
-    "unrelated keg such as `rust` is left exactly as Homebrew leaves it"
+ARCHIVE_PREPARATION_NOTICE = (
+    "notice: an unpublished candidate is compiled once and packaged with release.package_release "
+    "before Homebrew runs; both Formulae install that same checked archive and declare no Rust "
+    "build dependency"
 )
 SHARED_PLACEHOLDER = "<asm|skillmount>"
 COMPLETIONS_MARKER = "completions"
@@ -102,9 +104,9 @@ CARGO_PACKAGE_HEADER = "[package]"
 CARGO_VERSION_PATTERN = re.compile(r'^version = "([^"\n]+)"[ \t]*$', re.MULTILINE)
 CARGO_SECTION_PATTERN = re.compile(r"^\[", re.MULTILINE)
 AUDIT_OFFENSE_PATTERN = re.compile(r"^\s*(?:\*\s+)?(?:line \d+:|.*\bline \d+, col \d+\b)", re.I)
-LOCAL_SOURCE_AUDIT_ALLOWANCES = (
+LOCAL_ARCHIVE_AUDIT_ALLOWANCES = (
     # `brew audit --strict` requires an HTTPS stable URL. The local rehearsal deliberately
-    # renders a `file://` source so the lifecycle can be proven before any tag is published.
+    # renders a `file://` release archive before the candidate tag is published.
     re.compile(r"(?i)file://"),
     re.compile(r"(?i)\bhttps\b"),
     re.compile(r"(?i)\bsecure\b.*\burl\b"),
@@ -255,8 +257,8 @@ class ScenarioCoverage:
 
 
 @dataclass(frozen=True)
-class SourceArchive:
-    """The source tarball identity both rendered Formulae pin."""
+class ReleaseArchive:
+    """The checked Apple Silicon release archive both rendered Formulae pin."""
 
     url: str
     sha256: str
@@ -264,7 +266,7 @@ class SourceArchive:
 
     @property
     def local(self) -> bool:
-        """Return whether the pinned source is a locally built tarball."""
+        """Return whether the pinned release archive is local to this rehearsal."""
 
         return self.url.startswith("file://")
 
@@ -281,7 +283,7 @@ class SourceArchive:
 
 @dataclass(frozen=True)
 class UpgradeDecision:
-    """Whether the prior released source can serve as an upgrade rehearsal."""
+    """Whether the previous release archive can serve as an upgrade rehearsal."""
 
     status: str
     reason: str
@@ -331,7 +333,7 @@ class HarnessOptions:
     version: str
     tag: str
     commit: str | None
-    source: SourceArchive | None
+    archive: ReleaseArchive | None
     require_upgrade: bool
     prior_tag: str
 
@@ -377,21 +379,21 @@ SCENARIO_COVERAGE: tuple[ScenarioCoverage, ...] = (
         ),
     ),
     ScenarioCoverage(
-        requirement="Both Formulae build one immutable source version on the supported platform",
-        scenario="Supported paired source builds run",
+        requirement="Both Formulae consume one immutable release archive on the supported platform",
+        scenario="Supported paired release archives install",
         phases=("audit", "install-skillmount-alone", "install-asm-alone", "brew-test"),
         kind="direct",
-        note="Both Formulae pin one rendered source identity and build the selected Cargo binary.",
+        note="Both Formulae pin one checked release archive and install only the selected binary.",
     ),
     ScenarioCoverage(
-        requirement="Both Formulae build one immutable source version on the supported platform",
-        scenario="One Formula source identity differs",
+        requirement="Both Formulae consume one immutable release archive on the supported platform",
+        scenario="One Formula archive identity differs",
         phases=("audit",),
         kind="direct",
         note="package_channels.inspect_formulae compares the rendered pair before any install.",
     ),
     ScenarioCoverage(
-        requirement="Both Formulae build one immutable source version on the supported platform",
+        requirement="Both Formulae consume one immutable release archive on the supported platform",
         scenario="Unsupported platform requests installation",
         phases=("audit",),
         kind="static",
@@ -448,8 +450,8 @@ SCENARIO_COVERAGE: tuple[ScenarioCoverage, ...] = (
         phases=("style", "audit", "brew-test", "upgrade-from-prior"),
         kind="analogue",
         note=(
-            "The harness runs the same style, audit, build, test, and upgrade battery a tap "
-            "change must pass; merge eligibility itself is package_publish.reconcile_tap."
+            "The harness runs the same style, audit, archive-install, test, and upgrade battery a "
+            "tap change must pass; merge eligibility itself is package_publish.reconcile_tap."
         ),
     ),
     ScenarioCoverage(
@@ -468,8 +470,8 @@ SCENARIO_COVERAGE: tuple[ScenarioCoverage, ...] = (
         phases=("audit",),
         kind="analogue",
         note=(
-            "A pair whose source identity disagrees is rejected before any install; refusing to "
-            "overwrite conflicting tap state is package_publish.reconcile_tap."
+            "A pair whose release-archive identity disagrees is rejected before any install; "
+            "refusing to overwrite conflicting tap state is package_publish.reconcile_tap."
         ),
     ),
     ScenarioCoverage(
@@ -486,6 +488,16 @@ SCENARIO_COVERAGE: tuple[ScenarioCoverage, ...] = (
         phases=("cross-uninstall",),
         kind="direct",
         note="The removed Formula's keg, link, and completions vanish while the other still runs.",
+    ),
+    ScenarioCoverage(
+        requirement="Homebrew lifecycle is clean and independently owned",
+        scenario="A previously uninstalled Formula is installed again",
+        phases=("trust", "install-skillmount-alone", "install-asm-alone"),
+        kind="direct",
+        note=(
+            "Each standalone lifecycle uninstalls its Formula; later installs query the trust "
+            "store, diagnose a dropped name, and re-assert that name before reinstalling."
+        ),
     ),
     ScenarioCoverage(
         requirement="Homebrew lifecycle is clean and independently owned",
@@ -610,29 +622,31 @@ def validate_digest(value: str, *, label: str) -> str:
     return value
 
 
-def source_override(url: str | None, digest: str | None) -> SourceArchive | None:
-    """Validate an operator-supplied source URL and digest pair."""
+def archive_override(url: str | None, digest: str | None) -> ReleaseArchive | None:
+    """Validate an operator-supplied release-archive URL and digest pair."""
 
     if url is None:
         if digest is not None:
             raise HomebrewAcceptanceError(
-                "--source-sha256 was passed without --source-url-override; expected both or "
-                "neither because the locally built tarball is digested by this harness"
+                "--archive-sha256 was passed without --archive-url-override; expected both or "
+                "neither because the locally packaged release archive is digested by this harness"
             )
         return None
     if digest is None:
         raise HomebrewAcceptanceError(
-            f"--source-url-override is {url!r} without --source-sha256; expected the exact "
-            "digest of that tarball because Homebrew verifies the download before building"
+            f"--archive-url-override is {url!r} without --archive-sha256; expected the exact "
+            "digest because Homebrew verifies the release archive before installation"
         )
     if not (url.startswith("https://") or url.startswith("file://")):
         raise HomebrewAcceptanceError(
-            f"--source-url-override is {url!r}; expected an https:// or file:// URL"
+            f"--archive-url-override is {url!r}; expected an https:// or file:// URL"
         )
     if any(character.isspace() for character in url):
-        raise HomebrewAcceptanceError(f"--source-url-override is {url!r}; expected no whitespace")
-    digest = validate_digest(digest, label="--source-sha256")
-    return SourceArchive(url=url, sha256=digest, path=None)
+        raise HomebrewAcceptanceError(
+            f"--archive-url-override is {url!r}; expected no whitespace"
+        )
+    digest = validate_digest(digest, label="--archive-sha256")
+    return ReleaseArchive(url=url, sha256=digest, path=None)
 
 
 def cargo_version_from_manifest(text: str) -> str:
@@ -672,7 +686,7 @@ def upgrade_decision(
     prior_cli_source: str | None,
     require_upgrade: bool,
 ) -> UpgradeDecision:
-    """Decide whether the prior released source can be upgraded from."""
+    """Decide whether the previous release archive can be upgraded from."""
 
     reason = ""
     if prior_cli_source is None:
@@ -971,28 +985,35 @@ def version_findings(output: str, *, command: str, version: str) -> tuple[str, .
 
 
 def platform_findings(text: str, *, formula_class: str) -> tuple[str, ...]:
-    """Require one rendered Formula to build only on Apple Silicon macOS."""
+    """Require one binary Formula to install only on Apple Silicon macOS."""
 
     findings: list[str] = []
-    for required in ('depends_on "rust" => :build', "depends_on :macos", "depends_on arch: :arm64"):
+    for required in ("depends_on :macos", "depends_on arch: :arm64", "bin.install"):
         if required not in text:
             findings.append(f"{formula_class} does not declare `{required}`")
-    for forbidden in ("conflicts_with", "on_linux", "depends_on :linux", "bottle do"):
+    for forbidden in (
+        "conflicts_with",
+        "on_linux",
+        "depends_on :linux",
+        "bottle do",
+        'depends_on "rust"',
+        'system "cargo"',
+    ):
         if forbidden in text:
             findings.append(f"{formula_class} declares `{forbidden}`; expected it to be absent")
     return tuple(findings)
 
 
-def audit_findings(output: str, *, local_source: bool) -> tuple[str, ...]:
-    """Return `brew audit` offences that the local rehearsal does not explain."""
+def audit_findings(output: str, *, local_archive: bool) -> tuple[str, ...]:
+    """Return `brew audit` offences that the local archive rehearsal does not explain."""
 
     findings: list[str] = []
     for line in output.splitlines():
         candidate = line.strip()
-        if not candidate or AUDIT_OFFENSE_PATTERN.match(candidate) is None:
+        if not candidate or AUDIT_OFFENSE_PATTERN.search(candidate) is None:
             continue
-        if local_source and any(
-            allowance.search(candidate) for allowance in LOCAL_SOURCE_AUDIT_ALLOWANCES
+        if local_archive and any(
+            allowance.search(candidate) for allowance in LOCAL_ARCHIVE_AUDIT_ALLOWANCES
         ):
             continue
         findings.append(f"brew audit reported {candidate!r}")
@@ -1267,7 +1288,7 @@ def build_report(
     *,
     options: HarnessOptions,
     commit: str,
-    source: SourceArchive | None,
+    archive: ReleaseArchive | None,
     prefix: Path | None,
     environment: Mapping[str, object],
     trust: Mapping[str, object],
@@ -1289,7 +1310,7 @@ def build_report(
         "formulae": list(options.formula_ids),
         "selected_phases": list(options.phases),
         "require_upgrade": options.require_upgrade,
-        "source": source.to_json_object() if source is not None else None,
+        "archive": archive.to_json_object() if archive is not None else None,
         "environment": dict(environment),
         "trust": dict(trust),
         "phases": [phase.to_json_object() for phase in phases],
@@ -1416,7 +1437,7 @@ class CommandGateway(Protocol):
     def tool(
         self, executable: str, *arguments: str, timeout: int = DEFAULT_TIMEOUT
     ) -> CommandEvidence:
-        """Run one auxiliary executable such as `rustc` or an installed product command."""
+        """Run one auxiliary executable such as `cargo`, `rustc`, or an installed command."""
 
 
 class SubprocessGateway:
@@ -1480,7 +1501,7 @@ class Harness:
         self.active: Phase | None = None
         self.prefix: Path | None = None
         self.commit = ""
-        self.source: SourceArchive | None = None
+        self.archive: ReleaseArchive | None = None
         self.tap_root: Path | None = None
         self.tapped = False
         self.trusted: list[str] = []
@@ -1588,14 +1609,14 @@ class Harness:
             "sw_vers": os_version.stdout.strip().splitlines(),
             "shells": shells,
             "commands": [item.to_json_object() for item in evidence],
-            "build_dependencies": BUILD_DEPENDENCY_NOTICE,
+            "archive_preparation": ARCHIVE_PREPARATION_NOTICE,
         }
         print(f"brew: {' | '.join(record['brew'])}")
         print(f"rustc: {record['rustc']}")
         print(f"sw_vers: {' | '.join(record['sw_vers'])}")
         for shell, version in shells.items():
             print(f"{shell}: {version}")
-        print(BUILD_DEPENDENCY_NOTICE)
+        print(ARCHIVE_PREPARATION_NOTICE)
         self.environment_evidence = record
         return record
 
@@ -1625,75 +1646,149 @@ class Harness:
         require_clean_formula_state(listing.stdout)
         return prefix
 
-    # Identity, source, and rendering.
+    # Identity, release archive, and rendering.
 
     def resolve_identity(self) -> tuple[str, str]:
-        """Return the candidate commit and whether the worktree is dirty."""
+        """Return the candidate commit after proving any local build uses that exact tree."""
 
+        head = self.require_bare(self.gateway.git("rev-parse", "HEAD"), [])
+        head_commit = release.validate_commit(head.stdout.strip())
         requested = self.options.commit
         if requested is not None:
+            requested = release.validate_commit(requested)
             self.require_bare(self.gateway.git("cat-file", "-e", f"{requested}^{{commit}}"), [])
-            commit = requested
-        else:
-            head = self.require_bare(self.gateway.git("rev-parse", "HEAD"), [])
-            commit = release.validate_commit(head.stdout.strip())
-        status = self.gateway.git("status", "--porcelain")
+        commit = head_commit if requested is None else requested
+        status = self.require_bare(self.gateway.git("status", "--porcelain"), [])
         dirty = bool(status.stdout.strip())
+        if self.options.archive is None:
+            if commit != head_commit:
+                raise HomebrewAcceptanceError(
+                    f"local release archive would build HEAD {head_commit}; "
+                    f"expected requested commit {commit}"
+                )
+            if dirty:
+                raise HomebrewAcceptanceError(
+                    "local release archive requires a clean worktree at the validated commit"
+                )
         return commit, "dirty" if dirty else "clean"
 
-    def build_source(self, work: Path) -> SourceArchive:
-        """Return the candidate source identity, building it when none was given."""
+    def build_archive(self, work: Path) -> ReleaseArchive:
+        """Return the candidate release archive, packaging it when none was supplied."""
 
-        if self.options.source is not None:
-            return self.options.source
-        return self.archive_source(work, tag=self.options.tag, commit=self.commit)
-
-    def archive_source(self, work: Path, *, tag: str, commit: str) -> SourceArchive:
-        """Build and digest one source tarball with `git archive`."""
-
-        archive = work / f"skillmount-{tag}.tar.gz"
-        self.require_bare(
-            self.gateway.git(
-                "archive",
-                "--format=tar.gz",
-                f"--prefix=skillmount-{tag}/",
-                "--output",
-                str(archive),
-                commit,
-            ),
-            [],
+        if self.options.archive is not None:
+            return self.options.archive
+        channels = import_package_channels()
+        target = channels.MACOS_ARM64
+        target_directory = work / "cargo-target"
+        build = self.gateway.tool(
+            "cargo",
+            "build",
+            "--locked",
+            "--release",
+            "--target",
+            target.triple,
+            "--target-dir",
+            str(target_directory),
+            "--bins",
+            timeout=BUILD_TIMEOUT,
         )
-        return SourceArchive(
-            url=archive.as_uri(), sha256=release.sha256_file(archive), path=archive
+        self.require_bare(build, [])
+        self.environment_evidence.setdefault("archive_commands", []).append(
+            build.to_json_object()
+        )
+        try:
+            path = release.package_release(
+                self.options.repository,
+                target_directory / target.triple / "release",
+                work / "release",
+                target=target,
+                version=self.options.version,
+                tag=self.options.tag,
+                commit=self.commit,
+            )
+        except release.ReleaseError as error:
+            raise HomebrewAcceptanceError(
+                f"cannot package the checked Apple Silicon release archive: {error}"
+            ) from error
+        return ReleaseArchive(
+            url=path.as_uri(), sha256=release.sha256_file(path), path=path
+        )
+
+    def fetch_published_archive(
+        self, work: Path, *, version: str, tag: str, commit: str
+    ) -> ReleaseArchive:
+        """Download and validate the exact prior Apple Silicon release archive."""
+
+        channels = import_package_channels()
+        target = channels.MACOS_ARM64
+        name = release.asset_name(tag, target)
+        url = channels.asset_download_url(channels.DEFAULT_REPOSITORY, tag, name)
+        path = work / name
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "skillmount-homebrew-acceptance"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT) as response:
+                with path.open("wb") as output:
+                    shutil.copyfileobj(response, output)
+            release.inspect_archive(
+                path,
+                target=target,
+                version=version,
+                tag=tag,
+                commit=commit,
+            )
+        except (OSError, urllib.error.URLError, release.ReleaseError) as error:
+            raise HomebrewAcceptanceError(
+                f"cannot consume prior release archive {url}: {error}"
+            ) from error
+        return ReleaseArchive(
+            url=url, sha256=release.sha256_file(path), path=path
         )
 
     def channel_inputs(
-        self, channels: Any, *, source: SourceArchive, version: str, tag: str
+        self,
+        channels: Any,
+        *,
+        archive: ReleaseArchive,
+        version: str,
+        tag: str,
+        commit: str,
     ) -> Any:
-        """Return in-process `PackageInputs` pinning one already-digested source."""
+        """Return `PackageInputs` pinning one checked Apple Silicon release archive."""
 
         repository = channels.DEFAULT_REPOSITORY
+        target = channels.MACOS_ARM64
         try:
             return channels.PackageInputs(
                 repository=repository,
                 version=version,
                 tag=tag,
-                commit=self.commit,
+                commit=commit,
                 release_url=f"https://github.com/{repository}/releases/tag/{tag}",
-                source_url=source.url,
-                source_sha256=source.sha256,
-                archives=(),
+                archives=(
+                    channels.ArchiveIdentity(
+                        triple=target.triple,
+                        name=release.asset_name(tag, target),
+                        url=archive.url,
+                        sha256=archive.sha256,
+                    ),
+                ),
             )
         except channels.ChannelError as error:
             raise HomebrewAcceptanceError(
-                f"package_channels.PackageInputs rejected the source-only rehearsal identity "
-                f"({error}); this harness observes no release archive, so it records none. Pass "
-                "--inputs with a real preflight artifact, or let PackageInputs accept "
-                "archives=() and keep archive completeness in from_json and preflight"
+                "package_channels.PackageInputs rejected the checked Apple Silicon "
+                f"release-archive identity: {error}"
             ) from error
 
     def render_formulae(
-        self, output: Path, *, source: SourceArchive, version: str, tag: str
+        self,
+        output: Path,
+        *,
+        archive: ReleaseArchive,
+        version: str,
+        tag: str,
+        commit: str,
     ) -> dict[str, Path]:
         """Render both Formulae from the tracked templates."""
 
@@ -1703,7 +1798,9 @@ class Harness:
                 identity.package_id: (identity.command, identity.other.command)
                 for identity in channels.PACKAGES
             }
-        inputs = self.channel_inputs(channels, source=source, version=version, tag=tag)
+        inputs = self.channel_inputs(
+            channels, archive=archive, version=version, tag=tag, commit=commit
+        )
         try:
             rendered = channels.generate_formulae(
                 inputs,
@@ -1718,7 +1815,7 @@ class Harness:
         return {package_id: Path(path) for package_id, path in rendered.items()}
 
     def inspect_rendered_pair(self, phase: Phase, rendered: Mapping[str, Path]) -> None:
-        """Require the rendered pair to share one source identity."""
+        """Require the rendered pair to share one release-archive identity."""
 
         channels = import_package_channels()
         if len(rendered) != len(FORMULA_IDS):
@@ -1728,9 +1825,10 @@ class Harness:
             return
         inputs = self.channel_inputs(
             channels,
-            source=self.require_source(),
+            archive=self.require_archive(),
             version=self.options.version,
             tag=self.options.tag,
+            commit=self.commit,
         )
         try:
             channels.inspect_formulae(dict(rendered), inputs)
@@ -1739,12 +1837,12 @@ class Harness:
         else:
             phase.note("package_channels.inspect_formulae accepted the rendered pair")
 
-    def require_source(self) -> SourceArchive:
-        """Return the resolved source identity."""
+    def require_archive(self) -> ReleaseArchive:
+        """Return the resolved release-archive identity."""
 
-        if self.source is None:
-            raise HomebrewAcceptanceError("the source archive identity was never resolved")
-        return self.source
+        if self.archive is None:
+            raise HomebrewAcceptanceError("the release-archive identity was never resolved")
+        return self.archive
 
     def require_prefix(self) -> Path:
         """Return the validated Homebrew prefix."""
@@ -2093,18 +2191,18 @@ class Harness:
         if not self.enabled("audit"):
             return
         phase = self.phase("audit")
-        source = self.require_source()
+        archive = self.require_archive()
         for package_id in self.options.formula_ids:
             reference = self.formula_reference(package_id)
             evidence = phase.record(self.gateway.brew("audit", "--strict", "--formula", reference))
             offences = audit_findings(
-                f"{evidence.stdout}\n{evidence.stderr}", local_source=source.local
+                f"{evidence.stdout}\n{evidence.stderr}", local_archive=archive.local
             )
             phase.add(offences)
             if evidence.returncode != 0 and not offences:
                 phase.note(
                     f"brew audit exited {evidence.returncode} for {reference} with only "
-                    "local-source offences, which the file:// rehearsal explains"
+                    "local-archive offences, which the file:// rehearsal explains"
                 )
             text = self.formula_paths[package_id].read_text(encoding="utf-8")
             phase.add(platform_findings(text, formula_class=package_id))
@@ -2143,7 +2241,7 @@ class Harness:
         return True
 
     def install(self, phase: Phase, package_id: str) -> bool:
-        """Re-assert trust, then build and install one Formula from source."""
+        """Re-assert trust, then install one Formula from its checked release archive."""
 
         reference = self.formula_reference(package_id)
         # This list only proves the harness meant to trust the reference; Homebrew was observed to
@@ -2153,11 +2251,11 @@ class Harness:
             return False
         if not self.reassert_trust(phase, reference):
             return False
-        evidence = self.gateway.brew(
-            "install", "--formula", "--build-from-source", reference, timeout=BUILD_TIMEOUT
-        )
+        evidence = self.gateway.brew("install", "--formula", reference)
         if not self.check(
-            phase, evidence, expectation=f"{reference} must build and install from source"
+            phase,
+            evidence,
+            expectation=f"{reference} must install its checked release archive",
         ):
             if trust_refused_install(evidence, reference=reference):
                 phase.add((trust_regression_finding(evidence, reference=reference),))
@@ -2469,7 +2567,7 @@ class Harness:
         phase.settle()
 
     def stage_upgrade(self, work: Path) -> None:
-        """Install the prior released source and upgrade it to the candidate."""
+        """Install the previous release archive and upgrade it to the candidate."""
 
         if not self.enabled("upgrade-from-prior"):
             return
@@ -2504,10 +2602,30 @@ class Harness:
         if not decision.eligible or prior_version is None:
             self.settle_upgrade(phase, decision)
             return
-        prior = self.archive_source(work, tag=prior_tag, commit=prior_commit)
+        try:
+            prior = self.fetch_published_archive(
+                work,
+                version=prior_version,
+                tag=prior_tag,
+                commit=prior_commit,
+            )
+        except HomebrewAcceptanceError as error:
+            status = "failed" if self.options.require_upgrade else "skipped"
+            self.settle_upgrade(
+                phase,
+                UpgradeDecision(
+                    status=status,
+                    reason=f"previous release archive is unavailable: {error}",
+                ),
+            )
+            return
         prior_directory = work / f"prior-{prior_version}"
         rendered = self.render_formulae(
-            prior_directory, source=prior, version=prior_version, tag=prior_tag
+            prior_directory,
+            archive=prior,
+            version=prior_version,
+            tag=prior_tag,
+            commit=prior_commit,
         )
         candidate_formula = self.formula_paths[package_id]
         candidate_text = candidate_formula.read_text(encoding="utf-8")
@@ -2522,9 +2640,7 @@ class Harness:
             before = phase.record(self.gateway.tool(str(prefix / "bin" / command), "--version"))
             phase.add(version_findings(before.stdout, command=command, version=prior_version))
             candidate_formula.write_text(candidate_text, encoding="utf-8")
-            upgraded = self.gateway.brew(
-                "upgrade", "--formula", reference, timeout=BUILD_TIMEOUT
-            )
+            upgraded = self.gateway.brew("upgrade", "--formula", reference)
             if not self.check(
                 phase, upgraded, expectation=f"{reference} must upgrade to {self.options.version}"
             ):
@@ -2577,13 +2693,14 @@ class Harness:
     def lifecycle(self, work: Path) -> None:
         """Render, tap, and run every selected phase in canonical order."""
 
-        source = self.build_source(work)
-        self.source = source
+        archive = self.build_archive(work)
+        self.archive = archive
         rendered = self.render_formulae(
             work / "candidate",
-            source=source,
+            archive=archive,
             version=self.options.version,
             tag=self.options.tag,
+            commit=self.commit,
         )
         self.create_tap()
         self.place_formulae(rendered)
@@ -2638,7 +2755,7 @@ class Harness:
         return build_report(
             options=self.options,
             commit=self.commit,
-            source=self.source,
+            archive=self.archive,
             prefix=self.prefix,
             environment=environment,
             trust=self.trust_report(),
@@ -2667,22 +2784,23 @@ class Harness:
         target.status = "failed"
 
 
-def preflight_identity(path: Path) -> tuple[str, str, str, SourceArchive]:
-    """Return the version, tag, commit, and source identity a preflight artifact pins."""
+def preflight_identity(path: Path) -> tuple[str, str, str, ReleaseArchive]:
+    """Return the version, tag, commit, and macOS archive a preflight artifact pins."""
 
     channels = import_package_channels()
     try:
         inputs = channels.PackageInputs.from_json(path.read_text(encoding="utf-8"))
+        archive = inputs.archive(channels.MACOS_ARM64.triple)
     except channels.ChannelError as error:
         raise HomebrewAcceptanceError(
             f"{path} is not a valid preflight artifact: {error}"
         ) from error
-    source = SourceArchive(
-        url=inputs.source_url,
-        sha256=validate_digest(inputs.source_sha256, label=f"{path} source_sha256"),
+    selected = ReleaseArchive(
+        url=archive.url,
+        sha256=validate_digest(archive.sha256, label=f"{path} macOS archive sha256"),
         path=None,
     )
-    return inputs.version, inputs.tag, inputs.commit, source
+    return inputs.version, inputs.tag, inputs.commit, selected
 
 
 def resolve_options(options: argparse.Namespace) -> HarnessOptions:
@@ -2696,8 +2814,8 @@ def resolve_options(options: argparse.Namespace) -> HarnessOptions:
             for name, value in (
                 ("--version", options.version),
                 ("--tag", options.tag),
-                ("--source-url-override", options.source_url_override),
-                ("--source-sha256", options.source_sha256),
+                ("--archive-url-override", options.archive_url_override),
+                ("--archive-sha256", options.archive_sha256),
             )
             if value is not None
         )
@@ -2706,7 +2824,7 @@ def resolve_options(options: argparse.Namespace) -> HarnessOptions:
                 f"--inputs was passed with {conflicting}; expected --inputs to be the only "
                 "source of the release identity"
             )
-        version, tag, inputs_commit, source = preflight_identity(options.inputs)
+        version, tag, inputs_commit, archive = preflight_identity(options.inputs)
         commit = commit or inputs_commit
     else:
         manifest = repository / "Cargo.toml"
@@ -2717,7 +2835,7 @@ def resolve_options(options: argparse.Namespace) -> HarnessOptions:
         )
         release.validate_stable_version(version)
         tag = options.tag or f"v{version}"
-        source = source_override(options.source_url_override, options.source_sha256)
+        archive = archive_override(options.archive_url_override, options.archive_sha256)
     if release.stable_version_from_tag(tag) != version:
         raise HomebrewAcceptanceError(f"tag {tag!r} does not describe version {version!r}")
     template_directory = (
@@ -2737,7 +2855,7 @@ def resolve_options(options: argparse.Namespace) -> HarnessOptions:
         version=version,
         tag=tag,
         commit=commit,
-        source=source,
+        archive=archive,
         require_upgrade=options.require_upgrade,
         prior_tag=options.prior_tag,
     )
@@ -2756,8 +2874,8 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", default=None)
     parser.add_argument("--tag", default=None)
     parser.add_argument("--prior-tag", default=PRIOR_TAG)
-    parser.add_argument("--source-url-override", default=None)
-    parser.add_argument("--source-sha256", default=None)
+    parser.add_argument("--archive-url-override", default=None)
+    parser.add_argument("--archive-sha256", default=None)
     parser.add_argument("--require-upgrade", action="store_true")
     parser.add_argument("--report", type=Path, default=None)
     parser.add_argument("--print-coverage", action="store_true")

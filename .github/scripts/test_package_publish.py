@@ -32,16 +32,16 @@ FORMULA_TEMPLATE = """\
 class {formula_class} < Formula
   desc "{summary}"
   homepage "{homepage}"
-  url "{source_url}"
-  sha256 "{source_sha256}"
-  license "{license_expression}"
+  url "{archive_url}"
+  sha256 "{archive_sha256}"
+  license {license_expression}
 {version_line}
-  depends_on "rust" => :build
   depends_on :macos
   depends_on arch: :arm64
 
   def install
-    system "cargo", "install", "--bin", "{cargo_bin}", *std_cargo_args
+    bin.install "{installed_binary}"
+    pkgshare.install "LICENSE-APACHE", "LICENSE-MIT", "VERSION"
     generate_completions_from_executable(bin/"{command}", "completions",
                                          base_name: "{command}",
                                          shells: [:bash, :zsh, :fish])
@@ -84,10 +84,6 @@ def inputs_document(**overrides: Any) -> dict[str, Any]:
         "tag": TAG,
         "commit": COMMIT,
         "release_url": f"https://github.com/{REPOSITORY}/releases/tag/{TAG}",
-        "source_url": (
-            f"https://github.com/{REPOSITORY}/archive/refs/tags/{TAG}.tar.gz"
-        ),
-        "source_sha256": digest("source"),
         "archives": archives,
     }
     document.update(overrides)
@@ -104,15 +100,16 @@ def formula_text(
     inputs: channels.PackageInputs,
     identity: channels.PackageIdentity,
     *,
-    source_url: str | None = None,
-    source_sha256: str | None = None,
+    archive_url: str | None = None,
+    archive_sha256: str | None = None,
     version: str | None = None,
-    cargo_bin: str | None = None,
+    installed_binary: str | None = None,
     command: str | None = None,
     trailer: str = "",
 ) -> str:
     """Render one Formula fixture, optionally diverging from expected provenance."""
 
+    archive = inputs.archive(channels.MACOS_ARM64.triple)
     selected = command or identity.command
     return FORMULA_TEMPLATE.format(
         product=channels.PRODUCT_NAME,
@@ -122,11 +119,11 @@ def formula_text(
         formula_class=identity.formula_class,
         summary=identity.summary,
         homepage=channels.HOMEPAGE,
-        source_url=source_url or inputs.source_url,
-        source_sha256=source_sha256 or inputs.source_sha256,
-        license_expression=channels.LICENSE_EXPRESSION,
+        archive_url=archive_url or archive.url,
+        archive_sha256=archive_sha256 or archive.sha256,
+        license_expression=channels.HOMEBREW_LICENSE_EXPRESSION,
         version_line="" if version is None else f'  version "{version}"\n',
-        cargo_bin=cargo_bin or identity.cargo_bin,
+        installed_binary=installed_binary or identity.command,
         command=selected,
         other_command=identity.other.command,
         trailer=trailer,
@@ -540,33 +537,39 @@ class HomebrewTapTests(unittest.TestCase):
         self.assert_no_writes(gateway)
         return message
 
-    def test_conflicting_source_url_blocks_the_pair_without_writing(self) -> None:
-        """Never overwrite a Formula version that pins another source archive."""
+    def test_conflicting_archive_url_blocks_the_pair_without_writing(self) -> None:
+        """Never overwrite a Formula version that pins another release archive."""
 
         gateway = FakeTapGateway()
-        foreign = f"https://github.com/{REPOSITORY}/archive/refs/tags/v0.1.9.tar.gz"
+        foreign = (
+            f"https://github.com/{REPOSITORY}/releases/download/v0.1.9/"
+            "skillmount-v0.1.9-aarch64-apple-darwin.tar.gz"
+        )
         gateway.place(
             DEFAULT_BRANCH,
             self.first.formula_path,
-            formula_text(self.inputs, self.first, source_url=foreign),
+            formula_text(self.inputs, self.first, archive_url=foreign),
         )
         message = self.assert_conflict_reports_pair(gateway)
         self.assertIn(foreign, message)
-        self.assertIn(self.inputs.source_url, message)
+        self.assertIn(self.inputs.archive(channels.MACOS_ARM64.triple).url, message)
 
-    def test_conflicting_source_sha256_blocks_the_pair(self) -> None:
-        """Treat a differing source digest for the same URL as a hard conflict."""
+    def test_conflicting_archive_sha256_blocks_the_pair(self) -> None:
+        """Treat a differing release-archive digest for the same URL as a hard conflict."""
 
         gateway = FakeTapGateway()
-        foreign = digest("other-source")
+        foreign = digest("other-archive")
         gateway.place(
             BRANCH,
             self.second.formula_path,
-            formula_text(self.inputs, self.second, source_sha256=foreign),
+            formula_text(self.inputs, self.second, archive_sha256=foreign),
         )
         message = self.assert_conflict_reports_pair(gateway)
         self.assertIn(foreign, message)
-        self.assertIn(self.inputs.source_sha256, message)
+        self.assertIn(
+            self.inputs.archive(channels.MACOS_ARM64.triple).sha256,
+            message,
+        )
 
     def test_conflicting_version_blocks_the_pair(self) -> None:
         """Refuse to reconcile a Formula that declares another package version."""
@@ -582,17 +585,21 @@ class HomebrewTapTests(unittest.TestCase):
         self.assertIn(f"version={VERSION}", message)
 
     def test_conflicting_selected_binary_blocks_the_pair(self) -> None:
-        """Refuse a Formula that installs the pair member's Cargo binary."""
+        """Refuse a Formula that installs the pair member's release binary."""
 
         gateway = FakeTapGateway()
         gateway.place(
             DEFAULT_BRANCH,
             self.first.formula_path,
-            formula_text(self.inputs, self.first, cargo_bin=self.second.cargo_bin),
+            formula_text(
+                self.inputs,
+                self.first,
+                installed_binary=self.second.command,
+            ),
         )
         message = self.assert_conflict_reports_pair(gateway)
-        self.assertIn(f"bin={self.second.cargo_bin}", message)
-        self.assertIn(f"bin={self.first.cargo_bin}", message)
+        self.assertIn(f"installed={self.second.command}", message)
+        self.assertIn(f"installed={self.first.command}", message)
 
     def test_conflicting_selected_command_blocks_the_pair(self) -> None:
         """Refuse a Formula that generates completions for the other command."""
@@ -1128,8 +1135,8 @@ class PublisherHelperTests(unittest.TestCase):
             f"{channels.PACKAGES[1].package_id}=pending",
         )
 
-    def test_formula_identity_derives_version_from_the_source_tag(self) -> None:
-        """Read the package version from the pinned source archive URL."""
+    def test_formula_identity_derives_version_from_the_release_tag(self) -> None:
+        """Read the package version from the pinned release-archive URL."""
 
         inputs = package_inputs()
         identity = channels.PACKAGES[0]
@@ -1139,8 +1146,8 @@ class PublisherHelperTests(unittest.TestCase):
         )
         self.assertTrue(observed.complete)
 
-    def test_formula_identity_is_incomplete_for_ambiguous_source(self) -> None:
-        """Refuse to guess provenance when a Formula declares two source URLs."""
+    def test_formula_identity_is_incomplete_for_ambiguous_archive(self) -> None:
+        """Refuse to guess provenance when a Formula declares two archive URLs."""
 
         inputs = package_inputs()
         identity = channels.PACKAGES[1]
@@ -1325,7 +1332,7 @@ class PublisherCommandTests(unittest.TestCase):
             formula_text(
                 self.inputs,
                 channels.PACKAGES[0],
-                source_sha256=digest("foreign-source"),
+                archive_sha256=digest("foreign-archive"),
             ),
         )
         gateway.writes_forbidden = True

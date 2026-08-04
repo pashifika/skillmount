@@ -13,6 +13,7 @@ import sys
 import tempfile
 import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
@@ -63,16 +64,16 @@ FORMULA_TEMPLATE = """# Generated for @TAG@ at @COMMIT@.
 class Skillmount < Formula
   desc "SkillMount skill mounter"
   homepage "https://github.com/pashifika/skillmount"
-  url "file:///tmp/skillmount-v0.2.0.tar.gz"
+  url "file:///tmp/skillmount-v0.2.0-aarch64-apple-darwin.tar.gz"
   sha256 "{digest}"
-  license "MIT OR Apache-2.0"
+  license any_of: ["MIT", "Apache-2.0"]
 
-  depends_on "rust" => :build
   depends_on arch: :arm64
   depends_on :macos
 
   def install
-    system "cargo", "install", "--bin", "skillmount", *std_cargo_args
+    bin.install "skillmount"
+    pkgshare.install "LICENSE-APACHE", "LICENSE-MIT", "VERSION"
     generate_completions_from_executable(bin/"skillmount", "completions", base_name: "skillmount")
   end
 
@@ -229,7 +230,11 @@ def options_for(
         version=VERSION,
         tag=TAG,
         commit=COMMIT,
-        source=harness.SourceArchive(url="file:///tmp/source.tar.gz", sha256=DIGEST, path=None),
+        archive=harness.ReleaseArchive(
+            url="file:///tmp/skillmount-v0.2.0-aarch64-apple-darwin.tar.gz",
+            sha256=DIGEST,
+            path=None,
+        ),
         require_upgrade=require_upgrade,
         prior_tag=harness.PRIOR_TAG,
     )
@@ -298,6 +303,93 @@ class FixtureCase(unittest.TestCase):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(path, destination)
         return prefix
+
+
+class ArchivePreparationTests(FixtureCase):
+    """Candidate archive construction and exact-commit safeguards."""
+
+    def test_build_archive_packages_the_release_binary_pair(self) -> None:
+        """Build both bins once and package only the deterministic release members."""
+
+        target = release.target_for("aarch64-apple-darwin")
+        work = self.root / "work"
+        binary_directory = work / "cargo-target" / target.triple / "release"
+        for executable in release.executable_names(target):
+            self.write_executable(binary_directory / executable)
+        for license_name in release.LICENSE_FILES:
+            (self.root / license_name).write_text(f"{license_name}\n", encoding="utf-8")
+        gateway = ScriptedGateway({("cargo", "build"): (0, "", "")})
+        options = replace(options_for(self.root), archive=None)
+        subject = harness.Harness(gateway, options)
+        subject.commit = COMMIT
+
+        archive = subject.build_archive(work)
+
+        self.assertEqual(
+            gateway.calls,
+            [
+                (
+                    "cargo",
+                    "build",
+                    "--locked",
+                    "--release",
+                    "--target",
+                    target.triple,
+                    "--target-dir",
+                    str(work / "cargo-target"),
+                    "--bins",
+                )
+            ],
+        )
+        expected_path = (work / "release" / release.asset_name(TAG, target)).resolve()
+        self.assertEqual(archive.path, expected_path)
+        self.assertEqual(archive.url, archive.path.as_uri())
+        self.assertEqual(archive.sha256, release.sha256_file(archive.path))
+        release.inspect_archive(
+            archive.path,
+            target=target,
+            version=VERSION,
+            tag=TAG,
+            commit=COMMIT,
+        )
+        self.assertEqual(
+            subject.environment_evidence["archive_commands"][0]["argv"],
+            list(gateway.calls[0]),
+        )
+
+    def test_local_build_requires_the_clean_checked_out_commit(self) -> None:
+        """Refuse to label current-worktree bytes as another or dirty commit."""
+
+        other = "d" * 40
+        for head, dirty, expected in (
+            (COMMIT, " M src/lib.rs\n", "clean worktree"),
+            (other, "", "would build HEAD"),
+        ):
+            with self.subTest(head=head, dirty=bool(dirty)):
+                gateway = ScriptedGateway(
+                    {
+                        ("git", "rev-parse", "HEAD"): (0, f"{head}\n", ""),
+                        ("git", "cat-file", "-e"): (0, "", ""),
+                        ("git", "status", "--porcelain"): (0, dirty, ""),
+                    }
+                )
+                options = replace(options_for(self.root), archive=None)
+                subject = harness.Harness(gateway, options)
+                with self.assertRaisesRegex(harness.HomebrewAcceptanceError, expected):
+                    subject.resolve_identity()
+
+    def test_checked_archive_may_be_observed_from_a_dirty_checkout(self) -> None:
+        """Use preflight archive identity without pretending the checkout built it."""
+
+        gateway = ScriptedGateway(
+            {
+                ("git", "rev-parse", "HEAD"): (0, f"{COMMIT}\n", ""),
+                ("git", "cat-file", "-e"): (0, "", ""),
+                ("git", "status", "--porcelain"): (0, " M docs/packaging.md\n", ""),
+            }
+        )
+        subject = harness.Harness(gateway, options_for(self.root))
+        self.assertEqual(subject.resolve_identity(), (COMMIT, "dirty"))
 
 
 class SafetyRefusalTests(FixtureCase):
@@ -828,20 +920,20 @@ class FormulaTextTests(FixtureCase):
         self.assertIn("on_linux", joined)
         self.assertIn("depends_on :macos", joined)
 
-    def test_audit_offences_are_waived_only_for_a_local_source(self) -> None:
-        """Waive HTTPS-URL offences only while the source is a local tarball."""
+    def test_audit_offences_are_waived_only_for_a_local_archive(self) -> None:
+        """Waive HTTPS-URL offences only while the release archive is local."""
 
         output = (
             "skillmount:\n"
             "  * line 5: Please use a secure URL for the stable url\n"
             "  * line 12: `desc` should not start with an article\n"
         )
-        findings = harness.audit_findings(output, local_source=True)
+        findings = harness.audit_findings(output, local_archive=True)
         self.assertEqual(len(findings), 1)
         self.assertIn("should not start with an article", findings[0])
-        findings = harness.audit_findings(output, local_source=False)
+        findings = harness.audit_findings(output, local_archive=False)
         self.assertEqual(len(findings), 2)
-        self.assertEqual(harness.audit_findings("skillmount:\n\n", local_source=False), ())
+        self.assertEqual(harness.audit_findings("skillmount:\n\n", local_archive=False), ())
 
     def test_version_output_must_match_exactly(self) -> None:
         """Require the packaged version banner both executables print."""
@@ -938,30 +1030,35 @@ class SelectionTests(FixtureCase):
                 ):
                     harness.cargo_version_from_manifest(malformed)
 
-    def test_source_override_requires_a_digest(self) -> None:
-        """Require an explicit digest beside an overridden source URL."""
+    def test_archive_override_requires_a_digest(self) -> None:
+        """Require an explicit digest beside an overridden release-archive URL."""
 
-        self.assertIsNone(harness.source_override(None, None))
-        override = harness.source_override("https://example.invalid/source.tar.gz", DIGEST)
-        self.assertEqual(override, harness.SourceArchive(
-            url="https://example.invalid/source.tar.gz", sha256=DIGEST, path=None
-        ))
+        url = "https://example.invalid/skillmount-v0.2.0-aarch64-apple-darwin.tar.gz"
+        self.assertIsNone(harness.archive_override(None, None))
+        override = harness.archive_override(url, DIGEST)
+        self.assertEqual(
+            override, harness.ReleaseArchive(url=url, sha256=DIGEST, path=None)
+        )
         self.assertFalse(override.local)
-        self.assertTrue(harness.source_override("file:///tmp/source.tar.gz", DIGEST).local)
-        for url, digest in (
-            ("https://example.invalid/source.tar.gz", None),
+        self.assertTrue(
+            harness.archive_override(
+                "file:///tmp/skillmount-v0.2.0-aarch64-apple-darwin.tar.gz", DIGEST
+            ).local
+        )
+        for malformed_url, digest in (
+            (url, None),
             (None, DIGEST),
-            ("ftp://example.invalid/source.tar.gz", DIGEST),
+            ("ftp://example.invalid/archive.tar.gz", DIGEST),
             ("https://example.invalid/a b.tar.gz", DIGEST),
-            ("https://example.invalid/source.tar.gz", "C" * 64),
-            ("https://example.invalid/source.tar.gz", "abc"),
+            (url, "C" * 64),
+            (url, "abc"),
         ):
-            with self.subTest(url=url, digest=digest):
+            with self.subTest(url=malformed_url, digest=digest):
                 with self.assertRaises(harness.HomebrewAcceptanceError):
-                    harness.source_override(url, digest)
+                    harness.archive_override(malformed_url, digest)
 
     def test_upgrade_rehearsal_skips_a_prior_release_without_completions(self) -> None:
-        """Skip the rehearsal when the prior source predates `completions`."""
+        """Skip the rehearsal when the prior release predates `completions`."""
 
         decision = harness.upgrade_decision(
             prior_tag="v0.1.0",
@@ -1061,7 +1158,7 @@ class OptionResolutionTests(FixtureCase):
         self.assertEqual(options.version, VERSION)
         self.assertEqual(options.tag, TAG)
         self.assertIsNone(options.commit)
-        self.assertIsNone(options.source)
+        self.assertIsNone(options.archive)
         self.assertEqual(options.formula_ids, harness.FORMULA_IDS)
         self.assertEqual(options.phases, harness.PHASE_ORDER)
         self.assertEqual(options.repository, self.root.resolve())
@@ -1072,8 +1169,11 @@ class OptionResolutionTests(FixtureCase):
         self.assertEqual(options.prior_tag, harness.PRIOR_TAG)
 
     def test_selectors_and_overrides_are_validated(self) -> None:
-        """Resolve matrix selectors, a pinned commit, and a source override."""
+        """Resolve matrix selectors, a pinned commit, and a release-archive override."""
 
+        archive_url = (
+            "https://example.invalid/skillmount-v0.2.0-aarch64-apple-darwin.tar.gz"
+        )
         options = self.resolve(
             [
                 "--repository",
@@ -1084,9 +1184,9 @@ class OptionResolutionTests(FixtureCase):
                 "brew-test",
                 "--commit",
                 COMMIT,
-                "--source-url-override",
-                "https://example.invalid/source.tar.gz",
-                "--source-sha256",
+                "--archive-url-override",
+                archive_url,
+                "--archive-sha256",
                 DIGEST,
                 "--require-upgrade",
             ]
@@ -1097,7 +1197,7 @@ class OptionResolutionTests(FixtureCase):
             ("trust", "install-skillmount-alone", "brew-test", "install-asm-alone"),
         )
         self.assertEqual(options.commit, COMMIT)
-        self.assertEqual(options.source.url, "https://example.invalid/source.tar.gz")
+        self.assertEqual(options.archive.url, archive_url)
         self.assertTrue(options.require_upgrade)
 
     def test_inconsistent_or_missing_inputs_fail(self) -> None:
@@ -1131,13 +1231,13 @@ class OptionResolutionTests(FixtureCase):
                     str(artifact),
                     "--tag",
                     TAG,
-                    "--source-sha256",
+                    "--archive-sha256",
                     DIGEST,
                 ]
             )
         message = str(caught.exception)
         self.assertIn("--tag", message)
-        self.assertIn("--source-sha256", message)
+        self.assertIn("--archive-sha256", message)
 
 
 class ReportTests(FixtureCase):
@@ -1194,8 +1294,10 @@ class ReportTests(FixtureCase):
         document = harness.build_report(
             options=options_for(self.root),
             commit=COMMIT,
-            source=harness.SourceArchive(
-                url="file:///tmp/skillmount-v0.2.0.tar.gz", sha256=DIGEST, path=self.root / "a"
+            archive=harness.ReleaseArchive(
+                url="file:///tmp/skillmount-v0.2.0-aarch64-apple-darwin.tar.gz",
+                sha256=DIGEST,
+                path=self.root / "a",
             ),
             prefix=Path(harness.SUPPORTED_PREFIX),
             environment={"brew": ["Homebrew 5.0.0"], "shells": {"bash": "bash 5.3"}},
@@ -1223,7 +1325,7 @@ class ReportTests(FixtureCase):
         self.assertEqual(document["commit"], COMMIT)
         self.assertEqual(document["prefix"], harness.SUPPORTED_PREFIX)
         self.assertEqual(document["coverage_gaps"], [])
-        self.assertTrue(document["source"]["local"])
+        self.assertTrue(document["archive"]["local"])
         self.assertEqual(
             document["trust"]["argv"],
             [["brew", "trust", "--formula", acceptance_reference("skillmount")]],
@@ -1289,7 +1391,7 @@ class CoverageTests(FixtureCase):
         """Require every phase to prove at least one scenario."""
 
         self.assertEqual(harness.coverage_gaps(), ())
-        self.assertEqual(len(harness.SCENARIO_COVERAGE), 19)
+        self.assertEqual(len(harness.SCENARIO_COVERAGE), 20)
 
     def test_every_spec_scenario_is_mapped(self) -> None:
         """Require the mapping table to name exactly the spec's scenarios."""
@@ -1427,8 +1529,6 @@ class GatewayTests(FixtureCase):
             tag=TAG,
             commit=COMMIT,
             release_url=f"https://github.com/{repository}/releases/tag/{TAG}",
-            source_url=module.source_url(repository, TAG),
-            source_sha256=DIGEST,
             archives=archives,
         )
         path = self.root / "inputs.json"
@@ -1436,25 +1536,30 @@ class GatewayTests(FixtureCase):
         return path
 
     def test_preflight_artifact_supplies_the_release_identity(self) -> None:
-        """Take the version, tag, commit, and published source from preflight."""
+        """Take the version, tag, commit, and checked macOS archive from preflight."""
 
         module = self.channel_model()
         path = self.preflight_artifact(module)
-        version, tag, commit, source = harness.preflight_identity(path)
+        version, tag, commit, archive = harness.preflight_identity(path)
         self.assertEqual((version, tag, commit), (VERSION, TAG, COMMIT))
-        self.assertEqual(source.sha256, DIGEST)
-        self.assertTrue(source.url.startswith("https://github.com/"))
-        self.assertIn(TAG, source.url)
-        self.assertFalse(source.local)
-        self.assertIsNone(source.path)
+        self.assertEqual(archive.sha256, DIGEST)
+        self.assertTrue(archive.url.startswith("https://github.com/"))
+        self.assertIn(release.asset_name(TAG, module.MACOS_ARM64), archive.url)
+        self.assertFalse(archive.local)
+        self.assertIsNone(archive.path)
 
     def test_tampered_preflight_artifact_is_rejected(self) -> None:
-        """Refuse a preflight artifact whose strict validation fails."""
+        """Refuse a preflight artifact whose macOS release archive was replaced."""
 
         module = self.channel_model()
         path = self.preflight_artifact(module)
         document = json.loads(path.read_text(encoding="utf-8"))
-        document["source_url"] = "https://example.invalid/source.tar.gz"
+        macos = next(
+            archive
+            for archive in document["archives"]
+            if archive["triple"] == module.MACOS_ARM64.triple
+        )
+        macos["url"] = "https://example.invalid/foreign.tar.gz"
         path.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
             harness.preflight_identity(path)
@@ -1540,7 +1645,7 @@ class PhaseBookkeepingTests(FixtureCase):
         with self.assertRaises(harness.HomebrewAcceptanceError):
             subject.require_prefix()
         with self.assertRaises(harness.HomebrewAcceptanceError):
-            subject.require_source()
+            subject.require_archive()
 
 
 class BrewInvocationTests(FixtureCase):
@@ -1567,7 +1672,7 @@ class BrewInvocationTests(FixtureCase):
         return gateway, subject
 
     def test_install_names_the_formula_and_resolves_its_cellar(self) -> None:
-        """Build from source through `--formula` and record the resolved cellar."""
+        """Install the checked archive through `--formula` and resolve its cellar."""
 
         cellar = self.root / "Cellar" / "skillmount"
         gateway, subject = self.harness_for(
@@ -1584,7 +1689,7 @@ class BrewInvocationTests(FixtureCase):
             [
                 ("brew", "trust", "--json", harness.TRUST_JSON_VERSION),
                 ("brew", "trust", "--formula", reference),
-                ("brew", "install", "--formula", "--build-from-source", reference),
+                ("brew", "install", "--formula", reference),
                 ("brew", "--cellar", reference),
             ],
         )
@@ -1593,9 +1698,9 @@ class BrewInvocationTests(FixtureCase):
         self.assertEqual(phase.status, "passed")
 
     def test_failed_install_is_recorded_without_a_cellar_lookup(self) -> None:
-        """Turn a failed build into a finding instead of a keg inspection."""
+        """Turn a failed archive install into a finding instead of a keg inspection."""
 
-        gateway, subject = self.harness_for({("brew", "install"): (1, "", "build failed\n")})
+        gateway, subject = self.harness_for({("brew", "install"): (1, "", "install failed\n")})
         phase = subject.phase("install-asm-alone")
         self.assertFalse(subject.install(phase, "skillmount-asm"))
         self.assertEqual(
@@ -1605,7 +1710,7 @@ class BrewInvocationTests(FixtureCase):
         self.assertNotIn("skillmount-asm", subject.installed)
         phase.settle()
         self.assertEqual(phase.status, "failed")
-        self.assertIn("build failed", " ".join(phase.findings))
+        self.assertIn("install failed", " ".join(phase.findings))
 
     def test_brew_test_takes_no_formula_flag(self) -> None:
         """Run `brew test installed_formula`, which accepts no `--formula`."""
@@ -1758,6 +1863,8 @@ class BrewInvocationTests(FixtureCase):
         stub.package_for = lambda package_id: next(
             identity for identity in stub.PACKAGES if identity.package_id == package_id
         )
+        stub.MACOS_ARM64 = release.target_for("aarch64-apple-darwin")
+        stub.ArchiveIdentity = lambda **values: values
         stub.PackageInputs = lambda **values: values
 
         def reject(inputs, *, template_directory, output_directory):
@@ -1768,12 +1875,18 @@ class BrewInvocationTests(FixtureCase):
         sys.modules["package_channels"] = stub
         try:
             _, subject = self.harness_for({})
-            source = harness.SourceArchive(
-                url="file:///tmp/source.tar.gz", sha256=DIGEST, path=None
+            archive = harness.ReleaseArchive(
+                url="file:///tmp/skillmount-v0.2.0-aarch64-apple-darwin.tar.gz",
+                sha256=DIGEST,
+                path=None,
             )
             with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
                 subject.render_formulae(
-                    self.root / "candidate", source=source, version=VERSION, tag=TAG
+                    self.root / "candidate",
+                    archive=archive,
+                    version=VERSION,
+                    tag=TAG,
+                    commit=COMMIT,
                 )
             message = str(caught.exception)
             self.assertIn("@UNKNOWN@", message)
@@ -1948,13 +2061,7 @@ class TrustTests(FixtureCase):
                 ("brew", "trust", "--json", harness.TRUST_JSON_VERSION),
                 ("brew", "trust", "--json", harness.TRUST_JSON_VERSION),
                 ("brew", "trust", "--formula", acceptance_reference("skillmount")),
-                (
-                    "brew",
-                    "install",
-                    "--formula",
-                    "--build-from-source",
-                    acceptance_reference("skillmount"),
-                ),
+                ("brew", "install", "--formula", acceptance_reference("skillmount")),
                 ("brew", "--cellar", acceptance_reference("skillmount")),
             ],
         )
@@ -2126,7 +2233,7 @@ class TrustTests(FixtureCase):
         phase = subject.phase("co-install")
         self.assertFalse(subject.install(phase, "skillmount"))
         self.assertNotIn(
-            ("brew", "install", "--formula", "--build-from-source", reference), gateway.calls
+            ("brew", "install", "--formula", reference), gateway.calls
         )
         phase.settle()
         self.assertEqual(phase.status, "failed")
@@ -2150,7 +2257,7 @@ class TrustTests(FixtureCase):
         self.assertFalse(subject.install(phase, "skillmount"))
         self.assertEqual(
             gateway.calls[-1],
-            ("brew", "install", "--formula", "--build-from-source", reference),
+            ("brew", "install", "--formula", reference),
         )
         self.assertEqual(len(phase.findings), 2)
         self.assertNotIn("trust model changed", phase.findings[0])
@@ -2184,7 +2291,7 @@ class TrustTests(FixtureCase):
         phase = subject.phase("install-skillmount-alone")
         self.assertFalse(subject.install(phase, "skillmount"))
         self.assertNotIn(
-            ("brew", "install", "--formula", "--build-from-source", reference), gateway.calls
+            ("brew", "install", "--formula", reference), gateway.calls
         )
         phase.settle()
         self.assertEqual(phase.status, "failed")
@@ -2212,13 +2319,7 @@ class TrustTests(FixtureCase):
         install_phase = subject.phase("install-skillmount-alone")
         self.assertFalse(subject.install(install_phase, "skillmount"))
         self.assertNotIn(
-            (
-                "brew",
-                "install",
-                "--formula",
-                "--build-from-source",
-                acceptance_reference("skillmount"),
-            ),
+            ("brew", "install", "--formula", acceptance_reference("skillmount")),
             gateway.calls,
         )
         self.assertIn("was never trusted", " ".join(install_phase.findings))
@@ -2316,7 +2417,7 @@ class TrustTests(FixtureCase):
     def test_trust_is_restored_after_a_failed_lifecycle(self) -> None:
         """Restore the trust store even when the install that followed failed."""
 
-        gateway, subject = self.trust_harness({("brew", "install"): (1, "", "build failed\n")})
+        gateway, subject = self.trust_harness({("brew", "install"): (1, "", "install failed\n")})
         before = gateway.path.read_bytes()
         subject.phase_trust()
         phase = subject.phase("install-skillmount-alone")
@@ -2446,8 +2547,8 @@ class TrustTests(FixtureCase):
         self.assertFalse(subject.tapped)
         self.assertEqual(harness.parse_tap_list("b/a\na/b\nb/a\n"), ("a/b", "b/a"))
 
-    def test_rendered_templates_keep_the_brew_style_clean_shape(self) -> None:
-        """Pin the tracked templates to the shape `brew style` accepted."""
+    def test_rendered_templates_keep_the_binary_formula_shape(self) -> None:
+        """Pin the tracked templates to the binary Formula shape accepted by Homebrew."""
 
         directory = Path(__file__).resolve().parents[2] / "packaging" / "homebrew"
         templates = sorted(directory.glob("*.rb.in"))
@@ -2458,9 +2559,14 @@ class TrustTests(FixtureCase):
             with self.subTest(template=template.name):
                 text = template.read_text(encoding="utf-8")
                 self.assertIn(
-                    '  depends_on "rust" => :build\n'
-                    "  depends_on arch: :arm64\n"
-                    "  depends_on :macos\n",
+                    "  depends_on arch: :arm64\n  depends_on :macos\n",
+                    text,
+                )
+                self.assertNotIn('depends_on "rust"', text)
+                self.assertNotIn('system "cargo"', text)
+                self.assertIn('    bin.install "@COMMAND@"\n', text)
+                self.assertIn(
+                    '    pkgshare.install "LICENSE-APACHE", "LICENSE-MIT", "VERSION"\n',
                     text,
                 )
                 self.assertIn(
@@ -2476,9 +2582,11 @@ class TrustTests(FixtureCase):
                 self.assertNotIn("assert !", text)
         fixture = FORMULA_TEMPLATE.format(digest=DIGEST)
         self.assertIn(
-            '  depends_on "rust" => :build\n  depends_on arch: :arm64\n  depends_on :macos\n',
+            "  depends_on arch: :arm64\n  depends_on :macos\n",
             fixture,
         )
+        self.assertNotIn("cargo", fixture)
+        self.assertIn('    bin.install "skillmount"\n', fixture)
         self.assertEqual(harness.platform_findings(fixture, formula_class="skillmount"), ())
 
 
