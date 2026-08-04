@@ -122,13 +122,15 @@ gh api --method GET repos/{owner}/{repo}/rulesets -f targets=tag
 gh api repos/{owner}/{repo}/rulesets --input .github/rulesets/version-tags.json
 ```
 
-Read back the returned ID and require all of these values:
+Before submission, require the reviewed payload to contain the exact `refs/tags/v*` include with no
+exclusions; an `update` rule with `update_allows_fetch_and_merge=false`; `deletion` and
+`non_fast_forward` rules; no `creation` rule; and an empty `bypass_actors` array.
 
-- name `Protect version tags`, target `tag`, enforcement `active`;
-- include pattern exactly `refs/tags/v*`, with no exclusions;
-- `update`, `deletion`, and `non_fast_forward` rules;
-- `update_allows_fetch_and_merge=false`;
-- no `creation` rule and an empty `bypass_actors` array.
+After creation, read back the returned ID and require the expected name, `tag` target, `active`
+enforcement, conditions, rule types, and empty bypass list. GitHub's repository-ruleset GET response
+currently normalizes the `update` rule by omitting its `parameters` object even when the creation
+request included `update_allows_fetch_and_merge=false`. Retain the reviewed request payload as the
+evidence for that explicit setting; do not require the omitted field from the normalized readback.
 
 GitHub currently documents an effective-rules endpoint only for branches, not tags. Do not simulate
 effectiveness by moving or deleting a real version tag. After normal first-tag creation, query the
