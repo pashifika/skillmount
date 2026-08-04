@@ -1,0 +1,544 @@
+name: Package channels
+
+# Distribution of an already-published SkillMount release to Homebrew and Chocolatey.
+#
+# This workflow never builds or rewrites a release asset. It reads one immutable published
+# release, proves its dual-binary contract from the downloaded bytes, renders both Homebrew
+# Formulae and both Chocolatey package sources from packaging/, verifies them natively, and
+# only then reconciles the two external channels behind protected environments.
+#
+# Two rules keep the privilege boundary honest, and .github/scripts/package_workflow_policy.py
+# enforces both mechanically in the preflight job:
+#   1. Only the preflight job may read github.event.workflow_run fields, and no checkout may
+#      ever receive one, because a workflow_run payload is attacker-influenced.
+#   2. No step interpolates ${{ }} inside a run script body. Every value crosses into a shell
+#      through env:, so no expansion can inject shell syntax.
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to distribute, for example v0.2.0
+        required: true
+        type: string
+      channels:
+        description: Channels to exercise
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - homebrew
+          - chocolatey
+      verification_only:
+        description: Verify without publishing to any channel
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CHOCOLATEY_PACKAGE_IDS: skillmount skillmount-asm
+  TAP_REPOSITORY: pashifika/homebrew-tap
+
+jobs:
+  preflight:
+    name: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      version: ${{ steps.preflight.outputs.version }}
+      tag: ${{ steps.preflight.outputs.tag }}
+      commit: ${{ steps.preflight.outputs.commit }}
+      verification_only: ${{ steps.preflight.outputs.verification_only }}
+      inputs_sha256: ${{ steps.preflight.outputs.inputs_sha256 }}
+    steps:
+      # No ref: on purpose. A workflow_run run checks out the default branch, so the trusted
+      # scripts below are never the ones the triggering run happened to carry.
+      - name: Check out the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Enforce the workflow policy on the whole tree
+        run: >-
+          python -B .github/scripts/package_workflow_policy.py check
+          .github/workflows/package.yml
+          .github/workflows/release.yml
+          .github/workflows/ci.yml
+          .github/workflows/live-agent-smoke.yml
+
+      - name: Record the triggering workflow run
+        env:
+          WORKFLOW_RUN_JSON: ${{ toJSON(github.event.workflow_run) }}
+          WORKFLOW_RUN_PATH: ${{ runner.temp }}/workflow-run.json
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$WORKFLOW_RUN_PATH")"
+          printf '%s\n' "$WORKFLOW_RUN_JSON" > "$WORKFLOW_RUN_PATH"
+          wc -c "$WORKFLOW_RUN_PATH"
+
+      - name: Verify the published release and record package inputs
+        id: preflight
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+          DISPATCH_VERIFICATION_ONLY: ${{ inputs.verification_only || 'false' }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUTS_PATH: ${{ runner.temp }}/package-inputs/inputs.json
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_RUN_PATH: ${{ runner.temp }}/workflow-run.json
+          WORK_DIRECTORY: ${{ runner.temp }}/package-preflight
+        run: |
+          set -euo pipefail
+          gh --version
+          mkdir -p "$(dirname "$INPUTS_PATH")" "$WORK_DIRECTORY"
+          python -B .github/scripts/package_channels.py preflight \
+            --repository "$REPOSITORY" \
+            --event-name "$EVENT_NAME" \
+            --workflow-run-json "$WORKFLOW_RUN_PATH" \
+            --dispatch-tag "$DISPATCH_TAG" \
+            --verification-only "$DISPATCH_VERIFICATION_ONLY" \
+            --work-directory "$WORK_DIRECTORY" \
+            --inputs-path "$INPUTS_PATH" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload the validated package inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package-inputs
+          path: ${{ runner.temp }}/package-inputs/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  generate:
+    name: generate
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download the validated package inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package-inputs
+          path: ${{ runner.temp }}/package-inputs
+          digest-mismatch: error
+
+      - name: Render both Formulae and both Chocolatey package sources
+        env:
+          CANDIDATES_DIRECTORY: ${{ runner.temp }}/package-candidates
+          INPUTS_FILE: ${{ runner.temp }}/package-inputs/inputs.json
+        run: |
+          set -euo pipefail
+          python -B .github/scripts/package_channels.py selection-map
+          python -B .github/scripts/package_channels.py generate-homebrew \
+            --inputs "$INPUTS_FILE" \
+            --template-directory packaging/homebrew \
+            --output-directory "$CANDIDATES_DIRECTORY"
+          python -B .github/scripts/package_channels.py generate-chocolatey \
+            --inputs "$INPUTS_FILE" \
+            --template-directory packaging/chocolatey \
+            --output-directory "$CANDIDATES_DIRECTORY"
+
+      - name: Inspect the rendered pair for selection drift
+        env:
+          CANDIDATES_DIRECTORY: ${{ runner.temp }}/package-candidates
+          INPUTS_FILE: ${{ runner.temp }}/package-inputs/inputs.json
+        run: |
+          set -euo pipefail
+          python -B .github/scripts/package_channels.py inspect-homebrew \
+            --inputs "$INPUTS_FILE" \
+            --directory "$CANDIDATES_DIRECTORY"
+          python -B .github/scripts/package_channels.py inspect-chocolatey \
+            --inputs "$INPUTS_FILE" \
+            --directory "$CANDIDATES_DIRECTORY"
+
+      - name: Upload the inspected candidates
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package-candidates
+          path: ${{ runner.temp }}/package-candidates
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  homebrew-acceptance:
+    name: homebrew-acceptance
+    needs: preflight
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.channels != 'chocolatey' }}
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      # Full history and tags let the harness evaluate upgrade eligibility; candidate bytes come
+      # only from the validated release archive, and a prior archive is fetched when available.
+      - name: Check out the default branch with history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Download the validated package inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package-inputs
+          path: ${{ runner.temp }}/package-inputs
+          digest-mismatch: error
+
+      - name: Exercise the native Homebrew lifecycle
+        env:
+          HOMEBREW_NO_ANALYTICS: "1"
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_ENV_HINTS: "1"
+          INPUTS_FILE: ${{ runner.temp }}/package-inputs/inputs.json
+          REPORT_FILE: ${{ runner.temp }}/homebrew-acceptance/report.json
+          SKILLMOUNT_HOMEBREW_ACCEPTANCE: "1"
+        run: |
+          set -euo pipefail
+          python3 -B .github/scripts/homebrew_acceptance.py \
+            --inputs "$INPUTS_FILE" \
+            --report "$REPORT_FILE"
+
+      - name: Publish the acceptance report to the run summary
+        if: ${{ always() }}
+        env:
+          REPORT_FILE: ${{ runner.temp }}/homebrew-acceptance/report.json
+        run: |
+          set -euo pipefail
+          if [ ! -f "$REPORT_FILE" ]; then
+            echo "No Homebrew acceptance report was written." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### Homebrew acceptance"
+            echo '```json'
+            cat "$REPORT_FILE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  chocolatey-acceptance:
+    name: chocolatey-acceptance
+    needs: preflight
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.channels != 'homebrew' }}
+    runs-on: windows-2025
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download the validated package inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package-inputs
+          path: ${{ runner.temp }}/package-inputs
+          digest-mismatch: error
+
+      - name: Exercise the native Chocolatey lifecycle
+        shell: pwsh
+        env:
+          INPUTS_FILE: ${{ runner.temp }}/package-inputs/inputs.json
+          REPORT_FILE: ${{ runner.temp }}/chocolatey-acceptance/report.json
+          SKILLMOUNT_CHOCOLATEY_ACCEPTANCE: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco --version
+          python -B .github/scripts/chocolatey_acceptance.py --inputs $env:INPUTS_FILE --report $env:REPORT_FILE
+          if ($LASTEXITCODE -ne 0) {
+              throw "chocolatey_acceptance.py exited with $LASTEXITCODE"
+          }
+
+      - name: Render the publishable Chocolatey sources
+        shell: pwsh
+        env:
+          CANDIDATES_DIRECTORY: ${{ runner.temp }}/package-candidates
+          INPUTS_FILE: ${{ runner.temp }}/package-inputs/inputs.json
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -B .github/scripts/package_channels.py generate-chocolatey --inputs $env:INPUTS_FILE --template-directory packaging/chocolatey --output-directory $env:CANDIDATES_DIRECTORY
+          if ($LASTEXITCODE -ne 0) {
+              throw "generate-chocolatey exited with $LASTEXITCODE"
+          }
+          python -B .github/scripts/package_channels.py inspect-chocolatey --inputs $env:INPUTS_FILE --directory $env:CANDIDATES_DIRECTORY
+          if ($LASTEXITCODE -ne 0) {
+              throw "inspect-chocolatey exited with $LASTEXITCODE"
+          }
+
+      - name: Pack and inspect both nupkgs
+        shell: pwsh
+        env:
+          CANDIDATES_DIRECTORY: ${{ runner.temp }}/package-candidates
+          INPUTS_FILE: ${{ runner.temp }}/package-inputs/inputs.json
+          NUPKG_DIRECTORY: ${{ runner.temp }}/chocolatey-nupkgs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path $env:NUPKG_DIRECTORY -Force | Out-Null
+          foreach ($packageId in $env:CHOCOLATEY_PACKAGE_IDS.Split(' ')) {
+              $nuspec = Join-Path $env:CANDIDATES_DIRECTORY (Join-Path $packageId "$packageId.nuspec")
+              choco pack $nuspec --output-directory $env:NUPKG_DIRECTORY
+              if ($LASTEXITCODE -ne 0) {
+                  throw "choco pack failed for $packageId with exit code $LASTEXITCODE"
+              }
+          }
+          Get-ChildItem -LiteralPath $env:NUPKG_DIRECTORY | ForEach-Object { "$($_.Name) $($_.Length)" }
+          python -B .github/scripts/package_channels.py inspect-nupkg --inputs $env:INPUTS_FILE --directory $env:NUPKG_DIRECTORY
+          if ($LASTEXITCODE -ne 0) {
+              throw "inspect-nupkg exited with $LASTEXITCODE"
+          }
+
+      - name: Upload the inspected nupkgs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chocolatey-nupkgs
+          path: ${{ runner.temp }}/chocolatey-nupkgs/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Publish the acceptance report to the run summary
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          REPORT_FILE: ${{ runner.temp }}/chocolatey-acceptance/report.json
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath $env:REPORT_FILE)) {
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value 'No Chocolatey acceptance report was written.'
+              exit 0
+          }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '### Chocolatey acceptance'
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '```json'
+          Get-Content -LiteralPath $env:REPORT_FILE | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '```'
+
+  homebrew-publish:
+    name: homebrew-publish
+    needs:
+      - preflight
+      - generate
+      - homebrew-acceptance
+    if: needs.preflight.outputs.verification_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: homebrew
+    permissions:
+      contents: read
+    concurrency:
+      group: package-homebrew-${{ needs.preflight.outputs.version }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download the validated package inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package-inputs
+          path: ${{ runner.temp }}/package-inputs
+          digest-mismatch: error
+
+      - name: Download the inspected candidates
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package-candidates
+          path: ${{ runner.temp }}/package-candidates
+          digest-mismatch: error
+
+      # An installation token scoped to the tap repository alone. The product repository's own
+      # GITHUB_TOKEN stays read-only, so a compromised publish step cannot touch this repository.
+      - name: Mint a tap-scoped installation token
+        id: tap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.HOMEBREW_TAP_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
+          owner: pashifika
+          repositories: homebrew-tap
+
+      - name: Reconcile the tap pull request
+        env:
+          CANDIDATES_DIRECTORY: ${{ runner.temp }}/package-candidates
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+          INPUTS_FILE: ${{ runner.temp }}/package-inputs/inputs.json
+          REPORT_FILE: ${{ runner.temp }}/homebrew-publish/report.json
+        run: |
+          set -euo pipefail
+          gh --version
+          python -B .github/scripts/package_publish.py homebrew \
+            --inputs "$INPUTS_FILE" \
+            --formula-directory "$CANDIDATES_DIRECTORY" \
+            --tap-repository "$TAP_REPOSITORY" \
+            --report "$REPORT_FILE" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Publish the reconciliation evidence to the run summary
+        if: ${{ always() }}
+        env:
+          REPORT_FILE: ${{ runner.temp }}/homebrew-publish/report.json
+        run: |
+          set -euo pipefail
+          if [ ! -f "$REPORT_FILE" ]; then
+            echo "No Homebrew publication report was written." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### Homebrew publication"
+            echo '```json'
+            cat "$REPORT_FILE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  chocolatey-publish:
+    name: chocolatey-publish
+    needs:
+      - preflight
+      - generate
+      - chocolatey-acceptance
+    if: needs.preflight.outputs.verification_only != 'true'
+    runs-on: windows-2025
+    timeout-minutes: 20
+    environment: chocolatey
+    permissions:
+      contents: read
+    concurrency:
+      group: package-chocolatey-${{ needs.preflight.outputs.version }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download the validated package inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package-inputs
+          path: ${{ runner.temp }}/package-inputs
+          digest-mismatch: error
+
+      - name: Download the inspected nupkgs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: chocolatey-nupkgs
+          path: ${{ runner.temp }}/chocolatey-nupkgs
+          digest-mismatch: error
+
+      - name: Reconcile the community repository
+        shell: pwsh
+        env:
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+          INPUTS_FILE: ${{ runner.temp }}/package-inputs/inputs.json
+          NUPKG_DIRECTORY: ${{ runner.temp }}/chocolatey-nupkgs
+          REPORT_FILE: ${{ runner.temp }}/chocolatey-publish/report.json
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -B .github/scripts/package_publish.py chocolatey --inputs $env:INPUTS_FILE --nupkg-directory $env:NUPKG_DIRECTORY --report $env:REPORT_FILE --github-output $env:GITHUB_OUTPUT
+          if ($LASTEXITCODE -ne 0) {
+              throw "package_publish.py chocolatey exited with $LASTEXITCODE"
+          }
+
+      - name: Publish the reconciliation evidence to the run summary
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          REPORT_FILE: ${{ runner.temp }}/chocolatey-publish/report.json
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath $env:REPORT_FILE)) {
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value 'No Chocolatey publication report was written.'
+              exit 0
+          }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '### Chocolatey publication'
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '```json'
+          Get-Content -LiteralPath $env:REPORT_FILE | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '```'
+
+  summary:
+    name: summary
+    if: ${{ always() }}
+    needs:
+      - preflight
+      - generate
+      - homebrew-acceptance
+      - chocolatey-acceptance
+      - homebrew-publish
+      - chocolatey-publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # Only a failed non-publish predecessor fails this gate. One channel's publication
+      # outcome must never decide the other channel's reported result.
+      - name: Report every entry and require the verification lane to have passed
+        env:
+          CHOCOLATEY_ACCEPTANCE_RESULT: ${{ needs.chocolatey-acceptance.result }}
+          CHOCOLATEY_PUBLISH_RESULT: ${{ needs.chocolatey-publish.result }}
+          GENERATE_RESULT: ${{ needs.generate.result }}
+          HOMEBREW_ACCEPTANCE_RESULT: ${{ needs.homebrew-acceptance.result }}
+          HOMEBREW_PUBLISH_RESULT: ${{ needs.homebrew-publish.result }}
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          VERIFICATION_ONLY: ${{ needs.preflight.outputs.verification_only }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Package channels"
+            echo
+            echo "version \`${RELEASE_VERSION:-unknown}\`, tag \`${RELEASE_TAG:-unknown}\`,"
+            echo "verification-only \`${VERIFICATION_ONLY:-unknown}\`"
+            echo
+            echo "| entry | gating | result |"
+            echo "| --- | --- | --- |"
+            echo "| preflight | required | $PREFLIGHT_RESULT |"
+            echo "| generate | required | $GENERATE_RESULT |"
+            echo "| homebrew-acceptance | required | $HOMEBREW_ACCEPTANCE_RESULT |"
+            echo "| chocolatey-acceptance | required | $CHOCOLATEY_ACCEPTANCE_RESULT |"
+            echo "| homebrew-publish | reported | $HOMEBREW_PUBLISH_RESULT |"
+            echo "| chocolatey-publish | reported | $CHOCOLATEY_PUBLISH_RESULT |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=""
+          for entry in \
+            "preflight=$PREFLIGHT_RESULT" \
+            "generate=$GENERATE_RESULT" \
+            "homebrew-acceptance=$HOMEBREW_ACCEPTANCE_RESULT" \
+            "chocolatey-acceptance=$CHOCOLATEY_ACCEPTANCE_RESULT"
+          do
+            case "${entry#*=}" in
+              success | skipped) ;;
+              *) failed="$failed ${entry%%=*}" ;;
+            esac
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::expected every required entry to succeed or skip, observed failures:$failed"
+            exit 1
+          fi
+          echo "Every required package-channel entry succeeded or skipped."

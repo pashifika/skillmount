@@ -1,178 +1,225 @@
 # SkillMount
 
-SkillMount is a pre-release Rust wrapper that makes external Agent Skills visible for one Codex
-CLI or Claude Code CLI session. The package builds `asm` as its primary executable and
-`skillmount` as a behaviorally identical fallback name.
+Mount external Agent Skills into one Codex CLI or Claude Code session, then clean up
+automatically.
 
-SkillMount resolves an ordered Skill catalog, creates only session-owned directory links, starts
-the selected agent directly without a shell, and removes its verified entries after the managed
-process domain exits. It does not install agents, manage authentication, change agent permission
-modes, request elevation, or copy and rewrite Skills.
+Codex CLI and Claude Code discover Skills only in their own directories. When your Skills live in
+a shared or external folder, you end up copying them into every project and removing them by hand.
+SkillMount removes that chore. It links the Skills you select into the place the agent searches,
+launches the agent for you, and deletes exactly the links it created once the session ends.
 
-## Build locally
+One package installs two identical commands: `asm`, the primary name used in every example below,
+and `skillmount`, a descriptive fallback that behaves the same way.
 
-The repository currently targets Rust 1.85.0 or newer and has no published package contract yet.
+## Contents
 
-```text
-cargo build --locked --release --bins
-target/release/asm --help
-target/release/skillmount --version
+- [Features](#features)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Commands and options](#commands-and-options)
+- [Shell completion](#shell-completion)
+- [Health checks and cleanup](#health-checks-and-cleanup)
+- [Requirements](#requirements)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Features
+
+- **Session-scoped mounts:** Skills appear when the agent starts and disappear when it exits, so
+  your project directory stays clean.
+- **Layered catalogs:** repeat `--skills-dir` to stack Skill collections; the rightmost source
+  wins each Skill name.
+- **Conflict safety:** an existing Skill is never replaced, and a name clash stops the session
+  before anything changes.
+- **Crash recovery:** every change is journaled, so `asm doctor` can diagnose an interrupted
+  session and `asm cleanup` can reconcile what it left behind.
+- **Clean launches:** the agent starts directly, without a shell in between, and its output
+  streams pass through untouched, so JSON pipelines keep working.
+
+## Install
+
+### Download a release
+
+Each release archive contains both commands plus the license and version files, and the release
+publishes `SHA256SUMS` digests next to the archives. On macOS (Apple Silicon):
+
+```bash
+curl -LO https://github.com/pashifika/skillmount/releases/download/v0.1.0/skillmount-v0.1.0-aarch64-apple-darwin.tar.gz
+tar -xzf skillmount-v0.1.0-aarch64-apple-darwin.tar.gz
+skillmount-v0.1.0-aarch64-apple-darwin/asm --version   # prints: SkillMount 0.1.0
 ```
 
-Both binaries delegate to the same implementation. Examples below use `asm`.
+On Windows x64 (use the `i686` archive for x86):
+
+```powershell
+Invoke-WebRequest https://github.com/pashifika/skillmount/releases/download/v0.1.0/skillmount-v0.1.0-x86_64-pc-windows-msvc.zip -OutFile skillmount.zip
+Expand-Archive skillmount.zip .
+.\skillmount-v0.1.0-x86_64-pc-windows-msvc\asm.exe --version   # prints: SkillMount 0.1.0
+```
+
+Move `asm` — and `skillmount`, if you want the fallback name — into a directory on your `PATH`.
+Keep each executable under its own name; SkillMount rejects a renamed copy.
+
+### Package managers (not yet available)
+
+Homebrew and Chocolatey packages are prepared but not yet published. None of the commands below
+works today. Each becomes available once its own public endpoint resolves version `0.2.0` and a
+clean installation passes on a supported host:
+
+| Command | Would install | Status |
+|---|---|---|
+| `brew trust --formula pashifika/tap/skillmount && brew install pashifika/tap/skillmount` | `skillmount` on Apple Silicon macOS | Not yet available |
+| `brew trust --formula pashifika/tap/skillmount-asm && brew install pashifika/tap/skillmount-asm` | `asm` on Apple Silicon macOS | Not yet available |
+| `choco install skillmount` | `skillmount` on Windows x64/x86 | Not yet available |
+| `choco install skillmount-asm` | `asm` on Windows x64/x86 | Not yet available |
+
+Each package installs exactly one of the two commands and owns only that command's executable,
+shim, and completion files. Installing both packages from one manager is supported. The
+`brew trust` step is required because Homebrew refuses to install from an untrusted third-party
+tap; it persists across upgrades of an installed Formula, but uninstalling one drops its entry, so
+reinstalling needs it again. Upgrade, uninstall, and completion details per package live in
+[docs/packaging.md](docs/packaging.md).
+
+### Build from source
+
+Requires Rust 1.85.0 or newer:
+
+```bash
+git clone https://github.com/pashifika/skillmount.git
+cd skillmount
+cargo build --locked --release --bins
+target/release/asm --version
+```
 
 ## Quick start
 
-A `--skills-dir` value can be one direct Skill directory or a catalog whose immediate child
-directories are Skills. Repeat the option to overlay sources; the rightmost occurrence wins each
-logical name.
+A `--skills-dir` value is one Skill directory or a folder whose immediate children are Skills.
+Start by checking what the agents would see, without touching anything:
 
-Inspect both adapters without creating links, state directories, locks, journals, or child
-processes:
-
-```text
-asm inspect --skills-dir path/to/base-skills --skills-dir path/to/team-skills
+```bash
+asm inspect --skills-dir ~/agent-skills
 ```
 
-Preview the exact Codex plan and forwarded arguments:
+Preview a Codex session plan, still read-only:
 
-```text
-asm codex \
-  --skills-dir path/to/base-skills \
-  --skills-dir path/to/team-skills \
-  --dry-run --verbose \
-  -- exec "Use the selected Skill"
+```bash
+asm codex --skills-dir ~/agent-skills --dry-run -- exec "Summarize this project's build steps"
 ```
 
-Start a Codex session:
+Run the session for real. SkillMount mounts the Skills, launches Codex, and cleans up after the
+agent exits:
 
-```text
-asm codex \
-  --skills-dir path/to/base-skills \
-  --skills-dir path/to/team-skills \
-  -- exec "Use the selected Skill"
+```bash
+asm codex --skills-dir ~/agent-skills -- exec "Summarize this project's build steps"
 ```
 
-Start a Claude Code session. SkillMount creates an isolated staging root and injects it through
-Claude's supported `--add-dir` discovery path; it does not edit the project:
+Claude Code works the same way. SkillMount stages the Skills in a private directory and hands it
+to Claude through `--add-dir`, so the project itself is not modified:
 
-```text
-asm claude \
-  --skills-dir path/to/base-skills \
-  --skills-dir path/to/team-skills \
-  -- -p "Use the selected Skill"
+```bash
+asm claude --skills-dir ~/agent-skills -- -p "Review the staged diff with the team review Skill"
 ```
 
-Arguments after the standalone `--` are passed as distinct platform-native values. They are never
-joined into a shell command. Use `--agent-bin path/to/codex` or `--agent-bin path/to/claude` to pin
-an executable; otherwise the agent is resolved through `PATH`.
+Everything after the standalone `--` is passed to the agent unchanged. Repeat `--skills-dir` to
+overlay collections, and add `--agent-bin path/to/codex` to pin a specific agent executable
+instead of searching `PATH`.
 
-## Catalog and conflict rules
+Treat mounted Skills as code you chose to run: review their contents and provenance before making
+them visible to an agent.
 
-The catalog is a deterministic rightmost-wins overlay. SkillMount retains every displaced origin
-for verbose diagnostics, but validates only the selected winner. An invalid winner fails; an older
-valid candidate is never used as a fallback. Repeating the same canonical source is recorded as a
-repeat and does not count as a logical override.
+## Commands and options
 
-Agent discovery is inspected before mutation. A project-owned Skill or incompatible destination is
-never replaced. The default `--conflict error` stops with the existing and selected paths;
-`--conflict skip` preserves the existing entry and omits that selected mount without revealing a
-shadowed source. `--validation none` relaxes metadata checks only—safe names, regular Skill
-directories, containment, and destination-cycle checks remain mandatory.
-
-Selected Skills are trusted user code. Review their contents and provenance before making them
-visible to an agent. SkillMount validates catalog structure, not the safety or intent of Skill
-instructions, scripts, or bundled resources.
-
-## Session lifecycle and recovery
-
-A mutating session performs these observable phases:
-
-1. Validate the agent executable, version, configuration, catalog, and discovery model.
-2. Acquire every logical and physical resource lock and reconcile eligible stale transactions.
-3. Persist a write-ahead journal before each destination mutation.
-4. Create and atomically place session-owned directory links without replacing anything.
-5. Launch the agent directly with inherited standard streams.
-6. After process-domain death is proved, remove entries in reverse order only when live kind,
-   target, platform identity, and directory contents still match the journal.
-
-During a session, stdout is the child's data stream without a SkillMount prefix. Human-readable
-mount summaries, warnings, errors, and cleanup diagnostics use stderr, so agent JSON/JSONL output
-can be consumed directly.
-
-Successful ordinary cleanup is silent unless `--verbose` is requested. `--keep-mounts` reaches a
-terminal kept state instead. A crash before child exposure is recovered under the recorded locks;
-a journal that reached `supervising` is quarantined because wrapper death does not prove that an
-agent descendant exited.
-
-Diagnose the environment without modifying project or SkillMount state:
-
-```text
-asm doctor --project-root path/to/project
-asm doctor --project-root path/to/project \
-  --codex-bin path/to/codex --claude-bin path/to/claude
+```
+codex         Run a Codex session with the selected Skills
+claude        Resolve Skills for a future Claude Code session
+completions   Generate a shell completion script on standard output
+inspect       Inspect and validate a catalog without modifying the filesystem
+doctor        Inspect agent, discovery, link, lock, and transaction health
+cleanup       Reconcile transaction-owned residue from durable evidence
 ```
 
-Doctor reports pass, warning, failure, and unverified findings for pinned agent versions,
-discovery layouts and link chains, visible conflicts, advisory locks, journals, isolated link
-capability probes, and the remaining authenticated real-agent compatibility gap. Probe entries are
-created only in a unique owner-restricted temporary directory and never removed recursively. Links
-and directories require matching platform identity; the create-new source sentinel requires its
-regular-file kind and transaction-unique recorded bytes. Retained residue is always named.
+The session commands `codex` and `claude` share these options:
 
-Version capture starts the explicit or `PATH`-resolved agent directly with only `--version` and no
-shell. Treat that executable as trusted code: SkillMount does not change project state during its
-own checks, but it is not a sandbox for side effects an external binary might implement.
-
-After confirming that no related agent process or descendant is using the mounts, explicitly
-clean one canonical project or every validated SkillMount journal:
-
-```text
-asm cleanup --project-root path/to/project
-asm cleanup --all
+```
+--skills-dir <PATH>    Skill directory or direct Skill; repeat for a rightmost-wins overlay
+--cwd <PATH>           Working directory for the selected agent process
+--project-root <PATH>  Explicit project root
+--agent-bin <PATH>     Explicit agent executable path
+--link-mode <MODE>     Link implementation: auto, symlink, junction [default: auto]
+--mount-mode <MODE>    Mount location strategy: auto, project, staging [default: auto]
+--conflict <POLICY>    Existing-destination policy: error, skip [default: error]
+--validation <LEVEL>   Metadata validation policy: basic, strict, none [default: basic]
+--dry-run              Keep later planning read-only
+--keep-mounts          Retain later transaction-owned mounts for diagnostics
+--no-recover           Disable later stale-transaction recovery
+-v, --verbose          Increase diagnostic verbosity
 ```
 
-Invoking cleanup is the operator's process-domain-death assertion for quarantined transactions and
-the release decision for kept transactions. Cleanup still takes every recorded lock and calls the
-same evidence-checked removal path as automatic recovery. `--all` scans only SkillMount journal
-files under the current user's application-state root; it never searches arbitrary paths for
-similarly named entries. Active, corrupt, replaced, or non-empty entries are retained and reported.
+`--conflict skip` keeps an existing Skill and quietly drops the colliding mount instead of
+failing. `--validation none` relaxes metadata checks only; structural and safety checks always
+run.
 
-## Permissions and compatibility
+## Shell completion
 
-Skill discovery and agent sandbox access are separate. In particular, a Codex Skill link can be
-discoverable while a bundled file outside the workspace remains unreadable. Configure read access
-through Codex's own permission controls when appropriate. SkillMount never injects a broader
-permission mode, changes authentication, requests UAC or `sudo`, or treats `--add-dir` as a Codex
-permission workaround.
+`asm completions <shell>` writes one static completion script to standard output and changes
+nothing else. Supported shells are `bash`, `zsh`, `fish`, and `powershell`. Place the script where
+your shell loads completions from:
 
-The implemented release targets are:
+```bash
+mkdir -p ~/.local/share/skillmount ~/.zfunc ~/.config/fish/completions
+asm completions bash > ~/.local/share/skillmount/asm.bash   # then source it from ~/.bashrc
+asm completions zsh > ~/.zfunc/_asm                         # keep ~/.zfunc on fpath before compinit
+asm completions fish > ~/.config/fish/completions/asm.fish  # Fish loads it automatically
+```
 
-- Windows x86_64 and i686, including native junction support;
-- macOS on Apple Silicon.
+On PowerShell, save the script and dot-source it from your profile:
 
-Adapters currently pin Codex CLI 0.146.0 and Claude Code 2.1.220. Exact dated observations and
-unverified live-agent gaps are maintained in [`docs/compatibility.md`](docs/compatibility.md).
-Windows `--link-mode auto` may fall back to a junction when symlink creation is denied. Until the
-matrix contains passing real-agent junction evidence for the pinned release, that fallback emits a
-compatibility warning. Use `--link-mode symlink` to fail instead of falling back; SkillMount never
-elevates itself.
+```powershell
+asm completions powershell | Set-Content -LiteralPath "$HOME\asm-completion.ps1"
+Add-Content -LiteralPath $PROFILE -Value '. "$HOME\asm-completion.ps1"'
+```
 
-The manual `Live agent smoke` workflow verifies committed SHA-512 package integrity before
-extracting an allowlist of pinned native runtime files, then tests a three-source ordered overlay
-and a non-shadowed base Skill on macOS symlinks and explicit Windows x64/x86 junctions. It gives
-each agent only its own external credential, redacts retained output, kills the whole process tree
-on timeout even if the wrapper has already exited, and uploads versioned evidence with binary
-hashes and workflow provenance. The repository's OpenAI secret is exposed to the Codex child only
-as its non-interactive `CODEX_API_KEY`. The workflow is not a pull-request
-gate and never turns an absent or authentication-blocked run into a compatibility claim. Windows
-jobs use native `.exe` files; command shims that would need `cmd.exe` are not accepted.
+Each script is bound to the command that generated it: run `skillmount completions` for the
+fallback name. Regenerate the files after upgrading SkillMount. Completion is static — pressing
+Tab never runs SkillMount or an agent, and arguments after the session `--` are left to the
+agent's own completer.
 
-## Development verification
+## Health checks and cleanup
 
-Required deterministic checks use fake agents and isolated state:
+```bash
+asm doctor --project-root ~/projects/webapp
+asm cleanup --project-root ~/projects/webapp
+```
 
-```text
+`doctor` reports agent versions, discovery layout, link capability, locks, and leftover journals
+without changing project or SkillMount state. `cleanup` releases mounts left behind by an
+interrupted session; run it only after confirming no agent process still uses them, or sweep every
+recorded transaction with `asm cleanup --all`. The recovery rules and their guarantees are
+documented in [docs/architecture.md](docs/architecture.md).
+
+## Requirements
+
+- Supported hosts: Windows 10 version 1709 or later (x64 and x86) and macOS on Apple Silicon.
+- Sessions launch exactly the pinned agent releases: Codex CLI 0.146.0 and Claude Code 2.1.220.
+  Dated compatibility observations live in [docs/compatibility.md](docs/compatibility.md).
+- Building from source requires Rust 1.85.0 or newer.
+
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Module boundaries, safety invariants, implementation status |
+| [docs/compatibility.md](docs/compatibility.md) | Pinned agent versions and dated observations |
+| [docs/packaging.md](docs/packaging.md) | Package channels, availability, maintainer runbook |
+| [docs/releasing.md](docs/releasing.md) | Building and publishing a stable release |
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for the branch and review workflow. Before opening a pull
+request, run the required checks:
+
+```bash
 SKILLMOUNT_REQUIRE_LINKS=1 cargo test --locked --all-targets
 cargo test --locked --all-features
 cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -181,10 +228,7 @@ env RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 cargo deny --locked check
 ```
 
-See [`docs/architecture.md`](docs/architecture.md) for mutation ordering, module boundaries, and
-implementation status, and [`CONTRIBUTING.md`](CONTRIBUTING.md) for the branch and pull-request
-workflow.
+## License
 
-Maintainers preparing a stable version must also follow
-[`docs/releasing.md`](docs/releasing.md) for version/tag provenance, manual rehearsal, package and
-checksum verification, controlled draft retry, and tag-protection evidence.
+Licensed under either of the [Apache License 2.0](LICENSE-APACHE) or the [MIT License](LICENSE-MIT),
+at your option.

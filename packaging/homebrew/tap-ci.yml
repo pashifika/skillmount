@@ -1,0 +1,324 @@
+# Continuous integration for the SkillMount Homebrew tap.
+#
+# This file is NOT registered in pashifika/skillmount. It is the workflow the separate tap
+# repository pashifika/homebrew-tap installs as its own .github/workflows/tap.yml, so a tap
+# pull request opened by the package workflow is verified natively before it can merge.
+#
+# Homebrew maps the tap reference pashifika/tap onto the repository pashifika/homebrew-tap,
+# which is why `brew install pashifika/tap/skillmount` resolves Formula/skillmount.rb here.
+#
+# The tap is self-contained on purpose: every check below uses only `brew`, `git`, and the
+# system Python, so the tap never depends on a script that lives in the product repository.
+# Every action is pinned by 40-hex commit SHA with a version comment, matching the pinning
+# discipline of the product repository's workflows.
+
+name: tap
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tap-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HOMEBREW_NO_ANALYTICS: "1"
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_ENV_HINTS: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  TAP: pashifika/tap
+  TAP_DIRECTORY_NAME: homebrew-tap
+
+jobs:
+  formulae:
+    name: formulae
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - name: Check out the tap with history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tap-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Register the checkout as a local tap
+        run: |
+          set -euo pipefail
+          tap_directory="$(brew --repository)/Library/Taps/pashifika/$TAP_DIRECTORY_NAME"
+          mkdir -p "$(dirname "$tap_directory")"
+          cp -R "$GITHUB_WORKSPACE/tap-source/." "$tap_directory"
+          echo "TAP_DIRECTORY=$tap_directory" >> "$GITHUB_ENV"
+          brew tap-info --json=v1 "$TAP" > "$RUNNER_TEMP/tap-info.json"
+          ls -1 "$tap_directory/Formula"
+
+      - name: Trust this tap so Homebrew will load its formulae
+        run: |
+          set -euo pipefail
+          # Homebrew 6 refuses to load a formula from a non-official tap until it is trusted:
+          # "Refusing to load formula <tap>/<name> from untrusted tap <tap>." Operators run this
+          # once by hand; CI must do it explicitly so an install failure is never mistaken for a
+          # Formula defect. Trust is recorded per formula rather than for the whole tap so a new
+          # unreviewed file in this tap does not become trusted implicitly.
+          brew trust --formula "$TAP/skillmount" "$TAP/skillmount-asm"
+          brew trust --json v1 > "$RUNNER_TEMP/trust.json"
+          cat "$RUNNER_TEMP/trust.json"
+
+      - name: Record Homebrew, OS, and shell provenance
+        run: |
+          set -euo pipefail
+          brew --version
+          sw_vers
+          sw_vers -buildVersion
+          uname -srm
+          /bin/bash --version | sed -n '1p'
+          /bin/zsh --version
+          if command -v fish > /dev/null 2>&1; then fish --version; fi
+
+      - name: Install the shared verification helpers
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/tap-checks.sh" <<'CHECKS'
+          # Shared assertions for the SkillMount tap. Every failure names both the expected and
+          # the observed value, because a silently weakened check is worse than no check.
+          fail() {
+            printf '::error::%s\n' "$1"
+            exit 1
+          }
+
+          real_path() {
+            python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+          }
+
+          # Stable version a Formula currently declares, read from Homebrew rather than parsed
+          # out of the Ruby source, so the tap never reimplements Formula evaluation.
+          formula_version() {
+            brew info --json=v2 --formula "$1" |
+              python3 -c 'import json, sys; print(json.load(sys.stdin)["formulae"][0]["versions"]["stable"])'
+          }
+
+          # One keg must carry exactly one product executable, and the linked shim must resolve
+          # into that keg. SkillMount rejects a renamed alias, so a stray second executable or a
+          # shim pointing elsewhere is a product-breaking defect, not a cosmetic one.
+          require_selected_only() {
+            formula="$1"
+            command="$2"
+            other="$3"
+            keg="$(brew --prefix "$formula")"
+            cellar="$(brew --cellar "$formula")"
+            root="$(brew --prefix)"
+
+            [ -x "$keg/bin/$command" ] ||
+              fail "$formula: expected an executable at $keg/bin/$command, observed none"
+            [ ! -e "$keg/bin/$other" ] ||
+              fail "$formula: expected no $other under $keg/bin, observed $keg/bin/$other"
+
+            entries="$(find "$keg/bin" -mindepth 1 -maxdepth 1 | wc -l | tr -d '[:space:]')"
+            [ "$entries" = "1" ] ||
+              fail "$formula: expected exactly 1 entry under $keg/bin, observed $entries"
+
+            [ -e "$root/bin/$command" ] ||
+              fail "$formula: expected a linked shim at $root/bin/$command, observed none"
+            target="$(real_path "$root/bin/$command")"
+            case "$target" in
+              "$cellar"/*) : ;;
+              *) fail "$formula: expected $root/bin/$command to resolve under $cellar, observed $target" ;;
+            esac
+
+            printf 'selected-only %s: %s -> %s\n' "$formula" "$command" "$target"
+          }
+
+          # Each Formula must own one completion file per shell, name its own command, and never
+          # name the paired package's command.
+          require_completion_ownership() {
+            formula="$1"
+            command="$2"
+            other="$3"
+            keg="$(brew --prefix "$formula")"
+
+            for specification in \
+              "bash:etc/bash_completion.d/$command:etc/bash_completion.d/$other" \
+              "zsh:share/zsh/site-functions/_$command:share/zsh/site-functions/_$other" \
+              "fish:share/fish/vendor_completions.d/$command.fish:share/fish/vendor_completions.d/$other.fish"
+            do
+              shell="${specification%%:*}"
+              remainder="${specification#*:}"
+              owned="$keg/${remainder%%:*}"
+              foreign="$keg/${remainder#*:}"
+
+              [ -f "$owned" ] ||
+                fail "$formula: expected a $shell completion at $owned, observed none"
+              [ ! -e "$foreign" ] ||
+                fail "$formula: expected no $shell completion for $other, observed $foreign"
+              grep -q -- "$command" "$owned" ||
+                fail "$formula: expected the $shell completion to name $command, observed a file without it"
+              if grep -qE -- "(^|[^A-Za-z0-9_-])$other([^A-Za-z0-9_-]|\$)" "$owned"; then
+                fail "$formula: expected the $shell completion never to name $other, observed it in $owned"
+              fi
+              printf 'completion-ownership %s: %s %s\n' "$formula" "$shell" "$owned"
+            done
+          }
+
+          require_reports_version() {
+            command="$1"
+            expected="$2"
+            root="$(brew --prefix)"
+            reported="$("$root/bin/$command" --version)"
+            case "$reported" in
+              *"$expected"*) printf 'version %s: %s\n' "$command" "$reported" ;;
+              *) fail "expected $command --version to report $expected, observed '$reported'" ;;
+            esac
+          }
+
+          require_installed() {
+            command="$1"
+            root="$(brew --prefix)"
+            [ -x "$root/bin/$command" ] ||
+              fail "expected an installed and linked $root/bin/$command, observed none"
+            "$root/bin/$command" --version > /dev/null ||
+              fail "expected $root/bin/$command --version to succeed, observed a failure"
+          }
+
+          require_absent() {
+            command="$1"
+            root="$(brew --prefix)"
+            [ ! -e "$root/bin/$command" ] ||
+              fail "expected no $root/bin/$command after uninstall, observed $root/bin/$command"
+          }
+          CHECKS
+          bash -n "$RUNNER_TEMP/tap-checks.sh"
+
+      - name: Check formula style
+        run: brew style --formula "$TAP/skillmount" "$TAP/skillmount-asm"
+
+      - name: Audit both formulae strictly
+        run: |
+          set -euo pipefail
+          brew audit --strict --formula "$TAP/skillmount"
+          brew audit --strict --formula "$TAP/skillmount-asm"
+
+      - name: Install, test, and verify skillmount
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/tap-checks.sh"
+          brew install --formula "$TAP/skillmount"
+          brew test "$TAP/skillmount"
+          require_selected_only "$TAP/skillmount" skillmount asm
+          require_completion_ownership "$TAP/skillmount" skillmount asm
+          require_reports_version skillmount "$(formula_version "$TAP/skillmount")"
+          brew uninstall --formula "$TAP/skillmount"
+          require_absent skillmount
+
+      - name: Install, test, and verify skillmount-asm
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/tap-checks.sh"
+          brew install --formula "$TAP/skillmount-asm"
+          brew test "$TAP/skillmount-asm"
+          require_selected_only "$TAP/skillmount-asm" asm skillmount
+          require_completion_ownership "$TAP/skillmount-asm" asm skillmount
+          require_reports_version asm "$(formula_version "$TAP/skillmount-asm")"
+
+      - name: Verify co-installation and cross-uninstall
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/tap-checks.sh"
+          brew install --formula "$TAP/skillmount"
+          require_installed skillmount
+          require_installed asm
+          require_selected_only "$TAP/skillmount" skillmount asm
+          require_selected_only "$TAP/skillmount-asm" asm skillmount
+          require_completion_ownership "$TAP/skillmount" skillmount asm
+          require_completion_ownership "$TAP/skillmount-asm" asm skillmount
+
+          brew uninstall --formula "$TAP/skillmount"
+          require_absent skillmount
+          require_installed asm
+          require_selected_only "$TAP/skillmount-asm" asm skillmount
+          require_completion_ownership "$TAP/skillmount-asm" asm skillmount
+
+          brew uninstall --formula "$TAP/skillmount-asm"
+          require_absent asm
+          require_absent skillmount
+
+      # The upgrade rehearsal proves the release this pull request introduces can be reached
+      # from the revision already on the base branch, which is the only path a user takes.
+      - name: Verify upgrade from the base revision
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/tap-checks.sh"
+          cd "$TAP_DIRECTORY"
+
+          base="$BASE_SHA"
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2> /dev/null; then
+            base="$(git rev-parse --verify --quiet 'HEAD~1' || true)"
+          fi
+          if [ -z "$base" ]; then
+            printf '::notice::upgrade skipped: expected a base revision, observed none (first commit)\n'
+            exit 0
+          fi
+
+          missing=""
+          for formula in skillmount skillmount-asm; do
+            git cat-file -e "$base:Formula/$formula.rb" 2> /dev/null || missing="$missing $formula"
+          done
+          if [ -n "$missing" ]; then
+            printf '::notice::upgrade skipped: expected both Formulae at %s, observed none for%s (first publication)\n' \
+              "$base" "$missing"
+            exit 0
+          fi
+
+          head_revision="$(git rev-parse HEAD)"
+          git checkout --quiet "$base" -- Formula/skillmount.rb Formula/skillmount-asm.rb
+          base_skillmount="$(formula_version "$TAP/skillmount")"
+          base_asm="$(formula_version "$TAP/skillmount-asm")"
+          git checkout --quiet "$head_revision" -- Formula/skillmount.rb Formula/skillmount-asm.rb
+          head_skillmount="$(formula_version "$TAP/skillmount")"
+          head_asm="$(formula_version "$TAP/skillmount-asm")"
+
+          if [ "$base_skillmount" = "$head_skillmount" ] && [ "$base_asm" = "$head_asm" ]; then
+            printf '::notice::upgrade skipped: expected a version change, observed %s and %s unchanged\n' \
+              "$base_skillmount" "$base_asm"
+            exit 0
+          fi
+
+          git checkout --quiet "$base" -- Formula/skillmount.rb Formula/skillmount-asm.rb
+          brew install --formula "$TAP/skillmount" "$TAP/skillmount-asm"
+          require_reports_version skillmount "$base_skillmount"
+          require_reports_version asm "$base_asm"
+
+          git checkout --quiet "$head_revision" -- Formula/skillmount.rb Formula/skillmount-asm.rb
+          brew upgrade --formula "$TAP/skillmount" "$TAP/skillmount-asm"
+
+          require_reports_version skillmount "$head_skillmount"
+          require_reports_version asm "$head_asm"
+          require_selected_only "$TAP/skillmount" skillmount asm
+          require_selected_only "$TAP/skillmount-asm" asm skillmount
+          require_completion_ownership "$TAP/skillmount" skillmount asm
+          require_completion_ownership "$TAP/skillmount-asm" asm skillmount
+
+          for stale in "$(brew --cellar "$TAP/skillmount")" "$(brew --cellar "$TAP/skillmount-asm")"; do
+            kegs="$(find "$stale" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d '[:space:]')"
+            [ "$kegs" = "1" ] ||
+              fail "expected exactly 1 keg under $stale after upgrade, observed $kegs"
+          done
+
+          brew uninstall --formula "$TAP/skillmount" "$TAP/skillmount-asm"
+          require_absent skillmount
+          require_absent asm
+
+      - name: Leave the runner without SkillMount installed
+        if: ${{ always() }}
+        run: |
+          brew uninstall --formula --ignore-dependencies "$TAP/skillmount" || true
+          brew uninstall --formula --ignore-dependencies "$TAP/skillmount-asm" || true
+          brew list --formula

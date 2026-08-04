@@ -1,7 +1,9 @@
 //! Shared command-line parser for both executable shims.
 
-use std::ffi::OsString;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
@@ -28,6 +30,8 @@ enum CliCommand {
     Codex(SessionArgs),
     /// Resolve Skills for a future Claude Code session.
     Claude(SessionArgs),
+    /// Generate a shell completion script on standard output.
+    Completions(CompletionArgs),
     /// Inspect and validate a catalog without modifying the filesystem.
     Inspect(InspectArgs),
     /// Inspect agent, discovery, link, lock, and transaction health.
@@ -39,19 +43,28 @@ enum CliCommand {
 #[derive(Debug, Args)]
 struct SessionArgs {
     /// Skill directory or direct Skill; repeat for a rightmost-wins overlay.
-    #[arg(long = "skills-dir", value_name = "PATH", required = true)]
+    #[arg(
+        long = "skills-dir",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::DirPath,
+        required = true
+    )]
     skills_dirs: Vec<PathBuf>,
 
     /// Working directory for the selected agent process.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::DirPath)]
     cwd: Option<PathBuf>,
 
     /// Explicit project root.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::DirPath)]
     project_root: Option<PathBuf>,
 
     /// Explicit agent executable path.
-    #[arg(long, value_name = "PATH")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_hint = clap::ValueHint::ExecutablePath
+    )]
     agent_bin: Option<PathBuf>,
 
     /// Link implementation.
@@ -94,7 +107,12 @@ struct SessionArgs {
 #[derive(Debug, Args)]
 struct InspectArgs {
     /// Skill directory or direct Skill; repeat for a rightmost-wins overlay.
-    #[arg(long = "skills-dir", value_name = "PATH", required = true)]
+    #[arg(
+        long = "skills-dir",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::DirPath,
+        required = true
+    )]
     skills_dirs: Vec<PathBuf>,
 
     /// Adapter metadata policy to evaluate.
@@ -107,29 +125,110 @@ struct InspectArgs {
 }
 
 #[derive(Debug, Args)]
+struct CompletionArgs {
+    /// Shell whose static completion script should be generated.
+    #[arg(value_enum, value_name = "SHELL")]
+    shell: CompletionShell,
+}
+
+#[derive(Debug, Args)]
 struct DoctorArgs {
     /// Explicit project root.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::DirPath)]
     project_root: Option<PathBuf>,
 
     /// Explicit Codex executable path; otherwise search PATH.
-    #[arg(long, value_name = "PATH")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_hint = clap::ValueHint::ExecutablePath
+    )]
     codex_bin: Option<PathBuf>,
 
     /// Explicit Claude Code executable path; otherwise search PATH.
-    #[arg(long, value_name = "PATH")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_hint = clap::ValueHint::ExecutablePath
+    )]
     claude_bin: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct CleanupArgs {
     /// Explicit project root.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::DirPath)]
     project_root: Option<PathBuf>,
 
     /// Include every recoverable transaction.
     #[arg(long, conflicts_with = "project_root")]
     all: bool,
+}
+
+/// Shells whose static completion behavior `SkillMount` verifies natively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CompletionShell {
+    /// Bash.
+    Bash,
+    /// Zsh.
+    Zsh,
+    /// Fish.
+    Fish,
+    /// PowerShell.
+    #[value(name = "powershell")]
+    PowerShell,
+}
+
+/// Installed product name to which one generated script is bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProductBinary {
+    /// Primary `asm` executable.
+    Asm,
+    /// Behaviorally identical `skillmount` fallback.
+    Skillmount,
+}
+
+impl ProductBinary {
+    pub(crate) const fn registration_name(self) -> &'static str {
+        match self {
+            Self::Asm => "asm",
+            Self::Skillmount => "skillmount",
+        }
+    }
+
+    fn from_argv0(argv0: &OsStr) -> Option<Self> {
+        let name = Path::new(argv0).file_name()?;
+        #[cfg(windows)]
+        {
+            if windows_ascii_name_eq(name, b"asm") || windows_ascii_name_eq(name, b"asm.exe") {
+                Some(Self::Asm)
+            } else if windows_ascii_name_eq(name, b"skillmount")
+                || windows_ascii_name_eq(name, b"skillmount.exe")
+            {
+                Some(Self::Skillmount)
+            } else {
+                None
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            match name {
+                name if name == OsStr::new("asm") => Some(Self::Asm),
+                name if name == OsStr::new("skillmount") => Some(Self::Skillmount),
+                _ => None,
+            }
+        }
+    }
+}
+#[cfg(windows)]
+fn windows_ascii_name_eq(value: &OsStr, expected_lowercase: &[u8]) -> bool {
+    value
+        .encode_wide()
+        .map(|unit| match unit {
+            0x41..=0x5a => unit + 0x20,
+            _ => unit,
+        })
+        .eq(expected_lowercase.iter().copied().map(u16::from))
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -201,13 +300,26 @@ pub(crate) struct CleanupInput {
     pub(crate) all: bool,
 }
 
+/// Typed completion-generation request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompletionInput {
+    pub(crate) shell: CompletionShell,
+    pub(crate) product: ProductBinary,
+}
+
 /// One parsed root command.
 #[derive(Debug, Clone)]
 pub(crate) enum ParsedCommand {
+    Completions(CompletionInput),
     Session(SessionInput),
     Inspect(InspectInput),
     Doctor(DoctorInput),
     Cleanup(CleanupInput),
+}
+
+/// Returns a fresh shared command graph for completion generation.
+pub(crate) fn command() -> clap::Command {
+    Cli::command()
 }
 
 pub(crate) fn parse_command_from<I, T>(args: I) -> Result<ParsedCommand, clap::Error>
@@ -215,10 +327,27 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    let product = args
+        .first()
+        .and_then(|argv0| ProductBinary::from_argv0(argv0));
     let cli = Cli::try_parse_from(args)?;
     match cli.command {
         CliCommand::Codex(args) => session_input(AgentId::Codex, args),
         CliCommand::Claude(args) => session_input(AgentId::Claude, args),
+        CliCommand::Completions(args) => {
+            let product = product.ok_or_else(|| {
+                command().error(
+                    clap::error::ErrorKind::InvalidValue,
+                    "completion generation requires the installed executable name `asm` or \
+                     `skillmount` (with the normal `.exe` suffix on Windows)",
+                )
+            })?;
+            Ok(ParsedCommand::Completions(CompletionInput {
+                shell: args.shell,
+                product,
+            }))
+        }
         CliCommand::Inspect(args) => Ok(ParsedCommand::Inspect(InspectInput {
             skills_dirs: args.skills_dirs,
             agent: args.agent,
@@ -307,8 +436,11 @@ impl From<RawValidationLevel> for ValidationLevel {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParsedCommand, parse_command_from};
+    use super::{
+        CompletionInput, CompletionShell, ParsedCommand, ProductBinary, command, parse_command_from,
+    };
     use crate::domain::{AgentId, LinkMode, MountMode, ValidationLevel};
+    use clap::ValueHint;
     use clap::error::ErrorKind;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -319,6 +451,15 @@ mod tests {
             panic!("expected session command");
         };
         session
+    }
+
+    fn completion(argv0: &str, shell: &str) -> CompletionInput {
+        let command = parse_command_from([argv0, "completions", shell])
+            .expect("completion request should parse");
+        let ParsedCommand::Completions(input) = command else {
+            panic!("expected completion command");
+        };
+        input
     }
 
     #[test]
@@ -391,6 +532,149 @@ mod tests {
             parse_command_from(["asm", "codex", "--skills-dir", "skills", "--link-mode=copy"])
                 .expect_err("copy should be rejected");
         assert_eq!(error.kind(), ErrorKind::InvalidValue);
+    }
+    #[test]
+    fn completion_shell_values_parse() {
+        for (value, expected) in [
+            ("bash", CompletionShell::Bash),
+            ("zsh", CompletionShell::Zsh),
+            ("fish", CompletionShell::Fish),
+            ("powershell", CompletionShell::PowerShell),
+        ] {
+            assert_eq!(completion("asm", value).shell, expected);
+        }
+    }
+
+    #[test]
+    fn completion_shell_is_required_with_usage_category() {
+        let error =
+            parse_command_from(["asm", "completions"]).expect_err("shell should be required");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn only_advertised_completion_shells_parse() {
+        for value in ["elvish", "nushell", "power-shell"] {
+            let error = parse_command_from(["asm", "completions", value])
+                .expect_err("unadvertised shell should be rejected");
+            assert_eq!(error.kind(), ErrorKind::InvalidValue);
+            let rendered = error.to_string();
+            for supported in ["bash", "zsh", "fish", "powershell"] {
+                assert!(rendered.contains(supported), "{rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn completion_product_identity_recognizes_installed_names() {
+        assert_eq!(
+            completion("/installed/asm", "bash").product,
+            ProductBinary::Asm
+        );
+        assert_eq!(
+            completion("/installed/skillmount", "bash").product,
+            ProductBinary::Skillmount
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn completion_product_identity_recognizes_windows_names_case_insensitively() {
+        for (name, expected) in [
+            ("asm.exe", ProductBinary::Asm),
+            ("ASM.EXE", ProductBinary::Asm),
+            ("SkillMount", ProductBinary::Skillmount),
+            ("SKILLMOUNT.ExE", ProductBinary::Skillmount),
+        ] {
+            assert_eq!(completion(name, "bash").product, expected);
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn completion_product_identity_rejects_windows_suffixes() {
+        let error = parse_command_from(["asm.exe", "completions", "bash"])
+            .expect_err("Windows executable suffix should be rejected off Windows");
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn completion_product_identity_rejects_renamed_alias() {
+        let error = parse_command_from(["renamed", "completions", "bash"])
+            .expect_err("renamed alias should be rejected");
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        let rendered = error.to_string();
+        assert!(rendered.contains("`asm`"), "{rendered}");
+        assert!(rendered.contains("`skillmount`"), "{rendered}");
+    }
+
+    #[test]
+    fn completion_metadata_preserves_native_paths_and_opaque_passthrough() {
+        let input = session(
+            [
+                "asm",
+                "codex",
+                "--skills-dir",
+                "relative/skills",
+                "--cwd",
+                "relative/work",
+                "--project-root",
+                "relative/project",
+                "--agent-bin",
+                "relative/bin/codex",
+                "--",
+                "--search",
+                "literal value",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        );
+
+        assert_eq!(input.skills_dirs, [PathBuf::from("relative/skills")]);
+        assert_eq!(input.cwd, Some(PathBuf::from("relative/work")));
+        assert_eq!(input.project_root, Some(PathBuf::from("relative/project")));
+        assert_eq!(input.agent_bin, Some(PathBuf::from("relative/bin/codex")));
+        assert_eq!(
+            input.passthrough_args,
+            [OsString::from("--search"), OsString::from("literal value")]
+        );
+    }
+
+    #[test]
+    fn completion_command_graph_carries_path_value_hints() {
+        let mut root = command();
+        root.build();
+        let cases = [
+            ("codex", "skills_dirs", ValueHint::DirPath),
+            ("codex", "cwd", ValueHint::DirPath),
+            ("codex", "project_root", ValueHint::DirPath),
+            ("codex", "agent_bin", ValueHint::ExecutablePath),
+            ("claude", "skills_dirs", ValueHint::DirPath),
+            ("claude", "cwd", ValueHint::DirPath),
+            ("claude", "project_root", ValueHint::DirPath),
+            ("claude", "agent_bin", ValueHint::ExecutablePath),
+            ("inspect", "skills_dirs", ValueHint::DirPath),
+            ("doctor", "project_root", ValueHint::DirPath),
+            ("doctor", "codex_bin", ValueHint::ExecutablePath),
+            ("doctor", "claude_bin", ValueHint::ExecutablePath),
+            ("cleanup", "project_root", ValueHint::DirPath),
+        ];
+
+        for (subcommand, argument, expected) in cases {
+            let command = root
+                .find_subcommand(subcommand)
+                .expect("subcommand should exist");
+            let argument = command
+                .get_arguments()
+                .find(|candidate| candidate.get_id().as_str() == argument)
+                .expect("argument should exist");
+            assert_eq!(
+                argument.get_value_hint(),
+                expected,
+                "{subcommand} --{argument:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

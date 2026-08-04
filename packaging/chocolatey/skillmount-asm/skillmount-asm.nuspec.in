@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SkillMount Chocolatey package metadata template for `@PACKAGE_ID@`, release tag @TAG@.
+
+  Generated into @PACKAGE_ID@/@PACKAGE_ID@.nuspec by
+  `.github/scripts/package_channels.py generate-chocolatey`. Edit this template, never the
+  generated nuspec.
+-->
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>@PACKAGE_ID@</id>
+    <version>@VERSION@</version>
+    <title>@TITLE@</title>
+    <authors>pashifika</authors>
+    <owners>pashifika</owners>
+    <summary>@SUMMARY@</summary>
+    <description>@DESCRIPTION@
+
+This package keeps exactly one product executable, `@COMMAND@.exe`, and therefore exposes
+exactly one shim named `@COMMAND@`. SkillMount resolves its product identity from `argv[0]`
+and rejects a renamed alias, so the executable is never installed, copied, or shimmed under
+any other name. The paired package carries the other executable; installing both is
+supported, and each package owns its own shim.</description>
+    <projectUrl>@PROJECT_URL@</projectUrl>
+    <projectSourceUrl>@PROJECT_SOURCE_URL@</projectSourceUrl>
+    <packageSourceUrl>@PROJECT_SOURCE_URL@</packageSourceUrl>
+    <licenseUrl>@LICENSE_URL@</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <releaseNotes>@RELEASE_NOTES_URL@</releaseNotes>
+    <tags>skillmount agent-skills claude-code codex cli developer-tool</tags>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>
