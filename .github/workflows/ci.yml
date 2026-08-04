@@ -143,6 +143,7 @@ jobs:
       EXPECTED_BASH_VERSION: "5.3.15"
       EXPECTED_FISH_VERSION: "4.8.1"
       EXPECTED_ZSH_VERSION: "5.9.2"
+      HOMEBREW_BREW_REVISION: "3c9f3fd075ddcb2f6b1f5efaa2906e2f9ef6441d"
       HOMEBREW_CORE_REVISION: "56c6e019582b3f324c7db4e4ddac1d9a39539e35"
       HOMEBREW_NO_ANALYTICS: "1"
       HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -156,6 +157,9 @@ jobs:
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
       - name: Provision pinned native shells
         run: |
+          brew_repository="$(brew --repository)"
+          git -C "$brew_repository" fetch --depth=1 origin "$HOMEBREW_BREW_REVISION"
+          git -C "$brew_repository" checkout --detach "$HOMEBREW_BREW_REVISION"
           brew tap --force homebrew/core
           core="$(brew --repository homebrew/core)"
           git -C "$core" fetch --depth=1 origin "$HOMEBREW_CORE_REVISION"
