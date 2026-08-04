@@ -1,0 +1,49 @@
+# SkillMount Homebrew formula template for the `@PACKAGE_ID@` package.
+#
+# Generated into Formula/@PACKAGE_ID@.rb by
+# `.github/scripts/package_channels.py generate-homebrew`. Edit this template, never the
+# generated formula: the tap copy is rewritten from here on every release.
+#
+# Provenance of the source this formula builds:
+#   tag    @TAG@
+#   commit @COMMIT@
+class @FORMULA_CLASS@ < Formula
+  desc "@DESCRIPTION@"
+  homepage "@HOMEPAGE@"
+  url "@SOURCE_URL@"
+  sha256 "@SOURCE_SHA256@"
+  license "@LICENSE@"
+
+  depends_on "rust" => :build
+  depends_on :macos
+  depends_on arch: :arm64
+
+  def install
+    system "cargo", "install", "--locked", "--bin", "@CARGO_BIN@", *std_cargo_args
+    generate_completions_from_executable(
+      bin/"@COMMAND@", "completions",
+      base_name: "@COMMAND@",
+      shells: [:bash, :zsh, :fish],
+    )
+  end
+
+  test do
+    assert_match "@VERSION@", shell_output("#{bin}/@COMMAND@ --version")
+    assert_match "Usage:", shell_output("#{bin}/@COMMAND@ --help")
+
+    # SkillMount resolves its product identity from argv[0] and rejects a renamed alias, so
+    # this keg must carry exactly one executable and never the paired package's command.
+    refute_predicate bin/"@OTHER_COMMAND@", :exist?
+
+    {
+      bash_completion/"@COMMAND@" => "bash",
+      zsh_completion/"_@COMMAND@" => "zsh",
+      fish_completion/"@COMMAND@.fish" => "fish",
+    }.each do |completion, shell|
+      assert_predicate completion, :exist?, "no #{shell} completion was generated"
+      contents = completion.read
+      assert_match "@COMMAND@", contents
+      refute_match(/\b@OTHER_COMMAND@\b/, contents)
+    end
+  end
+end

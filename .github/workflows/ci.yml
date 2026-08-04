@@ -47,6 +47,23 @@ jobs:
         run: python -B .github/scripts/test_release.py
       - name: Test release publication safeguards
         run: python -B .github/scripts/test_release_publish.py
+      - name: Test package-channel preflight and generation safeguards
+        run: python -B .github/scripts/test_package_channels.py
+      - name: Test package-channel publication safeguards
+        run: python -B .github/scripts/test_package_publish.py
+      - name: Test package-workflow structural policy
+        run: python -B .github/scripts/test_package_workflow_policy.py
+      - name: Test Homebrew acceptance-harness safeguards
+        run: python -B .github/scripts/test_homebrew_acceptance.py
+      - name: Test Chocolatey acceptance-harness safeguards
+        run: python -B .github/scripts/test_chocolatey_acceptance.py
+      - name: Enforce workflow structural policy across the tree
+        run: >-
+          python -B .github/scripts/package_workflow_policy.py check
+          .github/workflows/package.yml
+          .github/workflows/release.yml
+          .github/workflows/ci.yml
+          .github/workflows/live-agent-smoke.yml
       - name: Validate pull-request branch flow
         if: github.event_name == 'pull_request'
         env:
@@ -130,6 +147,10 @@ jobs:
           rustup target add --toolchain "$RUST_TOOLCHAIN" "${{ matrix.target }}"
       - name: Test native live-smoke timeout safeguards
         run: python .github/scripts/test_live_agent_smoke.py
+      - name: Test native package acceptance-harness safeguards
+        run: python -B .github/scripts/test_homebrew_acceptance.py
+      - name: Test native Chocolatey acceptance-harness safeguards
+        run: python -B .github/scripts/test_chocolatey_acceptance.py
       - name: Build both executables
         run: cargo build --locked --target "${{ matrix.target }}" --bins
       - name: Run target tests and executable smoke suite

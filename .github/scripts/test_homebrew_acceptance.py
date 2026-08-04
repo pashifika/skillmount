@@ -1,0 +1,1705 @@
+#!/usr/bin/env python3
+"""Fixture tests for the native Homebrew Formula lifecycle harness."""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import shutil
+import stat
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from typing import Sequence
+
+import homebrew_acceptance as harness
+import release
+
+VERSION = "0.2.0"
+TAG = "v0.2.0"
+COMMIT = "b" * 40
+DIGEST = "c" * 64
+BASH_TEMPLATE = """_{command}() {{
+    COMPREPLY=()
+}}
+
+_{command}_before_passthrough() {{
+    _{command} "$@"
+}}
+
+if [[ "${{BASH_VERSINFO[0]}}" -ge 4 ]]; then
+    complete -F _{command}_before_passthrough -o nosort {command}
+fi
+"""
+ZSH_TEMPLATE = """#compdef {command}
+
+_{command}_complete() {{
+    local context state
+}}
+
+if [ "$funcstack[1]" = "_{command}" ]; then
+    _{command} "$@"
+else
+    compdef _{command} {command}
+fi
+"""
+FISH_TEMPLATE = """function _{command}_before_passthrough
+    not contains -- -- (commandline -opc)
+end
+
+complete -c {command} -n '_{command}_before_passthrough' -l help -d 'Print help'
+complete -c {command} -n 'not _{command}_before_passthrough' -f
+"""
+COMPLETION_TEMPLATES = {
+    "bash": BASH_TEMPLATE,
+    "zsh": ZSH_TEMPLATE,
+    "fish": FISH_TEMPLATE,
+}
+FORMULA_TEMPLATE = """# Generated for @TAG@ at @COMMIT@.
+class Skillmount < Formula
+  desc "SkillMount skill mounter"
+  homepage "https://github.com/pashifika/skillmount"
+  url "file:///tmp/skillmount-v0.2.0.tar.gz"
+  sha256 "{digest}"
+  license "MIT OR Apache-2.0"
+
+  depends_on "rust" => :build
+  depends_on :macos
+  depends_on arch: :arm64
+
+  def install
+    system "cargo", "install", "--locked", "--bin", "skillmount", *std_cargo_args
+  end
+end
+"""
+
+
+class ScriptedGateway:
+    """Fake command boundary answering only the argv prefixes a test scripts."""
+
+    def __init__(self, responses: dict[tuple[str, ...], tuple[int, str, str]]) -> None:
+        """Bind one response table and start with an empty call log."""
+
+        self.responses = responses
+        self.calls: list[tuple[str, ...]] = []
+
+    def answer(self, argv: tuple[str, ...]) -> harness.CommandEvidence:
+        """Return the scripted evidence for one argv, failing on a surprise."""
+
+        self.calls.append(argv)
+        for prefix, (status, stdout, stderr) in self.responses.items():
+            if argv[: len(prefix)] == prefix:
+                return harness.CommandEvidence(
+                    argv=argv, returncode=status, stdout=stdout, stderr=stderr
+                )
+        raise AssertionError(f"harness ran an unscripted command {argv}")
+
+    def brew(
+        self, *arguments: str, timeout: int = harness.DEFAULT_TIMEOUT
+    ) -> harness.CommandEvidence:
+        """Answer one scripted `brew` call."""
+
+        del timeout
+        return self.answer(("brew", *arguments))
+
+    def git(
+        self, *arguments: str, timeout: int = harness.DEFAULT_TIMEOUT
+    ) -> harness.CommandEvidence:
+        """Answer one scripted `git` call."""
+
+        del timeout
+        return self.answer(("git", *arguments))
+
+    def tool(
+        self, executable: str, *arguments: str, timeout: int = harness.DEFAULT_TIMEOUT
+    ) -> harness.CommandEvidence:
+        """Answer one scripted auxiliary call."""
+
+        del timeout
+        return self.answer((executable, *arguments))
+
+
+class ForbiddenGateway:
+    """Gateway proving a refusal happened before the machine was touched."""
+
+    def __init__(self) -> None:
+        """Start with an empty attempt log."""
+
+        self.calls: list[tuple[str, ...]] = []
+
+    def record(self, argv: tuple[str, ...]) -> harness.CommandEvidence:
+        """Record and reject one forbidden attempt."""
+
+        self.calls.append(argv)
+        raise AssertionError(f"harness ran {argv} before proving it was safe to do so")
+
+    def brew(
+        self, *arguments: str, timeout: int = harness.DEFAULT_TIMEOUT
+    ) -> harness.CommandEvidence:
+        """Reject any `brew` call."""
+
+        del timeout
+        return self.record(("brew", *arguments))
+
+    def git(
+        self, *arguments: str, timeout: int = harness.DEFAULT_TIMEOUT
+    ) -> harness.CommandEvidence:
+        """Reject any `git` call."""
+
+        del timeout
+        return self.record(("git", *arguments))
+
+    def tool(
+        self, executable: str, *arguments: str, timeout: int = harness.DEFAULT_TIMEOUT
+    ) -> harness.CommandEvidence:
+        """Reject any auxiliary call."""
+
+        del timeout
+        return self.record((executable, *arguments))
+
+
+def options_for(
+    repository: Path,
+    *,
+    formula_ids: Sequence[str] = harness.FORMULA_IDS,
+    phases: Sequence[str] = harness.PHASE_ORDER,
+    require_upgrade: bool = False,
+) -> harness.HarnessOptions:
+    """Return option values that need no packaging tree on disk."""
+
+    return harness.HarnessOptions(
+        repository=repository,
+        template_directory=repository / "packaging" / "homebrew",
+        formula_ids=tuple(formula_ids),
+        phases=tuple(phases),
+        version=VERSION,
+        tag=TAG,
+        commit=COMMIT,
+        source=harness.SourceArchive(url="file:///tmp/source.tar.gz", sha256=DIGEST, path=None),
+        require_upgrade=require_upgrade,
+        prior_tag=harness.PRIOR_TAG,
+    )
+
+
+class FixtureCase(unittest.TestCase):
+    """Shared on-disk fixture builders for keg, prefix, and completion trees."""
+
+    def setUp(self) -> None:
+        """Create one owned temporary tree removed after the test."""
+
+        self.root = Path(tempfile.mkdtemp(prefix="skillmount-homebrew-test-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def write_executable(self, path: Path) -> Path:
+        """Write one executable regular file."""
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        return path
+
+    def completion_text(self, shell: str, command: str) -> str:
+        """Return a realistic generated completion script for one command."""
+
+        return COMPLETION_TEMPLATES[shell].format(command=command)
+
+    def write_completions(self, root: Path, command: str, *, shells: Sequence[str] = ()) -> None:
+        """Write the canonical Homebrew-owned completion file per shell."""
+
+        for shell in shells or harness.COMPLETION_SHELLS:
+            directory, template = harness.COMPLETION_LOCATIONS[shell][0]
+            path = root / directory / template.format(command=command)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(self.completion_text(shell, command), encoding="utf-8")
+
+    def build_keg(
+        self,
+        package_id: str,
+        command: str,
+        *,
+        extra_executables: Sequence[str] = (),
+        version: str = VERSION,
+        completions: bool = True,
+    ) -> Path:
+        """Build one Cellar keg tree and return its version directory."""
+
+        keg = self.root / "Cellar" / package_id / version
+        self.write_executable(keg / "bin" / command)
+        for extra in extra_executables:
+            self.write_executable(keg / "bin" / extra)
+        if completions:
+            self.write_completions(keg, command)
+        return keg
+
+    def link_prefix(self, keg: Path, command: str, *, prefix: Path | None = None) -> Path:
+        """Link one keg executable and copy its completion files into a prefix."""
+
+        prefix = prefix if prefix is not None else self.root / "prefix"
+        (prefix / "bin").mkdir(parents=True, exist_ok=True)
+        (prefix / "bin" / command).symlink_to(keg / "bin" / command)
+        for shell in harness.COMPLETION_SHELLS:
+            for path in harness.completion_layout(keg, command=command)[shell]:
+                relative = path.relative_to(keg)
+                destination = prefix / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, destination)
+        return prefix
+
+
+class SafetyRefusalTests(FixtureCase):
+    """The three refusals that keep a developer machine untouched."""
+
+    def test_missing_opt_in_refuses_before_any_command(self) -> None:
+        """Refuse and touch nothing when the opt-in variable is absent."""
+
+        gateway = ForbiddenGateway()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            status = harness.main(
+                ["--report", str(self.root / "report.json")], environment={}, gateway=gateway
+            )
+        self.assertEqual(status, 1)
+        self.assertEqual(gateway.calls, [])
+        self.assertIn(harness.ENABLE_VARIABLE, stderr.getvalue())
+        self.assertFalse((self.root / "report.json").exists())
+
+    def test_wrong_opt_in_value_refuses(self) -> None:
+        """Refuse when the opt-in variable is set to any other value."""
+
+        for observed in ("", "0", "true", "yes"):
+            with self.subTest(observed=observed):
+                with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+                    harness.require_enabled({harness.ENABLE_VARIABLE: observed})
+                self.assertIn(repr(observed), str(caught.exception))
+        harness.require_enabled({harness.ENABLE_VARIABLE: harness.ENABLE_VALUE})
+
+    def test_unsupported_prefix_refuses_before_listing_formulae(self) -> None:
+        """Refuse an Intel or Linuxbrew prefix after exactly one probe."""
+
+        gateway = ScriptedGateway({("brew", "--prefix"): (0, "/usr/local\n", "")})
+        subject = harness.Harness(gateway, options_for(self.root))
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            subject.require_safe_state()
+        message = str(caught.exception)
+        self.assertIn("/usr/local", message)
+        self.assertIn(harness.SUPPORTED_PREFIX, message)
+        self.assertEqual(gateway.calls, [("brew", "--prefix")])
+
+    def test_supported_prefix_is_accepted(self) -> None:
+        """Accept the Apple Silicon prefix and paths under it."""
+
+        self.assertEqual(
+            harness.require_supported_prefix("/opt/homebrew\n"), Path("/opt/homebrew")
+        )
+        self.assertEqual(
+            harness.require_supported_prefix("/opt/homebrew/Cellar\n"),
+            Path("/opt/homebrew/Cellar"),
+        )
+        for malformed in ("", "\n", "opt/homebrew\n", "/opt/homebrew\n/opt/homebrew\n"):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(harness.HomebrewAcceptanceError):
+                    harness.require_supported_prefix(malformed)
+
+    def test_installed_product_formula_refuses(self) -> None:
+        """Refuse when either product Formula is already installed."""
+
+        for listing in (
+            "jq\nskillmount\nripgrep\n",
+            "skillmount-asm\n",
+            "pashifika/tap/skillmount-asm\njq\n",
+        ):
+            with self.subTest(listing=listing):
+                with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+                    harness.require_clean_formula_state(listing)
+                self.assertIn("skillmount", str(caught.exception))
+        harness.require_clean_formula_state("jq\nripgrep\nskillmount-tools\n")
+
+    def test_occupied_formula_name_refuses_through_the_gateway(self) -> None:
+        """Refuse an occupied Formula name without attempting an install."""
+
+        gateway = ScriptedGateway(
+            {
+                ("brew", "--prefix"): (0, "/opt/homebrew\n", ""),
+                ("brew", "list", "--formula"): (0, "jq\nskillmount\n", ""),
+            }
+        )
+        subject = harness.Harness(gateway, options_for(self.root))
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            subject.require_safe_state()
+        self.assertIn("skillmount", str(caught.exception))
+        self.assertEqual(
+            gateway.calls, [("brew", "--prefix"), ("brew", "list", "--formula")]
+        )
+
+    def test_failed_listing_is_not_treated_as_clean(self) -> None:
+        """Fail closed when Homebrew cannot report installed formulae."""
+
+        gateway = ScriptedGateway(
+            {
+                ("brew", "--prefix"): (0, "/opt/homebrew\n", ""),
+                ("brew", "list", "--formula"): (1, "", "brew: command failed\n"),
+            }
+        )
+        subject = harness.Harness(gateway, options_for(self.root))
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            subject.require_safe_state()
+        self.assertIn("brew list --formula", str(caught.exception))
+
+    def test_coverage_flag_touches_nothing(self) -> None:
+        """Print the scenario mapping without opting in or running a command."""
+
+        gateway = ForbiddenGateway()
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            status = harness.run(["--print-coverage"], environment={}, gateway=gateway)
+        self.assertEqual(status, 0)
+        self.assertEqual(gateway.calls, [])
+        self.assertIn("Complete paired lifecycle succeeds", stdout.getvalue())
+
+
+class KegInspectionTests(FixtureCase):
+    """Keg and prefix classification against real directory trees."""
+
+    def test_cellar_output_parsing(self) -> None:
+        """Parse exactly one absolute path from `brew --cellar`."""
+
+        self.assertEqual(
+            harness.parse_single_path("/opt/homebrew/Cellar/skillmount\n", label="brew --cellar"),
+            Path("/opt/homebrew/Cellar/skillmount"),
+        )
+        self.assertEqual(
+            harness.parse_single_path(
+                "\n  /opt/homebrew/Cellar/skillmount-asm  \n\n", label="brew --cellar"
+            ),
+            Path("/opt/homebrew/Cellar/skillmount-asm"),
+        )
+        for malformed in ("", "Cellar/skillmount\n", "/a\n/b\n"):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+                    harness.parse_single_path(malformed, label="brew --cellar")
+                self.assertIn("brew --cellar", str(caught.exception))
+
+    def test_single_keg_selection(self) -> None:
+        """Require exactly one installed keg for the expected version."""
+
+        keg = self.build_keg("skillmount", "skillmount")
+        cellar = keg.parent
+        self.assertEqual(harness.select_keg(cellar, version=VERSION), keg)
+        (cellar / "0.1.0").mkdir()
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            harness.select_keg(cellar, version=VERSION)
+        message = str(caught.exception)
+        self.assertIn("0.1.0", message)
+        self.assertIn(VERSION, message)
+        self.assertEqual(harness.keg_versions(cellar), ("0.1.0", VERSION))
+        self.assertEqual(harness.require_keg(cellar, version="0.1.0"), cellar / "0.1.0")
+        with self.assertRaises(harness.HomebrewAcceptanceError):
+            harness.require_keg(cellar, version="9.9.9")
+
+    def test_executable_listing_ignores_data_files(self) -> None:
+        """List only executable regular files directly in a directory."""
+
+        directory = self.root / "bin"
+        self.write_executable(directory / "skillmount")
+        (directory / "notes.txt").write_text("data\n", encoding="utf-8")
+        (directory / "nested").mkdir()
+        self.assertEqual(harness.executable_names_in(directory), ("skillmount",))
+        self.assertEqual(harness.executable_names_in(self.root / "absent"), ())
+
+    def test_keg_with_only_the_selected_executable_passes(self) -> None:
+        """Accept a keg holding exactly its selected command."""
+
+        for package_id, command, other in (
+            ("skillmount", "skillmount", "asm"),
+            ("skillmount-asm", "asm", "skillmount"),
+        ):
+            with self.subTest(package_id=package_id):
+                keg = self.build_keg(package_id, command)
+                self.assertEqual(
+                    harness.keg_findings(keg, command=command, other_command=other), ()
+                )
+
+    def test_keg_holding_both_executables_fails(self) -> None:
+        """Reject a keg that installed the pair member as well."""
+
+        keg = self.build_keg("skillmount", "skillmount", extra_executables=("asm",))
+        findings = harness.keg_findings(keg, command="skillmount", other_command="asm")
+        self.assertTrue(findings)
+        joined = " ".join(findings)
+        self.assertIn("asm", joined)
+        self.assertIn("skillmount", joined)
+        self.assertIn(str(keg), joined)
+
+    def test_keg_missing_the_selected_executable_fails(self) -> None:
+        """Reject a keg whose selected command never landed."""
+
+        keg = self.build_keg("skillmount-asm", "asm")
+        (keg / "bin" / "asm").unlink()
+        findings = harness.keg_findings(keg, command="asm", other_command="skillmount")
+        self.assertTrue(findings)
+        self.assertIn("expected exactly ['asm']", " ".join(findings))
+
+    def test_absent_keg_fails(self) -> None:
+        """Reject a keg directory that does not exist."""
+
+        findings = harness.keg_findings(
+            self.root / "missing", command="asm", other_command="skillmount"
+        )
+        self.assertEqual(len(findings), 1)
+        self.assertIn("is not a directory", findings[0])
+
+    def test_prefix_exposes_only_installed_commands(self) -> None:
+        """Require the prefix link to resolve into the owning keg."""
+
+        keg = self.build_keg("skillmount", "skillmount")
+        prefix = self.link_prefix(keg, "skillmount")
+        self.assertEqual(
+            harness.prefix_findings(
+                prefix,
+                keg,
+                command="skillmount",
+                other_command="asm",
+                other_installed=False,
+            ),
+            (),
+        )
+        findings = harness.prefix_findings(
+            prefix, keg, command="skillmount", other_command="asm", other_installed=True
+        )
+        self.assertTrue(findings)
+        self.assertIn("expected present", " ".join(findings))
+
+    def test_prefix_link_outside_the_keg_fails(self) -> None:
+        """Reject a product link that resolves outside its owning keg."""
+
+        keg = self.build_keg("skillmount-asm", "asm")
+        stray = self.write_executable(self.root / "elsewhere" / "asm")
+        prefix = self.root / "prefix"
+        (prefix / "bin").mkdir(parents=True)
+        (prefix / "bin" / "asm").symlink_to(stray)
+        findings = harness.prefix_findings(
+            prefix, keg, command="asm", other_command="skillmount", other_installed=False
+        )
+        self.assertTrue(findings)
+        self.assertIn(str(stray), " ".join(findings))
+
+    def test_prefix_missing_link_fails(self) -> None:
+        """Reject an install whose command never reached the prefix."""
+
+        keg = self.build_keg("skillmount", "skillmount")
+        prefix = self.root / "prefix"
+        (prefix / "bin").mkdir(parents=True)
+        findings = harness.prefix_findings(
+            prefix, keg, command="skillmount", other_command="asm", other_installed=False
+        )
+        self.assertTrue(findings)
+        self.assertIn("is absent", " ".join(findings))
+
+    def test_unrelated_pair_member_in_prefix_fails(self) -> None:
+        """Reject a prefix exposing the pair member when it is not installed."""
+
+        keg = self.build_keg("skillmount", "skillmount")
+        prefix = self.link_prefix(keg, "skillmount")
+        self.write_executable(prefix / "bin" / "asm")
+        findings = harness.prefix_findings(
+            prefix, keg, command="skillmount", other_command="asm", other_installed=False
+        )
+        self.assertTrue(findings)
+        self.assertIn("expected absent", " ".join(findings))
+
+
+class CompletionClassificationTests(FixtureCase):
+    """Completion ownership and registration classification."""
+
+    def test_layout_requires_exactly_one_file_per_shell(self) -> None:
+        """Accept one Formula-owned file per shell and reject any other count."""
+
+        keg = self.build_keg("skillmount", "skillmount")
+        layout = harness.completion_layout(keg, command="skillmount")
+        self.assertEqual(
+            harness.completion_layout_findings(layout, command="skillmount", label=f"keg {keg}"),
+            (),
+        )
+        duplicate = keg / "share" / "bash-completion" / "completions" / "skillmount"
+        duplicate.parent.mkdir(parents=True)
+        duplicate.write_text(self.completion_text("bash", "skillmount"), encoding="utf-8")
+        findings = harness.completion_layout_findings(
+            harness.completion_layout(keg, command="skillmount"),
+            command="skillmount",
+            label=f"keg {keg}",
+        )
+        self.assertEqual(len(findings), 1)
+        self.assertIn("holds 2 bash completion files", findings[0])
+
+    def test_layout_reports_a_missing_shell(self) -> None:
+        """Report a shell whose completion file was never generated."""
+
+        keg = self.build_keg("skillmount-asm", "asm", completions=False)
+        self.write_completions(keg, "asm", shells=("bash", "zsh"))
+        findings = harness.completion_layout_findings(
+            harness.completion_layout(keg, command="asm"), command="asm", label=f"keg {keg}"
+        )
+        self.assertEqual(len(findings), 1)
+        self.assertIn("0 fish completion files", findings[0])
+
+    def test_text_naming_the_selected_command_passes(self) -> None:
+        """Accept generated text that registers only the selected command."""
+
+        for command, other in (("skillmount", "asm"), ("asm", "skillmount")):
+            for shell in harness.COMPLETION_SHELLS:
+                with self.subTest(command=command, shell=shell):
+                    self.assertEqual(
+                        harness.completion_text_findings(
+                            shell,
+                            self.completion_text(shell, command),
+                            command=command,
+                            other_command=other,
+                        ),
+                        (),
+                    )
+
+    def test_text_naming_the_wrong_command_fails(self) -> None:
+        """Reject a file that registers the pair member instead."""
+
+        for shell in harness.COMPLETION_SHELLS:
+            with self.subTest(shell=shell):
+                findings = harness.completion_text_findings(
+                    shell,
+                    self.completion_text(shell, "asm"),
+                    command="skillmount",
+                    other_command="asm",
+                )
+                joined = " ".join(findings)
+                self.assertIn("lacks its registration", joined)
+                self.assertIn("registers the pair member", joined)
+                self.assertIn("mentions the pair member", joined)
+
+    def test_shared_command_model_placeholder_fails(self) -> None:
+        """Reject a file generated from a shared private command model."""
+
+        text = self.completion_text("zsh", "skillmount").replace(
+            "#compdef skillmount", "#compdef skillmount\n# usage: <asm|skillmount> completions"
+        )
+        findings = harness.completion_text_findings(
+            "zsh", text, command="skillmount", other_command="asm"
+        )
+        self.assertIn(harness.SHARED_PLACEHOLDER, " ".join(findings))
+
+    def test_empty_text_fails(self) -> None:
+        """Reject an empty completion file."""
+
+        findings = harness.completion_text_findings(
+            "fish", "\n \n", command="asm", other_command="skillmount"
+        )
+        self.assertIn("is empty", " ".join(findings))
+
+    def test_unknown_shell_is_rejected(self) -> None:
+        """Refuse to classify a shell this project does not ship."""
+
+        with self.assertRaises(harness.HomebrewAcceptanceError):
+            harness.completion_text_findings(
+                "powershell", "anything", command="asm", other_command="skillmount"
+            )
+
+    def test_linked_completions_accept_a_copy_or_a_symlink(self) -> None:
+        """Accept prefix files Homebrew exposes as either a copy or a link."""
+
+        keg = self.build_keg("skillmount", "skillmount")
+        prefix = self.link_prefix(keg, "skillmount")
+        self.assertEqual(
+            harness.linked_completion_findings(prefix, keg, command="skillmount"), ()
+        )
+        zsh_relative = Path(harness.COMPLETION_LOCATIONS["zsh"][0][0]) / "_skillmount"
+        (prefix / zsh_relative).unlink()
+        (prefix / zsh_relative).symlink_to(keg / zsh_relative)
+        self.assertEqual(
+            harness.linked_completion_findings(prefix, keg, command="skillmount"), ()
+        )
+
+    def test_linked_completions_reject_drift_and_absence(self) -> None:
+        """Reject a prefix completion file that differs or is missing."""
+
+        keg = self.build_keg("skillmount-asm", "asm")
+        prefix = self.link_prefix(keg, "asm")
+        fish_relative = Path(harness.COMPLETION_LOCATIONS["fish"][0][0]) / "asm.fish"
+        (prefix / fish_relative).write_text("complete -c asm -l other\n", encoding="utf-8")
+        findings = harness.linked_completion_findings(prefix, keg, command="asm")
+        self.assertEqual(len(findings), 1)
+        self.assertIn("digest is", findings[0])
+        (prefix / fish_relative).unlink()
+        findings = harness.linked_completion_findings(prefix, keg, command="asm")
+        self.assertEqual(len(findings), 1)
+        self.assertIn("expected exactly 1", findings[0])
+
+
+class UninstallTests(FixtureCase):
+    """Post-uninstall absence classification."""
+
+    def test_clean_uninstall_reports_nothing(self) -> None:
+        """Accept an uninstall that removed the keg, link, and completions."""
+
+        keg = self.build_keg("skillmount", "skillmount")
+        prefix = self.link_prefix(keg, "skillmount")
+        owned = {
+            str(path): harness.digest_or_none(path)
+            for shell in harness.COMPLETION_SHELLS
+            for path in harness.completion_layout(prefix, command="skillmount")[shell]
+        }
+        self.assertEqual(len(owned), len(harness.COMPLETION_SHELLS))
+        shutil.rmtree(keg)
+        (prefix / "bin" / "skillmount").unlink()
+        for name in owned:
+            Path(name).unlink()
+        self.assertEqual(
+            harness.uninstall_findings(prefix, keg, command="skillmount", owned=owned), ()
+        )
+
+    def test_surviving_keg_link_and_completion_fail(self) -> None:
+        """Reject an uninstall that left the keg, link, or completions behind."""
+
+        keg = self.build_keg("skillmount", "skillmount")
+        prefix = self.link_prefix(keg, "skillmount")
+        owned = {
+            str(path): harness.digest_or_none(path)
+            for shell in harness.COMPLETION_SHELLS
+            for path in harness.completion_layout(prefix, command="skillmount")[shell]
+        }
+        findings = harness.uninstall_findings(
+            prefix, keg, command="skillmount", owned=owned
+        )
+        joined = " ".join(findings)
+        self.assertIn("still exists after uninstall", joined)
+        self.assertIn("survived the uninstall", joined)
+        self.assertIn("survived uninstall with digest", joined)
+
+    def test_dangling_link_fails(self) -> None:
+        """Reject a completion link left pointing at a removed keg."""
+
+        keg = self.build_keg("skillmount-asm", "asm")
+        prefix = self.root / "prefix"
+        relative = Path(harness.COMPLETION_LOCATIONS["zsh"][0][0]) / "_asm"
+        (prefix / relative).parent.mkdir(parents=True)
+        (prefix / relative).symlink_to(keg / relative)
+        owned = {str(prefix / relative): harness.digest_or_none(prefix / relative)}
+        shutil.rmtree(keg)
+        findings = harness.uninstall_findings(prefix, keg, command="asm", owned=owned)
+        self.assertIn("is a dangling link after uninstall", " ".join(findings))
+
+    def test_replaced_completion_file_is_not_reported(self) -> None:
+        """Accept an unrelated file that reused the completion path."""
+
+        keg = self.build_keg("skillmount", "skillmount")
+        prefix = self.link_prefix(keg, "skillmount")
+        relative = Path(harness.COMPLETION_LOCATIONS["bash"][0][0]) / "skillmount"
+        owned = {str(prefix / relative): harness.digest_or_none(prefix / relative)}
+        shutil.rmtree(keg)
+        (prefix / "bin" / "skillmount").unlink()
+        (prefix / relative).write_text("# unrelated content\n", encoding="utf-8")
+        self.assertEqual(
+            harness.uninstall_findings(prefix, keg, command="skillmount", owned=owned), ()
+        )
+
+
+class SentinelTests(FixtureCase):
+    """Unrelated-path comparison across the lifecycle."""
+
+    def test_unchanged_paths_report_nothing(self) -> None:
+        """Accept sentinel files whose bytes never changed."""
+
+        first = self.root / "sentinel-one.txt"
+        second = self.root / "missing-profile"
+        first.write_bytes(harness.SENTINEL_CONTENT)
+        before = harness.capture_digests((first, second))
+        self.assertEqual(before[str(second)], None)
+        self.assertEqual(
+            harness.sentinel_findings(before, harness.capture_digests((first, second))), ()
+        )
+
+    def test_modified_removed_and_created_paths_fail(self) -> None:
+        """Report a changed, removed, or newly created unrelated path."""
+
+        changed = self.root / "changed.txt"
+        removed = self.root / "removed.txt"
+        created = self.root / "created.txt"
+        changed.write_bytes(harness.SENTINEL_CONTENT)
+        removed.write_bytes(harness.SENTINEL_CONTENT)
+        before = harness.capture_digests((changed, removed, created))
+        changed.write_bytes(b"tampered\n")
+        removed.unlink()
+        created.write_bytes(b"new\n")
+        findings = harness.sentinel_findings(
+            before, harness.capture_digests((changed, removed, created))
+        )
+        self.assertEqual(len(findings), 3)
+        joined = " ".join(findings)
+        self.assertIn("digest is", joined)
+        self.assertIn("was removed", joined)
+        self.assertIn("was created with digest", joined)
+
+    def test_unobserved_path_fails(self) -> None:
+        """Report a path that was not re-observed after the lifecycle."""
+
+        findings = harness.sentinel_findings({"/tmp/one": None}, {})
+        self.assertEqual(len(findings), 1)
+        self.assertIn("was not re-observed", findings[0])
+        findings = harness.sentinel_findings({}, {"/tmp/two": None})
+        self.assertEqual(len(findings), 1)
+        self.assertIn("only after", findings[0])
+
+
+class FormulaTextTests(FixtureCase):
+    """Rendered Formula text classification."""
+
+    def test_platform_requirements_are_required(self) -> None:
+        """Accept a Formula restricted to Apple Silicon macOS."""
+
+        text = FORMULA_TEMPLATE.format(digest=DIGEST)
+        self.assertEqual(harness.platform_findings(text, formula_class="skillmount"), ())
+
+    def test_missing_or_forbidden_declarations_fail(self) -> None:
+        """Reject Linux support, missing platform gates, and conflicts."""
+
+        text = FORMULA_TEMPLATE.format(digest=DIGEST)
+        without_arch = text.replace("  depends_on arch: :arm64\n", "")
+        findings = harness.platform_findings(without_arch, formula_class="skillmount")
+        self.assertIn("depends_on arch: :arm64", " ".join(findings))
+        with_conflict = text.replace(
+            "  depends_on :macos\n", '  depends_on :macos\n  conflicts_with "skillmount-asm"\n'
+        )
+        findings = harness.platform_findings(with_conflict, formula_class="skillmount")
+        self.assertIn("conflicts_with", " ".join(findings))
+        with_linux = text.replace("  depends_on :macos\n", "  on_linux do\n  end\n")
+        findings = harness.platform_findings(with_linux, formula_class="skillmount")
+        joined = " ".join(findings)
+        self.assertIn("on_linux", joined)
+        self.assertIn("depends_on :macos", joined)
+
+    def test_audit_offences_are_waived_only_for_a_local_source(self) -> None:
+        """Waive HTTPS-URL offences only while the source is a local tarball."""
+
+        output = (
+            "skillmount:\n"
+            "  * line 5: Please use a secure URL for the stable url\n"
+            "  * line 12: `desc` should not start with an article\n"
+        )
+        findings = harness.audit_findings(output, local_source=True)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("should not start with an article", findings[0])
+        findings = harness.audit_findings(output, local_source=False)
+        self.assertEqual(len(findings), 2)
+        self.assertEqual(harness.audit_findings("skillmount:\n\n", local_source=False), ())
+
+    def test_version_output_must_match_exactly(self) -> None:
+        """Require the packaged version banner both executables print."""
+
+        self.assertEqual(
+            harness.version_findings(
+                f"{release.PRODUCT_NAME} {VERSION}\n", command="asm", version=VERSION
+            ),
+            (),
+        )
+        for observed in (
+            f"{release.PRODUCT_NAME} 0.1.0\n",
+            f"asm {VERSION}\n",
+            f"{release.PRODUCT_NAME} {VERSION}\nextra\n",
+            "",
+        ):
+            with self.subTest(observed=observed):
+                findings = harness.version_findings(
+                    observed, command="asm", version=VERSION
+                )
+                self.assertEqual(len(findings), 1)
+                self.assertIn(repr(observed), findings[0])
+
+
+class SelectionTests(FixtureCase):
+    """Matrix selectors, manifest parsing, and upgrade eligibility."""
+
+    def test_formula_selection_keeps_pair_order(self) -> None:
+        """Return package ids in the immutable pair order."""
+
+        self.assertEqual(harness.select_formulae(None), harness.FORMULA_IDS)
+        self.assertEqual(harness.select_formulae([]), harness.FORMULA_IDS)
+        self.assertEqual(
+            harness.select_formulae(["skillmount-asm", "skillmount"]), harness.FORMULA_IDS
+        )
+        self.assertEqual(harness.select_formulae(["skillmount-asm"]), ("skillmount-asm",))
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            harness.select_formulae(["asm"])
+        self.assertIn("asm", str(caught.exception))
+
+    def test_phase_selection_adds_prerequisites(self) -> None:
+        """Add every prerequisite phase in canonical order."""
+
+        self.assertEqual(harness.expand_phases(None), harness.PHASE_ORDER)
+        self.assertEqual(
+            harness.expand_phases(["completions"]),
+            ("install-skillmount-alone", "completions", "install-asm-alone"),
+        )
+        self.assertEqual(
+            harness.expand_phases(["cross-uninstall"]), ("co-install", "cross-uninstall")
+        )
+        self.assertEqual(
+            harness.expand_phases(["uninstall", "selected-only"]),
+            (
+                "install-skillmount-alone",
+                "selected-only",
+                "uninstall",
+                "install-asm-alone",
+            ),
+        )
+        self.assertEqual(harness.expand_phases(["style"]), ("style",))
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            harness.expand_phases(["install"])
+        self.assertIn("install", str(caught.exception))
+
+    def test_cargo_manifest_version_is_read_from_the_package_table(self) -> None:
+        """Read the version of the root package, not of a dependency."""
+
+        manifest = (
+            '[package]\nname = "skillmount"\nversion = "0.4.2"\nedition = "2024"\n\n'
+            '[dependencies]\nclap = { version = "4.6.8" }\nversion = "9.9.9"\n'
+        )
+        self.assertEqual(harness.cargo_version_from_manifest(manifest), "0.4.2")
+        repository = Path(__file__).resolve().parents[2]
+        observed = harness.cargo_version_from_manifest(
+            (repository / "Cargo.toml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(observed, release.validate_stable_version(observed))
+        for malformed in (
+            '[dependencies]\nversion = "1.0.0"\n',
+            '[package]\nname = "skillmount"\n',
+            '[package]\nversion = "1.0.0"\nversion = "1.0.1"\n',
+            '[package]\nversion = "1.0"\n',
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(
+                    (harness.HomebrewAcceptanceError, release.ReleaseError)
+                ):
+                    harness.cargo_version_from_manifest(malformed)
+
+    def test_source_override_requires_a_digest(self) -> None:
+        """Require an explicit digest beside an overridden source URL."""
+
+        self.assertIsNone(harness.source_override(None, None))
+        override = harness.source_override("https://example.invalid/source.tar.gz", DIGEST)
+        self.assertEqual(override, harness.SourceArchive(
+            url="https://example.invalid/source.tar.gz", sha256=DIGEST, path=None
+        ))
+        self.assertFalse(override.local)
+        self.assertTrue(harness.source_override("file:///tmp/source.tar.gz", DIGEST).local)
+        for url, digest in (
+            ("https://example.invalid/source.tar.gz", None),
+            (None, DIGEST),
+            ("ftp://example.invalid/source.tar.gz", DIGEST),
+            ("https://example.invalid/a b.tar.gz", DIGEST),
+            ("https://example.invalid/source.tar.gz", "C" * 64),
+            ("https://example.invalid/source.tar.gz", "abc"),
+        ):
+            with self.subTest(url=url, digest=digest):
+                with self.assertRaises(harness.HomebrewAcceptanceError):
+                    harness.source_override(url, digest)
+
+    def test_upgrade_rehearsal_skips_a_prior_release_without_completions(self) -> None:
+        """Skip the rehearsal when the prior source predates `completions`."""
+
+        decision = harness.upgrade_decision(
+            prior_tag="v0.1.0",
+            prior_version="0.1.0",
+            candidate_version=VERSION,
+            prior_cli_source=None,
+            require_upgrade=False,
+        )
+        self.assertEqual(decision.status, "skipped")
+        self.assertFalse(decision.eligible)
+        self.assertIn("src/cli.rs", decision.reason)
+        decision = harness.upgrade_decision(
+            prior_tag="v0.1.0",
+            prior_version="0.1.0",
+            candidate_version=VERSION,
+            prior_cli_source="enum CliCommand { Mount(MountArgs) }",
+            require_upgrade=False,
+        )
+        self.assertEqual(decision.status, "skipped")
+        self.assertIn(harness.COMPLETIONS_MARKER, decision.reason)
+
+    def test_require_upgrade_turns_a_skip_into_a_failure(self) -> None:
+        """Fail the rehearsal when the operator demanded it."""
+
+        decision = harness.upgrade_decision(
+            prior_tag="v0.1.0",
+            prior_version="0.1.0",
+            candidate_version=VERSION,
+            prior_cli_source=None,
+            require_upgrade=True,
+        )
+        self.assertEqual(decision.status, "failed")
+        self.assertIn("--require-upgrade", decision.reason)
+
+    def test_upgrade_rehearsal_needs_a_newer_candidate(self) -> None:
+        """Skip a degenerate or backwards upgrade and accept a real one."""
+
+        source = "Completions(CompletionArgs) // completions"
+        equal = harness.upgrade_decision(
+            prior_tag="v0.2.0",
+            prior_version=VERSION,
+            candidate_version=VERSION,
+            prior_cli_source=source,
+            require_upgrade=False,
+        )
+        self.assertEqual(equal.status, "skipped")
+        self.assertIn("equals candidate version", equal.reason)
+        backwards = harness.upgrade_decision(
+            prior_tag="v0.3.0",
+            prior_version="0.3.0",
+            candidate_version=VERSION,
+            prior_cli_source=source,
+            require_upgrade=False,
+        )
+        self.assertEqual(backwards.status, "skipped")
+        self.assertIn("is newer than", backwards.reason)
+        eligible = harness.upgrade_decision(
+            prior_tag="v0.2.0",
+            prior_version=VERSION,
+            candidate_version="0.3.0",
+            prior_cli_source=source,
+            require_upgrade=True,
+        )
+        self.assertEqual(eligible.status, "eligible")
+        self.assertTrue(eligible.eligible)
+
+    def test_version_order_validates_before_comparing(self) -> None:
+        """Compare only validated stable versions."""
+
+        self.assertEqual(harness.version_order("1.20.3"), (1, 20, 3))
+        self.assertLess(harness.version_order("0.2.0"), harness.version_order("0.10.0"))
+        with self.assertRaises(release.ReleaseError):
+            harness.version_order("0.2.0-rc.1")
+
+
+class OptionResolutionTests(FixtureCase):
+    """Command-line resolution against a repository fixture."""
+
+    def resolve(self, arguments: Sequence[str]) -> harness.HarnessOptions:
+        """Resolve options against a minimal repository fixture."""
+
+        return harness.resolve_options(harness.argument_parser().parse_args(list(arguments)))
+
+    def setUp(self) -> None:
+        """Create a repository fixture with a manifest and templates."""
+
+        super().setUp()
+        (self.root / "packaging" / "homebrew").mkdir(parents=True)
+        (self.root / "Cargo.toml").write_text(
+            '[package]\nname = "skillmount"\nversion = "0.2.0"\n', encoding="utf-8"
+        )
+
+    def test_defaults_come_from_the_checked_out_manifest(self) -> None:
+        """Derive the version, tag, and template directory from the repository."""
+
+        options = self.resolve(["--repository", str(self.root)])
+        self.assertEqual(options.version, VERSION)
+        self.assertEqual(options.tag, TAG)
+        self.assertIsNone(options.commit)
+        self.assertIsNone(options.source)
+        self.assertEqual(options.formula_ids, harness.FORMULA_IDS)
+        self.assertEqual(options.phases, harness.PHASE_ORDER)
+        self.assertEqual(options.repository, self.root.resolve())
+        self.assertEqual(
+            options.template_directory, self.root.resolve() / "packaging" / "homebrew"
+        )
+        self.assertFalse(options.require_upgrade)
+        self.assertEqual(options.prior_tag, harness.PRIOR_TAG)
+
+    def test_selectors_and_overrides_are_validated(self) -> None:
+        """Resolve matrix selectors, a pinned commit, and a source override."""
+
+        options = self.resolve(
+            [
+                "--repository",
+                str(self.root),
+                "--formula",
+                "skillmount-asm",
+                "--phase",
+                "brew-test",
+                "--commit",
+                COMMIT,
+                "--source-url-override",
+                "https://example.invalid/source.tar.gz",
+                "--source-sha256",
+                DIGEST,
+                "--require-upgrade",
+            ]
+        )
+        self.assertEqual(options.formula_ids, ("skillmount-asm",))
+        self.assertEqual(
+            options.phases,
+            ("install-skillmount-alone", "brew-test", "install-asm-alone"),
+        )
+        self.assertEqual(options.commit, COMMIT)
+        self.assertEqual(options.source.url, "https://example.invalid/source.tar.gz")
+        self.assertTrue(options.require_upgrade)
+
+    def test_inconsistent_or_missing_inputs_fail(self) -> None:
+        """Fail closed on a mismatched tag, missing manifest, or absent templates."""
+
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            self.resolve(["--repository", str(self.root), "--tag", "v9.9.9"])
+        self.assertIn("v9.9.9", str(caught.exception))
+        with self.assertRaises((harness.HomebrewAcceptanceError, release.ReleaseError)):
+            self.resolve(["--repository", str(self.root), "--commit", "not-a-commit"])
+        shutil.rmtree(self.root / "packaging")
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            self.resolve(["--repository", str(self.root)])
+        self.assertIn("packaging", str(caught.exception))
+        (self.root / "Cargo.toml").unlink()
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            self.resolve(["--repository", str(self.root)])
+        self.assertIn("Cargo.toml", str(caught.exception))
+
+    def test_preflight_inputs_reject_a_manual_identity(self) -> None:
+        """Refuse to mix a preflight artifact with a hand-written identity."""
+
+        artifact = self.root / "inputs.json"
+        artifact.write_text("{}\n", encoding="utf-8")
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            self.resolve(
+                [
+                    "--repository",
+                    str(self.root),
+                    "--inputs",
+                    str(artifact),
+                    "--tag",
+                    TAG,
+                    "--source-sha256",
+                    DIGEST,
+                ]
+            )
+        message = str(caught.exception)
+        self.assertIn("--tag", message)
+        self.assertIn("--source-sha256", message)
+
+
+class ReportTests(FixtureCase):
+    """Report shaping, aggregation, and phase bookkeeping."""
+
+    def phases(self) -> list[harness.Phase]:
+        """Return one representative phase per status."""
+
+        passed = harness.Phase(name="style")
+        passed.record(
+            harness.CommandEvidence(
+                argv=("brew", "style", "--formula", "skillmount"),
+                returncode=0,
+                stdout="ok\n",
+                stderr="",
+            )
+        )
+        passed.note("skillmount resolved through the disposable tap")
+        passed.settle()
+        skipped = harness.Phase(name="upgrade-from-prior")
+        skipped.skip("v0.1.0 predates the completions command")
+        failed = harness.Phase(name="selected-only")
+        failed.add(("keg holds both executables",))
+        failed.settle()
+        return [passed, skipped, failed]
+
+    def test_phase_settlement_follows_findings(self) -> None:
+        """Resolve a pending phase from its findings and keep a skip intact."""
+
+        passed, skipped, failed = self.phases()
+        self.assertEqual(passed.status, "passed")
+        self.assertEqual(skipped.status, "skipped")
+        self.assertEqual(failed.status, "failed")
+        skipped.add(("late finding",))
+        skipped.settle()
+        self.assertEqual(skipped.status, "skipped")
+
+    def test_status_aggregation(self) -> None:
+        """Aggregate the report status from every phase and from cleanup."""
+
+        passed, skipped, failed = self.phases()
+        self.assertEqual(harness.aggregate_status([passed, skipped]), "passed")
+        self.assertEqual(harness.aggregate_status([skipped]), "skipped")
+        self.assertEqual(harness.aggregate_status([passed, failed]), "failed")
+        self.assertEqual(
+            harness.aggregate_status([passed, harness.Phase(name="audit")]), "incomplete"
+        )
+        self.assertEqual(harness.aggregate_status([passed], ("cleanup failed",)), "failed")
+
+    def test_report_document_round_trips(self) -> None:
+        """Shape a deterministic report document that reloads unchanged."""
+
+        phases = self.phases()
+        document = harness.build_report(
+            options=options_for(self.root),
+            commit=COMMIT,
+            source=harness.SourceArchive(
+                url="file:///tmp/skillmount-v0.2.0.tar.gz", sha256=DIGEST, path=self.root / "a"
+            ),
+            prefix=Path(harness.SUPPORTED_PREFIX),
+            environment={"brew": ["Homebrew 5.0.0"], "shells": {"bash": "bash 5.3"}},
+            phases=phases,
+            cleanup=[
+                harness.CommandEvidence(
+                    argv=("brew", "untap", harness.ACCEPTANCE_TAP),
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                )
+            ],
+            cleanup_findings=(),
+        )
+        self.assertEqual(document["schema"], harness.REPORT_SCHEMA)
+        self.assertEqual(document["status"], "failed")
+        self.assertEqual(document["tap"], harness.ACCEPTANCE_TAP)
+        self.assertEqual(document["version"], VERSION)
+        self.assertEqual(document["commit"], COMMIT)
+        self.assertEqual(document["prefix"], harness.SUPPORTED_PREFIX)
+        self.assertEqual(document["coverage_gaps"], [])
+        self.assertTrue(document["source"]["local"])
+        text = harness.report_text(document)
+        self.assertTrue(text.endswith("\n"))
+        self.assertEqual(json.loads(text), document)
+        names = [phase["name"] for phase in document["phases"]]
+        self.assertEqual(names, ["style", "upgrade-from-prior", "selected-only"])
+        self.assertEqual(
+            document["phases"][1]["reason"], "v0.1.0 predates the completions command"
+        )
+        summary = harness.summary_text(document)
+        for name in names:
+            self.assertIn(name, summary)
+        self.assertIn("keg holds both executables", summary)
+        self.assertIn("Homebrew acceptance status: failed", summary)
+
+    def test_summary_rejects_a_malformed_document(self) -> None:
+        """Fail closed when a report document has no phase list."""
+
+        with self.assertRaises(harness.HomebrewAcceptanceError):
+            harness.summary_text({"status": "passed"})
+
+    def test_evidence_is_bounded(self) -> None:
+        """Keep only the diagnostic tail of very long command output."""
+
+        self.assertEqual(harness.bounded_text("short"), "short")
+        trimmed = harness.bounded_text("a" * 40 + "TAIL", limit=8)
+        self.assertTrue(trimmed.endswith("aaaaTAIL"))
+        self.assertIn("36 earlier characters elided", trimmed)
+        with self.assertRaises(harness.HomebrewAcceptanceError):
+            harness.bounded_text("value", limit=0)
+        evidence = harness.CommandEvidence(
+            argv=("brew", "install", "--formula", "skillmount", "--extra"),
+            returncode=1,
+            stdout="x" * (harness.EVIDENCE_LIMIT + 10),
+            stderr="boom\n",
+        )
+        self.assertEqual(evidence.label, "brew install --formula skillmount")
+        shaped = evidence.to_json_object()
+        self.assertEqual(shaped["status"], 1)
+        self.assertEqual(shaped["argv"][-1], "--extra")
+        self.assertLess(len(shaped["stdout"]), len(evidence.stdout) + 40)
+        self.assertEqual(shaped["stderr"], "boom\n")
+
+
+class CoverageTests(FixtureCase):
+    """Every spec scenario maps to a named phase, and every phase proves one."""
+
+    def spec_path(self) -> Path:
+        """Return the tracked `homebrew-distribution` spec, or skip."""
+
+        repository = Path(__file__).resolve().parents[2]
+        candidates = sorted(repository.glob("rasen/**/homebrew-distribution/spec.md"))
+        if not candidates:
+            raise unittest.SkipTest("homebrew-distribution/spec.md is not in this checkout")
+        return candidates[0]
+
+    def test_no_coverage_gaps(self) -> None:
+        """Require every phase to prove at least one scenario."""
+
+        self.assertEqual(harness.coverage_gaps(), ())
+        self.assertEqual(len(harness.SCENARIO_COVERAGE), 18)
+
+    def test_every_spec_scenario_is_mapped(self) -> None:
+        """Require the mapping table to name exactly the spec's scenarios."""
+
+        text = self.spec_path().read_text(encoding="utf-8")
+        scenarios = [
+            line.removeprefix("#### Scenario:").strip()
+            for line in text.splitlines()
+            if line.startswith("#### Scenario:")
+        ]
+        self.assertEqual(len(scenarios), len(set(scenarios)))
+        self.assertEqual(
+            sorted(scenarios),
+            sorted(coverage.scenario for coverage in harness.SCENARIO_COVERAGE),
+        )
+
+    def test_every_spec_requirement_is_mapped(self) -> None:
+        """Require the mapping table to name exactly the spec's requirements."""
+
+        text = self.spec_path().read_text(encoding="utf-8")
+        requirements = [
+            line.removeprefix("### Requirement:").strip()
+            for line in text.splitlines()
+            if line.startswith("### Requirement:")
+        ]
+        self.assertEqual(
+            sorted(set(requirements)),
+            sorted({coverage.requirement for coverage in harness.SCENARIO_COVERAGE}),
+        )
+
+    def test_coverage_text_names_every_phase(self) -> None:
+        """Print a mapping that names every phase and flags no gap."""
+
+        rendered = harness.coverage_text()
+        for phase in harness.PHASE_ORDER:
+            self.assertIn(phase, rendered)
+        self.assertIn("gaps: none", rendered)
+
+
+class GatewayTests(FixtureCase):
+    """The thin command boundary, exercised without Homebrew."""
+
+    def test_output_and_status_are_captured(self) -> None:
+        """Capture status, stdout, and stderr from one real process."""
+
+        evidence = harness.run_command(
+            [
+                sys.executable,
+                "-c",
+                "import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)",
+            ]
+        )
+        self.assertEqual(evidence.returncode, 3)
+        self.assertEqual(evidence.stdout, "out\n")
+        self.assertEqual(evidence.stderr, "err\n")
+        self.assertEqual(evidence.argv[0], sys.executable)
+
+    def test_missing_executable_fails_closed(self) -> None:
+        """Report a missing executable instead of treating it as success."""
+
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            harness.run_command([str(self.root / "definitely-absent-binary")])
+        self.assertIn("is not installed", str(caught.exception))
+
+    def test_timeout_fails_closed(self) -> None:
+        """Report a hung command instead of waiting forever."""
+
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            harness.run_command(
+                [sys.executable, "-c", "import time; time.sleep(5)"], timeout=1
+            )
+        self.assertIn("exceeded 1s", str(caught.exception))
+
+    def test_homebrew_behaviour_is_pinned_off(self) -> None:
+        """Pin Homebrew's implicit update and cleanup behaviour off."""
+
+        gateway = harness.SubprocessGateway(self.root, environment={"PATH": os.environ["PATH"]})
+        for name, value in harness.HOMEBREW_PINS.items():
+            self.assertEqual(gateway.environment[name], value)
+        self.assertEqual(gateway.repository, self.root.resolve())
+
+    def test_missing_channel_model_fails_closed(self) -> None:
+        """Report the missing shared channel model instead of guessing."""
+
+        scripts = Path(harness.__file__).resolve().parent
+        saved_path = list(sys.path)
+        saved_module = sys.modules.pop("package_channels", None)
+        sys.path[:] = [
+            entry for entry in sys.path if Path(entry or ".").resolve() != scripts
+        ]
+        try:
+            with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+                harness.import_package_channels()
+            self.assertIn("package_channels.py", str(caught.exception))
+        finally:
+            sys.path[:] = saved_path
+            if saved_module is not None:
+                sys.modules["package_channels"] = saved_module
+
+    def channel_model(self) -> types.ModuleType:
+        """Return the shared channel model, or skip when it is not in the checkout."""
+
+        try:
+            return harness.import_package_channels()
+        except harness.HomebrewAcceptanceError as error:
+            raise unittest.SkipTest(str(error)) from error
+
+    def test_channel_model_selection_is_pinned(self) -> None:
+        """Require the shared channel model to keep the immutable selection map."""
+
+        module = self.channel_model()
+        self.assertEqual(
+            [identity.package_id for identity in module.PACKAGES], list(harness.FORMULA_IDS)
+        )
+        for package_id, (command, other) in harness.PACKAGE_TABLE_PINS.items():
+            identity = module.package_for(package_id)
+            self.assertEqual((identity.command, identity.other.command), (command, other))
+
+    def preflight_artifact(self, module: types.ModuleType) -> Path:
+        """Write one strictly valid preflight artifact for the release identity."""
+
+        repository = module.DEFAULT_REPOSITORY
+        archives = tuple(
+            module.ArchiveIdentity(
+                triple=target.triple,
+                name=release.asset_name(TAG, target),
+                url=module.asset_download_url(repository, TAG, release.asset_name(TAG, target)),
+                sha256=DIGEST,
+            )
+            for target in sorted(release.TARGETS, key=lambda target: target.triple)
+        )
+        inputs = module.PackageInputs(
+            repository=repository,
+            version=VERSION,
+            tag=TAG,
+            commit=COMMIT,
+            release_url=f"https://github.com/{repository}/releases/tag/{TAG}",
+            source_url=module.source_url(repository, TAG),
+            source_sha256=DIGEST,
+            archives=archives,
+        )
+        path = self.root / "inputs.json"
+        path.write_text(inputs.to_json(), encoding="utf-8")
+        return path
+
+    def test_preflight_artifact_supplies_the_release_identity(self) -> None:
+        """Take the version, tag, commit, and published source from preflight."""
+
+        module = self.channel_model()
+        path = self.preflight_artifact(module)
+        version, tag, commit, source = harness.preflight_identity(path)
+        self.assertEqual((version, tag, commit), (VERSION, TAG, COMMIT))
+        self.assertEqual(source.sha256, DIGEST)
+        self.assertTrue(source.url.startswith("https://github.com/"))
+        self.assertIn(TAG, source.url)
+        self.assertFalse(source.local)
+        self.assertIsNone(source.path)
+
+    def test_tampered_preflight_artifact_is_rejected(self) -> None:
+        """Refuse a preflight artifact whose strict validation fails."""
+
+        module = self.channel_model()
+        path = self.preflight_artifact(module)
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["source_url"] = "https://example.invalid/source.tar.gz"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            harness.preflight_identity(path)
+        self.assertIn(str(path), str(caught.exception))
+
+    def test_reordered_channel_model_is_rejected(self) -> None:
+        """Refuse a channel model whose pair order or selection drifted."""
+
+        stub = types.ModuleType("package_channels")
+        stub.PACKAGES = tuple(
+            types.SimpleNamespace(package_id=package_id)
+            for package_id in reversed(harness.FORMULA_IDS)
+        )
+        saved_module = sys.modules.get("package_channels")
+        sys.modules["package_channels"] = stub
+        try:
+            with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+                harness.import_package_channels()
+            message = str(caught.exception)
+            for package_id in harness.FORMULA_IDS:
+                self.assertIn(package_id, message)
+        finally:
+            if saved_module is None:
+                del sys.modules["package_channels"]
+            else:
+                sys.modules["package_channels"] = saved_module
+
+
+class PhaseBookkeepingTests(FixtureCase):
+    """Phase tables, aborts, and selection bookkeeping inside the harness."""
+
+    def test_unselected_phases_start_skipped(self) -> None:
+        """Mark every unselected phase as skipped before anything runs."""
+
+        subject = harness.Harness(
+            ForbiddenGateway(), options_for(self.root, phases=("style", "audit"))
+        )
+        self.assertEqual(subject.phases["style"].status, "pending")
+        self.assertEqual(subject.phases["co-install"].status, "skipped")
+        self.assertIn("--phase", subject.phases["co-install"].reason)
+        self.assertTrue(subject.enabled("style"))
+        self.assertFalse(subject.enabled("co-install"))
+        with self.assertRaises(harness.HomebrewAcceptanceError):
+            subject.phase("not-a-phase")
+
+    def test_abort_is_attributed_to_the_active_phase(self) -> None:
+        """Attribute an aborting failure to the phase that was running."""
+
+        subject = harness.Harness(ForbiddenGateway(), options_for(self.root))
+        subject.phase("audit")
+        subject.record_failure(harness.HomebrewAcceptanceError("brew audit vanished"))
+        self.assertEqual(subject.phases["audit"].status, "failed")
+        self.assertIn("brew audit vanished", " ".join(subject.phases["audit"].findings))
+
+    def test_abort_before_any_phase_lands_on_the_first_pending_phase(self) -> None:
+        """Attribute an early failure to the first phase that had not run."""
+
+        subject = harness.Harness(ForbiddenGateway(), options_for(self.root))
+        subject.record_failure(harness.HomebrewAcceptanceError("tap already exists"))
+        self.assertEqual(subject.phases["style"].status, "failed")
+        self.assertIn("tap already exists", " ".join(subject.phases["style"].findings))
+
+    def test_selection_requires_a_resolved_command_table(self) -> None:
+        """Refuse to inspect a package whose command selection is unknown."""
+
+        subject = harness.Harness(ForbiddenGateway(), options_for(self.root))
+        with self.assertRaises(harness.HomebrewAcceptanceError):
+            subject.selection("skillmount")
+        subject.commands = dict(harness.PACKAGE_TABLE_PINS)
+        self.assertEqual(subject.selection("skillmount"), ("skillmount", "asm"))
+        self.assertEqual(subject.selection("skillmount-asm"), ("asm", "skillmount"))
+        self.assertEqual(
+            subject.formula_reference("skillmount-asm"),
+            f"{harness.ACCEPTANCE_TAP}/skillmount-asm",
+        )
+
+    def test_uninstalled_package_has_no_keg(self) -> None:
+        """Refuse to resolve a keg for a package that was never installed."""
+
+        subject = harness.Harness(ForbiddenGateway(), options_for(self.root))
+        with self.assertRaises(harness.HomebrewAcceptanceError):
+            subject.keg_for("skillmount", version=VERSION)
+        with self.assertRaises(harness.HomebrewAcceptanceError):
+            subject.require_prefix()
+        with self.assertRaises(harness.HomebrewAcceptanceError):
+            subject.require_source()
+
+
+class BrewInvocationTests(FixtureCase):
+    """The exact `brew` argv this harness is documented to run."""
+
+    def harness_for(self, responses: dict[tuple[str, ...], tuple[int, str, str]]):
+        """Return a harness bound to one scripted gateway with a resolved state."""
+
+        gateway = ScriptedGateway(responses)
+        subject = harness.Harness(gateway, options_for(self.root))
+        subject.prefix = Path(harness.SUPPORTED_PREFIX)
+        subject.commands = dict(harness.PACKAGE_TABLE_PINS)
+        return gateway, subject
+
+    def test_install_names_the_formula_and_resolves_its_cellar(self) -> None:
+        """Build from source through `--formula` and record the resolved cellar."""
+
+        cellar = self.root / "Cellar" / "skillmount"
+        gateway, subject = self.harness_for(
+            {
+                ("brew", "install"): (0, "", ""),
+                ("brew", "--cellar"): (0, f"{cellar}\n", ""),
+            }
+        )
+        phase = subject.phase("install-skillmount-alone")
+        self.assertTrue(subject.install(phase, "skillmount"))
+        reference = f"{harness.ACCEPTANCE_TAP}/skillmount"
+        self.assertEqual(
+            gateway.calls,
+            [
+                ("brew", "install", "--formula", "--build-from-source", reference),
+                ("brew", "--cellar", reference),
+            ],
+        )
+        self.assertEqual(subject.installed["skillmount"], cellar)
+        phase.settle()
+        self.assertEqual(phase.status, "passed")
+
+    def test_failed_install_is_recorded_without_a_cellar_lookup(self) -> None:
+        """Turn a failed build into a finding instead of a keg inspection."""
+
+        gateway, subject = self.harness_for({("brew", "install"): (1, "", "build failed\n")})
+        phase = subject.phase("install-asm-alone")
+        self.assertFalse(subject.install(phase, "skillmount-asm"))
+        self.assertEqual(len(gateway.calls), 1)
+        self.assertNotIn("skillmount-asm", subject.installed)
+        phase.settle()
+        self.assertEqual(phase.status, "failed")
+        self.assertIn("build failed", " ".join(phase.findings))
+
+    def test_brew_test_takes_no_formula_flag(self) -> None:
+        """Run `brew test installed_formula`, which accepts no `--formula`."""
+
+        gateway, subject = self.harness_for({("brew", "test"): (0, "", "")})
+        subject.observe_brew_test("skillmount-asm")
+        self.assertEqual(
+            gateway.calls, [("brew", "test", f"{harness.ACCEPTANCE_TAP}/skillmount-asm")]
+        )
+        subject.phases["brew-test"].settle()
+        self.assertEqual(subject.phases["brew-test"].status, "passed")
+
+    def test_uninstall_names_the_formula(self) -> None:
+        """Remove exactly one Formula and forget it only when Homebrew agreed."""
+
+        gateway, subject = self.harness_for({("brew", "uninstall"): (0, "", "")})
+        subject.installed["skillmount"] = self.root / "Cellar" / "skillmount"
+        subject.uninstall("skillmount")
+        self.assertEqual(
+            gateway.calls,
+            [("brew", "uninstall", "--formula", f"{harness.ACCEPTANCE_TAP}/skillmount")],
+        )
+        self.assertEqual(subject.installed, {})
+        self.assertEqual(len(subject.cleanup_commands), 1)
+
+    def test_failed_uninstall_keeps_the_package_and_reports_it(self) -> None:
+        """Keep a Formula recorded when its uninstall failed, and report cleanup."""
+
+        gateway, subject = self.harness_for({("brew", "uninstall"): (1, "", "locked\n")})
+        subject.installed["skillmount"] = self.root / "Cellar" / "skillmount"
+        subject.cleanup()
+        self.assertIn("skillmount", subject.installed)
+        self.assertIn("locked", " ".join(subject.cleanup_findings))
+        self.assertEqual(gateway.calls[0][:2], ("brew", "uninstall"))
+
+    def test_tap_creation_refuses_leftover_state(self) -> None:
+        """Refuse to reuse a disposable tap directory that already exists."""
+
+        existing = self.root / "Taps" / "skillmount-acceptance" / "homebrew-homebrew-tap"
+        existing.mkdir(parents=True)
+        gateway, subject = self.harness_for(
+            {("brew", "--repository"): (0, f"{existing}\n", "")}
+        )
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            subject.create_tap()
+        message = str(caught.exception)
+        self.assertIn(str(existing), message)
+        self.assertIn(f"brew untap {harness.ACCEPTANCE_TAP}", message)
+        self.assertFalse(subject.tapped)
+        self.assertEqual(gateway.calls, [("brew", "--repository", harness.ACCEPTANCE_TAP)])
+
+    def test_tap_creation_places_both_formulae(self) -> None:
+        """Create the tap without Git and copy both rendered Formulae into it."""
+
+        located = self.root / "Taps" / "skillmount-acceptance" / "homebrew-homebrew-tap"
+        gateway, subject = self.harness_for(
+            {
+                ("brew", "--repository"): (0, f"{located}\n", ""),
+                ("brew", "tap-new"): (0, "", ""),
+            }
+        )
+        self.assertEqual(subject.create_tap(), located)
+        self.assertTrue(subject.tapped)
+        self.assertTrue((located / "Formula").is_dir())
+        self.assertEqual(
+            gateway.calls,
+            [
+                ("brew", "--repository", harness.ACCEPTANCE_TAP),
+                ("brew", "tap-new", "--no-git", harness.ACCEPTANCE_TAP),
+            ],
+        )
+        rendered = {}
+        for package_id in harness.FORMULA_IDS:
+            path = self.root / "candidate" / "Formula" / f"{package_id}.rb"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"# {package_id}\n", encoding="utf-8")
+            rendered[package_id] = path
+        placed = subject.place_formulae(rendered)
+        self.assertEqual(sorted(placed), sorted(harness.FORMULA_IDS))
+        for package_id, path in placed.items():
+            self.assertEqual(path, located / "Formula" / f"{package_id}.rb")
+            self.assertEqual(path.read_text(encoding="utf-8"), f"# {package_id}\n")
+        del rendered["skillmount-asm"]
+        with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+            subject.place_formulae(rendered)
+        self.assertIn("skillmount-asm", str(caught.exception))
+
+    def test_style_requires_tap_ownership(self) -> None:
+        """Reject a Formula reference that resolves outside the owned tap."""
+
+        located = self.root / "Taps" / "skillmount-acceptance" / "homebrew-homebrew-tap"
+        stray = self.root / "elsewhere" / "skillmount.rb"
+        stray.parent.mkdir(parents=True)
+        stray.write_text("# stray\n", encoding="utf-8")
+        gateway, subject = self.harness_for(
+            {
+                ("brew", "formula"): (0, f"{stray}\n", ""),
+                ("brew", "style"): (0, "", ""),
+            }
+        )
+        subject.tap_root = located
+        located.mkdir(parents=True)
+        subject.phase_style()
+        phase = subject.phases["style"]
+        self.assertEqual(phase.status, "failed")
+        self.assertIn(str(stray), " ".join(phase.findings))
+        self.assertIn("disposable tap", " ".join(phase.findings))
+        self.assertIn(
+            ("brew", "style", "--formula", f"{harness.ACCEPTANCE_TAP}/skillmount"),
+            gateway.calls,
+        )
+
+    def test_style_accepts_tap_owned_formulae(self) -> None:
+        """Accept both Formulae when the owned tap resolves them."""
+
+        located = self.root / "Taps" / "skillmount-acceptance" / "homebrew-homebrew-tap"
+        (located / "Formula").mkdir(parents=True)
+        owned = located / "Formula" / "skillmount.rb"
+        owned.write_text("# owned\n", encoding="utf-8")
+        gateway, subject = self.harness_for(
+            {
+                ("brew", "formula"): (0, f"{owned}\n", ""),
+                ("brew", "style"): (0, "", ""),
+            }
+        )
+        subject.tap_root = located
+        subject.phase_style()
+        phase = subject.phases["style"]
+        self.assertEqual(phase.status, "passed")
+        self.assertEqual(len(phase.observations), len(harness.FORMULA_IDS))
+        self.assertEqual(len(gateway.calls), 2 * len(harness.FORMULA_IDS))
+
+    def test_channel_errors_become_harness_errors(self) -> None:
+        """Translate a rendering rejection into this harness's own error type."""
+
+        class StubError(RuntimeError):
+            """Stand-in for package_channels.ChannelError."""
+
+        stub = types.ModuleType("package_channels")
+        stub.ChannelError = StubError
+        stub.DEFAULT_REPOSITORY = "pashifika/skillmount"
+        stub.PACKAGES = tuple(
+            types.SimpleNamespace(
+                package_id=package_id,
+                command=command,
+                other=types.SimpleNamespace(command=other),
+            )
+            for package_id, (command, other) in harness.PACKAGE_TABLE_PINS.items()
+        )
+        stub.package_for = lambda package_id: next(
+            identity for identity in stub.PACKAGES if identity.package_id == package_id
+        )
+        stub.PackageInputs = lambda **values: values
+
+        def reject(inputs, *, template_directory, output_directory):
+            raise StubError("template @UNKNOWN@ token is not a known value")
+
+        stub.generate_formulae = reject
+        saved_module = sys.modules.get("package_channels")
+        sys.modules["package_channels"] = stub
+        try:
+            _, subject = self.harness_for({})
+            source = harness.SourceArchive(
+                url="file:///tmp/source.tar.gz", sha256=DIGEST, path=None
+            )
+            with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
+                subject.render_formulae(
+                    self.root / "candidate", source=source, version=VERSION, tag=TAG
+                )
+            message = str(caught.exception)
+            self.assertIn("@UNKNOWN@", message)
+            self.assertIn("packaging", message)
+        finally:
+            if saved_module is None:
+                del sys.modules["package_channels"]
+            else:
+                sys.modules["package_channels"] = saved_module
+
+
+if __name__ == "__main__":
+    unittest.main()
