@@ -184,3 +184,7 @@ cargo deny --locked check
 See [`docs/architecture.md`](docs/architecture.md) for mutation ordering, module boundaries, and
 implementation status, and [`CONTRIBUTING.md`](CONTRIBUTING.md) for the branch and pull-request
 workflow.
+
+Maintainers preparing a stable version must also follow
+[`docs/releasing.md`](docs/releasing.md) for version/tag provenance, manual rehearsal, package and
+checksum verification, controlled draft retry, and tag-protection evidence.
