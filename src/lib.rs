@@ -17,6 +17,7 @@ mod app;
 pub mod catalog;
 pub mod checkpoint;
 mod cli;
+mod completion;
 pub mod diagnostic;
 pub mod domain;
 pub mod error;

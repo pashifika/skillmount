@@ -4,12 +4,13 @@
 //! executable, including the error paths, because that is what an operator actually runs.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
+const SKILLMOUNT: &str = env!("CARGO_BIN_EXE_skillmount");
 
 /// A fixture holding a project, a Skill source, and a private home directory.
 ///
@@ -65,7 +66,11 @@ impl Fixture {
     }
 
     fn command(&self, arguments: &[&str]) -> Command {
-        let mut command = Command::new(ASM);
+        self.command_for(ASM, arguments)
+    }
+
+    fn command_for(&self, binary: &str, arguments: &[&str]) -> Command {
+        let mut command = Command::new(binary);
         command
             .current_dir(&self.project)
             .args(arguments)
@@ -169,6 +174,21 @@ fn fake_agent_executable(root: &Path, sentinel: &Path) -> PathBuf {
     }
 }
 
+fn create_broken_directory_link(link: &Path, missing_target: &Path) {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(missing_target, link);
+    #[cfg(windows)]
+    let result = std::os::windows::fs::symlink_dir(missing_target, link);
+
+    if let Err(error) = result {
+        assert!(
+            std::env::var_os("SKILLMOUNT_REQUIRE_LINKS").is_none(),
+            "required broken-link fixture could not be created at {}: {error}",
+            link.display()
+        );
+    }
+}
+
 /// Records a tree without following links, so a replaced link shows up as a difference.
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, String> {
     let mut entries = BTreeMap::new();
@@ -189,7 +209,10 @@ fn collect(root: &Path, current: &Path, entries: &mut BTreeMap<PathBuf, String>)
     } else if file_type.is_dir() {
         "dir".to_owned()
     } else {
-        format!("file {}", metadata.len())
+        fs::read(current).map_or_else(
+            |_| "unreadable file".to_owned(),
+            |bytes| format!("file {bytes:?}"),
+        )
     };
     if let Ok(relative) = current.strip_prefix(root) {
         entries.insert(relative.to_path_buf(), descriptor);
@@ -202,6 +225,75 @@ fn collect(root: &Path, current: &Path, entries: &mut BTreeMap<PathBuf, String>)
             collect(root, &child.path(), entries);
         }
     }
+}
+
+#[test]
+fn completions_ignore_invalid_state_and_leave_every_sentinel_unchanged() {
+    use fs4::FileExt;
+
+    let fixture = Fixture::new("completions-invalid-state");
+    let arguments = ["completions", "powershell"];
+    let baseline = [ASM, SKILLMOUNT].map(|binary| {
+        fixture
+            .command_for(binary, &arguments)
+            .output()
+            .expect("baseline completion should run")
+    });
+    for output in &baseline {
+        assert!(output.status.success());
+        assert!(!output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+
+    fixture.skill("alpha");
+    fs::write(fixture.project.join("project-sentinel"), b"project bytes")
+        .expect("project sentinel");
+    fs::write(fixture.sources.join("source-sentinel"), b"source bytes").expect("source sentinel");
+    let discovery = fixture.project.join(".agents/skills");
+    fs::create_dir_all(&discovery).expect("discovery directory");
+    create_broken_directory_link(
+        &discovery.join("broken-skill"),
+        &fixture.root.join("missing-discovery-target"),
+    );
+
+    let transactions = fixture.root.join("state/transactions");
+    fs::create_dir_all(&transactions).expect("transaction directory");
+    fs::write(
+        transactions.join("corrupt.journal"),
+        b"not a SkillMount journal\n",
+    )
+    .expect("corrupt journal");
+    let locks = fixture.root.join("state/locks");
+    fs::create_dir_all(&locks).expect("lock directory");
+    let active_lock_path = locks.join("active.lock");
+    let active_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&active_lock_path)
+        .expect("active lock file");
+    fs::write(&active_lock_path, b"held by read-only completion test\n").expect("lock owner");
+    FileExt::lock(&active_lock).expect("active advisory lock");
+
+    let before = snapshot(&fixture.root);
+    for ((binary, expected), product) in [ASM, SKILLMOUNT]
+        .into_iter()
+        .zip(baseline)
+        .zip(["asm", "skillmount"])
+    {
+        let output = fixture
+            .command_for(binary, &arguments)
+            .output()
+            .expect("completion should ignore invalid state");
+        assert!(output.status.success(), "{product}");
+        assert_eq!(output.stdout, expected.stdout, "{product}");
+        assert!(output.stderr.is_empty(), "{product}");
+        assert_eq!(snapshot(&fixture.root), before, "{product}");
+        assert!(!fixture.launch_sentinel.exists(), "{product}");
+    }
+
+    FileExt::unlock(&active_lock).expect("active advisory lock should release");
 }
 
 #[test]

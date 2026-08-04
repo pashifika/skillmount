@@ -41,6 +41,8 @@ jobs:
         run: python .github/scripts/test_branch_policy.py
       - name: Test live-smoke harness safeguards
         run: python .github/scripts/test_live_agent_smoke.py
+      - name: Test shell-completion harness safeguards
+        run: python .github/scripts/test_shell_completion_acceptance.py
       - name: Test release preparation safeguards
         run: python -B .github/scripts/test_release.py
       - name: Test release publication safeguards
@@ -133,6 +135,93 @@ jobs:
       - name: Run target tests and executable smoke suite
         run: cargo test --locked --target "${{ matrix.target }}" --all-features
 
+  shell-completions-macos:
+    name: shell-completions-macos
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      EXPECTED_BASH_VERSION: "5.3.15"
+      EXPECTED_FISH_VERSION: "4.8.1"
+      EXPECTED_ZSH_VERSION: "5.9.2"
+      HOMEBREW_CORE_REVISION: "56c6e019582b3f324c7db4e4ddac1d9a39539e35"
+      HOMEBREW_NO_ANALYTICS: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - name: Provision pinned native shells
+        run: |
+          brew tap --force homebrew/core
+          core="$(brew --repository homebrew/core)"
+          git -C "$core" fetch --depth=1 origin "$HOMEBREW_CORE_REVISION"
+          git -C "$core" checkout --detach "$HOMEBREW_CORE_REVISION"
+          brew install bash zsh fish
+          test "$("$(brew --prefix bash)/bin/bash" -c 'printf %s "$BASH_VERSION"' | cut -d '(' -f 1)" = "$EXPECTED_BASH_VERSION"
+          test "$("$(brew --prefix zsh)/bin/zsh" -fc 'printf %s "$ZSH_VERSION"')" = "$EXPECTED_ZSH_VERSION"
+          test "$("$(brew --prefix fish)/bin/fish" -c 'printf %s "$version"')" = "$EXPECTED_FISH_VERSION"
+          printf '%s\n' \
+            "$(brew --prefix bash)/bin" \
+            "$(brew --prefix zsh)/bin" \
+            "$(brew --prefix fish)/bin" >> "$GITHUB_PATH"
+      - name: Build optimized executables
+        run: cargo build --locked --release --bins
+      - name: Record optimized executable sizes
+        run: wc -c target/release/asm target/release/skillmount
+      - name: Test acceptance-harness safeguards
+        run: python3 .github/scripts/test_shell_completion_acceptance.py
+      - name: Exercise Bash, Zsh, and Fish completions
+        run: >-
+          python3 .github/scripts/shell_completion_acceptance.py
+          --asm target/release/asm
+          --skillmount target/release/skillmount
+          --target aarch64-apple-darwin
+          --shell bash
+          --shell zsh
+          --shell fish
+
+  shell-completions-windows:
+    name: shell-completions-windows (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - i686-pc-windows-msvc
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust target
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup target add --toolchain "$RUST_TOOLCHAIN" "${{ matrix.target }}"
+      - name: Build optimized executables
+        run: cargo build --locked --release --target "${{ matrix.target }}" --bins
+      - name: Record optimized executable sizes
+        run: >-
+          Get-Item
+          "target/${{ matrix.target }}/release/asm.exe",
+          "target/${{ matrix.target }}/release/skillmount.exe"
+          | ForEach-Object { "$($_.Name) $($_.Length)" }
+      - name: Test acceptance-harness safeguards
+        run: python .github/scripts/test_shell_completion_acceptance.py
+      - name: Exercise native PowerShell completions
+        run: >-
+          python .github/scripts/shell_completion_acceptance.py
+          --asm "target/${{ matrix.target }}/release/asm.exe"
+          --skillmount "target/${{ matrix.target }}/release/skillmount.exe"
+          --target "${{ matrix.target }}"
+          --shell powershell
+
   gate:
     name: gate
     if: ${{ always() }}
@@ -140,6 +229,8 @@ jobs:
       - branch-policy
       - quality
       - test
+      - shell-completions-macos
+      - shell-completions-windows
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -148,11 +239,15 @@ jobs:
           BRANCH_POLICY_RESULT: ${{ needs.branch-policy.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
           TEST_RESULT: ${{ needs.test.result }}
+          SHELL_COMPLETIONS_MACOS_RESULT: ${{ needs.shell-completions-macos.result }}
+          SHELL_COMPLETIONS_WINDOWS_RESULT: ${{ needs.shell-completions-windows.result }}
         run: |
           if [[ "$BRANCH_POLICY_RESULT" != "success" || \
                 "$QUALITY_RESULT" != "success" || \
-                "$TEST_RESULT" != "success" ]]; then
-            echo "::error::Required job results: branch-policy=$BRANCH_POLICY_RESULT quality=$QUALITY_RESULT test=$TEST_RESULT"
+                "$TEST_RESULT" != "success" || \
+                "$SHELL_COMPLETIONS_MACOS_RESULT" != "success" || \
+                "$SHELL_COMPLETIONS_WINDOWS_RESULT" != "success" ]]; then
+            echo "::error::Required job results: branch-policy=$BRANCH_POLICY_RESULT quality=$QUALITY_RESULT test=$TEST_RESULT shell-completions-macos=$SHELL_COMPLETIONS_MACOS_RESULT shell-completions-windows=$SHELL_COMPLETIONS_WINDOWS_RESULT"
             exit 1
           fi
           echo "All required CI jobs succeeded."

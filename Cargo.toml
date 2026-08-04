@@ -48,6 +48,9 @@ pedantic = "deny"
 
 [dependencies]
 clap = { version = "=4.6.5", features = ["derive"] }
+# Completion generation uses only the stable ahead-of-time API. Keep default and unstable dynamic
+# features disabled so this read-only command does not acquire callback or executable-probing code.
+clap_complete = { version = "=4.6.8", default-features = false }
 # Real operating-system advisory locks. `flock` and `LockFileEx` are the liveness signal the
 # transaction layer needs, and neither is reachable from the standard library. `fs4` wraps exactly
 # those two calls, keeps locking-related unsafe within the two audited link FFI modules (ADR 0011),

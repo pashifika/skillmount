@@ -67,6 +67,74 @@ Arguments after the standalone `--` are passed as distinct platform-native value
 joined into a shell command. Use `--agent-bin path/to/codex` or `--agent-bin path/to/claude` to pin
 an executable; otherwise the agent is resolved through `PATH`.
 
+## Shell completion
+
+`completions` writes one static script to stdout. It does not create a completion directory, edit a
+profile, inspect Skills or agent state, or install anything. Output is bound to the executable name
+that generated it, so install `asm` output for `asm` and `skillmount` output for the fallback name.
+Regenerate the file after upgrading SkillMount.
+
+For Bash, generate either or both files, then add the matching `source` line to `~/.bashrc`:
+
+```text
+mkdir -p ~/.local/share/skillmount/completions
+asm completions bash > ~/.local/share/skillmount/completions/asm.bash
+skillmount completions bash > ~/.local/share/skillmount/completions/skillmount.bash
+
+source ~/.local/share/skillmount/completions/asm.bash
+source ~/.local/share/skillmount/completions/skillmount.bash
+```
+
+For Zsh, put the generated function in a directory on `fpath`:
+
+```text
+mkdir -p ~/.zfunc
+asm completions zsh > ~/.zfunc/_asm
+skillmount completions zsh > ~/.zfunc/_skillmount
+```
+
+Place the `fpath` assignment before any existing `compinit` call. If `~/.zshrc` does not initialize
+completion yet, add all three lines:
+
+```text
+fpath=(~/.zfunc $fpath)
+autoload -Uz compinit
+compinit
+```
+
+Fish discovers command-named files in its user completion directory:
+
+```text
+mkdir -p ~/.config/fish/completions
+asm completions fish > ~/.config/fish/completions/asm.fish
+skillmount completions fish > ~/.config/fish/completions/skillmount.fish
+```
+
+For PowerShell, generate the files under the current user's profile directory:
+
+```powershell
+$CompletionRoot = Join-Path (Split-Path -Parent $PROFILE.CurrentUserAllHosts) "completions"
+New-Item -ItemType Directory -Force -Path $CompletionRoot
+asm completions powershell |
+    Set-Content -LiteralPath (Join-Path $CompletionRoot "asm.ps1")
+skillmount completions powershell |
+    Set-Content -LiteralPath (Join-Path $CompletionRoot "skillmount.ps1")
+```
+
+Add the matching registrations to `$PROFILE.CurrentUserAllHosts`:
+
+```powershell
+$SkillMountCompletionRoot = Join-Path (Split-Path -Parent $PROFILE.CurrentUserAllHosts) "completions"
+. (Join-Path $SkillMountCompletionRoot "asm.ps1")
+. (Join-Path $SkillMountCompletionRoot "skillmount.ps1")
+```
+
+Keep only the lines for executable names you use. The generated completer is static: tab completion
+does not run SkillMount or an agent, and wrapper candidates stop at the session `--` delimiter.
+Arguments beyond that delimiter remain opaque for the selected agent or another agent-owned
+completer. Homebrew, Chocolatey, and other downstream packages own their completion-file placement
+and shell-integration policy; this command supplies the package-independent generation interface.
+
 ## Catalog and conflict rules
 
 The catalog is a deterministic rightmost-wins overlay. SkillMount retains every displaced origin
