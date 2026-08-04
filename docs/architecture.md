@@ -645,6 +645,14 @@ through a GitHub App token scoped to that repository. The Chocolatey Community R
 package moderation and public listing per package ID. Each publisher runs behind its own protected
 GitHub Environment — `homebrew` and `chocolatey` — holding only that channel's credential;
 preflight, generation, and acceptance jobs hold no external credential.
+
+Before that external tap can enforce its required check, one reviewed pre-protection bootstrap
+change installs the tap-owned workflow and maintainer documents without any Formula. The workflow
+accepts this state only while the baseline is complete and no Formula exists in either the tree or
+its checked-out history; partial, extra, symlinked, or later-deleted Formulae fail. After the
+bootstrap push passes, `main` gains its required `formulae` check and review rule before the
+tap-scoped GitHub App is installed. This is the tap's only permitted pre-protection change.
+
 Homebrew's tap trust state is a further operator-owned boundary: Homebrew refuses to install a
 Formula from an untrusted third-party tap, so an install requires a name-keyed operator
 `brew trust` first. The entry survives upgrades of an installed Formula but is dropped when that

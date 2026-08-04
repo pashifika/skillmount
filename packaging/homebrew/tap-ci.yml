@@ -49,7 +49,80 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The repository must carry its workflow and maintainer documents before the first
+      # release exists. That one unpublished state may skip Formula lifecycle work, but only
+      # while neither Formula has ever appeared in this branch's history. Once published,
+      # deleting both Formulae must fail rather than turn the bootstrap allowance back on.
+      - name: Classify the tap publication state
+        id: publication
+        env:
+          TAP_SOURCE: ${{ github.workspace }}/tap-source
+        run: |
+          set -euo pipefail
+          formula_directory="$TAP_SOURCE/Formula"
+          formula_count=0
+          if [ -d "$formula_directory" ]; then
+            formula_count="$(
+              find "$formula_directory" -mindepth 1 -maxdepth 1 -name '*.rb' |
+                wc -l |
+                tr -d '[:space:]'
+            )"
+          fi
+
+          skillmount=absent
+          if [ -f "$formula_directory/skillmount.rb" ] &&
+            [ ! -L "$formula_directory/skillmount.rb" ]; then skillmount=present; fi
+          skillmount_asm=absent
+          if [ -f "$formula_directory/skillmount-asm.rb" ] &&
+            [ ! -L "$formula_directory/skillmount-asm.rb" ]; then skillmount_asm=present; fi
+
+          if [ "$skillmount" = present ] &&
+            [ "$skillmount_asm" = present ] &&
+            [ "$formula_count" = 2 ]
+          then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$skillmount" = absent ] &&
+            [ "$skillmount_asm" = absent ] &&
+            [ "$formula_count" = 0 ]
+          then
+            if git -C "$TAP_SOURCE" rev-list -n 1 HEAD -- Formula | grep -q .; then
+              echo "::error::both Formulae are absent after a Formula existed in tap history"
+              exit 1
+            fi
+
+            missing=""
+            for required in .github/workflows/tap.yml README.md CONTRIBUTING.md SECURITY.md; do
+              if [ ! -f "$TAP_SOURCE/$required" ]; then missing="$missing $required"; fi
+            done
+            if [ -n "$missing" ]; then
+              echo "::error::unpublished tap is missing required bootstrap files:$missing"
+              exit 1
+            fi
+
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Formula lifecycle skipped: this tap has never published a Formula"
+            exit 0
+          fi
+
+          echo "::error::expected exactly the skillmount Formula pair or a never-published tap;" \
+            " observed skillmount=$skillmount, skillmount-asm=$skillmount_asm," \
+            " rb_files=$formula_count"
+          exit 1
+
+      - name: Record the unpublished bootstrap state
+        if: steps.publication.outputs.published == 'false'
+        run: |
+          {
+            echo "### Homebrew tap"
+            echo
+            echo "Bootstrap documents and CI are present; no Formula has been published."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Register the checkout as a local tap
+        if: steps.publication.outputs.published == 'true'
         run: |
           set -euo pipefail
           tap_directory="$(brew --repository)/Library/Taps/pashifika/$TAP_DIRECTORY_NAME"
@@ -60,6 +133,7 @@ jobs:
           ls -1 "$tap_directory/Formula"
 
       - name: Trust this tap so Homebrew will load its formulae
+        if: steps.publication.outputs.published == 'true'
         run: |
           set -euo pipefail
           # Homebrew 6 refuses to load a formula from a non-official tap until it is trusted:
@@ -72,6 +146,7 @@ jobs:
           cat "$RUNNER_TEMP/trust.json"
 
       - name: Record Homebrew, OS, and shell provenance
+        if: steps.publication.outputs.published == 'true'
         run: |
           set -euo pipefail
           brew --version
@@ -83,6 +158,7 @@ jobs:
           if command -v fish > /dev/null 2>&1; then fish --version; fi
 
       - name: Install the shared verification helpers
+        if: steps.publication.outputs.published == 'true'
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/tap-checks.sh" <<'CHECKS'
@@ -196,15 +272,18 @@ jobs:
           bash -n "$RUNNER_TEMP/tap-checks.sh"
 
       - name: Check formula style
+        if: steps.publication.outputs.published == 'true'
         run: brew style --formula "$TAP/skillmount" "$TAP/skillmount-asm"
 
       - name: Audit both formulae strictly
+        if: steps.publication.outputs.published == 'true'
         run: |
           set -euo pipefail
           brew audit --strict --formula "$TAP/skillmount"
           brew audit --strict --formula "$TAP/skillmount-asm"
 
       - name: Install, test, and verify skillmount
+        if: steps.publication.outputs.published == 'true'
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/tap-checks.sh"
@@ -217,6 +296,7 @@ jobs:
           require_absent skillmount
 
       - name: Install, test, and verify skillmount-asm
+        if: steps.publication.outputs.published == 'true'
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/tap-checks.sh"
@@ -227,6 +307,7 @@ jobs:
           require_reports_version asm "$(formula_version "$TAP/skillmount-asm")"
 
       - name: Verify co-installation and cross-uninstall
+        if: steps.publication.outputs.published == 'true'
         run: |
           set -euo pipefail
           . "$RUNNER_TEMP/tap-checks.sh"
@@ -251,6 +332,7 @@ jobs:
       # The upgrade rehearsal proves the release this pull request introduces can be reached
       # from the revision already on the base branch, which is the only path a user takes.
       - name: Verify upgrade from the base revision
+        if: steps.publication.outputs.published == 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
@@ -317,7 +399,7 @@ jobs:
           require_absent asm
 
       - name: Leave the runner without SkillMount installed
-        if: ${{ always() }}
+        if: ${{ always() && steps.publication.outputs.published == 'true' }}
         run: |
           brew uninstall --formula --ignore-dependencies "$TAP/skillmount" || true
           brew uninstall --formula --ignore-dependencies "$TAP/skillmount-asm" || true

@@ -88,6 +88,21 @@ The `homebrew` environment exposes only the tap-scoped GitHub App credentials
 `CHOCOLATEY_API_KEY`. A workflow run that requests any other secret, or a secret from the wrong
 job, fails the tracked workflow policy check.
 
+## Bootstrap the Homebrew tap
+
+Before the first package release, create the tap with a minimal default-branch commit, then land
+one reviewed tap-owned change that copies `packaging/homebrew/tap-ci.yml` to
+`.github/workflows/tap.yml` and copies `packaging/homebrew/tap/{README,CONTRIBUTING,SECURITY}.md` to
+the tap root. The `formulae` job reports this as an unpublished bootstrap and skips Homebrew
+lifecycle work only when all four files exist, neither expected Formula exists, no other Ruby
+Formula exists, and no Formula has ever existed in the checked-out history.
+
+This allowance is one-way. A partial pair, an extra Formula, or deletion after either Formula has
+appeared fails the classifier; it cannot turn a published tap back into the bootstrap state. After
+the bootstrap push passes, protect `main`, require the `formulae` check and review, and only then
+install the tap-scoped GitHub App or enable the publisher. Record the initial reviewed bootstrap as
+the sole pre-protection change.
+
 ## Review the paired tap pull request
 
 The Homebrew publisher never pushes the tap's protected default branch. It writes both rendered
