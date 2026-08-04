@@ -1435,6 +1435,8 @@ fn cross_project_quarantine_names_the_recorded_project_cleanup_argv() {
         .output()
         .expect("cross-project recovery attempt");
     let stderr = String::from_utf8_lossy(&refused.stderr);
+    let recorded_project = fs::canonicalize(&fixture.project).expect("recorded project root");
+    let unrelated_project = fs::canonicalize(&second_project).expect("unrelated project root");
 
     assert_eq!(refused.status.code(), Some(75), "{stderr}");
     let recovery_project = stderr
@@ -1442,11 +1444,11 @@ fn cross_project_quarantine_names_the_recorded_project_cleanup_argv() {
         .find(|line| line.contains("recovery[0] argv[3] ="))
         .expect("targeted project recovery argv");
     assert!(
-        recovery_project.contains(&fixture.project.to_string_lossy().into_owned()),
+        recovery_project.contains(&recorded_project.to_string_lossy().into_owned()),
         "the recovery command must target the quarantined journal's project: {recovery_project}"
     );
     assert!(
-        !recovery_project.contains(&second_project.to_string_lossy().into_owned()),
+        !recovery_project.contains(&unrelated_project.to_string_lossy().into_owned()),
         "the current but unrelated project must not be suggested: {recovery_project}"
     );
     assert!(exists(&fixture.project.join(".agents/skills/alpha")));
