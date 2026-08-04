@@ -17,6 +17,11 @@ target
 __pycache__/
 *.py[cod]
 
+# Machine-local planning and design inputs are managed outside the product repository.
+/.rasen/
+/rasen/
+/local_docs/
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

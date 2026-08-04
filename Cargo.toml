@@ -15,6 +15,19 @@ path = "src/bin/asm.rs"
 name = "skillmount"
 path = "src/bin/skillmount.rs"
 
+[[bin]]
+name = "skillmount-fake-agent"
+path = "tests/fixtures/fake_agent.rs"
+required-features = ["test-fixtures"]
+
+[[bin]]
+name = "skillmount-supervisor-harness"
+path = "tests/fixtures/supervisor_harness.rs"
+required-features = ["test-fixtures"]
+
+[features]
+test-fixtures = ["dep:ctrlc", "signal-hook/iterator"]
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
@@ -22,8 +35,62 @@ strip = "symbols"
 
 [lints.rust]
 missing_docs = "deny"
-unsafe_code = "forbid"
+# `deny` rather than `forbid`: the platform link backends, native process dispatch/containment, and
+# the Codex managed-preference and Windows Known Folder probes need narrow raw calls that no safe
+# dependency satisfying the repository license policy exposes, and `forbid` cannot be lifted
+# anywhere. Every `allow` is a whole audited FFI module, and no other module may opt in. See ADR
+# 0011, ADR 0019, and ADR 0023.
+unsafe_code = "deny"
 
 [lints.clippy]
 all = "deny"
 pedantic = "deny"
+
+[dependencies]
+clap = { version = "=4.6.5", features = ["derive"] }
+# Real operating-system advisory locks. `flock` and `LockFileEx` are the liveness signal the
+# transaction layer needs, and neither is reachable from the standard library. `fs4` wraps exactly
+# those two calls, keeps locking-related unsafe within the two audited link FFI modules (ADR 0011),
+# and already resolves to the `windows-sys` version pinned below.
+fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+# Codex plugin manifests are JSON rather than YAML. Pin the same parser release as Codex 0.146.0
+# so duplicate-field and type rejection at the namespace gate do not silently diverge.
+serde_json = "=1.0.149"
+serde_yaml_ng = "=0.10.0"
+# Lock filenames are SHA-256 digests of tagged identity bytes, so two spellings of one resource
+# reach the same file. Only `alloc`-free digesting is used.
+sha2 = { version = "=0.11.0", default-features = false }
+
+# Placement needs an atomic no-replace rename, which `std::fs::rename` does not provide: it
+# replaces. macOS reaches `renameatx_np(RENAME_EXCL)` and other Unix hosts reach
+# `renameat2(RENAME_NOREPLACE)`, both only through libc.
+[target."cfg(unix)".dependencies]
+libc = "=0.2.189"
+# Product handlers record event identity directly in an atomic ledger through the audited Unix FFI
+# boundary. Only the feature-gated fake agent uses signal-hook's iterator support.
+signal-hook = { version = "=0.4.4", default-features = false }
+# `kill`/`killpg` and effective-user execute checks are exposed through maintained safe APIs,
+# keeping raw Unix process and access-check FFI out of shared code.
+nix = { version = "=0.31.3", default-features = false, features = ["fs", "signal", "user"] }
+
+# Junctions are reparse points. Creating, reading, and identifying one needs `DeviceIoControl`,
+# `CreateFileW`, and `GetFileInformationByHandle`, none of which the standard library exposes.
+[target."cfg(windows)".dependencies]
+# The fake-agent fixture uses `ctrlc` to observe its inherited console events. Product supervision
+# preserves the raw event type through the audited process FFI module instead.
+ctrlc = { version = "=3.5.2", optional = true }
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
