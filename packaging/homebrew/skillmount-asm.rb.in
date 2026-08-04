@@ -19,7 +19,10 @@ class @FORMULA_CLASS@ < Formula
   depends_on :macos
 
   def install
-    system "cargo", "install", "--locked", "--bin", "@CARGO_BIN@", *std_cargo_args
+    # `std_cargo_args` already supplies `--locked --root=<keg> --path=.`. Adding `--locked` here
+    # makes Cargo reject the repeated flag and fails the install after every build dependency has
+    # been poured.
+    system "cargo", "install", "--bin", "@CARGO_BIN@", *std_cargo_args
     generate_completions_from_executable(bin/"@COMMAND@", "completions", base_name: "@COMMAND@")
   end
 

@@ -43,7 +43,7 @@ class @FORMULA_CLASS@ < Formula
   depends_on arch: :arm64
 
   def install
-    system "cargo", "install", "--locked", "--bin", "@CARGO_BIN@", *std_cargo_args
+    system "cargo", "install", "--bin", "@CARGO_BIN@", *std_cargo_args
     generate_completions_from_executable(
       bin/"@COMMAND@", "completions", base_name: "@COMMAND@", shells: [:bash, :zsh, :fish]
     )

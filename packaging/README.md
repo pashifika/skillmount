@@ -57,8 +57,14 @@ Each Formula builds from the GitHub source tarball for one exact tag, requires m
 and installs one binary:
 
 ```ruby
-system "cargo", "install", "--locked", "--bin", "@CARGO_BIN@", *std_cargo_args
+system "cargo", "install", "--bin", "@CARGO_BIN@", *std_cargo_args
 ```
+
+Do not add `--locked` to that call. `std_cargo_args` already expands to
+`--locked --root=<keg> --path=.`, and Cargo rejects a repeated flag with
+`error: the argument '--locked' cannot be used multiple times`, which fails the install after
+Homebrew has already poured every build dependency. The lock file is still honoured, by
+`std_cargo_args`.
 
 `generate_completions_from_executable` is called with an explicit `base_name:`. Homebrew
 otherwise defaults `base_name:` to the formula name, which would make the `skillmount-asm`

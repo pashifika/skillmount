@@ -72,7 +72,7 @@ class Skillmount < Formula
   depends_on :macos
 
   def install
-    system "cargo", "install", "--locked", "--bin", "skillmount", *std_cargo_args
+    system "cargo", "install", "--bin", "skillmount", *std_cargo_args
     generate_completions_from_executable(bin/"skillmount", "completions", base_name: "skillmount")
   end
 
