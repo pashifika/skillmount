@@ -780,6 +780,25 @@ class TriggerTests(unittest.TestCase):
         with self.assertRaises(channels.ChannelError):
             self.decide(repository="skillmount")
 
+    def test_serialized_missing_workflow_run_is_absent(self) -> None:
+        """Treat GitHub's serialized missing workflow_run field as no run payload."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "workflow-run.json"
+            path.write_text("null\n", encoding="utf-8")
+            self.assertIsNone(channels.read_workflow_run(path))
+
+    def test_non_object_workflow_run_payload_is_rejected(self) -> None:
+        """Refuse every non-null JSON value that is not a workflow-run object."""
+
+        for payload in ("[]\n", '"run"\n', "false\n", "42\n"):
+            with self.subTest(payload=payload):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "workflow-run.json"
+                    path.write_text(payload, encoding="utf-8")
+                    with self.assertRaises(channels.ChannelError):
+                        channels.read_workflow_run(path)
+
 
 class GatewayTests(unittest.TestCase):
     """Cover the real GitHub CLI adapter logic without any network access."""
