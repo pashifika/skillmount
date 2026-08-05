@@ -156,9 +156,9 @@ SCENARIO_MAP = (
     ScenarioMapping("One co-installed package is uninstalled", ("cross-uninstall",)),
     ScenarioMapping("Package is uninstalled alone", ("uninstall", "residue")),
     ScenarioMapping(
-        "Pair eligibility is not confirmed",
+        "Public feed has no package entry",
         ("inspect",),
-        "package_publish.reconcile_chocolatey queries both ids before any push",
+        "package_publish.reconcile_chocolatey treats absence as preflight, not ownership proof",
     ),
     ScenarioMapping(
         "New package upload is accepted",

@@ -593,10 +593,13 @@ Distribution starts at the immutable GitHub release described in [docs/releasing
 and, beginning with `v0.2.0`, continues into two package channels operated through
 [docs/packaging.md](packaging.md).
 [ADR 0030](adr/0030-publish-selectable-packages-through-isolated-post-release-channels.md) records
-the channel and isolation decisions, and
+the channel and isolation decisions,
 [ADR 0031](adr/0031-use-release-archives-for-homebrew-formulae.md) records the Homebrew
-release-archive decision. The release asset set and dual-binary archive layout are unchanged by
-packaging: the channels consume the published release and never add, remove, or rewrite an asset.
+release-archive decision, and
+[ADR 0032](adr/0032-establish-chocolatey-ownership-through-submission.md) records the Community
+Repository ownership and moderation ordering. The release asset set and dual-binary archive layout
+are unchanged by packaging: the channels consume the published release and never add, remove, or
+rewrite an asset.
 
 The release-to-package flow chains from workflow completion rather than from a release event,
 because publication with the repository `GITHUB_TOKEN` suppresses `release.published`:
@@ -645,6 +648,20 @@ through a GitHub App token scoped to that repository. The Chocolatey Community R
 package moderation and public listing per package ID. Each publisher runs behind its own protected
 GitHub Environment — `homebrew` and `chocolatey` — holding only that channel's credential;
 preflight, generation, and acceptance jobs hold no external credential.
+
+The Community Repository exposes distinct observation and mutation boundaries. Immutable
+package/version metadata, moderation state, and the repository's SHA-512 nupkg digest are read from
+its public OData feed; current public resolution is proved separately through the supported
+`choco search --version=<version> --exact --all-versions --approved-only --limit-output` interface.
+Package bytes are sent only to the documented `https://push.chocolatey.org/` upload endpoint. The
+credential-free generation step's nupkg SHA-256 binds the candidate before any channel access,
+while the independently computed SHA-512 binds those same bytes to an existing OData record.
+The feed cannot prove ownership of an absent or unlisted ID, and there is no separate reservation
+operation: an accepted first upload creates the package record under the API-key account and starts
+per-ID moderation. The publisher observes both members before
+any write, submits `skillmount` before `skillmount-asm`, preserves an accepted first member if the
+second fails, and treats ownership errors or moderation rejection as a stop-for-review boundary
+rather than installing both commands from one package.
 
 Before that external tap can enforce its required check, one reviewed pre-protection bootstrap
 change installs the tap-owned workflow and maintainer documents without any Formula. The workflow
@@ -708,11 +725,13 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
 - the package-channel publication contract for Homebrew and Chocolatey, implemented and CI-verified
   on this branch: shared credential-free release preflight and identity model, deterministic
   release-archive Formula and Chocolatey package generation with structural pair inspection,
-  pair-aware fail-closed tap and Community Repository publishers, the isolated `workflow_run`
-  package workflow with its tracked policy checker, native selected-only lifecycle acceptance
-  harnesses for both channels, tap repository source material, and the packaging runbook
+  pair-aware fail-closed tap and Community Repository publishers with distinct OData-metadata,
+  supported CLI-resolution, and package-upload boundaries, the isolated `workflow_run` package
+  workflow with its tracked policy checker, native selected-only lifecycle acceptance harnesses
+  for both channels, tap repository source material, and the packaging runbook
   ([ADR 0030](adr/0030-publish-selectable-packages-through-isolated-post-release-channels.md),
-  [ADR 0031](adr/0031-use-release-archives-for-homebrew-formulae.md));
+  [ADR 0031](adr/0031-use-release-archives-for-homebrew-formulae.md),
+  [ADR 0032](adr/0032-establish-chocolatey-ownership-through-submission.md));
 - crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
 
 ### Reserved work
@@ -725,8 +744,8 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
 - rejecting pre-existing links in application-state directory paths before creation or permission changes;
 - external package-channel publication: the separately managed `pashifika/homebrew-tap` is created,
   bootstrapped, and protected, while publication still requires release verification at workflow
-  time, the tap-scoped GitHub App installation, the Chocolatey account with both public package IDs
-  and pair-eligibility confirmation, both protected environments with their credentials, and the
+  time, the tap-scoped GitHub App installation, the Chocolatey account API key, both protected
+  environments with their credentials, first package submissions and per-ID moderation, and the
   four publicly resolved, clean-host-verified install commands;
 
 Both session adapters use the supervisor in the product application path, but real-agent and
