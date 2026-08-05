@@ -138,7 +138,7 @@ jobs:
     steps:
       - name: Reconcile the tap pull request
         env:
-          APP_ID: ${{{{ secrets.HOMEBREW_TAP_APP_ID }}}}
+          CLIENT_ID: ${{{{ vars.HOMEBREW_TAP_APP_CLIENT_ID }}}}
         run: python -B .github/scripts/package_publish.py homebrew
 
   chocolatey-publish:
@@ -231,13 +231,31 @@ MUTATIONS: dict[str, tuple[str, str, int, frozenset[int]]] = {
     ),
     "foreign-secret-outside-publish": (
         "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
-        "GH_TOKEN: ${{ secrets.HOMEBREW_TAP_APP_ID }}",
+        "GH_TOKEN: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}",
         1,
         frozenset({4}),
     ),
     "chocolatey-secret-in-homebrew-publish": (
-        "APP_ID: ${{ secrets.HOMEBREW_TAP_APP_ID }}",
-        "APP_ID: ${{ secrets.CHOCOLATEY_API_KEY }}",
+        "CLIENT_ID: ${{ vars.HOMEBREW_TAP_APP_CLIENT_ID }}",
+        "CLIENT_ID: ${{ secrets.CHOCOLATEY_API_KEY }}",
+        1,
+        frozenset({4}),
+    ),
+    "homebrew-variable-outside-publish": (
+        "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
+        "GH_TOKEN: ${{ vars.HOMEBREW_TAP_APP_CLIENT_ID }}",
+        1,
+        frozenset({4}),
+    ),
+    "wrong-homebrew-variable-in-homebrew-publish": (
+        "CLIENT_ID: ${{ vars.HOMEBREW_TAP_APP_CLIENT_ID }}",
+        "CLIENT_ID: ${{ vars.HOMEBREW_TAP_APP_ID }}",
+        1,
+        frozenset({4}),
+    ),
+    "homebrew-variable-in-chocolatey-publish": (
+        "API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}",
+        "CLIENT_ID: ${{ vars.HOMEBREW_TAP_APP_CLIENT_ID }}",
         1,
         frozenset({4}),
     ),

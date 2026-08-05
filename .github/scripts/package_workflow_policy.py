@@ -18,6 +18,10 @@ PUBLISH_CHANNELS = {HOMEBREW_PUBLISH_JOB: "homebrew", CHOCOLATEY_PUBLISH_JOB: "c
 PUBLISH_JOBS = tuple(PUBLISH_CHANNELS)
 FOREIGN_SECRET_PREFIX = {HOMEBREW_PUBLISH_JOB: "CHOCOLATEY", CHOCOLATEY_PUBLISH_JOB: "HOMEBREW"}
 ALLOWED_SHARED_SECRET = "GITHUB_TOKEN"
+PUBLISH_VARIABLES = {
+    HOMEBREW_PUBLISH_JOB: frozenset({"HOMEBREW_TAP_APP_CLIENT_ID"}),
+    CHOCOLATEY_PUBLISH_JOB: frozenset(),
+}
 PREFLIGHT_PERMISSIONS = {"actions": "read", "contents": "read"}
 FORBIDDEN_PERMISSIONS = {"contents": "write", "packages": "write", "id-token": "write"}
 BLANKET_WRITE_PERMISSIONS = "write-all"
@@ -33,6 +37,7 @@ PINNED_USES = re.compile(r"[A-Za-z0-9._/-]+@[0-9a-f]{40}")
 USES_LINE = re.compile(r"^ *(?:- +)?uses: *(?P<value>[^ #]+) *(?P<comment>#.*)?$")
 VERSION_COMMENT = re.compile(r"# *v?\d[\w.+-]* *$")
 SECRET_REFERENCE = re.compile(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)")
+VARIABLE_REFERENCE = re.compile(r"vars\.([A-Za-z_][A-Za-z0-9_]*)")
 WORKFLOW_RUN_REFERENCE = re.compile(
     r"github\.event\.workflow_run\.(head_sha|head_branch|head_commit|head_repository)"
 )
@@ -754,15 +759,15 @@ def _policy_checkout_hygiene(document: Mapping[str, Any], text: str) -> list[str
 
 
 def _policy_secret_scoping(document: Mapping[str, Any], text: str) -> list[str]:
-    """4. Secrets stay inside their own publish job, and neither lane reads the other's."""
+    """4. Channel secrets and variables stay inside their own publish job."""
 
     violations: list[str] = []
     for path, node in _walk(document):
         if not isinstance(node, str):
             continue
         job_name = _job_name(path)
+        where = _describe(path)
         for name in SECRET_REFERENCE.findall(node):
-            where = _describe(path)
             if job_name not in PUBLISH_JOBS:
                 if name != ALLOWED_SHARED_SECRET:
                     violations.append(
@@ -775,6 +780,14 @@ def _policy_secret_scoping(document: Mapping[str, Any], text: str) -> list[str]:
                 violations.append(
                     f"policy 4: {where} expected no secrets.{prefix}* in {job_name}, observed "
                     f"secrets.{name}"
+                )
+        expected_variables = PUBLISH_VARIABLES.get(job_name, frozenset())
+        for name in VARIABLE_REFERENCE.findall(node):
+            if name not in expected_variables:
+                violations.append(
+                    f"policy 4: {where} expected vars references "
+                    f"{sorted(expected_variables)} in {job_name or 'a non-publish job'}, "
+                    f"observed vars.{name}"
                 )
     return violations
 
