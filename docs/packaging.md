@@ -93,6 +93,46 @@ The `homebrew` environment exposes only the tap-scoped GitHub App credentials
 `CHOCOLATEY_API_KEY`. A workflow run that requests any other secret, or a secret from the wrong
 job, fails the tracked workflow policy check.
 
+## Connect the Homebrew publisher App
+
+After the protected tap bootstrap passes, create the personally owned GitHub App
+`pashifika-skillmount-homebrew` with homepage
+`https://github.com/pashifika/homebrew-tap`. Disable webhooks, leave callback and setup URLs empty,
+subscribe to no events, and restrict installation to the `pashifika` account.
+
+Grant only these repository permissions:
+
+- **Contents: Read and write**;
+- **Pull requests: Read and write**;
+- the implicit **Metadata: Read-only** permission.
+
+Leave every account, organization, enterprise, and other repository permission at no access.
+Install the App with **Only select repositories** and select only `pashifika/homebrew-tap`.
+
+Generate one private key, set its local mode to `0600`, and copy the App ID from the App settings.
+Load both values without putting the private key in chat, a command argument, shell history, or
+repository content:
+
+```bash
+gh secret set HOMEBREW_TAP_APP_ID \
+  --repo pashifika/skillmount --env homebrew
+gh secret set HOMEBREW_TAP_APP_PRIVATE_KEY \
+  --repo pashifika/skillmount --env homebrew < /absolute/path/to/downloaded.pem
+```
+
+The first command reads the App ID from a hidden prompt. Verify only secret metadata:
+
+```bash
+gh api repos/pashifika/skillmount/environments/homebrew/secrets \
+  --jq '.secrets[] | {name, updated_at}'
+```
+
+Before enabling publication, mint and immediately revoke one short-lived installation token with
+the uploaded key. Its API view must report exactly `contents: write`, `pull_requests: write`, and
+`metadata: read`, with `repository_selection: selected` and only
+`pashifika/homebrew-tap`. Retain those non-secret fields as evidence. Keep the local PEM at mode
+`0600` only until this smoke check passes, then remove it from local storage.
+
 ## Connect the Chocolatey publisher account
 
 The Community Repository has no separate package-ID reservation operation. Its official first-
@@ -232,13 +272,16 @@ Never print, echo, or paste a secret value into a log, issue, or evidence file; 
 by name and rotation date only.
 
 - **Homebrew (tap-scoped GitHub App).** The App is installed only on `pashifika/homebrew-tap`.
-  Rotate by generating a new private key in the App settings, updating
-  `HOMEBREW_TAP_APP_PRIVATE_KEY` in the `homebrew` environment, and deleting the old key. Revoke by
-  deleting the key or suspending/uninstalling the App installation; either action disables only the
+  Rotate by generating a second private key, updating `HOMEBREW_TAP_APP_PRIVATE_KEY` in the
+  `homebrew` environment, minting and revoking one short-lived token to verify the selected
+  repository and exact permissions, and only then deleting the old key. Revoke by deleting the
+  active key or suspending/uninstalling the App installation; either action disables only the
   Homebrew lane.
-- **Chocolatey (API key).** Rotate from the Chocolatey account's API-key page, update
-  `CHOCOLATEY_API_KEY` in the `chocolatey` environment, then invalidate the old key. Revoke the key
-  immediately on suspected compromise; the Homebrew lane and the GitHub release are unaffected.
+- **Chocolatey (API key).** The account page's **Generate New API Key** action invalidates the old
+  key immediately; there is no overlap window. First ensure the protected Chocolatey lane is idle,
+  then regenerate, update `CHOCOLATEY_API_KEY` in the `chocolatey` environment through a hidden
+  prompt, and verify only secret metadata. Regenerate immediately after any suspected disclosure;
+  the Homebrew lane and the GitHub release remain unaffected.
 
 Record every rotation and revocation (date, actor, reason, affected environment) with the release
 evidence. Environment reviewer lists are part of the credential boundary: review them whenever
