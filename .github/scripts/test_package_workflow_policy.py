@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import re
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -1045,6 +1047,165 @@ class TemplateTokenTests(unittest.TestCase):
         selection = text.index("foreach ($retained in")
         self.assertLess(text.rindex("@OTHER_EXECUTABLE@"), selection)
         self.assertLess(text.rindex("$unselectedExecutable"), selection)
+
+
+class TapWorkflowTests(unittest.TestCase):
+    """Exercise the self-contained tap workflow's publication-state boundary."""
+
+    WORKFLOW = (
+        Path(__file__).resolve().parent.parent.parent / "packaging/homebrew/tap-ci.yml"
+    )
+    FORMULAE = ("skillmount", "skillmount-asm")
+    BOOTSTRAP_FILES = ("README.md", "CONTRIBUTING.md", "SECURITY.md")
+
+    @classmethod
+    def classifier_script(cls) -> str:
+        """Extract the exact shell program GitHub Actions runs to classify the tap."""
+
+        document = governance.parse_yaml(cls.WORKFLOW.read_text(encoding="utf-8"))
+        steps = document["jobs"]["formulae"]["steps"]
+        return next(
+            step["run"]
+            for step in steps
+            if step.get("name") == "Classify the tap publication state"
+        )
+
+    @staticmethod
+    def git(root: Path, *arguments: str) -> None:
+        """Run one deterministic local Git operation for a disposable tap."""
+
+        subprocess.run(
+            ("git", "-C", str(root), *arguments),
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+
+    def commit(self, root: Path, message: str) -> None:
+        """Commit the disposable tap without depending on operator Git identity."""
+
+        self.git(root, "add", "-A")
+        self.git(
+            root,
+            "-c",
+            "user.name=SkillMount Tests",
+            "-c",
+            "user.email=tests@skillmount.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        )
+
+    def initialize_tap(
+        self,
+        root: Path,
+        *,
+        formulae: tuple[str, ...] = (),
+        omit: str | None = None,
+    ) -> None:
+        """Create one committed tap state with the requested Formula names."""
+
+        self.git(root, "init", "--quiet", "-b", "main")
+        for relative in self.BOOTSTRAP_FILES:
+            if relative != omit:
+                (root / relative).write_text(f"# {relative}\n", encoding="utf-8")
+        workflow = root / ".github/workflows/tap.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_text(self.WORKFLOW.read_text(encoding="utf-8"), encoding="utf-8")
+        formula_directory = root / "Formula"
+        for formula in formulae:
+            formula_directory.mkdir(exist_ok=True)
+            (formula_directory / f"{formula}.rb").write_text(
+                f"class {formula.replace('-', '_').title()} < Formula\nend\n",
+                encoding="utf-8",
+            )
+        self.commit(root, "initialize tap")
+
+    def classify(self, root: Path) -> tuple[subprocess.CompletedProcess[str], str]:
+        """Run the workflow classifier and return its process and declared output."""
+
+        output = root.parent / "github-output.txt"
+        output.touch()
+        environment = os.environ.copy()
+        environment.update({"GITHUB_OUTPUT": str(output), "TAP_SOURCE": str(root)})
+        result = subprocess.run(
+            ("bash", "-c", self.classifier_script()),
+            cwd=root,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        return result, output.read_text(encoding="utf-8")
+
+    def test_classifier_accepts_bootstrap_and_complete_pair(self) -> None:
+        """Accept only the intended states before and after first publication."""
+
+        for formulae, expected in (((), "published=false\n"), (self.FORMULAE, "published=true\n")):
+            with self.subTest(formulae=formulae):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory) / "tap"
+                    root.mkdir()
+                    self.initialize_tap(root, formulae=formulae)
+                    result, output = self.classify(root)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(output, expected)
+
+    def test_classifier_rejects_partial_or_extra_formulae(self) -> None:
+        """Reject an incomplete pair and any third Ruby Formula."""
+
+        for formulae in (("skillmount",), (*self.FORMULAE, "unrelated")):
+            with self.subTest(formulae=formulae):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory) / "tap"
+                    root.mkdir()
+                    self.initialize_tap(root, formulae=formulae)
+                    result, _ = self.classify(root)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("expected exactly the skillmount Formula pair", result.stdout)
+
+    def test_classifier_rejects_a_symlinked_expected_formula(self) -> None:
+        """Require both expected Formulae to be regular tap-owned files."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tap"
+            root.mkdir()
+            self.initialize_tap(root, formulae=("skillmount-asm",))
+            (root / "skillmount.rb").write_text(
+                "class Redirected < Formula\nend\n", encoding="utf-8"
+            )
+            (root / "Formula/skillmount.rb").symlink_to("../skillmount.rb")
+            self.commit(root, "add symlinked formula")
+            result, _ = self.classify(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("expected exactly the skillmount Formula pair", result.stdout)
+
+    def test_classifier_never_reopens_bootstrap_after_publication(self) -> None:
+        """Reject deletion of both Formulae even when the current tree looks unpublished."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tap"
+            root.mkdir()
+            self.initialize_tap(root, formulae=self.FORMULAE)
+            for formula in self.FORMULAE:
+                (root / "Formula" / f"{formula}.rb").unlink()
+            self.commit(root, "remove formulae")
+            result, output = self.classify(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(output, "")
+            self.assertIn("after a Formula existed in tap history", result.stdout)
+
+    def test_classifier_requires_every_bootstrap_file(self) -> None:
+        """Reject an unpublished tap that omits a maintainer-owned baseline file."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tap"
+            root.mkdir()
+            self.initialize_tap(root, omit="SECURITY.md")
+            result, _ = self.classify(root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("missing required bootstrap files: SECURITY.md", result.stdout)
 
 
 if __name__ == "__main__":

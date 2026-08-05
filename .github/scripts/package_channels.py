@@ -1621,6 +1621,8 @@ def read_workflow_run(path: Path | None) -> dict[str, Any] | None:
     except (OSError, UnicodeError) as error:
         raise ChannelError(f"cannot read workflow-run payload {path}: {error}") from error
     document = json.loads(text)
+    if document is None:
+        return None
     if not isinstance(document, dict):
         raise ChannelError(
             f"workflow-run payload is a {type(document).__name__}; expected a JSON object"

@@ -101,6 +101,12 @@ because `brew install` would otherwise refuse the tap, both release-archive inst
 `brew test` runs, selected-only install and uninstall checks, co-installation, cross-uninstall,
 completion ownership, and an upgrade rehearsal from the pull request's base revision.
 
+Before the first Formula pull request, the same job accepts one unpublished bootstrap state so the
+separate repository can land its workflow and maintainer documents. That state requires
+`.github/workflows/tap.yml`, `README.md`, `CONTRIBUTING.md`, and `SECURITY.md`, rejects a partial or
+extra Formula set, and uses Git history to ensure deleting a previously published pair cannot
+re-enable the lifecycle skip.
+
 ## Chocolatey
 
 One release archive carries both executables, so `chocolateyinstall.ps1` must keep one and

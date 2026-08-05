@@ -1,8 +1,7 @@
 # Contributing to the SkillMount tap
 
-> Source material: this file is tracked in `pashifika/skillmount` under `packaging/homebrew/tap/`
-> and is transferred to the separately managed `pashifika/homebrew-tap` repository through that
-> repository's own reviewed change. It is not the live tap.
+> Canonical source: `pashifika/skillmount:packaging/homebrew/tap/CONTRIBUTING.md`. Changes are
+> transferred to this tap through its own reviewed pull requests.
 
 This repository owns the published SkillMount Formulae, their CI, and their history. The Formula
 content itself is generated in the product repository from templates under
@@ -23,6 +22,20 @@ hand-edit a Formula's version, release-archive URL, digest, or selected binary; 
 provenance generated from a verified release, and a hand edit breaks the pair-consistency checks
 the publisher runs before every write. If a published version's bytes are wrong, the fix is a new
 SkillMount patch release, never an in-place digest edit.
+
+## Repository bootstrap
+
+The tap starts with one reviewed infrastructure change containing this file, `README.md`,
+`SECURITY.md`, and `.github/workflows/tap.yml`, before any Formula exists. In that never-published
+state the `formulae` job records an explicit bootstrap notice and skips package-manager lifecycle
+work. The classifier accepts that skip only while the complete maintainer baseline is present and
+no Formula exists anywhere in the checked-out history. A partial pair, an unrelated Formula, or
+deletion after publication fails.
+
+After the bootstrap push passes, protect `main` and require the `formulae` job and review before
+merging. Do not install the publisher's GitHub App until those protections are active. This is the
+only pre-protection repository change; every Formula change follows the normal required-check
+contract below.
 
 ## Required checks
 
