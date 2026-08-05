@@ -538,7 +538,7 @@ fn an_untested_codex_version_warns_once_runs_the_child_and_preserves_child_statu
     fixture.skill("alpha");
 
     let output = fixture
-        .command()
+        .command_with_options(&["-v"])
         .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", "codex-cli 0.147.0")
         .env("SKILLMOUNT_FAKE_EXIT", "23")
         .output()
@@ -556,6 +556,11 @@ fn an_untested_codex_version_warns_once_runs_the_child_and_preserves_child_statu
     assert!(stderr.contains("codex-cli 0.147.0"), "{stderr}");
     assert!(stderr.contains("codex-cli 0.146.0"), "{stderr}");
     assert!(stderr.contains("docs/compatibility.md"), "{stderr}");
+    assert!(
+        stderr.contains("bounded --version observation attempted before state access"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("executable not queried"), "{stderr}");
     assert!(fixture.record.is_file(), "the child must start");
     assert_eq!(
         fs::read_to_string(&fixture.version_record)
@@ -599,6 +604,92 @@ fn unavailable_codex_version_warns_once_and_keep_mounts_preserves_the_session() 
         1
     );
     assert!(exists(&fixture.project.join(".agents/skills/alpha")));
+}
+
+#[test]
+fn oversized_interleaved_version_output_is_bounded_and_the_session_continues() {
+    let fixture = Fixture::new("oversized-interleaved-version");
+    fixture.skill("alpha");
+
+    let output = fixture
+        .command()
+        .env("SKILLMOUNT_FAKE_VERSION_BEHAVIOR", "oversized-interleaved")
+        .output()
+        .expect("asm should bound both version output streams");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("1024-byte observation bound"), "{stderr}");
+    assert!(fixture.record.is_file(), "the real child must start");
+    assert_eq!(
+        fs::read_to_string(&fixture.version_record)
+            .expect("version observation record")
+            .lines()
+            .count(),
+        1
+    );
+    assert!(!exists(&fixture.project.join(".agents")));
+    assert!(!exists(&fixture.project.join(".codex")));
+}
+
+#[test]
+fn inherited_version_output_handles_are_terminated_at_the_lifetime_bound() {
+    let fixture = Fixture::new("inherited-version-descriptor");
+    fixture.skill("alpha");
+    let descendant_record = fixture.root.join("version-descendant.record");
+    let started = Instant::now();
+
+    let output = fixture
+        .command()
+        .env("SKILLMOUNT_FAKE_VERSION_BEHAVIOR", "inherited-descriptor")
+        .env(
+            "SKILLMOUNT_FAKE_VERSION_DESCENDANT_RECORD",
+            &descendant_record,
+        )
+        .output()
+        .expect("asm should stop a version descendant that retains the output handles");
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(elapsed < Duration::from_secs(8), "capture took {elapsed:?}");
+    assert!(
+        stderr.contains("3-second process/output lifetime bound"),
+        "{stderr}"
+    );
+    assert!(fixture.record.is_file(), "the real child must start");
+    assert_eq!(
+        fs::read_to_string(&fixture.version_record)
+            .expect("version observation record")
+            .lines()
+            .count(),
+        1
+    );
+    #[cfg(unix)]
+    {
+        let descendant = UnixProcessGuard::from_record(&descendant_record);
+        assert!(
+            !descendant.is_running(),
+            "the version descendant must be dead before launch continues"
+        );
+    }
+    #[cfg(windows)]
+    {
+        let descendant = fs::read_to_string(&descendant_record)
+            .expect("fake version descendant record")
+            .lines()
+            .find_map(|line| line.strip_prefix("pid="))
+            .expect("fake version descendant records its PID")
+            .parse::<u32>()
+            .expect("fake version descendant PID is numeric");
+        assert!(
+            !skillmount::process::test_support::process_is_running(descendant)
+                .expect("query version descendant liveness"),
+            "the version descendant must be dead before launch continues"
+        );
+    }
+    assert!(!exists(&fixture.project.join(".agents")));
+    assert!(!exists(&fixture.project.join(".codex")));
 }
 
 #[test]

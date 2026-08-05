@@ -23,6 +23,9 @@ const RECORD_CODEX_HOME_ENV: &str = "SKILLMOUNT_FAKE_RECORD_CODEX_HOME";
 const VERSION_RECORD_ENV: &str = "SKILLMOUNT_FAKE_VERSION_RECORD";
 const VERSION_OUTPUT_ENV: &str = "SKILLMOUNT_FAKE_VERSION_OUTPUT";
 const VERSION_EXIT_ENV: &str = "SKILLMOUNT_FAKE_VERSION_EXIT";
+const VERSION_BEHAVIOR_ENV: &str = "SKILLMOUNT_FAKE_VERSION_BEHAVIOR";
+const VERSION_DESCENDANT_RECORD_ENV: &str = "SKILLMOUNT_FAKE_VERSION_DESCENDANT_RECORD";
+const VERSION_PIPE_HOLDER_ARG: &str = "--skillmount-version-pipe-holder";
 
 fn main() -> ExitCode {
     match run() {
@@ -35,10 +38,13 @@ fn main() -> ExitCode {
 }
 
 fn run() -> io::Result<ExitCode> {
-    if env::args_os().skip(1).eq([OsStr::new("--version")]) {
+    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments.len() == 1 && arguments[0] == OsStr::new(VERSION_PIPE_HOLDER_ARG) {
+        return hold_version_pipes();
+    }
+    if arguments.len() == 1 && arguments[0] == OsStr::new("--version") {
         return report_version();
     }
-    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
     let record_path = required_path(RECORD_ENV)?;
     let recorder = Recorder::create(record_path)?;
     recorder.number("pid", std::process::id())?;
@@ -124,10 +130,57 @@ fn report_version() -> io::Result<ExitCode> {
     if code != 0 {
         return Ok(ExitCode::from(code));
     }
-    println!(
+    let behavior = env::var(VERSION_BEHAVIOR_ENV).unwrap_or_else(|_| "normal".to_owned());
+    match behavior.as_str() {
+        "normal" => write_version_banner(),
+        "oversized-interleaved" => Ok(write_oversized_interleaved_version()),
+        "inherited-descriptor" => {
+            #[cfg(windows)]
+            // Exercise Job inheritance after the documented immediate post-spawn attachment window,
+            // rather than deliberately racing the residual window accepted by ADR 0019.
+            thread::sleep(Duration::from_millis(100));
+            Command::new(env::current_exe()?)
+                .arg(VERSION_PIPE_HOLDER_ARG)
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()?;
+            write_version_banner()
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown version behavior {other:?}"),
+        )),
+    }
+}
+
+fn write_version_banner() -> io::Result<ExitCode> {
+    writeln!(
+        io::stdout().lock(),
         "{}",
         env::var(VERSION_OUTPUT_ENV).unwrap_or_else(|_| "codex-cli 0.146.0".to_owned())
-    );
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn write_oversized_interleaved_version() -> ExitCode {
+    let mut stdout = io::stdout().lock();
+    let mut stderr = io::stderr().lock();
+    let stdout_chunk = [b'o'; 256];
+    let stderr_chunk = [b'e'; 256];
+    for _ in 0..8 {
+        let _ = stdout.write_all(&stdout_chunk);
+        let _ = stdout.flush();
+        let _ = stderr.write_all(&stderr_chunk);
+        let _ = stderr.flush();
+    }
+    ExitCode::SUCCESS
+}
+
+fn hold_version_pipes() -> io::Result<ExitCode> {
+    let record = required_path(VERSION_DESCENDANT_RECORD_ENV)?;
+    fs::write(record, format!("pid={}\n", std::process::id()))?;
+    thread::sleep(Duration::from_secs(60));
     Ok(ExitCode::SUCCESS)
 }
 

@@ -54,6 +54,42 @@ pub mod test_support {
     }
 }
 
+/// A dedicated process domain for one bounded captured command.
+///
+/// The caller must terminate the domain before reaping its root, then mark the root reaped and
+/// prove the domain empty. Dropping an unreaped domain requests best-effort forceful termination
+/// without waiting.
+pub(crate) struct CaptureDomain {
+    inner: platform::CaptureDomain,
+}
+
+impl CaptureDomain {
+    /// Configures platform containment before spawning the command.
+    pub(crate) fn prepare(command: &mut Command) -> io::Result<Self> {
+        platform::CaptureDomain::prepare(command).map(|inner| Self { inner })
+    }
+
+    /// Attaches a newly spawned root process to the prepared domain.
+    pub(crate) fn attach(&mut self, child: &Child) -> io::Result<()> {
+        self.inner.attach(child)
+    }
+
+    /// Requests forceful termination before the root process is reaped.
+    pub(crate) fn terminate(&self, child: &mut Child) -> io::Result<()> {
+        self.inner.terminate(child)
+    }
+
+    /// Records that the root status was collected, disabling unsafe identifier-based force.
+    pub(crate) fn mark_root_reaped(&mut self) {
+        self.inner.mark_root_reaped();
+    }
+
+    /// Probes whether the contained process domain is empty without sending another signal.
+    pub(crate) fn is_empty(&self) -> io::Result<bool> {
+        self.inner.is_empty()
+    }
+}
+
 /// A completed child-launch request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupervisionRequest {

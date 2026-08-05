@@ -8,12 +8,23 @@
 use std::ffi::OsStr;
 use std::io::{self, Read};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
+use crate::process::CaptureDomain;
 use crate::render::{path_value, text_value};
 
 /// Maximum bytes retained from either output stream of an Agent `--version` process.
 const VERSION_OUTPUT_LIMIT: usize = 1024;
+/// Maximum wall-clock lifetime of an Agent `--version` process and its inherited output handles.
+const VERSION_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(3);
+/// Grace between captured-stream closure and forceful process-domain finalization.
+const VERSION_EXIT_GRACE: Duration = Duration::from_millis(25);
+/// Maximum time allowed for force, root reaping, reader shutdown, and domain-death proof.
+const VERSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Agent-specific evidence needed by the shared observer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,48 +178,280 @@ struct BoundedBytes {
     exceeded: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CapturedStream {
+    Stdout,
+    Stderr,
+}
+
+type ReaderMessage = (CapturedStream, io::Result<BoundedBytes>);
+
+struct RunningCapture {
+    domain: CaptureDomain,
+    child: Child,
+    receiver: Receiver<ReaderMessage>,
+    _stdout_reader: JoinHandle<()>,
+    _stderr_reader: JoinHandle<()>,
+    stdout: Option<io::Result<BoundedBytes>>,
+    stderr: Option<io::Result<BoundedBytes>>,
+}
+
+impl RunningCapture {
+    fn start(executable: &Path, invocation_cwd: &Path) -> Result<Self, String> {
+        let mut command = Command::new(executable);
+        command
+            .arg("--version")
+            .current_dir(invocation_cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut domain = CaptureDomain::prepare(&mut command)
+            .map_err(|error| format!("cannot prepare bounded --version containment: {error}"))?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cannot start --version: {error}"))?;
+        if let Err(error) = domain.attach(&child) {
+            stop_after_setup_failure(&mut domain, &mut child);
+            return Err(format!(
+                "cannot attach --version to bounded process containment: {error}"
+            ));
+        }
+        let Some(stdout) = child.stdout.take() else {
+            stop_after_setup_failure(&mut domain, &mut child);
+            return Err("cannot capture --version standard output".to_owned());
+        };
+        let Some(stderr) = child.stderr.take() else {
+            stop_after_setup_failure(&mut domain, &mut child);
+            return Err("cannot capture --version standard error".to_owned());
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let stdout_reader = match spawn_reader(
+            "skillmount-version-stdout",
+            CapturedStream::Stdout,
+            stdout,
+            sender.clone(),
+        ) {
+            Ok(reader) => reader,
+            Err(error) => {
+                stop_after_setup_failure(&mut domain, &mut child);
+                return Err(format!(
+                    "cannot start the --version standard-output reader: {error}"
+                ));
+            }
+        };
+        let stderr_reader = match spawn_reader(
+            "skillmount-version-stderr",
+            CapturedStream::Stderr,
+            stderr,
+            sender.clone(),
+        ) {
+            Ok(reader) => reader,
+            Err(error) => {
+                stop_after_setup_failure(&mut domain, &mut child);
+                drop(stdout_reader);
+                return Err(format!(
+                    "cannot start the --version standard-error reader: {error}"
+                ));
+            }
+        };
+        drop(sender);
+
+        Ok(Self {
+            domain,
+            child,
+            receiver,
+            _stdout_reader: stdout_reader,
+            _stderr_reader: stderr_reader,
+            stdout: None,
+            stderr: None,
+        })
+    }
+
+    fn await_output_bound(&mut self) -> bool {
+        let deadline = Instant::now() + VERSION_OBSERVATION_TIMEOUT;
+        while self.stdout.is_none() || self.stderr.is_none() {
+            if reader_requires_stop(self.stdout.as_ref())
+                || reader_requires_stop(self.stderr.as_ref())
+            {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            match self.receiver.recv_timeout(remaining) {
+                Ok(message) => self.store_reader_result(message),
+                Err(RecvTimeoutError::Timeout) => return true,
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+
+        if reader_completed_within_bound(self.stdout.as_ref())
+            && reader_completed_within_bound(self.stderr.as_ref())
+        {
+            thread::sleep(VERSION_EXIT_GRACE);
+        }
+        false
+    }
+
+    fn finish(mut self, lifetime_exceeded: bool) -> Result<CapturedVersion, String> {
+        let termination_error = self.domain.terminate(&mut self.child).err();
+        let shutdown_deadline = Instant::now() + VERSION_SHUTDOWN_TIMEOUT;
+        let mut status = None;
+        let mut wait_error = None;
+        let mut domain_empty = false;
+        let mut domain_error = None;
+        while Instant::now() < shutdown_deadline {
+            while let Ok(message) = self.receiver.try_recv() {
+                self.store_reader_result(message);
+            }
+            if status.is_none() && wait_error.is_none() {
+                match self.child.try_wait() {
+                    Ok(Some(observed)) => {
+                        self.domain.mark_root_reaped();
+                        status = Some(observed);
+                    }
+                    Ok(None) => {}
+                    Err(error) => wait_error = Some(error),
+                }
+            }
+            if status.is_some() && !domain_empty && domain_error.is_none() {
+                match self.domain.is_empty() {
+                    Ok(empty) => domain_empty = empty,
+                    Err(error) => domain_error = Some(error),
+                }
+            }
+            if status.is_some() && domain_empty && self.stdout.is_some() && self.stderr.is_some() {
+                break;
+            }
+            let remaining = shutdown_deadline.saturating_duration_since(Instant::now());
+            thread::sleep(remaining.min(CAPTURE_POLL_INTERVAL));
+        }
+        while let Ok(message) = self.receiver.try_recv() {
+            self.store_reader_result(message);
+        }
+
+        if let Some(error) = termination_error {
+            return Err(format!(
+                "cannot terminate the bounded --version process domain: {error}"
+            ));
+        }
+        if let Some(error) = wait_error {
+            return Err(format!("cannot wait for --version: {error}"));
+        }
+        let Some(status) = status else {
+            return Err(format!(
+                "cannot reap --version within the {}-second shutdown bound",
+                VERSION_SHUTDOWN_TIMEOUT.as_secs()
+            ));
+        };
+        if let Some(error) = domain_error {
+            return Err(format!(
+                "cannot prove the --version process domain is empty: {error}"
+            ));
+        }
+        if !domain_empty {
+            return Err(format!(
+                "the --version process domain did not become empty within the {}-second shutdown bound",
+                VERSION_SHUTDOWN_TIMEOUT.as_secs()
+            ));
+        }
+        if self.stdout.is_none() || self.stderr.is_none() {
+            return Err(format!(
+                "the --version output readers did not stop within the {}-second shutdown bound",
+                VERSION_SHUTDOWN_TIMEOUT.as_secs()
+            ));
+        }
+        if lifetime_exceeded {
+            return Err(format!(
+                "--version did not complete within the {}-second process/output lifetime bound",
+                VERSION_OBSERVATION_TIMEOUT.as_secs()
+            ));
+        }
+
+        let stdout = self
+            .stdout
+            .take()
+            .expect("the stdout reader result was checked")
+            .map_err(|error| format!("cannot read --version standard output: {error}"))?;
+        let stderr = self
+            .stderr
+            .take()
+            .expect("the stderr reader result was checked")
+            .map_err(|error| format!("cannot read --version standard error: {error}"))?;
+        let success = status.success();
+        let status = status
+            .code()
+            .map_or_else(|| status.to_string(), |code| format!("exit code {code}"));
+        Ok(CapturedVersion {
+            success,
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn store_reader_result(&mut self, (stream, result): ReaderMessage) {
+        match stream {
+            CapturedStream::Stdout => self.stdout = Some(result),
+            CapturedStream::Stderr => self.stderr = Some(result),
+        }
+    }
+}
+
 fn capture(executable: &Path, invocation_cwd: &Path) -> Result<CapturedVersion, String> {
-    let mut child = Command::new(executable)
-        .arg("--version")
-        .current_dir(invocation_cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("cannot start --version: {error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "cannot capture --version standard output".to_owned())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "cannot capture --version standard error".to_owned())?;
+    let mut capture = RunningCapture::start(executable, invocation_cwd)?;
+    let lifetime_exceeded = capture.await_output_bound();
+    capture.finish(lifetime_exceeded)
+}
 
-    let (status, stdout, stderr) = std::thread::scope(|scope| {
-        let stdout = scope.spawn(move || read_bounded(stdout));
-        let stderr = scope.spawn(move || read_bounded(stderr));
-        let status = child.wait();
-        (status, stdout.join(), stderr.join())
-    });
-    let status = status.map_err(|error| format!("cannot wait for --version: {error}"))?;
-    let success = status.success();
-    let status = status
-        .code()
-        .map_or_else(|| status.to_string(), |code| format!("exit code {code}"));
-    let stdout = stdout
-        .map_err(|_| "the --version stdout reader stopped unexpectedly".to_owned())?
-        .map_err(|error| format!("cannot read --version standard output: {error}"))?;
-    let stderr = stderr
-        .map_err(|_| "the --version stderr reader stopped unexpectedly".to_owned())?
-        .map_err(|error| format!("cannot read --version standard error: {error}"))?;
-
-    Ok(CapturedVersion {
-        success,
-        status,
-        stdout,
-        stderr,
+fn spawn_reader(
+    name: &str,
+    stream: CapturedStream,
+    reader: impl Read + Send + 'static,
+    sender: Sender<ReaderMessage>,
+) -> io::Result<JoinHandle<()>> {
+    thread::Builder::new().name(name.to_owned()).spawn(move || {
+        let _ = sender.send((stream, read_bounded(reader)));
     })
+}
+
+fn reader_requires_stop(result: Option<&io::Result<BoundedBytes>>) -> bool {
+    match result {
+        Some(Ok(bytes)) => bytes.exceeded,
+        Some(Err(_)) => true,
+        None => false,
+    }
+}
+
+fn reader_completed_within_bound(result: Option<&io::Result<BoundedBytes>>) -> bool {
+    matches!(result, Some(Ok(bytes)) if !bytes.exceeded)
+}
+
+fn stop_after_setup_failure(domain: &mut CaptureDomain, child: &mut Child) {
+    let _ = domain.terminate(child);
+    let deadline = Instant::now() + VERSION_SHUTDOWN_TIMEOUT;
+    let mut root_reaped = false;
+    while Instant::now() < deadline {
+        if !root_reaped {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    domain.mark_root_reaped();
+                    root_reaped = true;
+                }
+                Ok(None) => {}
+                Err(_) => return,
+            }
+        }
+        if root_reaped {
+            match domain.is_empty() {
+                Ok(true) | Err(_) => return,
+                Ok(false) => {}
+            }
+        }
+        thread::sleep(CAPTURE_POLL_INTERVAL);
+    }
 }
 
 fn read_bounded(mut reader: impl Read) -> io::Result<BoundedBytes> {
@@ -221,17 +464,10 @@ fn read_bounded(mut reader: impl Read) -> io::Result<BoundedBytes> {
     if exceeded {
         bytes.truncate(VERSION_OUTPUT_LIMIT);
     }
-    io::copy(&mut reader, &mut io::sink())?;
     Ok(BoundedBytes { bytes, exceeded })
 }
 
 fn classify_capture(spec: VersionSpec, output: CapturedVersion) -> VersionObservation {
-    if !output.success {
-        return VersionObservation::Unavailable {
-            spec,
-            reason: format!("--version exited with {}", output.status),
-        };
-    }
     if output.stdout.exceeded || output.stderr.exceeded {
         let stream = match (output.stdout.exceeded, output.stderr.exceeded) {
             (true, true) => "standard output and standard error",
@@ -244,6 +480,12 @@ fn classify_capture(spec: VersionSpec, output: CapturedVersion) -> VersionObserv
             reason: format!(
                 "--version {stream} exceeds the {VERSION_OUTPUT_LIMIT}-byte observation bound"
             ),
+        };
+    }
+    if !output.success {
+        return VersionObservation::Unavailable {
+            spec,
+            reason: format!("--version exited with {}", output.status),
         };
     }
     let Ok(banner) = String::from_utf8(output.stdout.bytes) else {
@@ -345,17 +587,21 @@ mod tests {
     }
 
     #[test]
-    fn oversized_output_is_drained_but_never_retained_past_the_bound() {
-        let bounded = read_bounded(Cursor::new(vec![b'x'; VERSION_OUTPUT_LIMIT + 512]))
-            .expect("bounded read");
+    fn oversized_output_closes_the_reader_and_outweighs_forced_status() {
+        let mut source = Cursor::new(vec![b'x'; VERSION_OUTPUT_LIMIT + 512]);
+        let bounded = read_bounded(&mut source).expect("bounded read");
         assert!(bounded.exceeded);
         assert_eq!(bounded.bytes.len(), VERSION_OUTPUT_LIMIT);
+        assert_eq!(
+            source.position(),
+            u64::try_from(VERSION_OUTPUT_LIMIT + 1).expect("bound fits u64")
+        );
 
         let observation = classify_capture(
             SPEC,
             CapturedVersion {
-                success: true,
-                status: "exit status: 0".to_owned(),
+                success: false,
+                status: "signal: 9 (SIGKILL)".to_owned(),
                 stdout: bounded,
                 stderr: BoundedBytes {
                     bytes: Vec::new(),

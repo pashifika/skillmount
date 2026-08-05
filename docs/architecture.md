@@ -210,7 +210,7 @@ conflict until recovery removes it. This ordering is the accepted decision in
 | `src/lock/` | Logical/physical resource identities and sorted operating-system advisory locks. |
 | `src/journal/` | Versioned, checksummed write-ahead ownership records and durable storage. |
 | `src/transaction/` | Apply, rollback, ordinary cleanup, kept state, and stale recovery. |
-| `src/process/` | Shell-free direct child launch, inherited streams, reusable platform interruption, liveness-gated cleanup coordination, structured status, and exit-policy mapping. |
+| `src/process/` | Shell-free direct child launch, bounded captured-command containment, inherited session streams, reusable platform interruption, liveness-gated cleanup coordination, structured status, and exit-policy mapping. |
 | `src/link/` | Sealed platform boundary for no-follow inspection, link creation, no-replace placement, and verified entry removal. |
 | `src/state.rs` | Computes state locations and, only after the mutation boundary, creates their requested final directories with platform-specific access restrictions. |
 | `src/native.rs` | Lossless platform-native path encoding for journals and lock keys. |
@@ -234,18 +234,25 @@ no-follow inspection, but the adapter never invokes a mutating platform operatio
 
 The version observer is a sibling of `AgentAdapter`, not a transaction participant. It may launch
 only the resolved executable with literal `--version`, null stdin, bounded captured streams, and
-the invocation CWD. It has no mount, lock, journal, transaction, or cleanup API and its result is
-never persisted as ownership evidence. `src/app.rs` owns the single pre-state session observation;
-`doctor` owns its independent diagnostic observation.
+the invocation CWD. Native process containment gives the observation a finite lifetime: crossing a
+stream or time bound closes capture, terminates the dedicated process domain before reaping its
+root, and requires bounded reader shutdown plus domain-death proof. A capture or containment
+failure becomes unavailable advisory evidence. The observer has no mount, lock, journal,
+transaction, or cleanup API and its result is never persisted as ownership evidence. `src/app.rs`
+owns the single pre-state session observation; `doctor` owns its independent diagnostic
+observation.
 
 The shared application layer owns ordering and policy. The transaction layer owns multi-step
 mutation and durable ownership. The sealed link backend provides both read-only inspection and
 narrow mutation primitives; it does not decide when a plan should be applied, recovered, or cleaned
 up. There is no recursive removal operation in the link contract.
 
-The process layer consumes a completed `LaunchPlan` and a single-use cleanup operation. It does not
-select an agent executable, inject agent-specific arguments, apply a mount transaction, or decide
-retention policy. `src/app.rs` composes that boundary for both implemented session adapters.
+The process layer exposes two shell-free lifecycle boundaries. Session supervision consumes a
+completed `LaunchPlan` and a single-use cleanup operation. Version capture configures one dedicated
+native process domain before spawn and exposes only force-before-reap and signal-free emptiness
+proof operations to the observer. The layer does not select an agent executable, inject
+agent-specific arguments, apply a mount transaction, or decide retention policy. `src/app.rs`
+composes the session boundary for both implemented adapters.
 
 `src/link/` therefore serves two callers without owning their policy:
 
@@ -286,7 +293,7 @@ unsound; [ADR 0010](adr/0010-discovery-entry-identity.md) records this decision.
 | Compatibility | `.codex/skills` is a visible legacy conflict scope but never a placement candidate; an existing `.agents/skills -> .codex/skills` link is respected as operator configuration | No project compatibility store is created |
 | Planned destination | Always `<project>/.agents/skills`; a missing path is planned as a regular directory chain | Default: unique state-root staging tree at `<session>/root/.claude/skills`; project mode: `<project>/.claude/skills` |
 | Project mutation | Transaction-owned Skill links may be added only through `.agents/skills` | Project mode may add transaction-owned entries; default staging does not modify the project namespace |
-| Launch integration | Implemented for bounded `exec` and `review` launches on exactly `codex-cli 0.146.0`, re-probed before state, after lock stabilization, and at the spawn boundary; interactive TUI is rejected because it can reload higher-precedence managed configuration after spawn; child `current_dir`, canonical explicit `CODEX_HOME`, injected native `-C` and session discovery overrides, validated passthrough, and no `--add-dir` | Implemented on exactly `2.1.220 (Claude Code)`, re-probed at the same three boundaries; default staging injects one `--add-dir <session>/root` pair and every mode injects a session-only selected-name `skillOverrides` object before unchanged validated passthrough |
+| Launch integration | Implemented for bounded `exec` and `review` launches; one bounded pre-state version observation compares against the dated last-tested banner `codex-cli 0.146.0`, while release-independent hard launch invariants repeat after lock stabilization and at the spawn boundary; interactive TUI is rejected because it can reload higher-precedence managed configuration after spawn; child `current_dir`, canonical explicit `CODEX_HOME`, injected native `-C` and session discovery overrides, validated passthrough, and no `--add-dir` | Implemented with one bounded pre-state version observation against the dated last-tested banner `2.1.220 (Claude Code)` and the same repeated hard-invariant boundaries; default staging injects one `--add-dir <session>/root` pair and every mode injects a session-only selected-name `skillOverrides` object before unchanged validated passthrough |
 
 Scopes that resolve to one terminal directory and use the same traversal policy are folded for
 conflict evaluation while their visible aliases remain available for diagnostics. A bundled-system
@@ -299,8 +306,9 @@ namespaces without losing alias-level contention.
 
 The Codex model was revalidated on 2026-08-03 against `codex-cli 0.146.0`, current official Skill
 documentation, the pinned open-source loader, home resolver and bundled-Skill installer, and
-black-box prompt discovery. A mutating session accepts exactly that reported release; dry-run and
-inspection describe the pinned contract without launching an executable. This evidence replaced
+black-box prompt discovery. A mutating session treats that reported banner as dated last-tested
+evidence; a different or unavailable banner warns once and continues. Dry-run and inspection
+describe the same evidence boundary without launching an executable. This evidence replaced
 the older direct-directory-name and two-entry backing models;
 [ADR 0021](adr/0021-merge-codex-visible-names-and-mount-through-agents.md) records the proof, merged
 index, placement rule, and deferred compatibility work. Repository, user, and administrator roots

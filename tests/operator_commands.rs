@@ -251,6 +251,38 @@ fn unavailable_agent_version_is_unverified_without_suppressing_other_checks() {
 }
 
 #[test]
+fn enforced_launch_configuration_fails_doctor_without_suppressing_other_checks() {
+    let fixture = Fixture::new("doctor-enforced-configuration");
+    let project_before = snapshot(&fixture.project);
+
+    let output = fixture
+        .doctor_command()
+        .env("SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG", "present")
+        .env("CLAUDE_CODE_SAFE_MODE", "1")
+        .output()
+        .expect("enforced-configuration doctor should run");
+
+    assert_eq!(output.status.code(), Some(65));
+    assert!(output.stderr.is_empty());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("[FAIL] codex executable"), "{rendered}");
+    assert!(
+        rendered.contains("legacy managed configuration"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("[FAIL] claude executable"), "{rendered}");
+    assert!(rendered.contains("CLAUDE_CODE_SAFE_MODE"), "{rendered}");
+    assert!(rendered.contains("[PASS] codex discovery"), "{rendered}");
+    assert!(rendered.contains("[PASS] claude discovery"), "{rendered}");
+    assert!(rendered.contains("2 failure"), "{rendered}");
+    assert_eq!(snapshot(&fixture.project), project_before);
+    assert!(
+        !fixture.state.exists(),
+        "doctor must not create transaction state"
+    );
+}
+
+#[test]
 fn duplicate_visible_skill_is_a_warning_without_failing_doctor() {
     let fixture = Fixture::new("doctor-warning");
     for root in [".agents/skills", ".codex/skills"] {

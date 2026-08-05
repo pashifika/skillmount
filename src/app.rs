@@ -106,6 +106,7 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError
                 snapshot: &report.snapshot,
                 plan: &report.plan,
                 verbosity: context.options.verbosity,
+                version_observation_attempted: false,
             }))?;
             warn(&render::render_warnings(&report.catalog, &report.snapshot));
             Ok(0)
@@ -130,6 +131,7 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError
                     snapshot: &report.snapshot,
                     plan: &report.plan,
                     verbosity: 0,
+                    version_observation_attempted: false,
                 }));
                 warnings.extend(render::render_warnings(&report.catalog, &report.snapshot));
             }
@@ -323,6 +325,7 @@ fn render_session_output(context: &RunContext, outcome: &ReadOnlyOutcome) -> Str
         snapshot: &outcome.snapshot,
         plan: &outcome.plan,
         verbosity: context.options.verbosity,
+        version_observation_attempted: true,
     };
     let mut output = render::render_session_start(&report);
     if context.options.verbosity > 0 {
