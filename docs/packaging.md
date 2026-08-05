@@ -319,15 +319,15 @@ immutable release bytes as the other package channel; it does not depend on GitH
 tarball, a Homebrew Rust toolchain, or a second build. A mismatch blocks publication. Never repair
 published metadata or bytes in place; publish a new patch release through the normal flow.
 
-## Operator guidance (not yet available)
+## Operator guidance
 
-None of the four install commands below works today. Each becomes available only when its own
-public endpoint resolves version `0.2.0` and a clean selected-only installation passes on a
-supported host, per the evidence contract above. Until then, install from
-[GitHub Releases](https://github.com/pashifika/skillmount/releases) as described in the
-[README](../README.md). Installing both Formulae or both Chocolatey packages together is supported;
-each command owns only its own executable, shim, and completion files, and uninstalling one never
-removes the other.
+The two Homebrew install commands below are public at version `0.2.0` and passed clean,
+selected-only installation on Apple Silicon macOS. The two Chocolatey commands remain unavailable
+until their own public endpoints and clean Windows installations pass. Install from
+[GitHub Releases](https://github.com/pashifika/skillmount/releases) when a package-manager entry is
+unavailable. Installing both Formulae or, once published, both Chocolatey packages together is
+supported; each command owns only its own executable, shim, and completion files, and uninstalling
+one never removes the other.
 
 Homebrew adds a trust prerequisite to the install path, proven with Homebrew 6.0.12 on `macos-15`:
 `brew install` refuses a Formula from an untrusted third-party tap, while `brew style` and
@@ -344,10 +344,10 @@ Formula you previously removed, which is why every command block below repeats i
 why the harness re-asserts trust before each install rather than once per run. Trusting the whole
 tap avoids the repetition at the cost of trusting Formulae added later.
 
-### Homebrew `pashifika/tap/skillmount` — unavailable
+### Homebrew `pashifika/tap/skillmount` — available
 
-Available once the tap's `skillmount` Formula resolves `0.2.0` publicly and its clean-host
-selected-only install passes on Apple Silicon macOS.
+The public tap resolves the reviewed `0.2.0` Formula. Its selected-only, completion, Formula-test,
+co-installation, cross-uninstall, and final-uninstall checks passed on Apple Silicon macOS.
 
 ```bash
 brew trust --formula pashifika/tap/skillmount    # required before install
@@ -361,10 +361,10 @@ generates Bash, Zsh, and Fish completions by running `skillmount completions <sh
 time and places them in Homebrew-managed completion directories; they register only `skillmount`,
 and uninstalling removes only them. No user profile is edited.
 
-### Homebrew `pashifika/tap/skillmount-asm` — unavailable
+### Homebrew `pashifika/tap/skillmount-asm` — available
 
-Available once the tap's `skillmount-asm` Formula resolves `0.2.0` publicly and its clean-host
-selected-only install passes on Apple Silicon macOS.
+The public tap resolves the reviewed `0.2.0` Formula. Its selected-only, completion, Formula-test,
+co-installation, cross-uninstall, and final-uninstall checks passed on Apple Silicon macOS.
 
 ```bash
 brew trust --formula pashifika/tap/skillmount-asm    # required before install
@@ -376,6 +376,11 @@ brew uninstall skillmount-asm
 Installs only the `asm` command from the checked Apple Silicon release archive. Bash, Zsh, and Fish
 completions are generated through `asm completions <shell>`, register only `asm`, and are owned and
 removed by this Formula alone. No user profile is edited.
+
+Version-transition testing is not yet applicable: `v0.2.0` is the first published Formula pair,
+and `v0.1.0` predates the `completions` command that both Formulae require during installation.
+`brew upgrade` is the supported command for future releases; the next completion-capable release
+must exercise that transition before publication.
 
 ### Chocolatey `skillmount` — unavailable
 

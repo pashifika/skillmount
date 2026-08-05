@@ -732,6 +732,9 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
   ([ADR 0030](adr/0030-publish-selectable-packages-through-isolated-post-release-channels.md),
   [ADR 0031](adr/0031-use-release-archives-for-homebrew-formulae.md),
   [ADR 0032](adr/0032-establish-chocolatey-ownership-through-submission.md));
+- protected publication of both `v0.2.0` Homebrew Formulae through a reviewed tap pull request,
+  followed by public selected-only, completion, co-installation, cross-uninstall, and final
+  uninstall verification on Apple Silicon macOS;
 - crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
 
 ### Reserved work
@@ -742,11 +745,10 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
 - lock-file reclamation;
 - binding a public transaction's lifetime to the lock guard validated when it is opened or adopted;
 - rejecting pre-existing links in application-state directory paths before creation or permission changes;
-- external package-channel publication: the separately managed `pashifika/homebrew-tap` is created,
-  bootstrapped, and protected, while publication still requires release verification at workflow
-  time, the tap-scoped GitHub App installation, the Chocolatey account API key, both protected
-  environments with their credentials, first package submissions and per-ID moderation, and the
-  four publicly resolved, clean-host-verified install commands;
+- completing external package-channel state: controlled real-publisher failure, retry, and recovery
+  exercises remain for both channels, while Chocolatey additionally requires first submission of
+  both package IDs, per-ID moderation, and two publicly resolved, clean-host-verified install
+  commands;
 
 Both session adapters use the supervisor in the product application path, but real-agent and
 Windows-junction certification remain non-blocking compatibility evidence gaps rather than claims

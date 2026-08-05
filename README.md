@@ -39,46 +39,65 @@ and `skillmount`, a descriptive fallback that behaves the same way.
 
 ## Install
 
+### Homebrew on Apple Silicon
+
+Homebrew is the fastest installation path on supported Apple Silicon Macs. Install the primary
+`asm` command:
+
+```bash
+brew trust --formula pashifika/tap/skillmount-asm
+brew install pashifika/tap/skillmount-asm
+asm --version   # prints: SkillMount 0.2.0
+```
+
+Or install the descriptive `skillmount` command:
+
+```bash
+brew trust --formula pashifika/tap/skillmount
+brew install pashifika/tap/skillmount
+skillmount --version   # prints: SkillMount 0.2.0
+```
+
+Each Formula installs only the command you selected and generates its Bash, Zsh, and Fish
+completions. Installing both Formulae together is supported. Homebrew requires the explicit trust
+step for this third-party tap; uninstalling a Formula removes its trust entry, so repeat that step
+before reinstalling it.
+
 ### Download a release
 
 Each release archive contains both commands plus the license and version files, and the release
 publishes `SHA256SUMS` digests next to the archives. On macOS (Apple Silicon):
 
 ```bash
-curl -LO https://github.com/pashifika/skillmount/releases/download/v0.1.0/skillmount-v0.1.0-aarch64-apple-darwin.tar.gz
-tar -xzf skillmount-v0.1.0-aarch64-apple-darwin.tar.gz
-skillmount-v0.1.0-aarch64-apple-darwin/asm --version   # prints: SkillMount 0.1.0
+curl -LO https://github.com/pashifika/skillmount/releases/download/v0.2.0/skillmount-v0.2.0-aarch64-apple-darwin.tar.gz
+tar -xzf skillmount-v0.2.0-aarch64-apple-darwin.tar.gz
+skillmount-v0.2.0-aarch64-apple-darwin/asm --version   # prints: SkillMount 0.2.0
 ```
 
 On Windows x64 (use the `i686` archive for x86):
 
 ```powershell
-Invoke-WebRequest https://github.com/pashifika/skillmount/releases/download/v0.1.0/skillmount-v0.1.0-x86_64-pc-windows-msvc.zip -OutFile skillmount.zip
+Invoke-WebRequest https://github.com/pashifika/skillmount/releases/download/v0.2.0/skillmount-v0.2.0-x86_64-pc-windows-msvc.zip -OutFile skillmount.zip
 Expand-Archive skillmount.zip .
-.\skillmount-v0.1.0-x86_64-pc-windows-msvc\asm.exe --version   # prints: SkillMount 0.1.0
+.\skillmount-v0.2.0-x86_64-pc-windows-msvc\asm.exe --version   # prints: SkillMount 0.2.0
 ```
 
 Move `asm` — and `skillmount`, if you want the fallback name — into a directory on your `PATH`.
 Keep each executable under its own name; SkillMount rejects a renamed copy.
 
-### Package managers (not yet available)
+### Chocolatey (not yet available)
 
-Homebrew and Chocolatey packages are prepared but not yet published. None of the commands below
-works today. Each becomes available once its own public endpoint resolves version `0.2.0` and a
-clean installation passes on a supported host:
+The Chocolatey packages have passed native package CI but are not public yet. These commands remain
+unavailable until their individual Community Repository approvals and clean Windows installations
+pass:
 
 | Command | Would install | Status |
 |---|---|---|
-| `brew trust --formula pashifika/tap/skillmount && brew install pashifika/tap/skillmount` | `skillmount` on Apple Silicon macOS | Not yet available |
-| `brew trust --formula pashifika/tap/skillmount-asm && brew install pashifika/tap/skillmount-asm` | `asm` on Apple Silicon macOS | Not yet available |
 | `choco install skillmount` | `skillmount` on Windows x64/x86 | Not yet available |
 | `choco install skillmount-asm` | `asm` on Windows x64/x86 | Not yet available |
 
-Each package installs exactly one of the two commands and owns only that command's executable,
-shim, and completion files. Installing both packages from one manager is supported. The
-`brew trust` step is required because Homebrew refuses to install from an untrusted third-party
-tap; it persists across upgrades of an installed Formula, but uninstalling one drops its entry, so
-reinstalling needs it again. Upgrade, uninstall, and completion details per package live in
+Each package will own only its selected executable and ordinary Chocolatey shim. Upgrade,
+uninstall, and completion details for every channel live in
 [docs/packaging.md](docs/packaging.md).
 
 ### Build from source
