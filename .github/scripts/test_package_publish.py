@@ -8,6 +8,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Any
 
@@ -328,8 +329,8 @@ class FakeCommunityGateway:
             "version": version,
             "listed": False,
             "moderation_status": "pending",
-            "package_hash": hashlib.sha256(path.read_bytes()).hexdigest(),
-            "package_hash_algorithm": "SHA256",
+            "package_hash": hashlib.sha512(path.read_bytes()).hexdigest(),
+            "package_hash_algorithm": "SHA512",
         }
         response = {"package_id": package_id, "version": version, "status": "accepted"}
         response.update(self.push_response.get(package_id, {}))
@@ -352,10 +353,10 @@ class FakeCommunityGateway:
         package_id: str,
         version: str,
         *,
-        sha256: str,
+        package_hash: str,
         moderation_status: str = "approved",
         listed: bool = True,
-        algorithm: str = "SHA256",
+        algorithm: str = "SHA512",
     ) -> None:
         """Seed one observed Community Repository package version."""
 
@@ -363,7 +364,7 @@ class FakeCommunityGateway:
             "version": version,
             "listed": listed,
             "moderation_status": moderation_status,
-            "package_hash": sha256,
+            "package_hash": package_hash,
             "package_hash_algorithm": algorithm,
         }
 
@@ -730,12 +731,16 @@ class ChocolateyCommunityTests(unittest.TestCase):
         self.inputs = package_inputs()
         self.first, self.second = channels.PACKAGES
         self.nupkgs: dict[str, Path] = {}
-        self.digests: dict[str, str] = {}
+        self.package_sha256s: dict[str, str] = {}
+        self.package_hashes: dict[str, str] = {}
         for identity in channels.PACKAGES:
             path = self.root / channels.nupkg_name(identity, VERSION)
             path.write_bytes(f"nupkg:{identity.package_id}:{VERSION}\n".encode())
             self.nupkgs[identity.package_id] = path
-            self.digests[identity.package_id] = hashlib.sha256(
+            self.package_sha256s[identity.package_id] = hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+            self.package_hashes[identity.package_id] = hashlib.sha512(
                 path.read_bytes()
             ).hexdigest()
 
@@ -749,7 +754,7 @@ class ChocolateyCommunityTests(unittest.TestCase):
 
         return dict(
             package_publish.reconcile_chocolatey(
-                gateway, self.inputs, self.nupkgs, self.digests
+                gateway, self.inputs, self.nupkgs, self.package_sha256s
             )
         )
 
@@ -790,7 +795,9 @@ class ChocolateyCommunityTests(unittest.TestCase):
 
         gateway = FakeCommunityGateway()
         gateway.publish(
-            self.first.package_id, VERSION, sha256=self.digests[self.first.package_id]
+            self.first.package_id,
+            VERSION,
+            package_hash=self.package_hashes[self.first.package_id],
         )
         states = self.reconcile(gateway)
 
@@ -807,7 +814,7 @@ class ChocolateyCommunityTests(unittest.TestCase):
         gateway.publish(
             self.second.package_id,
             VERSION,
-            sha256=self.digests[self.second.package_id],
+            package_hash=self.package_hashes[self.second.package_id],
             moderation_status="pending",
             listed=False,
         )
@@ -827,7 +834,7 @@ class ChocolateyCommunityTests(unittest.TestCase):
             gateway.publish(
                 identity.package_id,
                 VERSION,
-                sha256=self.digests[identity.package_id],
+                package_hash=self.package_hashes[identity.package_id],
             )
         gateway.pushes_forbidden = True
         states = self.reconcile(gateway)
@@ -845,7 +852,7 @@ class ChocolateyCommunityTests(unittest.TestCase):
             gateway.publish(
                 identity.package_id,
                 VERSION,
-                sha256=self.digests[identity.package_id],
+                package_hash=self.package_hashes[identity.package_id],
                 moderation_status="pending",
                 listed=False,
             )
@@ -863,12 +870,14 @@ class ChocolateyCommunityTests(unittest.TestCase):
 
         gateway = FakeCommunityGateway()
         gateway.publish(
-            self.first.package_id, VERSION, sha256=self.digests[self.first.package_id]
+            self.first.package_id,
+            VERSION,
+            package_hash=self.package_hashes[self.first.package_id],
         )
         gateway.publish(
             self.second.package_id,
             VERSION,
-            sha256=self.digests[self.second.package_id],
+            package_hash=self.package_hashes[self.second.package_id],
             moderation_status="pending",
             listed=False,
         )
@@ -880,15 +889,15 @@ class ChocolateyCommunityTests(unittest.TestCase):
             {self.first.package_id: "listed", self.second.package_id: "pending"},
         )
 
-    def test_unlisted_but_approved_member_is_unchanged(self) -> None:
-        """Distinguish an approved but unlisted member from a publicly listed one."""
+    def test_approved_but_not_publicly_resolved_member_is_unchanged(self) -> None:
+        """Distinguish approved metadata from a publicly resolved package."""
 
         gateway = FakeCommunityGateway()
         for identity in channels.PACKAGES:
             gateway.publish(
                 identity.package_id,
                 VERSION,
-                sha256=self.digests[identity.package_id],
+                package_hash=self.package_hashes[identity.package_id],
                 listed=False,
             )
         gateway.pushes_forbidden = True
@@ -904,11 +913,11 @@ class ChocolateyCommunityTests(unittest.TestCase):
 
         gateway = FakeCommunityGateway()
         for identity in channels.PACKAGES:
-            raw = bytes.fromhex(self.digests[identity.package_id])
+            raw = bytes.fromhex(self.package_hashes[identity.package_id])
             gateway.publish(
                 identity.package_id,
                 VERSION,
-                sha256=base64.b64encode(raw).decode("ascii"),
+                package_hash=base64.b64encode(raw).decode("ascii"),
             )
         gateway.pushes_forbidden = True
         states = self.reconcile(gateway)
@@ -934,25 +943,25 @@ class ChocolateyCommunityTests(unittest.TestCase):
         """Never repush or overwrite a version whose published bytes differ."""
 
         gateway = FakeCommunityGateway()
-        foreign = digest("foreign-nupkg")
-        gateway.publish(self.first.package_id, VERSION, sha256=foreign)
+        foreign = hashlib.sha512(b"foreign-nupkg").hexdigest()
+        gateway.publish(self.first.package_id, VERSION, package_hash=foreign)
         message = self.assert_pair_blocked(gateway)
         self.assertIn(foreign, message)
-        self.assertIn(self.digests[self.first.package_id], message)
+        self.assertIn(self.package_hashes[self.first.package_id], message)
 
     def test_wrong_hash_algorithm_is_a_conflict_not_a_pass(self) -> None:
-        """Refuse a member whose digest cannot be compared under SHA-256."""
+        """Refuse a member whose digest cannot be compared under SHA-512."""
 
         gateway = FakeCommunityGateway()
         gateway.publish(
             self.second.package_id,
             VERSION,
-            sha256=self.digests[self.second.package_id],
-            algorithm="SHA512",
+            package_hash=self.package_hashes[self.second.package_id],
+            algorithm="SHA256",
         )
         message = self.assert_pair_blocked(gateway)
-        self.assertIn("'SHA512'", message)
-        self.assertIn("expected 'SHA256'", message)
+        self.assertIn("'SHA256'", message)
+        self.assertIn("expected 'SHA512'", message)
 
     def test_rejected_member_blocks_both_ids(self) -> None:
         """Stop the pair for human review when moderation rejected a member."""
@@ -961,7 +970,7 @@ class ChocolateyCommunityTests(unittest.TestCase):
         gateway.publish(
             self.first.package_id,
             VERSION,
-            sha256=self.digests[self.first.package_id],
+            package_hash=self.package_hashes[self.first.package_id],
             moderation_status="rejected",
             listed=False,
         )
@@ -975,7 +984,7 @@ class ChocolateyCommunityTests(unittest.TestCase):
         gateway.publish(
             self.second.package_id,
             VERSION,
-            sha256=self.digests[self.second.package_id],
+            package_hash=self.package_hashes[self.second.package_id],
             moderation_status="quarantined",
         )
         message = self.assert_pair_blocked(gateway)
@@ -989,8 +998,8 @@ class ChocolateyCommunityTests(unittest.TestCase):
             "version": "0.1.9",
             "listed": True,
             "moderation_status": "approved",
-            "package_hash": self.digests[self.first.package_id],
-            "package_hash_algorithm": "SHA256",
+            "package_hash": self.package_hashes[self.first.package_id],
+            "package_hash_algorithm": "SHA512",
         }
         message = self.assert_pair_blocked(gateway)
         self.assertIn("'0.1.9'", message)
@@ -1020,6 +1029,32 @@ class ChocolateyCommunityTests(unittest.TestCase):
             self.reconcile(gateway)
         self.assertEqual(gateway.pushes, [self.first.package_id])
         self.assertEqual(gateway.entries, {})
+
+    def test_second_push_failure_preserves_the_accepted_first_member(self) -> None:
+        """Retry only the member missing after a non-atomic second upload failure."""
+
+        gateway = FakeCommunityGateway()
+        gateway.push_error[self.second.package_id] = OSError("forbidden package id")
+        with self.assertRaisesRegex(
+            package_publish.PublicationError, "was not retried"
+        ):
+            self.reconcile(gateway)
+        self.assertEqual(
+            gateway.pushes, [self.first.package_id, self.second.package_id]
+        )
+        self.assertIn((self.first.package_id, VERSION), gateway.entries)
+        self.assertNotIn((self.second.package_id, VERSION), gateway.entries)
+
+        gateway.push_error.clear()
+        gateway.queries.clear()
+        gateway.pushes.clear()
+        states = self.reconcile(gateway)
+
+        self.assertEqual(
+            states,
+            {self.first.package_id: "pending", self.second.package_id: "pending"},
+        )
+        self.assertEqual(gateway.pushes, [self.second.package_id])
 
     def test_duplicate_run_performs_no_second_push(self) -> None:
         """Observe the accepted pair on retry instead of pushing either id again."""
@@ -1058,7 +1093,7 @@ class ChocolateyCommunityTests(unittest.TestCase):
         """Prove the candidate digest from bytes before contacting the repository."""
 
         gateway = FakeCommunityGateway()
-        self.digests[self.second.package_id] = digest("stale-digest")
+        self.package_sha256s[self.second.package_id] = digest("stale-digest")
         with self.assertRaisesRegex(package_publish.PublicationError, "hashes to"):
             self.reconcile(gateway)
         self.assertEqual(gateway.queries, [])
@@ -1096,31 +1131,157 @@ class ChocolateyCommunityTests(unittest.TestCase):
         self.assertEqual(gateway.queries, [])
 
 
+class ChocolateyGatewayTests(unittest.TestCase):
+    """Cover the distinct official read and write Community endpoints."""
+
+    def test_gateway_parses_sha512_and_proves_listing_with_supported_cli(self) -> None:
+        """Bind real OData hash fields to an exact public `choco search` result."""
+
+        package_bytes = b"candidate"
+        package_hash = base64.b64encode(hashlib.sha512(package_bytes).digest()).decode()
+        body = f"""\
+<entry xmlns="http://www.w3.org/2005/Atom"
+       xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"
+       xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+  <m:properties>
+    <d:Version>{VERSION}</d:Version>
+    <d:IsApproved m:type="Edm.Boolean">true</d:IsApproved>
+    <d:PackageStatus>Approved</d:PackageStatus>
+    <d:PackageHash>{package_hash}</d:PackageHash>
+    <d:PackageHashAlgorithm>SHA512</d:PackageHashAlgorithm>
+  </m:properties>
+</entry>
+""".encode()
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = body
+        completed = mock.Mock(
+            returncode=0,
+            stdout=f"skillmount|{VERSION}\n".encode(),
+            stderr=b"",
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            package_publish.os.environ,
+            {"CHOCOLATEY_API_KEY": "test-api-key"},
+        ):
+            gateway = package_publish.ChocolateyGateway(
+                working_directory=Path(directory)
+            )
+            with mock.patch.object(
+                package_publish.urllib.request, "urlopen", return_value=response
+            ), mock.patch.object(
+                package_publish.subprocess, "run", return_value=completed
+            ) as run:
+                observed = gateway.package_version("skillmount", VERSION)
+
+        self.assertEqual(
+            observed,
+            {
+                "version": VERSION,
+                "listed": True,
+                "moderation_status": "approved",
+                "package_hash": package_hash,
+                "package_hash_algorithm": "SHA512",
+            },
+        )
+        self.assertEqual(
+            package_publish.normalized_sha512_hash(observed["package_hash"]),
+            hashlib.sha512(package_bytes).hexdigest(),
+        )
+        arguments = run.call_args.args[0]
+        self.assertEqual(
+            arguments,
+            [
+                "choco",
+                "search",
+                "skillmount",
+                f"--version={VERSION}",
+                "--exact",
+                "--all-versions",
+                "--approved-only",
+                "--limit-output",
+                "--source",
+                package_publish.COMMUNITY_QUERY_SOURCE,
+            ],
+        )
+        self.assertNotIn("CHOCOLATEY_API_KEY", run.call_args.kwargs["env"])
+
+    def test_gateway_queries_the_feed_and_pushes_to_the_upload_endpoint(self) -> None:
+        """Never send a package upload to the read-only OData endpoint."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / f"skillmount.{VERSION}.nupkg"
+            candidate.write_bytes(b"candidate")
+            with mock.patch.dict(
+                package_publish.os.environ,
+                {"CHOCOLATEY_API_KEY": "test-api-key"},
+            ):
+                gateway = package_publish.ChocolateyGateway(
+                    working_directory=root
+                )
+
+            not_found = package_publish.urllib.error.HTTPError(
+                "https://example.invalid", 404, "not found", {}, None
+            )
+            with mock.patch.object(
+                package_publish.urllib.request,
+                "urlopen",
+                side_effect=not_found,
+            ) as urlopen:
+                self.assertIsNone(gateway.package_version("skillmount", VERSION))
+            not_found.close()
+            request = urlopen.call_args.args[0]
+            self.assertTrue(
+                request.full_url.startswith(
+                    f"{package_publish.COMMUNITY_QUERY_SOURCE}/Packages("
+                )
+            )
+
+            completed = mock.Mock(returncode=0, stdout=b"accepted", stderr=b"")
+            with mock.patch.object(
+                package_publish.subprocess, "run", return_value=completed
+            ) as run:
+                response = gateway.push(
+                    candidate,
+                    package_id="skillmount",
+                    version=VERSION,
+                )
+            arguments = run.call_args.args[0]
+            source_index = arguments.index("--source") + 1
+            self.assertEqual(
+                arguments[source_index], package_publish.COMMUNITY_PUSH_SOURCE
+            )
+            self.assertNotIn(package_publish.COMMUNITY_QUERY_SOURCE, arguments)
+            self.assertEqual(
+                response["source"], package_publish.COMMUNITY_PUSH_SOURCE
+            )
+
+
 class PublisherHelperTests(unittest.TestCase):
     """Cover the pure helpers both lanes depend on."""
 
-    def test_normalized_package_hash_accepts_hex_and_base64(self) -> None:
-        """Normalize both published digest encodings to lowercase hex."""
+    def test_normalized_sha512_hash_accepts_hex_and_base64(self) -> None:
+        """Normalize both published SHA-512 encodings to lowercase hex."""
 
-        expected = digest("candidate")
+        expected = hashlib.sha512(b"candidate").hexdigest()
         raw = bytes.fromhex(expected)
-        self.assertEqual(package_publish.normalized_package_hash(expected), expected)
+        self.assertEqual(package_publish.normalized_sha512_hash(expected), expected)
         self.assertEqual(
-            package_publish.normalized_package_hash(expected.upper()), expected
+            package_publish.normalized_sha512_hash(expected.upper()), expected
         )
         self.assertEqual(
-            package_publish.normalized_package_hash(
+            package_publish.normalized_sha512_hash(
                 base64.b64encode(raw).decode("ascii")
             ),
             expected,
         )
 
-    def test_normalized_package_hash_rejects_other_values(self) -> None:
-        """Return None for a value that is not a SHA-256 digest."""
+    def test_normalized_sha512_hash_rejects_other_values(self) -> None:
+        """Return None for a value that is not a SHA-512 digest."""
 
-        for value in (None, "", "zz", digest("x")[:32], base64.b64encode(b"short")):
+        for value in (None, "", "zz", digest("x"), base64.b64encode(b"short")):
             with self.subTest(value=value):
-                self.assertIsNone(package_publish.normalized_package_hash(value))
+                self.assertIsNone(package_publish.normalized_sha512_hash(value))
 
     def test_format_states_reports_both_members_in_pair_order(self) -> None:
         """Render one workflow-output line naming each member's own state."""
@@ -1178,11 +1339,15 @@ class PublisherCommandTests(unittest.TestCase):
             path.write_text(text, encoding="utf-8")
         self.nupkg_directory = self.root / "nupkgs"
         self.nupkg_directory.mkdir()
-        self.digests: dict[str, str] = {}
+        self.package_sha256s: dict[str, str] = {}
+        self.package_hashes: dict[str, str] = {}
         for identity in channels.PACKAGES:
             path = self.nupkg_directory / channels.nupkg_name(identity, VERSION)
             path.write_bytes(f"nupkg:{identity.package_id}\n".encode())
-            self.digests[identity.package_id] = hashlib.sha256(
+            self.package_sha256s[identity.package_id] = hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+            self.package_hashes[identity.package_id] = hashlib.sha512(
                 path.read_bytes()
             ).hexdigest()
         self.report = self.root / "report.json"
@@ -1209,7 +1374,7 @@ class PublisherCommandTests(unittest.TestCase):
         self.addCleanup(setattr, package_publish, "ChocolateyGateway", original_gateway)
         self.addCleanup(setattr, channels, "inspect_nupkg_pair", original_inspect)
         package_publish.ChocolateyGateway = lambda *arguments, **keywords: gateway
-        channels.inspect_nupkg_pair = lambda paths, inputs: dict(self.digests)
+        channels.inspect_nupkg_pair = lambda paths, inputs: dict(self.package_sha256s)
 
     def outputs(self) -> dict[str, str]:
         """Parse the appended single-line GitHub Actions outputs."""
@@ -1288,7 +1453,7 @@ class PublisherCommandTests(unittest.TestCase):
         gateway.publish(
             channels.PACKAGES[0].package_id,
             VERSION,
-            sha256=self.digests[channels.PACKAGES[0].package_id],
+            package_hash=self.package_hashes[channels.PACKAGES[0].package_id],
         )
         self.install_community_gateway(gateway)
         status = package_publish.run(
@@ -1308,6 +1473,12 @@ class PublisherCommandTests(unittest.TestCase):
         self.assertEqual(status, 0)
         report = json.loads(self.report.read_text(encoding="utf-8"))
         self.assertEqual(report["channel"], "chocolatey")
+        self.assertEqual(
+            report["query_source"], package_publish.COMMUNITY_QUERY_SOURCE
+        )
+        self.assertEqual(
+            report["push_source"], package_publish.COMMUNITY_PUSH_SOURCE
+        )
         self.assertEqual(
             report["package_states"],
             {
