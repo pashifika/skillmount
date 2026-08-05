@@ -1,8 +1,7 @@
 # SkillMount Homebrew tap
 
-> Source material: this file is tracked in `pashifika/skillmount` under `packaging/homebrew/tap/`
-> and is transferred to the separately managed `pashifika/homebrew-tap` repository through that
-> repository's own reviewed change. It is not the live tap.
+> Canonical source: `pashifika/skillmount:packaging/homebrew/tap/README.md`. Changes are
+> transferred to this tap through its own reviewed pull requests.
 
 This tap publishes the two SkillMount Formulae. SkillMount is a Rust wrapper CLI that mounts
 external Agent Skills into one Codex CLI or Claude Code session; the product itself lives at
