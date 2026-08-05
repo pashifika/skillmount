@@ -1,9 +1,11 @@
 # Compatibility evidence
 
-SkillMount pins each launch adapter to a tested agent release. This matrix records observations,
-not evergreen compatibility claims. A row is `observed` only when the named command or scenario
-ran on the stated platform and date. Documentation review without a live agent run remains
-`unverified` for runtime discovery.
+SkillMount records a dated last-tested banner for each launch adapter and observes the installed
+banner as advisory evidence. It is not an exact-version launch allowlist. This matrix records
+observations, not evergreen compatibility claims. A row is `observed` only when the named command
+or scenario ran on the stated platform and date. A banner observation alone does not certify
+mounted Skill discovery, lifecycle, link loading, or cleanup, and documentation review without a
+live Agent run remains `unverified` for runtime discovery.
 
 The deterministic fake-agent and native filesystem suites are the release gate. Authenticated
 real-agent checks are additional compatibility evidence and are never inferred from a missing or
@@ -13,10 +15,12 @@ green CI job.
 
 | Agent | Version | OS / architecture | Link kind | Scenario | Date | Outcome | Evidence |
 |---|---|---|---|---|---|---|---|
-| Codex CLI | 0.146.0 | macOS / Apple Silicon | n/a | `codex --version` reports the adapter-pinned release | 2026-08-03 | observed | Local command output: `codex-cli 0.146.0` |
-| Claude Code | 2.1.220 | macOS / Apple Silicon | n/a | `claude --version` reports the adapter-pinned release | 2026-08-03 | observed | Local command output: `2.1.220 (Claude Code)` |
-| Codex CLI | 0.146.0 | macOS / Apple Silicon | directory symlink | Rightmost overlay and non-shadowed base Skills are discoverable in a real authenticated session | 2026-08-03 | unverified | Live smoke has not run |
+| Codex CLI | 0.146.0 | macOS / Apple Silicon | n/a | `codex --version` reports the adapter's last-tested banner | 2026-08-05 | observed | Local command output at base revision `977dfd21f0d597348e36b004b796cdbb2c3140bc`: `codex-cli 0.146.0` |
+| Claude Code | 2.1.220 | macOS / Apple Silicon | n/a | `claude --version` reports the adapter's last-tested banner | 2026-08-03 | observed | Local command output: `2.1.220 (Claude Code)` |
+| Claude Code | 2.1.222 | macOS / Apple Silicon | n/a | `claude --version` reports a banner newer than the last-tested evidence | 2026-08-05 | observed | Local command output at base revision `977dfd21f0d597348e36b004b796cdbb2c3140bc`: `2.1.222 (Claude Code)`; banner only |
+| Codex CLI | 0.146.0 | macOS / Apple Silicon | directory symlink | Rightmost overlay and non-shadowed base Skills are discoverable in a real authenticated session | 2026-08-05 | unverified | Live smoke has not run |
 | Claude Code | 2.1.220 | macOS / Apple Silicon | directory symlink | Rightmost overlay and non-shadowed base Skills are discoverable in a real authenticated session | 2026-08-03 | unverified | Live smoke has not run |
+| Claude Code | 2.1.222 | macOS / Apple Silicon | directory symlink | Rightmost overlay and non-shadowed base Skills are discoverable in a real authenticated session | 2026-08-05 | unverified | Version/help/documentation review only; authenticated mounted-session smoke did not run |
 | Codex CLI | 0.146.0 | Windows / x86_64 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-03 | unverified | No native live-agent run recorded |
 | Codex CLI | 0.146.0 | Windows / i686 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-03 | unverified | No native live-agent run recorded |
 | Claude Code | 2.1.220 | Windows / x86_64 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through the injected staging root | 2026-08-03 | unverified | No native live-agent run recorded |
@@ -37,8 +41,29 @@ documented behavior:
   [Environment variables](https://code.claude.com/docs/en/env-vars) and managed settings as the
   highest-precedence tier in [Settings](https://code.claude.com/docs/en/settings).
 
-The documentation does not establish real Windows junction discovery for either pinned agent.
-Those rows remain `unverified` until the manual smoke workflow records a native run.
+The 2026-08-05 implementation review observed `codex-cli 0.146.0` and
+`2.1.222 (Claude Code)` on macOS / Apple Silicon at base revision
+`977dfd21f0d597348e36b004b796cdbb2c3140bc`:
+
+- Current Codex [Skills](https://developers.openai.com/codex/skills) and
+  [configuration](https://developers.openai.com/codex/config-basic) documentation retained the
+  reviewed repository/user/system discovery and higher-precedence configuration model. The
+  installed banner matched the last-tested evidence; published `0.147.0-alpha` material was treated
+  as prerelease source evidence, not compatibility.
+- Current Claude [Skills](https://code.claude.com/docs/en/skills),
+  [settings](https://code.claude.com/docs/en/settings), and
+  [changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) material retained the
+  reviewed discovery and managed-policy model but documented lifecycle changes after `2.1.220`.
+  Local `claude --help` additionally exposed the non-session `import` command and value-taking
+  `--autocompact` option. Those two observed parser shapes are enforced, while `2.1.222` mounted
+  Skill discovery remains `unverified`.
+
+No authenticated mounted-session smoke ran during that review. Deterministic fake-agent tests are
+the release gate and no live compatibility row was promoted.
+
+The documentation does not establish real Windows junction discovery for any listed
+Agent/platform combination. Those rows remain `unverified` until the manual smoke workflow records
+a native run.
 
 The manual workflow fetches exact native npm platform packages with lifecycle scripts disabled,
 checks each archive against a committed SHA-512 SRI value, extracts only allowlisted regular-file
@@ -62,15 +87,18 @@ validity, winner/base observations, displaced-token absence, and journal residue
 
 On Windows, `--link-mode=auto` may fall back from a directory symlink to a junction when the host
 denies symlink creation. SkillMount continues only after the native backend creates and records an
-ownership-verifiable junction, but emits a warning whenever the pinned agent/version lacks passing
-live junction evidence in this matrix. The warning is a compatibility boundary, not a cleanup
-warning: transaction-owned junctions still use the same journal, lock, and verified-removal path.
+ownership-verifiable junction, but emits a warning whenever this Agent/platform/link combination
+lacks passing live junction evidence in the matrix. The adapter's last-tested banner is diagnostic
+context, not proof that the junction was exercised. The warning is a compatibility boundary, not a
+cleanup warning: transaction-owned junctions still use the same journal, lock, and verified-removal
+path.
 Operators who prefer fail-closed capability behavior can pass `--link-mode=symlink`; SkillMount
 does not request elevation or change Windows privilege policy.
 
 ## Evidence policy
 
-A maintainer updating this matrix records the exact agent version, OS and architecture, link kind,
-scenario, date, result, and a retained log or CI run. `pass` and `fail` are reserved for a completed
-scenario. `observed` records a narrower fact such as a version probe. `unverified` means the
-scenario did not run or its evidence is incomplete.
+A maintainer updating this matrix records the exact Agent version, OS and architecture, link kind,
+scenario, date, result, revision, and a retained log or CI run. `pass` and `fail` are reserved for a
+completed scenario. `observed` records a narrower fact such as a version probe and never promotes
+another Agent/platform/link scenario. `unverified` means the scenario did not run or its evidence
+is incomplete.

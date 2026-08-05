@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(unix)]
 use std::process::Stdio;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use skillmount::domain::LinkMode;
 use skillmount::link::{LinkRequest, PlacementOutcome, platform_backend};
@@ -282,6 +283,26 @@ fn native_from_hex(value: &str) -> OsString {
     OsString::from_wide(&wide)
 }
 
+fn assert_single_silent_last_tested_observation(fixture: &Fixture, stderr: &str) {
+    let version_record =
+        fs::read_to_string(&fixture.version_record).expect("version observation record");
+    assert_eq!(
+        version_record.lines().count(),
+        1,
+        "the version banner is observed exactly once"
+    );
+    assert_eq!(
+        fs::canonicalize(PathBuf::from(recorded_os(&version_record, "cwd")))
+            .expect("canonical version observation CWD"),
+        fs::canonicalize(&fixture.root).expect("canonical invocation CWD"),
+        "the observation uses the wrapper invocation CWD, not the child launch CWD"
+    );
+    assert!(
+        !stderr.contains("version compatibility is unverified"),
+        "the last-tested banner must not warn: {stderr}"
+    );
+}
+
 #[test]
 fn selected_skills_stay_mounted_while_fake_codex_runs_then_cleanup_succeeds() {
     let fixture = Fixture::new("happy-path");
@@ -292,6 +313,7 @@ fn selected_skills_stay_mounted_while_fake_codex_runs_then_cleanup_succeeds() {
     let output = fixture
         .command()
         .env("SKILLMOUNT_FAKE_EXPECT_PATHS", expected_paths)
+        .current_dir(&fixture.root)
         .output()
         .expect("asm should run");
 
@@ -373,14 +395,7 @@ fn selected_skills_stay_mounted_while_fake_codex_runs_then_cleanup_succeeds() {
     assert!(fixture.sources.join("alpha/SKILL.md").is_file());
     assert!(!exists(&fixture.project.join(".agents")));
     assert!(!exists(&fixture.project.join(".codex")));
-    assert_eq!(
-        fs::read_to_string(&fixture.version_record)
-            .expect("version probe record")
-            .lines()
-            .count(),
-        3,
-        "compatibility is re-probed before apply and again before spawn"
-    );
+    assert_single_silent_last_tested_observation(&fixture, &stderr);
 }
 
 #[test]
@@ -518,49 +533,72 @@ fn a_missing_explicit_codex_fails_with_66_before_mutation() {
 }
 
 #[test]
-fn an_unsupported_codex_version_fails_before_skillmount_state_or_mounts() {
-    let fixture = Fixture::new("unsupported-version");
+fn an_untested_codex_version_warns_once_runs_the_child_and_preserves_child_status() {
+    let fixture = Fixture::new("untested-version");
     fixture.skill("alpha");
 
     let output = fixture
-        .command_with_agent(Some(Path::new(ASM)))
+        .command()
+        .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", "codex-cli 0.147.0")
+        .env("SKILLMOUNT_FAKE_EXIT", "23")
         .output()
-        .expect("asm should reject its own non-Codex version output");
+        .expect("asm should continue under untested version evidence");
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(64));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("0.146.0"));
+    assert_eq!(output.status.code(), Some(23), "{stderr}");
+    assert_eq!(
+        stderr
+            .matches("version compatibility is unverified")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.contains("codex-cli 0.147.0"), "{stderr}");
+    assert!(stderr.contains("codex-cli 0.146.0"), "{stderr}");
+    assert!(stderr.contains("docs/compatibility.md"), "{stderr}");
+    assert!(fixture.record.is_file(), "the child must start");
+    assert_eq!(
+        fs::read_to_string(&fixture.version_record)
+            .expect("version observation record")
+            .lines()
+            .count(),
+        1
+    );
     assert!(!exists(&fixture.project.join(".agents")));
     assert!(!exists(&fixture.project.join(".codex")));
-    assert!(!exists(&fixture.state));
-    assert!(!exists(&fixture.record));
 }
 
 #[test]
-fn a_codex_upgrade_after_apply_overrides_keep_and_cleans_mounts() {
-    let fixture = Fixture::new("upgrade-after-apply");
+fn unavailable_codex_version_warns_once_and_keep_mounts_preserves_the_session() {
+    let fixture = Fixture::new("unavailable-version-keep");
     fixture.skill("alpha");
 
     let output = fixture
         .command_with_options(&["--keep-mounts"])
-        .env("SKILLMOUNT_FAKE_UNSUPPORTED_VERSION_AT", "3")
+        .env("SKILLMOUNT_FAKE_VERSION_EXIT", "9")
         .output()
-        .expect("asm should reject a child that changes release at the spawn boundary");
+        .expect("asm should continue without usable version evidence");
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(64));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("0.146.0"));
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(
+        stderr
+            .matches("version compatibility is unverified")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.contains("exit code 9"), "{stderr}");
+    assert!(stderr.contains("codex-cli 0.146.0"), "{stderr}");
+    assert!(fixture.record.is_file(), "the child must start");
     assert_eq!(
         fs::read_to_string(&fixture.version_record)
-            .expect("version probe record")
+            .expect("version observation record")
             .lines()
             .count(),
-        3
+        1
     );
-    assert!(
-        !exists(&fixture.record),
-        "the incompatible child must not start"
-    );
-    assert!(!exists(&fixture.project.join(".agents")));
-    assert!(!exists(&fixture.project.join(".codex")));
+    assert!(exists(&fixture.project.join(".agents/skills/alpha")));
 }
 
 #[test]
@@ -568,21 +606,43 @@ fn a_plugin_namespace_appearing_after_apply_overrides_keep_and_cleans_mounts() {
     let fixture = Fixture::new("plugin-after-apply");
     fixture.skill("alpha");
     let manifest = fixture.sources.join(".codex-plugin/plugin.json");
+    let mounted = fixture.project.join(".agents/skills/alpha");
+    let release = fixture.root.join("release-plugin-check");
+    let manifest_for_injector = manifest.clone();
+    let release_for_injector = release.clone();
+    let injector = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !exists(&mounted) {
+            assert!(
+                Instant::now() < deadline,
+                "the applied mount never became observable"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        fs::create_dir_all(
+            manifest_for_injector
+                .parent()
+                .expect("plugin manifest parent"),
+        )
+        .expect("plugin fixture directory");
+        fs::write(&manifest_for_injector, br#"{"name":"late-plugin"}"#)
+            .expect("late plugin manifest");
+        fs::write(release_for_injector, b"release\n").expect("release spawn-boundary check");
+    });
 
     let output = fixture
         .command_with_options(&["--keep-mounts"])
-        .env("SKILLMOUNT_FAKE_CREATE_PLUGIN_MANIFEST_AT", "3")
-        .env("SKILLMOUNT_FAKE_PLUGIN_MANIFEST_PATH", &manifest)
+        .env("SKILLMOUNT_HOLD_AT", "journal-active")
+        .env("SKILLMOUNT_HOLD_MS", "10000")
+        .env("SKILLMOUNT_HOLD_UNTIL", &release)
         .output()
         .expect("asm should reject namespace qualification at the spawn boundary");
+    injector.join().expect("plugin injector");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_eq!(output.status.code(), Some(73), "{stderr}");
     assert!(stderr.contains("namespace-qualify"), "{stderr}");
-    assert!(
-        manifest.is_file(),
-        "the third version probe created the race fixture"
-    );
+    assert!(manifest.is_file(), "the post-apply race fixture remains");
     assert!(!exists(&fixture.record), "the child must not start");
     assert!(!exists(&fixture.project.join(".agents")));
     assert!(!exists(&fixture.project.join(".codex")));

@@ -114,6 +114,12 @@ fn header(out: &mut String, report: &ReadOnlyReport<'_>) {
             crate::domain::AgentId::Claude => "claude",
         }
     );
+    let _ = writeln!(
+        out,
+        "{:<15} {:?} (advisory evidence; executable not queried)",
+        "Last tested:",
+        crate::agent::version_spec(context.agent).last_tested_banner()
+    );
     field(out, "Launch CWD:", &context.launch_cwd);
     field(out, "Project root:", &context.project_root);
     let _ = writeln!(

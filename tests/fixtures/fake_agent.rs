@@ -21,11 +21,8 @@ const CREATE_IN_ADD_DIR_ENV: &str = "SKILLMOUNT_FAKE_CREATE_IN_ADD_DIR";
 const RELEASE_FILE_ENV: &str = "SKILLMOUNT_FAKE_RELEASE_FILE";
 const RECORD_CODEX_HOME_ENV: &str = "SKILLMOUNT_FAKE_RECORD_CODEX_HOME";
 const VERSION_RECORD_ENV: &str = "SKILLMOUNT_FAKE_VERSION_RECORD";
-const UNSUPPORTED_VERSION_AT_ENV: &str = "SKILLMOUNT_FAKE_UNSUPPORTED_VERSION_AT";
 const VERSION_OUTPUT_ENV: &str = "SKILLMOUNT_FAKE_VERSION_OUTPUT";
-const UNSUPPORTED_VERSION_OUTPUT_ENV: &str = "SKILLMOUNT_FAKE_UNSUPPORTED_VERSION_OUTPUT";
-const CREATE_PLUGIN_MANIFEST_AT_ENV: &str = "SKILLMOUNT_FAKE_CREATE_PLUGIN_MANIFEST_AT";
-const PLUGIN_MANIFEST_PATH_ENV: &str = "SKILLMOUNT_FAKE_PLUGIN_MANIFEST_PATH";
+const VERSION_EXIT_ENV: &str = "SKILLMOUNT_FAKE_VERSION_EXIT";
 
 fn main() -> ExitCode {
     match run() {
@@ -111,46 +108,26 @@ fn write_json_line(recorder: &Recorder) -> io::Result<()> {
 }
 
 fn report_version() -> io::Result<ExitCode> {
-    let probe = if let Some(path) = env::var_os(VERSION_RECORD_ENV).map(PathBuf::from) {
-        let prior = match fs::read_to_string(&path) {
-            Ok(contents) => contents.lines().count(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error),
-        };
+    if let Some(path) = env::var_os(VERSION_RECORD_ENV).map(PathBuf::from) {
+        let cwd = env::current_dir()?;
+        let entry = format!("cwd={}\n", hex(&os_bytes(cwd.as_os_str())));
         OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?
-            .write_all(b"probe\n")?;
-        prior + 1
-    } else {
-        1
-    };
-    let unsupported_at = env::var(UNSUPPORTED_VERSION_AT_ENV)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok());
-    let create_plugin_manifest_at = env::var(CREATE_PLUGIN_MANIFEST_AT_ENV)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok());
-    if create_plugin_manifest_at == Some(probe) {
-        let manifest = required_path(PLUGIN_MANIFEST_PATH_ENV)?;
-        fs::create_dir_all(manifest.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "plugin manifest has no parent")
-        })?)?;
-        fs::write(manifest, br#"{"name":"late-plugin"}"#)?;
+            .write_all(entry.as_bytes())?;
     }
-    if unsupported_at == Some(probe) {
-        println!(
-            "{}",
-            env::var(UNSUPPORTED_VERSION_OUTPUT_ENV)
-                .unwrap_or_else(|_| "codex-cli 0.147.0".to_owned())
-        );
-    } else {
-        println!(
-            "{}",
-            env::var(VERSION_OUTPUT_ENV).unwrap_or_else(|_| "codex-cli 0.146.0".to_owned())
-        );
+    let code = env::var(VERSION_EXIT_ENV)
+        .unwrap_or_else(|_| "0".to_owned())
+        .parse::<u8>()
+        .map_err(invalid_data)?;
+    if code != 0 {
+        return Ok(ExitCode::from(code));
     }
+    println!(
+        "{}",
+        env::var(VERSION_OUTPUT_ENV).unwrap_or_else(|_| "codex-cli 0.146.0".to_owned())
+    );
     Ok(ExitCode::SUCCESS)
 }
 

@@ -107,10 +107,6 @@ impl Fixture {
             .env("SKILLMOUNT_FAKE_RECORD", &self.record)
             .env("SKILLMOUNT_FAKE_VERSION_RECORD", &self.version_record)
             .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", "2.1.220 (Claude Code)")
-            .env(
-                "SKILLMOUNT_FAKE_UNSUPPORTED_VERSION_OUTPUT",
-                "2.1.221 (Claude Code)",
-            )
             .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
             .current_dir(&self.project);
         command
@@ -190,6 +186,26 @@ fn three_source_overrides_count_once_normally_and_list_every_origin_verbose() {
     assert!(output.stdout.is_empty());
 }
 
+fn assert_single_silent_last_tested_observation(fixture: &Fixture, stderr: &str) {
+    let version_record =
+        fs::read_to_string(&fixture.version_record).expect("version observation record");
+    assert_eq!(
+        version_record.lines().count(),
+        1,
+        "the version banner is observed exactly once"
+    );
+    assert_eq!(
+        fs::canonicalize(PathBuf::from(recorded_os_value(&version_record, "cwd")))
+            .expect("canonical version observation CWD"),
+        fs::canonicalize(&fixture.root).expect("canonical invocation CWD"),
+        "the observation uses the wrapper invocation CWD, not the child launch CWD"
+    );
+    assert!(
+        !stderr.contains("version compatibility is unverified"),
+        "the last-tested banner must not warn: {stderr}"
+    );
+}
+
 #[test]
 fn selected_winners_are_visible_only_in_the_injected_root_then_cleanup_succeeds() {
     let fixture = Fixture::new("happy-path");
@@ -216,6 +232,7 @@ fn selected_winners_are_visible_only_in_the_injected_root_then_cleanup_succeeds(
         .arg("prompt with spaces")
         .env("SKILLMOUNT_FAKE_EXPECT_ADD_DIR_SKILLS", expected_names)
         .env("SKILLMOUNT_FAKE_EXPECT_PATHS", expected_existing)
+        .current_dir(&fixture.root)
         .output()
         .expect("asm should launch fake Claude");
 
@@ -274,13 +291,7 @@ fn selected_winners_are_visible_only_in_the_injected_root_then_cleanup_succeeds(
     }));
     assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
     assert_eq!(fixture.journal_count(), 0);
-    assert_eq!(
-        fs::read_to_string(&fixture.version_record)
-            .expect("version probe record")
-            .lines()
-            .count(),
-        3
-    );
+    assert_single_silent_last_tested_observation(&fixture, &stderr);
     for (root, before) in watched {
         assert_eq!(snapshot(&root), before, "{} changed", root.display());
     }
@@ -311,7 +322,7 @@ fn machine_readable_claude_stdout_is_not_prefixed_by_wrapper_diagnostics() {
 }
 
 #[test]
-fn disabling_flags_and_unsupported_versions_fail_before_state_or_child_launch() {
+fn discovery_changing_and_detached_controls_fail_before_state_or_child_launch() {
     for rejected in ["--bare", "--safe-mode", "--disable-slash-commands"] {
         let fixture = Fixture::new(rejected.trim_start_matches('-'));
         fixture.skill(&fixture.left, "alpha", "fixture");
@@ -406,22 +417,6 @@ fn disabling_flags_and_unsupported_versions_fail_before_state_or_child_launch() 
     assert!(String::from_utf8_lossy(&output.stderr).contains("CLAUDE_CODE_SIMPLE"));
     assert!(!fixture.state.exists());
     assert!(!fixture.record.exists());
-
-    let fixture = Fixture::new("unsupported-version");
-    fixture.skill(&fixture.left, "alpha", "fixture");
-    let output = fixture
-        .command()
-        .arg("--")
-        .arg("prompt")
-        .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", "2.1.219 (Claude Code)")
-        .output()
-        .expect("asm should reject an unsupported Claude release");
-
-    assert_eq!(output.status.code(), Some(64));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("2.1.220"));
-    assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
-    assert_eq!(fixture.journal_count(), 0);
-    assert!(!fixture.record.exists());
 }
 
 #[test]
@@ -433,6 +428,7 @@ fn non_session_subcommands_fail_before_state_or_child_launch() {
         "doctor",
         "gateway",
         "install",
+        "import",
         "mcp",
         "plugin",
         "plugins",
@@ -502,8 +498,46 @@ fn an_invalid_rightmost_claude_winner_never_falls_back_or_launches() {
 }
 
 #[test]
-fn a_version_change_at_the_spawn_boundary_overrides_keep_and_cleans_staging() {
-    let fixture = Fixture::new("upgrade-after-apply");
+fn an_untested_claude_version_warns_once_runs_the_child_and_preserves_child_status() {
+    let fixture = Fixture::new("untested-version");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+
+    let output = fixture
+        .command()
+        .arg("--")
+        .arg("prompt")
+        .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", "2.1.222 (Claude Code)")
+        .env("SKILLMOUNT_FAKE_EXIT", "2")
+        .output()
+        .expect("asm should continue under untested version evidence");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert_eq!(
+        stderr
+            .matches("version compatibility is unverified")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.contains("2.1.222 (Claude Code)"), "{stderr}");
+    assert!(stderr.contains("2.1.220 (Claude Code)"), "{stderr}");
+    assert!(stderr.contains("docs/compatibility.md"), "{stderr}");
+    assert!(fixture.record.is_file(), "the child must start");
+    assert_eq!(
+        fs::read_to_string(&fixture.version_record)
+            .expect("version observation record")
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
+    assert_eq!(fixture.journal_count(), 0);
+}
+
+#[test]
+fn unavailable_claude_version_warns_once_and_keep_mounts_preserves_the_session() {
+    let fixture = Fixture::new("unavailable-version-keep");
     fixture.skill(&fixture.left, "alpha", "fixture");
 
     let output = fixture
@@ -511,25 +545,31 @@ fn a_version_change_at_the_spawn_boundary_overrides_keep_and_cleans_staging() {
         .arg("--keep-mounts")
         .arg("--")
         .arg("prompt")
-        .env("SKILLMOUNT_FAKE_UNSUPPORTED_VERSION_AT", "3")
+        .env("SKILLMOUNT_FAKE_VERSION_EXIT", "9")
         .output()
-        .expect("asm should reject a changed child release");
+        .expect("asm should continue without usable version evidence");
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(64));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("2.1.220"));
-    assert!(
-        !fixture.record.exists(),
-        "the incompatible child must not start"
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(
+        stderr
+            .matches("version compatibility is unverified")
+            .count(),
+        1,
+        "{stderr}"
     );
-    assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
-    assert_eq!(fixture.journal_count(), 0);
+    assert!(stderr.contains("exit code 9"), "{stderr}");
+    assert!(stderr.contains("2.1.220 (Claude Code)"), "{stderr}");
+    assert!(fixture.record.is_file(), "the child must start");
     assert_eq!(
         fs::read_to_string(&fixture.version_record)
-            .expect("version probe record")
+            .expect("version observation record")
             .lines()
             .count(),
-        3
+        1
     );
+    assert_eq!(fixture.sessions().len(), 1);
+    assert_eq!(fixture.journal_count(), 1);
 }
 
 #[test]

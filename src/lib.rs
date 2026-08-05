@@ -2,15 +2,16 @@
 //!
 //! The read-only half parses the wrapper contract, preserves platform-native paths, resolves an
 //! ordered Skill catalog, inspects the namespaces in the selected adapter's current discovery
-//! model, and builds one deterministic mount plan. `inspect` and `--dry-run` create no directory,
-//! link, lock, journal, recovery mutation, or child process, and `tests/read_only.rs` fails if any
-//! of them ever does.
+//! model, and builds one deterministic mount plan. `inspect` and `--dry-run` render dated
+//! last-tested evidence but create no directory, link, lock, journal, recovery mutation, version
+//! process, or Agent child; `tests/read_only.rs` fails if any of them ever does.
 //!
-//! A mutating session acquires the discovery snapshot's resource locks, recovers incomplete
-//! transactions, builds and stabilizes the full plan under those locks, persists a write-ahead
-//! journal, and applies it. Implemented Codex and Claude sessions then launch through the generic
-//! process supervisor and clean up after the managed process domain is dead; see
-//! `docs/architecture.md` for their pinned compatibility boundaries.
+//! A mutating session checks release-independent launch invariants, observes one bounded advisory
+//! version banner before state access, acquires the discovery snapshot's resource locks, recovers
+//! incomplete transactions, builds and stabilizes the full plan under those locks, persists a
+//! write-ahead journal, and applies it. Implemented Codex and Claude sessions repeat only the hard
+//! invariants before launch, then use the generic process supervisor and clean up after the managed
+//! process domain is dead; see `docs/architecture.md` and ADR 0033 for the evidence boundary.
 
 pub mod agent;
 mod app;

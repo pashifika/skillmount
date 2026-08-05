@@ -1,11 +1,13 @@
-//! Agent adapter boundary and read-only discovery inspection.
+//! Agent adapter boundary, read-only discovery inspection, and advisory version observation.
 //!
-//! An adapter observes and describes; it never mutates. Every method here returns a snapshot or a
+//! An adapter observes and describes; it never mutates. Every adapter method returns a snapshot or
 //! plan, and the shared application and transaction layers apply those values after the mutation
-//! boundary.
+//! boundary. The sibling `version` module may launch one bounded, shell-free `--version` process;
+//! it has no access to locks, journals, transactions, mount mutation, or cleanup identity.
 
 pub mod claude;
 pub mod codex;
+pub(crate) mod version;
 
 #[cfg(test)]
 mod tests;
@@ -21,6 +23,13 @@ use crate::error::AppError;
 use crate::lock::LockResource;
 use crate::mount::MountPlan;
 use crate::mount::resolve::{PathKind, ResolvedEntry, classify};
+/// Returns the dated version evidence attached to one adapter.
+pub(crate) const fn version_spec(agent: AgentId) -> version::VersionSpec {
+    match agent {
+        AgentId::Codex => codex::version_spec(),
+        AgentId::Claude => claude::version_spec(),
+    }
+}
 
 /// Which namespace a discovery scope represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

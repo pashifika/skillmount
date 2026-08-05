@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
+use crate::agent::version::VersionSpec;
 use crate::agent::{
     AgentAdapter, DiscoverySnapshot, ScopeKind, dedupe_scopes_by_terminal, discovery_indexes,
     inspect_scope,
@@ -23,16 +23,19 @@ use crate::state::{PENDING_SESSION, session_root_base};
 /// Namespace Claude Code searches inside any directory it is given.
 const SKILLS_SUFFIX: &str = ".claude/skills";
 
-/// Claude Code release whose discovery and CLI contract this adapter implements.
-pub(crate) const SUPPORTED_CLAUDE_VERSION: &str = "2.1.220";
-const SUPPORTED_CLAUDE_VERSION_OUTPUT: &str = "2.1.220 (Claude Code)";
-const VERSION_OUTPUT_LIMIT: usize = 1024;
+/// Claude Code banner attached to the adapter's last-tested discovery evidence.
+const LAST_TESTED_CLAUDE_BANNER: &str = "2.1.220 (Claude Code)";
+const CLAUDE_VERSION_SPEC: VersionSpec = VersionSpec::new(
+    "Claude Code",
+    LAST_TESTED_CLAUDE_BANNER,
+    "SKILLMOUNT_TEST_CLAUDE_VERSION",
+);
 
-/// Passthrough arguments that switch off Skill loading entirely.
+/// Passthrough arguments that change the normal Skill discovery model.
 ///
-/// Mounting Skills and then starting an agent that ignores them wastes the mount and misleads the
-/// operator, so these fail before anything is planned. A future `--allow-agent-conflicts` option
-/// can downgrade them to warnings.
+/// Mounting Skills and then starting an agent under another discovery mode can waste the mount and
+/// mislead the operator, so these fail before anything is planned. A future
+/// `--allow-agent-conflicts` option can downgrade them to warnings.
 const SKILL_DISABLING_ARGS: [&str; 3] = ["--bare", "--safe-mode", "--disable-slash-commands"];
 
 /// Passthrough settings inputs that could undo `SkillMount`'s session visibility override.
@@ -41,18 +44,20 @@ const SKILL_VISIBILITY_ARGS: [&str; 3] = ["--managed-settings", "--setting-sourc
 /// Passthrough controls that detach the logical session or relocate its discovery root.
 const SESSION_BOUNDARY_ARGS: [&str; 5] = ["--background", "--bg", "--tmux", "--worktree", "-w"];
 
-/// Pinned 2.1.220 commands that do not start a supervised foreground session.
+/// Last-tested commands, plus implementation-time additions observed in Claude Code 2.1.222, that
+/// do not start a supervised foreground session.
 ///
 /// Claude selects a command from the first unconsumed positional argument, including after a
 /// standalone `--`. Forwarding one of these commands would hand the staged root to an operator or
 /// service process whose lifetime and discovery behavior are outside this adapter's contract.
-const NON_SESSION_SUBCOMMANDS: [&str; 14] = [
+const NON_SESSION_SUBCOMMANDS: [&str; 15] = [
     "agents",
     "auth",
     "auto-mode",
     "doctor",
     "gateway",
     "install",
+    "import",
     "mcp",
     "plugin",
     "plugins",
@@ -63,14 +68,16 @@ const NON_SESSION_SUBCOMMANDS: [&str; 14] = [
     "upgrade",
 ];
 
-/// Pinned 2.1.220 options that consume exactly one following value.
+/// Last-tested options, plus implementation-time additions observed in Claude Code 2.1.222, that
+/// consume exactly one following value.
 ///
 /// This table exists only to keep flag-shaped values opaque while locating Skill discovery
 /// controls. It is not a second Claude CLI parser and deliberately has no validation policy for
 /// these options.
-const SINGLE_VALUE_ARGS: [&str; 22] = [
+const SINGLE_VALUE_ARGS: [&str; 23] = [
     "--agent",
     "--agents",
+    "--autocompact",
     "--append-system-prompt",
     "--debug-file",
     "--effort",
@@ -392,23 +399,45 @@ fn inspect_claude_scope(
     Ok(scope)
 }
 
-/// Proves that the executable still matches the pinned Claude Code contract.
-pub(crate) fn verify_supported_launch(context: &RunContext) -> Result<(), AppError> {
-    verify_environment()?;
-    verify_version_text(&reported_version(context)?)
+/// Verifies the Claude launch invariants that remain mandatory for every observed release.
+pub(crate) fn verify_launch_invariants() -> Result<(), AppError> {
+    verify_environment()
 }
 
-/// Verifies environment switches that disable the discovery model this adapter inspected.
+/// Verifies environment switches that change the discovery model this adapter inspected.
 pub(crate) fn verify_environment() -> Result<(), AppError> {
+    // Debug builds expose a filesystem marker so the real-process transaction suite can introduce
+    // a discovery-changing control after apply. Release builds contain no such lookup.
+    #[cfg(debug_assertions)]
+    if let Some(path) =
+        std::env::var_os("SKILLMOUNT_TEST_CLAUDE_ENVIRONMENT_CONTROL_PATH").map(PathBuf::from)
+    {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(AppError::Usage(
+                    "the deterministic Claude environment-control marker changes normal Skill discovery"
+                        .to_owned(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Usage(format!(
+                    "cannot inspect the deterministic Claude environment-control marker {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
     if env_flag_enabled(std::env::var_os("CLAUDE_CODE_SAFE_MODE").as_deref()) {
         return Err(AppError::Usage(
-            "CLAUDE_CODE_SAFE_MODE disables Claude Code's custom Skill discovery; unset it or run the agent directly"
+            "CLAUDE_CODE_SAFE_MODE changes Claude Code's normal Skill discovery; unset it or run the agent directly"
                 .to_owned(),
         ));
     }
     if env_flag_enabled(std::env::var_os("CLAUDE_CODE_SIMPLE").as_deref()) {
         return Err(AppError::Usage(
-            "CLAUDE_CODE_SIMPLE enables Claude Code's bare mode and disables normal Skill discovery; unset it or run the agent directly"
+            "CLAUDE_CODE_SIMPLE changes Claude Code's normal Skill discovery; unset it or run the agent directly"
                 .to_owned(),
         ));
     }
@@ -416,59 +445,15 @@ pub(crate) fn verify_environment() -> Result<(), AppError> {
     Ok(())
 }
 
-/// Captures the bounded, text version banner used by operator diagnostics and launch checks.
-pub(crate) fn reported_version(context: &RunContext) -> Result<String, AppError> {
-    // Native integration suites use the shared fake-agent executable. The override is absent from
-    // release builds, like failure checkpoints and other deterministic platform fixtures.
-    #[cfg(debug_assertions)]
-    if let Some(version) = std::env::var_os("SKILLMOUNT_TEST_CLAUDE_VERSION") {
-        return Ok(version.to_string_lossy().trim().to_owned());
-    }
-
-    let output = Command::new(&context.agent_bin)
-        .arg("--version")
-        .current_dir(&context.invocation_cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| AppError::MissingInput {
-            path: context.agent_bin.clone(),
-            reason: format!("cannot query Claude Code version: {error}"),
-        })?;
-    if !output.status.success() {
-        return Err(AppError::MissingInput {
-            path: context.agent_bin.clone(),
-            reason: format!("Claude Code --version exited with {}", output.status),
-        });
-    }
-    if output.stdout.len() > VERSION_OUTPUT_LIMIT || output.stderr.len() > VERSION_OUTPUT_LIMIT {
-        return Err(AppError::Usage(format!(
-            "Claude Code --version output exceeds the {VERSION_OUTPUT_LIMIT}-byte compatibility bound"
-        )));
-    }
-    let version = std::str::from_utf8(&output.stdout).map_err(|_| {
-        AppError::Usage("Claude Code --version output is not valid UTF-8".to_owned())
-    })?;
-    Ok(version.trim().to_owned())
+/// Returns the dated version evidence used by the shared advisory observer.
+pub(crate) const fn version_spec() -> VersionSpec {
+    CLAUDE_VERSION_SPEC
 }
 
 fn env_flag_enabled(value: Option<&OsStr>) -> bool {
     value.is_some_and(|value| {
         !value.is_empty() && value != OsStr::new("0") && !value.eq_ignore_ascii_case("false")
     })
-}
-
-/// Checks a captured version banner against the adapter-pinned release.
-pub(crate) fn verify_version_text(version: &str) -> Result<(), AppError> {
-    if version.trim() == SUPPORTED_CLAUDE_VERSION_OUTPUT {
-        Ok(())
-    } else {
-        Err(AppError::Usage(format!(
-            "Claude Code {SUPPORTED_CLAUDE_VERSION} is required by this adapter, but --version reported {:?}",
-            version.trim()
-        )))
-    }
 }
 
 impl AgentAdapter for ClaudeAdapter {
@@ -484,7 +469,7 @@ impl AgentAdapter for ClaudeAdapter {
         let scan = scan_passthrough(args)?;
         if let Some(rejected) = scan.disabling_arg {
             return Err(AppError::Usage(format!(
-                "{rejected} disables Claude Code's normal Skill discovery, so mounted Skills would not satisfy the session contract; remove it or run the agent directly"
+                "{rejected} changes Claude Code's normal Skill discovery, so mounted Skills would not satisfy the session contract; remove it or run the agent directly"
             )));
         }
         if let Some(rejected) = scan.visibility_arg {
@@ -655,8 +640,8 @@ impl AgentAdapter for ClaudeAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeAdapter, env_flag_enabled, missing_directory_chain, parse_add_dirs,
-        verify_version_text,
+        ClaudeAdapter, LAST_TESTED_CLAUDE_BANNER, env_flag_enabled, missing_directory_chain,
+        parse_add_dirs, version_spec,
     };
     use crate::agent::AgentAdapter;
     use std::ffi::OsString;
@@ -731,6 +716,7 @@ mod tests {
             "plugins",
             "project",
             "setup-token",
+            "import",
             "ultrareview",
             "update",
             "upgrade",
@@ -746,6 +732,11 @@ mod tests {
         let error = ClaudeAdapter
             .validate_passthrough_args(&args(&["--", "agents", "list"]))
             .expect_err("the separator does not prevent Claude subcommand dispatch");
+        assert_eq!(error.category(), crate::error::ExitCategory::Usage);
+
+        let error = ClaudeAdapter
+            .validate_passthrough_args(&args(&["--autocompact", "200000", "import"]))
+            .expect_err("the observed autocompact value must not hide the command position");
         assert_eq!(error.category(), crate::error::ExitCategory::Usage);
     }
 
@@ -811,6 +802,7 @@ mod tests {
             args(&["--model", "--tmux", "prompt"]),
             args(&["--model", "agents", "prompt"]),
             args(&["--system-prompt", "--disable-slash-commands", "prompt"]),
+            args(&["--autocompact", "import", "prompt"]),
         ] {
             ClaudeAdapter
                 .validate_passthrough_args(&passthrough)
@@ -872,18 +864,11 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_gate_accepts_only_the_pinned_claude_release() {
-        verify_version_text("2.1.220 (Claude Code)\n").expect("supported Claude Code version");
-        for unsupported in [
-            "2.1.219 (Claude Code)",
-            "2.1.221 (Claude Code)",
-            "codex-cli 0.146.0",
-        ] {
-            assert!(
-                verify_version_text(unsupported).is_err(),
-                "{unsupported} must not borrow the 2.1.220 discovery contract"
-            );
-        }
+    fn version_spec_names_the_last_tested_claude_evidence() {
+        assert_eq!(
+            version_spec().last_tested_banner(),
+            LAST_TESTED_CLAUDE_BANNER
+        );
     }
 
     #[cfg(unix)]

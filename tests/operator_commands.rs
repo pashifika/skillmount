@@ -207,21 +207,47 @@ fn doctor_resolves_both_agent_executables_from_path() {
 }
 
 #[test]
-fn unsupported_agent_version_is_a_failing_finding_with_stable_status() {
-    let fixture = Fixture::new("doctor-version-failure");
+fn untested_agent_version_is_unverified_without_failing_doctor() {
+    let fixture = Fixture::new("doctor-version-unverified");
 
     let output = fixture
         .doctor_command()
         .env("SKILLMOUNT_TEST_CODEX_VERSION", "codex-cli 999.0.0")
         .output()
-        .expect("version-failure doctor should run");
+        .expect("untested-version doctor should run");
 
-    assert_eq!(output.status.code(), Some(65));
+    assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let rendered = String::from_utf8_lossy(&output.stdout);
-    assert!(rendered.contains("[FAIL] codex executable"));
+    assert!(rendered.contains("[UNVERIFIED] codex executable"));
     assert!(rendered.contains("codex-cli 999.0.0"));
-    assert!(rendered.contains("1 failure"));
+    assert!(rendered.contains("codex-cli 0.146.0"));
+    assert!(rendered.contains("docs/compatibility.md"));
+    assert!(rendered.contains("[PASS] claude executable"));
+    assert!(rendered.contains("0 failure"));
+    assert!(!fixture.state.exists());
+}
+
+#[test]
+fn unavailable_agent_version_is_unverified_without_suppressing_other_checks() {
+    let fixture = Fixture::new("doctor-version-unavailable");
+
+    let output = fixture
+        .doctor_command()
+        .env("SKILLMOUNT_TEST_CODEX_VERSION", "x".repeat(1025))
+        .output()
+        .expect("unavailable-version doctor should run");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("[UNVERIFIED] codex executable"));
+    assert!(rendered.contains("1024-byte observation bound"));
+    assert!(rendered.contains("codex-cli 0.146.0"));
+    assert!(rendered.contains("[PASS] claude executable"));
+    assert!(rendered.contains("[PASS] codex discovery"));
+    assert!(rendered.contains("0 failure"));
+    assert!(!fixture.state.exists());
 }
 
 #[test]
