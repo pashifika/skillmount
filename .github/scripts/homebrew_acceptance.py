@@ -445,6 +445,37 @@ SCENARIO_COVERAGE: tuple[ScenarioCoverage, ...] = (
         note="Each shell owns one file per Formula, and uninstalling one keeps the other's files.",
     ),
     ScenarioCoverage(
+        requirement="Tap bootstrap is one-way and fail-closed",
+        scenario="Never-published tap baseline is complete",
+        phases=("style",),
+        kind="static",
+        note=(
+            "The tracked tap workflow classifier and its policy tests require the complete "
+            "workflow/maintainer baseline with no Formula in the tree or history before allowing "
+            "the one unpublished lifecycle skip."
+        ),
+    ),
+    ScenarioCoverage(
+        requirement="Tap bootstrap is one-way and fail-closed",
+        scenario="Bootstrap allowance is reopened after publication",
+        phases=("audit",),
+        kind="static",
+        note=(
+            "The tracked tap workflow searches checked-out history and refuses the bootstrap "
+            "state once either expected Formula has appeared."
+        ),
+    ),
+    ScenarioCoverage(
+        requirement="Tap bootstrap is one-way and fail-closed",
+        scenario="Bootstrap or published Formula set is incomplete",
+        phases=("style", "audit"),
+        kind="static",
+        note=(
+            "The tracked tap workflow rejects a partial baseline, a partial or extra Formula set, "
+            "and symlinked expected Formulae before package-manager lifecycle work."
+        ),
+    ),
+    ScenarioCoverage(
         requirement="Paired Formula updates use protected review and CI",
         scenario="New paired Formula update is valid",
         phases=("style", "audit", "brew-test", "upgrade-from-prior"),

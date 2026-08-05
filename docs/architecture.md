@@ -723,11 +723,11 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
 - lock-file reclamation;
 - binding a public transaction's lifetime to the lock guard validated when it is opened or adopted;
 - rejecting pre-existing links in application-state directory paths before creation or permission changes;
-- external package-channel publication, reserved pending external account creation and the `v0.2.0`
-  release: creation, protection, and registration of `pashifika/homebrew-tap`, the tap-scoped
-  GitHub App installation, the Chocolatey account with both public package IDs and pair-eligibility
-  confirmation, both protected environments with their credentials, and the four publicly resolved,
-  clean-host-verified install commands;
+- external package-channel publication: the separately managed `pashifika/homebrew-tap` is created,
+  bootstrapped, and protected, while publication still requires release verification at workflow
+  time, the tap-scoped GitHub App installation, the Chocolatey account with both public package IDs
+  and pair-eligibility confirmation, both protected environments with their credentials, and the
+  four publicly resolved, clean-host-verified install commands;
 
 Both session adapters use the supervisor in the product application path, but real-agent and
 Windows-junction certification remain non-blocking compatibility evidence gaps rather than claims

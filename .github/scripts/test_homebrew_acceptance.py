@@ -1391,7 +1391,7 @@ class CoverageTests(FixtureCase):
         """Require every phase to prove at least one scenario."""
 
         self.assertEqual(harness.coverage_gaps(), ())
-        self.assertEqual(len(harness.SCENARIO_COVERAGE), 20)
+        self.assertEqual(len(harness.SCENARIO_COVERAGE), 23)
 
     def test_every_spec_scenario_is_mapped(self) -> None:
         """Require the mapping table to name exactly the spec's scenarios."""
