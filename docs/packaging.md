@@ -88,10 +88,10 @@ environment, require:
 2. successful `generate` and the channel's acceptance job for the same run;
 3. the recorded `inputs_sha256` matching between the run outputs and the retained artifact.
 
-The `homebrew` environment exposes only the tap-scoped GitHub App credentials
-(`HOMEBREW_TAP_APP_ID`, `HOMEBREW_TAP_APP_PRIVATE_KEY`). The `chocolatey` environment exposes only
-`CHOCOLATEY_API_KEY`. A workflow run that requests any other secret, or a secret from the wrong
-job, fails the tracked workflow policy check.
+The `homebrew` environment exposes only the non-secret, tap-scoped GitHub App variable
+`HOMEBREW_TAP_APP_CLIENT_ID` and the `HOMEBREW_TAP_APP_PRIVATE_KEY` secret. The `chocolatey`
+environment exposes only the `CHOCOLATEY_API_KEY` secret. A workflow run that requests any other
+channel variable or secret, or reads one from the wrong job, fails the tracked workflow policy check.
 
 ## Connect the Homebrew publisher App
 
@@ -109,20 +109,23 @@ Grant only these repository permissions:
 Leave every account, organization, enterprise, and other repository permission at no access.
 Install the App with **Only select repositories** and select only `pashifika/homebrew-tap`.
 
-Generate one private key, set its local mode to `0600`, and copy the App ID from the App settings.
-Load both values without putting the private key in chat, a command argument, shell history, or
-repository content:
+Generate one private key, set its local mode to `0600`, and copy the Client ID (the `Iv...`
+identifier) from the App settings. Load the non-secret Client ID as an environment variable and the
+private key as an environment secret without putting the private key in chat, a command argument,
+shell history, or repository content:
 
 ```bash
-gh secret set HOMEBREW_TAP_APP_ID \
+gh variable set HOMEBREW_TAP_APP_CLIENT_ID \
   --repo pashifika/skillmount --env homebrew
 gh secret set HOMEBREW_TAP_APP_PRIVATE_KEY \
   --repo pashifika/skillmount --env homebrew < /absolute/path/to/downloaded.pem
 ```
 
-The first command reads the App ID from a hidden prompt. Verify only secret metadata:
+The first command prompts for the Client ID. Verify only variable and secret metadata:
 
 ```bash
+gh api repos/pashifika/skillmount/environments/homebrew/variables \
+  --jq '.variables[] | {name, updated_at}'
 gh api repos/pashifika/skillmount/environments/homebrew/secrets \
   --jq '.secrets[] | {name, updated_at}'
 ```
