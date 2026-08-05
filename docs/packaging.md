@@ -7,7 +7,9 @@ or change the success state of that release, its tag, assets, notes, or checksum
 [ADR 0030](adr/0030-publish-selectable-packages-through-isolated-post-release-channels.md) records
 the channel and isolation decisions;
 [ADR 0031](adr/0031-use-release-archives-for-homebrew-formulae.md) records the Homebrew
-release-archive decision; [docs/architecture.md](architecture.md) records the resulting baseline.
+release-archive decision; [ADR 0032](adr/0032-establish-chocolatey-ownership-through-submission.md)
+records the Chocolatey ownership and moderation ordering;
+[docs/architecture.md](architecture.md) records the resulting baseline.
 
 ## Channel and identity contract
 
@@ -28,9 +30,11 @@ for Chocolatey. Homebrew Core, casks, bottles, Linux, macOS Intel, Windows ARM64
 and crates.io are out of scope.
 
 Current state: the protected `pashifika/homebrew-tap` exists in its never-published bootstrap state,
-but no Formula or publisher credential exists and no Chocolatey package ID is reserved.
-Package-manager version `0.2.0` is not yet publicly available, so every install command in this
-document remains unavailable and is documented as such.
+but no Formula or publisher credential exists. Chocolatey profile
+[`pashifika`](https://community.chocolatey.org/profiles/pashifika) exists with no published package;
+neither ID appears in the public feed, ownership remains unobserved until first submission, and the
+protected publisher credential is absent. Package-manager version `0.2.0` is not yet publicly
+available, so every install command in this document remains unavailable and is documented as such.
 
 ## The package workflow
 
@@ -89,6 +93,38 @@ The `homebrew` environment exposes only the tap-scoped GitHub App credentials
 `CHOCOLATEY_API_KEY`. A workflow run that requests any other secret, or a secret from the wrong
 job, fails the tracked workflow policy check.
 
+## Connect the Chocolatey publisher account
+
+The Community Repository has no separate package-ID reservation operation. Its official first-
+publication sequence is account registration, API-key retrieval, then `choco push`; an accepted
+first upload creates the package record under that account and enters moderation. The public OData
+feed cannot reveal an unlisted package owned by another user, so an empty query is a preflight
+observation, not ownership proof.
+
+Connect the existing `pashifika` account without exposing its API key:
+
+1. Sign in at <https://community.chocolatey.org/users/account/LogOn>, then open
+   <https://community.chocolatey.org/account> and copy the API key.
+2. In a trusted terminal, run `gh secret set CHOCOLATEY_API_KEY --env chocolatey`, paste the key at
+   the hidden prompt, and submit it. Do not paste the value into chat, a command argument, a file, or
+   release evidence.
+3. Verify only the secret metadata:
+
+   ```bash
+   gh api repos/pashifika/skillmount/environments/chocolatey/secrets \
+     --jq '.secrets[] | {name, updated_at}'
+   ```
+
+The publisher reads immutable package metadata and moderation state from
+`https://community.chocolatey.org/api/v2`, compares each record's base64 `SHA512` package hash with
+the exact validated nupkg bytes, and uses
+`choco search <id> --version=<version> --exact --all-versions --approved-only --limit-output` to
+prove current public resolution. It sends package bytes only to Chocolatey's documented Community
+upload endpoint, `https://push.chocolatey.org/`. The credential-free generation step's nupkg
+SHA-256 and the Community record's SHA-512 independently bind the same candidate bytes. The
+publisher passes the environment secret directly to the isolated `chocolatey-publish` process and
+never stores it in a repository file or runner-wide Chocolatey configuration.
+
 ## Bootstrap the Homebrew tap
 
 Before the first package release, create the tap with a minimal default-branch commit, then land
@@ -123,18 +159,34 @@ for the pair. Before merging, require:
 A retried run that finds the branch or pull request already correct resumes it instead of creating
 a duplicate; it never force-pushes, closes, or merges an existing pull request.
 
-## Chocolatey moderation and pair eligibility
+## Chocolatey submission, ownership, and moderation
 
-Before either public package ID exists, confirm with the Chocolatey Community Repository that the
-`skillmount` plus `skillmount-asm` pair — two packages with distinct installed executables but
-behaviorally equivalent entrypoints — is eligible rather than prohibited duplicate packaging. A
-refusal blocks Chocolatey publication entirely; automation must not fall back to one package that
-installs both commands, because that denies the selection contract.
+Before the first write, query both package/version identities through the public OData feed and
+confirm that neither has an observed conflicting version, package SHA-512, or explicit moderator
+refusal. Empty results do not prove reservation or ownership. For an approved existing member, the
+publisher separately runs the supported exact `choco search` query; OData records do not expose the
+listing field assumed by the original fake gateway. The reviewed Community Hub question remains
+useful advisory context, but silence there is not a separate publication gate: the documented
+moderation workflow starts when a maintainer submits a package.
 
-After a push is accepted, each package ID is moderated independently. Record `pending` per ID;
-pending is upload acceptance, not public availability. A package ID's install command becomes
-advertisable only after moderation approves and lists it, its public endpoint resolves `0.2.0`,
-and a clean-host selected-only installation passes. One approved member never implies the other.
+After environment approval, the publisher sends the exact validated `skillmount` nupkg first and
+then `skillmount-asm`, both to `https://push.chocolatey.org/`. An accepted upload establishes that
+package record under the API-key account and reports `pending`. An HTTP 403 can mean another user
+owns an existing or unlisted ID, a package version is already in moderation, or the name is
+forbidden; treat it as an ownership/publication conflict and stop without touching the remaining
+member.
+
+Each accepted package ID is moderated independently. Moderation supplies the authoritative
+duplicate-package decision, and `pending` is upload acceptance, not public availability. A
+moderator refusal or rejection blocks further Chocolatey writes and requires product/ADR review;
+automation must not fall back to one package that installs both commands. Any already accepted
+matching member remains immutable and unadvertised while that review is open. Reconciliation binds
+it twice: the credential-free generation step's nupkg SHA-256 proves the local candidate and the
+Community SHA-512 proves that the existing package record contains the same nupkg bytes.
+
+A package ID's install command becomes advertisable only after moderation approves it, the supported
+exact `choco search` query resolves version `0.2.0`, and a clean-host selected-only installation
+passes. One approved member never implies the other.
 
 ## Retry a partially published pair
 
@@ -145,6 +197,10 @@ pair-aware and idempotent:
   selected executable) is left unchanged and reported as an idempotent success or status check;
 - only an absent member receives creation work, and only when the existing member matches;
 - nothing is pushed twice for one ID in one run, and the GitHub release is never touched.
+
+If the first package was accepted and the second upload failed, the next run re-observes both IDs,
+preserves the pending or listed first member, and pushes only the absent second member. It never
+replays the accepted upload.
 
 A **conflict** means an existing external version — a tap branch, pull request, Formula, or
 Community Repository package — carries different immutable metadata than preflight expects. The
@@ -193,8 +249,8 @@ maintainers change.
 An install command may be advertised only with retained clean-host evidence. For each of the four
 entries, the evidence must contain:
 
-- the exact package version, tag, commit, release/archive URLs, and SHA-256 values, plus the Formula
-  file or nupkg digest;
+- the exact package version, tag, commit, and release/archive URLs; release and nupkg SHA-256 values;
+  the Formula file digest or the Community OData package SHA-512, as applicable;
 - the external identities involved: tap repository and pull request, GitHub App installation,
   Chocolatey account and package ID;
 - the workflow run and action revisions, runner labels, and manager/platform versions (Homebrew,

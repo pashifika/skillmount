@@ -1,6 +1,7 @@
 # ADR 0030: Publish Selectable Packages Through Isolated Post-Release Channels
 
-- **Status:** Accepted; Homebrew source-build decision superseded by ADR 0031
+- **Status:** Accepted; Homebrew source-build decision superseded by ADR 0031; Chocolatey
+  pre-reservation decision superseded by ADR 0032
 - **Date:** 2026-08-04
 - **Supersedes:** _none_
 
@@ -103,8 +104,9 @@ key. Preflight, generation, and acceptance jobs hold no external credential.
   and GitHub has historically re-compressed such tarballs. Preflight validates the digest at
   publication time; a later upstream re-compression invalidates an already-published Formula digest
   and requires a new patch version rather than an in-place edit.
-- Chocolatey moderation can delay or reject either package ID independently, and pair eligibility
-  must be confirmed with the Community Repository before either public ID exists.
+- Chocolatey moderation can delay or reject either package ID independently. ADR 0032 supersedes
+  pre-submission eligibility confirmation: each accepted first upload creates its package record
+  and enters the authoritative per-ID moderation path.
 - The Homebrew install contract is two-step: a name-keyed
   `brew trust --formula pashifika/tap/<id>` (or `brew trust pashifika/tap`) precedes `brew install`.
   Homebrew 6.0.12 proved the refusal, and the acceptance run then proved the entry's lifetime: trust

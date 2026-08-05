@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
@@ -23,13 +24,15 @@ import package_channels as channels
 import release as release_assets
 
 API_VERSION = "2026-03-10"
-COMMUNITY_SOURCE = "https://community.chocolatey.org/api/v2"
-PACKAGE_HASH_ALGORITHM = "SHA256"
+COMMUNITY_QUERY_SOURCE = "https://community.chocolatey.org/api/v2"
+COMMUNITY_PUSH_SOURCE = "https://push.chocolatey.org/"
+COMMUNITY_PACKAGE_HASH_ALGORITHM = "SHA512"
 TAP_BRANCH_NAMESPACE = "skillmount"
 HTTP_TIMEOUT_SECONDS = 30
 USER_AGENT = "skillmount-package-publisher"
 MODERATION_STATES = ("approved", "pending", "rejected")
 HEX64_PATTERN = re.compile(r"[0-9a-f]{64}")
+HEX128_PATTERN = re.compile(r"[0-9a-f]{128}")
 FORMULA_URL_PATTERN = re.compile(r'^\s*url\s+"([^"\n]+)"', re.MULTILINE)
 FORMULA_SHA256_PATTERN = re.compile(r'^\s*sha256\s+"([^"\n]+)"', re.MULTILINE)
 FORMULA_VERSION_PATTERN = re.compile(r'^\s*version\s+"([^"\n]+)"', re.MULTILINE)
@@ -73,19 +76,19 @@ def unique_match(pattern: re.Pattern[str], text: str) -> str | None:
     return values.pop() if len(values) == 1 else None
 
 
-def normalized_package_hash(value: object) -> str | None:
-    """Return the lowercase hex form of a base64 or hex SHA-256 value."""
+def normalized_sha512_hash(value: object) -> str | None:
+    """Return the lowercase hex form of a base64 or hex SHA-512 value."""
 
     if not isinstance(value, str):
         return None
     text = value.strip()
-    if HEX64_PATTERN.fullmatch(text.lower()):
+    if HEX128_PATTERN.fullmatch(text.lower()):
         return text.lower()
     try:
         raw = base64.b64decode(text, validate=True)
     except (binascii.Error, ValueError):
         return None
-    return raw.hex() if len(raw) == 32 else None
+    return raw.hex() if len(raw) == 64 else None
 
 
 @dataclass(frozen=True)
@@ -533,7 +536,8 @@ class ChocolateyMember:
     identity: channels.PackageIdentity
     version: str
     nupkg: Path
-    sha256: str
+    package_sha256: str
+    package_sha512: str
     payload: dict[str, Any] | None
 
     @property
@@ -547,7 +551,9 @@ class ChocolateyMember:
 
         return (
             f"{self.identity.package_id}: expected version={self.version} "
-            f"sha256={self.sha256} algorithm={PACKAGE_HASH_ALGORITHM} "
+            f"package_sha256={self.package_sha256} "
+            f"package_sha512={self.package_sha512} "
+            f"algorithm={COMMUNITY_PACKAGE_HASH_ALGORITHM} "
             f"nupkg={self.nupkg.name}"
         )
 
@@ -556,12 +562,12 @@ class ChocolateyMember:
 
         if self.payload is None:
             return f"{self.identity.package_id}: observed absent"
-        normalized = normalized_package_hash(self.payload.get("package_hash"))
+        normalized = normalized_sha512_hash(self.payload.get("package_hash"))
         return (
             f"{self.identity.package_id}: observed "
             f"version={self.payload.get('version')!r} "
             f"hash={self.payload.get('package_hash')!r} "
-            f"hash_sha256={normalized or 'unparsed'} "
+            f"hash_sha512={normalized or 'unparsed'} "
             f"algorithm={self.payload.get('package_hash_algorithm')!r} "
             f"moderation={self.payload.get('moderation_status')!r} "
             f"listed={self.payload.get('listed')!r}"
@@ -572,11 +578,10 @@ class ChocolateyMember:
 
         A `(None, None)` result means the version is absent and is the only work
         this run may perform. An approved member is reported as `listed` only when
-        the feed proves it is publicly listed, because the
-        `chocolatey-distribution` spec advertises an install command only for a
-        listed package; an approved but unlisted member is `unchanged`, an
-        accepted member awaiting moderation is `pending`, and a rejected member is
-        a conflict.
+        the supported exact approved-only `choco search` path resolves this
+        version; approved metadata without that public resolution is `unchanged`,
+        an accepted member awaiting moderation is `pending`, and a rejected member
+        is a conflict.
         """
 
         payload = self.payload
@@ -586,19 +591,21 @@ class ChocolateyMember:
         if version != self.version:
             return None, f"version is {version!r}; expected {self.version!r}"
         algorithm = payload.get("package_hash_algorithm")
-        if algorithm != PACKAGE_HASH_ALGORITHM:
+        if algorithm != COMMUNITY_PACKAGE_HASH_ALGORITHM:
             return None, (
                 f"package hash algorithm is {algorithm!r}; "
-                f"expected {PACKAGE_HASH_ALGORITHM!r}"
+                f"expected {COMMUNITY_PACKAGE_HASH_ALGORITHM!r}"
             )
-        observed_hash = normalized_package_hash(payload.get("package_hash"))
+        observed_hash = normalized_sha512_hash(payload.get("package_hash"))
         if observed_hash is None:
             return None, (
                 f"package hash {payload.get('package_hash')!r} is neither a "
-                "64-hex nor a base64 SHA-256 value"
+                "128-hex nor a base64 SHA-512 value"
             )
-        if observed_hash != self.sha256:
-            return None, f"package hash is {observed_hash}; expected {self.sha256}"
+        if observed_hash != self.package_sha512:
+            return None, (
+                f"package hash is {observed_hash}; expected {self.package_sha512}"
+            )
         status = payload.get("moderation_status")
         if status not in MODERATION_STATES:
             return None, (
@@ -668,6 +675,16 @@ def validated_candidate(
     return path, digest
 
 
+def sha512_file(path: Path) -> str:
+    """Return the Community Repository's streaming SHA-512 package digest."""
+
+    digest = hashlib.sha512()
+    with path.open("rb") as input_file:
+        while chunk := input_file.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def query_package_version(
     gateway: CommunityGateway, identity: channels.PackageIdentity, version: str
 ) -> dict[str, Any] | None:
@@ -734,24 +751,30 @@ def reconcile_chocolatey(
 
     paths = require_pair(nupkgs, "Chocolatey nupkg path")
     hashes = require_pair(digests, "Chocolatey nupkg digest")
-    candidates: dict[str, tuple[Path, str]] = {}
+    candidates: dict[str, tuple[Path, str, str]] = {}
     for identity in channels.PACKAGES:
-        candidates[identity.package_id] = validated_candidate(
+        candidate, package_sha256 = validated_candidate(
             identity,
             inputs.version,
             paths[identity.package_id],
             hashes[identity.package_id],
         )
+        candidates[identity.package_id] = (
+            candidate,
+            package_sha256,
+            sha512_file(candidate),
+        )
 
     members: list[ChocolateyMember] = []
     for identity in channels.PACKAGES:
-        path, digest = candidates[identity.package_id]
+        path, package_sha256, package_sha512 = candidates[identity.package_id]
         members.append(
             ChocolateyMember(
                 identity=identity,
                 version=inputs.version,
                 nupkg=path,
-                sha256=digest,
+                package_sha256=package_sha256,
+                package_sha512=package_sha512,
                 payload=query_package_version(gateway, identity, inputs.version),
             )
         )
@@ -1057,18 +1080,24 @@ class ChocolateyGateway:
     def __init__(
         self,
         *,
-        source: str = COMMUNITY_SOURCE,
+        query_source: str = COMMUNITY_QUERY_SOURCE,
+        push_source: str = COMMUNITY_PUSH_SOURCE,
         choco: str = "choco",
         working_directory: Path | None = None,
         timeout: int = HTTP_TIMEOUT_SECONDS,
     ) -> None:
-        """Bind pushes to the Chocolatey-only API key and one repository source."""
+        """Bind reads and pushes to their distinct official endpoints."""
 
-        if not source.startswith("https://"):
-            raise PublicationError(
-                f"Chocolatey source is {source!r}; expected an https URL"
-            )
-        self.source = source.rstrip("/")
+        for label, source in (
+            ("query", query_source),
+            ("push", push_source),
+        ):
+            if not source.startswith("https://"):
+                raise PublicationError(
+                    f"Chocolatey {label} source is {source!r}; expected an https URL"
+                )
+        self.query_source = query_source.rstrip("/")
+        self.push_source = f"{push_source.rstrip('/')}/"
         self.choco = choco
         self.working_directory = (working_directory or Path.cwd()).resolve()
         self.timeout = timeout
@@ -1137,11 +1166,58 @@ class ChocolateyGateway:
             if element.get(null_attribute) != "true"
         }
 
+    def _publicly_listed(self, package_id: str, version: str) -> bool:
+        """Prove that the supported CLI resolves this exact current version."""
+
+        search_environment = os.environ.copy()
+        search_environment.pop("CHOCOLATEY_API_KEY", None)
+        completed = subprocess.run(
+            [
+                self.choco,
+                "search",
+                package_id,
+                f"--version={version}",
+                "--exact",
+                "--all-versions",
+                "--approved-only",
+                "--limit-output",
+                "--source",
+                self.query_source,
+            ],
+            cwd=self.working_directory,
+            env=search_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        stdout = completed.stdout.decode(errors="replace").strip()
+        stderr = completed.stderr.decode(errors="replace").strip()
+        if completed.returncode != 0:
+            raise PublicationError(
+                f"choco search for {package_id} {version} failed with status "
+                f"{completed.returncode}: {stderr or stdout}"
+            )
+        lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+        if not lines:
+            return False
+        if len(lines) != 1 or "|" not in lines[0]:
+            raise PublicationError(
+                f"choco search for {package_id} returned unexpected limited output "
+                f"{stdout!r}"
+            )
+        observed_id, observed_version = lines[0].split("|", 1)
+        if observed_id.casefold() != package_id.casefold():
+            raise PublicationError(
+                f"choco search for {package_id} returned unexpected package "
+                f"{observed_id!r}"
+            )
+        return observed_version == version
+
     def package_version(self, package_id: str, version: str) -> dict[str, Any] | None:
         """Read one package version from the OData feed, or None when it is absent."""
 
         endpoint = (
-            f"{self.source}/Packages(Id='{quote(package_id, safe='')}',"
+            f"{self.query_source}/Packages(Id='{quote(package_id, safe='')}',"
             f"Version='{quote(version, safe='')}')"
         )
         request = urllib.request.Request(
@@ -1164,10 +1240,15 @@ class ChocolateyGateway:
                 f"{error.reason}"
             ) from error
         values = self._entry_properties(body, package_id, version)
+        moderation_status = self._moderation_status(values, package_id, version)
         return {
             "version": values.get("Version", ""),
-            "listed": self._boolean(values.get("Listed") or values.get("IsListed")),
-            "moderation_status": self._moderation_status(values, package_id, version),
+            "listed": (
+                self._publicly_listed(package_id, version)
+                if moderation_status == "approved"
+                else False
+            ),
+            "moderation_status": moderation_status,
             "package_hash": values.get("PackageHash", ""),
             "package_hash_algorithm": values.get("PackageHashAlgorithm", ""),
         }
@@ -1187,7 +1268,7 @@ class ChocolateyGateway:
                 "push",
                 str(path),
                 "--source",
-                self.source,
+                self.push_source,
                 "--api-key",
                 self._api_key,
                 "--limit-output",
@@ -1207,7 +1288,7 @@ class ChocolateyGateway:
         return {
             "package_id": package_id,
             "version": version,
-            "source": self.source,
+            "source": self.push_source,
             "status": "accepted",
             "output": stdout,
         }
@@ -1270,7 +1351,8 @@ def argument_parser() -> argparse.ArgumentParser:
     )
     chocolatey.add_argument("--inputs", type=Path, required=True)
     chocolatey.add_argument("--nupkg-directory", type=Path, required=True)
-    chocolatey.add_argument("--source", default=COMMUNITY_SOURCE)
+    chocolatey.add_argument("--query-source", default=COMMUNITY_QUERY_SOURCE)
+    chocolatey.add_argument("--push-source", default=COMMUNITY_PUSH_SOURCE)
     chocolatey.add_argument("--report", type=Path)
     chocolatey.add_argument("--github-output", type=Path)
     return parser
@@ -1315,11 +1397,18 @@ def run(arguments: Sequence[str]) -> int:
         }
         digests = channels.inspect_nupkg_pair(nupkgs, inputs)
         states = reconcile_chocolatey(
-            ChocolateyGateway(source=options.source), inputs, nupkgs, digests
+            ChocolateyGateway(
+                query_source=options.query_source,
+                push_source=options.push_source,
+            ),
+            inputs,
+            nupkgs,
+            digests,
         )
         report = {
             "channel": "chocolatey",
-            "source": options.source,
+            "query_source": options.query_source,
+            "push_source": options.push_source,
             "version": inputs.version,
             "tag": inputs.tag,
             "commit": inputs.commit,
@@ -1327,7 +1416,10 @@ def run(arguments: Sequence[str]) -> int:
             "package_states": dict(states),
         }
         outputs = {"chocolatey_states": format_states(states)}
-        print(f"Chocolatey {options.source} {inputs.version}: {format_states(states)}")
+        print(
+            f"Chocolatey query={options.query_source} push={options.push_source} "
+            f"{inputs.version}: {format_states(states)}"
+        )
     else:
         raise PublicationError(f"unhandled publisher command {options.command!r}")
 
