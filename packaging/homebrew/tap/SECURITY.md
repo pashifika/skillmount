@@ -1,8 +1,7 @@
 # Security policy for the SkillMount tap
 
-> Source material: this file is tracked in `pashifika/skillmount` under `packaging/homebrew/tap/`
-> and is transferred to the separately managed `pashifika/homebrew-tap` repository through that
-> repository's own reviewed change. It is not the live tap.
+> Canonical source: `pashifika/skillmount:packaging/homebrew/tap/SECURITY.md`. Changes are
+> transferred to this tap through its own reviewed pull requests.
 
 ## Ownership model
 

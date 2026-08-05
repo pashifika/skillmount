@@ -1,8 +1,7 @@
 # Contributing to the SkillMount tap
 
-> Source material: this file is tracked in `pashifika/skillmount` under `packaging/homebrew/tap/`
-> and is transferred to the separately managed `pashifika/homebrew-tap` repository through that
-> repository's own reviewed change. It is not the live tap.
+> Canonical source: `pashifika/skillmount:packaging/homebrew/tap/CONTRIBUTING.md`. Changes are
+> transferred to this tap through its own reviewed pull requests.
 
 This repository owns the published SkillMount Formulae, their CI, and their history. The Formula
 content itself is generated in the product repository from templates under
