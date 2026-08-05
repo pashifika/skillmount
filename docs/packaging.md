@@ -27,9 +27,10 @@ files. The supported package targets are Apple Silicon macOS for Homebrew and Wi
 for Chocolatey. Homebrew Core, casks, bottles, Linux, macOS Intel, Windows ARM64, WinGet, Scoop,
 and crates.io are out of scope.
 
-Current state: no Homebrew tap repository exists, no Chocolatey package ID is reserved, `v0.2.0`
-is not released, and the Cargo version is still `0.1.0`. Every install command in this document is
-therefore unavailable and documented as such.
+Current state: the protected `pashifika/homebrew-tap` exists in its never-published bootstrap state,
+but no Formula or publisher credential exists and no Chocolatey package ID is reserved.
+Package-manager version `0.2.0` is not yet publicly available, so every install command in this
+document remains unavailable and is documented as such.
 
 ## The package workflow
 
