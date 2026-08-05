@@ -27,6 +27,8 @@ pub(crate) struct ReadOnlyReport<'a> {
     pub(crate) plan: &'a MountPlan,
     /// Requested diagnostic verbosity.
     pub(crate) verbosity: u8,
+    /// Whether the mutating path already attempted its one advisory version observation.
+    pub(crate) version_observation_attempted: bool,
 }
 
 impl ReadOnlyReport<'_> {
@@ -113,6 +115,17 @@ fn header(out: &mut String, report: &ReadOnlyReport<'_>) {
             crate::domain::AgentId::Codex => "codex",
             crate::domain::AgentId::Claude => "claude",
         }
+    );
+    let evidence_note = if report.version_observation_attempted {
+        "advisory evidence; bounded --version observation attempted before state access"
+    } else {
+        "advisory evidence; executable not queried"
+    };
+    let _ = writeln!(
+        out,
+        "{:<15} {:?} ({evidence_note})",
+        "Last tested:",
+        crate::agent::version_spec(context.agent).last_tested_banner()
     );
     field(out, "Launch CWD:", &context.launch_cwd);
     field(out, "Project root:", &context.project_root);

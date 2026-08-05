@@ -488,7 +488,7 @@ fn check_agent(
                 FindingSeverity::Failure,
                 component,
                 format!(
-                    "{}; install the pinned agent or pass its explicit binary path",
+                    "{}; install the Agent or pass its explicit binary path",
                     render_error(&error)
                 ),
             ));
@@ -496,33 +496,37 @@ fn check_agent(
         }
     };
 
-    let result = match agent {
-        AgentId::Codex => crate::agent::codex::verify_managed_configuration(&context)
-            .and_then(|()| crate::agent::codex::reported_version(&context))
-            .and_then(|version| {
-                crate::agent::codex::verify_version_text(&version).map(|()| version)
-            }),
-        AgentId::Claude => crate::agent::claude::verify_environment()
-            .and_then(|()| crate::agent::claude::reported_version(&context))
-            .and_then(|version| {
-                crate::agent::claude::verify_version_text(&version).map(|()| version)
-            }),
+    let invariant = match agent {
+        AgentId::Codex => crate::agent::codex::verify_launch_invariants(&context),
+        AgentId::Claude => crate::agent::claude::verify_launch_invariants(),
     };
-    match result {
-        Ok(version) => findings.push(DoctorFinding::new(
-            FindingSeverity::Pass,
-            component,
-            format!("{} reports {version}", path_value(&context.agent_bin, true)),
-        )),
-        Err(error) => findings.push(DoctorFinding::new(
+    if let Err(error) = invariant {
+        findings.push(DoctorFinding::new(
             FindingSeverity::Failure,
             component,
             format!(
-                "{}: {error}; install the pinned release before starting a mounted session",
+                "{}: {error}; correct the enforced launch configuration before starting a mounted session",
                 path_value(&context.agent_bin, true)
             ),
-        )),
+        ));
+        return Some(context);
     }
+
+    let observation = crate::agent::version::observe(
+        &context.agent_bin,
+        &context.invocation_cwd,
+        crate::agent::version_spec(agent),
+    );
+    let severity = match observation.kind() {
+        crate::agent::version::VersionEvidenceKind::LastTested => FindingSeverity::Pass,
+        crate::agent::version::VersionEvidenceKind::Untested
+        | crate::agent::version::VersionEvidenceKind::Unavailable => FindingSeverity::Unverified,
+    };
+    findings.push(DoctorFinding::new(
+        severity,
+        component,
+        observation.doctor_detail(&context.agent_bin),
+    ));
     Some(context)
 }
 
@@ -594,7 +598,7 @@ fn check_discovery(
                 FindingSeverity::Unverified,
                 format!("{} live compatibility", context.agent.label()),
                 format!(
-                    "filesystem inspection does not prove that an authenticated pinned {} process loads mounted Skills; run the live-agent smoke workflow and record the result in docs/compatibility.md",
+                    "filesystem inspection does not prove that an authenticated {} process loads mounted Skills; run the live-agent smoke workflow and record the result in docs/compatibility.md",
                     context.agent.label()
                 ),
             ));

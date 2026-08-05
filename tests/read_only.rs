@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
 const SKILLMOUNT: &str = env!("CARGO_BIN_EXE_skillmount");
+#[cfg(feature = "test-fixtures")]
+const FAKE_AGENT: &str = env!("CARGO_BIN_EXE_skillmount-fake-agent");
 
 /// A fixture holding a project, a Skill source, and a private home directory.
 ///
@@ -309,6 +311,9 @@ fn inspect_reports_both_agents_without_touching_anything() {
     assert!(rendered.contains("Agent:          codex"));
     assert!(rendered.contains("Agent:          claude"));
     assert!(rendered.contains("Overlay: 1 Skill(s)"));
+    assert!(rendered.contains("codex-cli 0.146.0"));
+    assert!(rendered.contains("2.1.220 (Claude Code)"));
+    assert_eq!(rendered.matches("executable not queried").count(), 2);
 }
 
 #[test]
@@ -324,6 +329,82 @@ fn inspect_can_be_filtered_to_one_agent() {
     let rendered = String::from_utf8_lossy(&output.stdout);
     assert!(rendered.contains("Agent:          claude"));
     assert!(!rendered.contains("Agent:          codex"));
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn inspect_and_both_dry_runs_launch_neither_version_observation_nor_child_process() {
+    let fixture = Fixture::new("all-read-only-process-free");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let fake_agent = Path::new(FAKE_AGENT).to_string_lossy().into_owned();
+    let version_record = fixture.root.join("version-process.record");
+    let child_record = fixture.root.join("child-process.record");
+    let bin = fixture.root.join("agent-bin");
+    fs::create_dir(&bin).expect("PATH fixture");
+    for name in ["codex", "claude"] {
+        fs::copy(
+            FAKE_AGENT,
+            bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .expect("copy native fake Agent");
+    }
+    let search_path = std::env::join_paths([&bin]).expect("PATH fixture encoding");
+
+    let mut commands = [
+        fixture.command(&["inspect", "--skills-dir", &sources]),
+        fixture.command(&[
+            "codex",
+            "--skills-dir",
+            &sources,
+            "--agent-bin",
+            &fake_agent,
+            "--dry-run",
+            "--",
+            "exec",
+            "fixture",
+        ]),
+        fixture.command(&[
+            "claude",
+            "--skills-dir",
+            &sources,
+            "--agent-bin",
+            &fake_agent,
+            "--dry-run",
+        ]),
+    ];
+    for (index, command) in commands.iter_mut().enumerate() {
+        let before = snapshot(&fixture.root);
+        let output = command
+            .env("PATH", &search_path)
+            .env_remove("SKILLMOUNT_TEST_CODEX_VERSION")
+            .env_remove("SKILLMOUNT_TEST_CLAUDE_VERSION")
+            .env("SKILLMOUNT_FAKE_VERSION_RECORD", &version_record)
+            .env("SKILLMOUNT_FAKE_RECORD", &child_record)
+            .output()
+            .expect("read-only command should run");
+
+        assert!(
+            output.status.success(),
+            "read-only case {index}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            snapshot(&fixture.root),
+            before,
+            "read-only case {index} changed the fixture"
+        );
+        assert!(
+            !version_record.exists(),
+            "read-only case {index} launched --version"
+        );
+        assert!(
+            !child_record.exists(),
+            "read-only case {index} launched the Agent child"
+        );
+        let rendered = String::from_utf8_lossy(&output.stdout);
+        assert!(rendered.contains("advisory evidence; executable not queried"));
+    }
 }
 
 #[test]
@@ -354,6 +435,8 @@ fn a_codex_dry_run_plans_the_whole_layout_without_creating_it() {
     );
     assert!(!fixture.project.join(".codex").exists());
     assert!(!fixture.project.join(".agents").exists());
+    assert!(rendered.contains("codex-cli 0.146.0"));
+    assert!(rendered.contains("advisory evidence; executable not queried"));
 }
 
 #[test]
@@ -522,6 +605,8 @@ fn a_claude_dry_run_never_creates_a_session_root() {
             && !fixture.home.join("AppData/Local/skillmount").exists(),
         "no session or transaction storage may be created"
     );
+    assert!(rendered.contains("2.1.220 (Claude Code)"));
+    assert!(rendered.contains("advisory evidence; executable not queried"));
 }
 
 #[test]

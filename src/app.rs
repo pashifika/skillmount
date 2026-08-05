@@ -106,6 +106,7 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError
                 snapshot: &report.snapshot,
                 plan: &report.plan,
                 verbosity: context.options.verbosity,
+                version_observation_attempted: false,
             }))?;
             warn(&render::render_warnings(&report.catalog, &report.snapshot));
             Ok(0)
@@ -130,6 +131,7 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError
                     snapshot: &report.snapshot,
                     plan: &report.plan,
                     verbosity: 0,
+                    version_observation_attempted: false,
                 }));
                 warnings.extend(render::render_warnings(&report.catalog, &report.snapshot));
             }
@@ -170,13 +172,18 @@ pub(crate) struct ReadOnlyOutcome {
 /// journal untouched for recovery. `--keep-mounts` reaches the transaction's terminal kept state
 /// through that same callback.
 fn run_session(context: &RunContext) -> Result<u8, AppError> {
-    // Root-changing arguments and an incompatible Codex binary are rejected before reading or
-    // creating SkillMount state. The later locked replan repeats the pure argument check, but it
-    // must not be the first time a mutating invocation learns that its launch contract is unsafe.
+    // Root-changing arguments and release-independent Agent controls are rejected before reading
+    // or creating SkillMount state. Version evidence is observed once and can warn, but never
+    // authorizes the launch or enters transaction ownership state.
     adapter_for(context.agent).validate_passthrough_args(&context.passthrough_args)?;
-    match context.agent {
-        AgentId::Codex => crate::agent::codex::verify_supported_launch(context)?,
-        AgentId::Claude => crate::agent::claude::verify_supported_launch(context)?,
+    verify_agent_launch_invariants(context)?;
+    let version = crate::agent::version::observe(
+        &context.agent_bin,
+        &context.invocation_cwd,
+        crate::agent::version_spec(context.agent),
+    );
+    if let Some(message) = version.session_warning(&context.agent_bin) {
+        warn(&[message]);
     }
 
     // Unknown ownership state is checked before creating even SkillMount's own staging or lock
@@ -246,13 +253,10 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
         ))
     })?;
 
-    // Lock acquisition may wait behind a long-running session while the installed agent is
-    // upgraded. Re-probe after the lock set stabilizes so a plan is never persisted or applied
-    // using only compatibility evidence captured before that wait.
-    match context.agent {
-        AgentId::Codex => crate::agent::codex::verify_supported_launch(&context)?,
-        AgentId::Claude => crate::agent::claude::verify_supported_launch(&context)?,
-    }
+    // Lock acquisition may wait behind a long-running session while managed configuration or
+    // another hard launch control changes. Repeat those release-independent checks after the lock
+    // set stabilizes; version evidence remains the single advisory observation made before state.
+    verify_agent_launch_invariants(&context)?;
 
     warn(&render::render_warnings(
         &rebuilt.catalog,
@@ -276,9 +280,9 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
         warn(&[message]);
     }
 
-    // Apply can itself take time and runs after the last version probe. Check once more at the
-    // child boundary. If an updater replaced the agent, no child is spawned and the active
-    // transaction is released through the normal evidence-checked cleanup path.
+    // Apply can itself take time. Repeat only the hard launch invariants at the child boundary. If
+    // one changed, no child is spawned and the active transaction is released through the normal
+    // evidence-checked cleanup path.
     verify_spawn_boundary(&context, &rebuilt.catalog, &mut transaction)?;
 
     if let Err(error) = transaction.begin_supervision() {
@@ -321,6 +325,7 @@ fn render_session_output(context: &RunContext, outcome: &ReadOnlyOutcome) -> Str
         snapshot: &outcome.snapshot,
         plan: &outcome.plan,
         verbosity: context.options.verbosity,
+        version_observation_attempted: true,
     };
     let mut output = render::render_session_start(&report);
     if context.options.verbosity > 0 {
@@ -352,15 +357,19 @@ fn junction_policy_warning(
     used_junction: bool,
 ) -> Option<String> {
     (requested == LinkMode::Auto && used_junction).then(|| {
-        let version = match agent {
-            AgentId::Codex => crate::agent::codex::SUPPORTED_CODEX_VERSION,
-            AgentId::Claude => crate::agent::claude::SUPPORTED_CLAUDE_VERSION,
-        };
+        let last_tested = crate::agent::version_spec(agent).last_tested_banner();
         format!(
-            "automatic symlink fallback selected a Windows junction, but real {} {version} junction discovery is unverified in docs/compatibility.md; this session will continue with the ownership-verified junction. Run the opt-in native smoke before claiming compatibility, or request --link-mode=symlink to fail instead of falling back",
+            "automatic symlink fallback selected a Windows junction, but live {} junction compatibility is unverified: docs/compatibility.md has no passing evidence for this Agent/platform/link combination. The adapter's dated last-tested banner is {last_tested:?}, not evidence that this junction was exercised. This session will continue with the ownership-verified junction. Run the opt-in native smoke before claiming compatibility, or request --link-mode=symlink to fail instead of falling back",
             agent.label()
         )
     })
+}
+
+fn verify_agent_launch_invariants(context: &RunContext) -> Result<(), AppError> {
+    match context.agent {
+        AgentId::Codex => crate::agent::codex::verify_launch_invariants(context),
+        AgentId::Claude => crate::agent::claude::verify_launch_invariants(),
+    }
 }
 
 fn verify_spawn_boundary(
@@ -368,16 +377,16 @@ fn verify_spawn_boundary(
     catalog: &SkillCatalog,
     transaction: &mut Transaction,
 ) -> Result<(), AppError> {
-    let compatibility = match context.agent {
-        AgentId::Codex => crate::agent::codex::verify_supported_launch(context)
-            .and_then(|()| crate::agent::codex::verify_selected_plugin_namespaces(catalog)),
-        AgentId::Claude => crate::agent::claude::verify_supported_launch(context),
-    };
+    let compatibility =
+        verify_agent_launch_invariants(context).and_then(|()| match context.agent {
+            AgentId::Codex => crate::agent::codex::verify_selected_plugin_namespaces(catalog),
+            AgentId::Claude => Ok(()),
+        });
     if let Err(error) = compatibility {
         match transaction.cleanup_required() {
             Ok(report) => warn(&report.describe()),
             Err(cleanup_error) => warn(&[format!(
-                "agent compatibility changed before launch and cleanup also failed: {cleanup_error}"
+                "an Agent hard launch invariant changed before spawn and cleanup also failed: {cleanup_error}"
             )]),
         }
         return Err(error);

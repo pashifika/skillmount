@@ -1851,6 +1851,74 @@ fn a_claude_conflict_introduced_after_preliminary_discovery_is_seen_under_lock()
 }
 
 #[test]
+fn hard_agent_controls_appearing_after_apply_prevent_child_and_force_owned_cleanup() {
+    for (agent, marker_variable, expected_error) in [
+        (
+            "codex",
+            "SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG_PATH",
+            "legacy managed configuration",
+        ),
+        (
+            "claude",
+            "SKILLMOUNT_TEST_CLAUDE_ENVIRONMENT_CONTROL_PATH",
+            "environment-control marker",
+        ),
+    ] {
+        let fixture = Fixture::new(&format!("{agent}-control-after-apply"));
+        fixture.skill("alpha");
+        let marker = fixture.root.join("late-agent-control");
+        let release = fixture.root.join("release-agent-control");
+        let mut session = fixture
+            .command(agent, &["--keep-mounts"])
+            .env(marker_variable, &marker)
+            .env("SKILLMOUNT_HOLD_AT", "journal-active")
+            .env("SKILLMOUNT_HOLD_MS", "10000")
+            .env("SKILLMOUNT_HOLD_UNTIL", &release)
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the session should reach its active transaction");
+        let mut diagnostics = wait_for_hold(&mut session, "journal-active");
+
+        match agent {
+            "codex" => assert!(exists(&fixture.project.join(".agents/skills/alpha"))),
+            "claude" => assert!(!fixture.session_tree().is_empty()),
+            _ => unreachable!("the fixture table names both supported Agents"),
+        }
+        fs::write(&marker, b"present\n").expect("introduce the late hard Agent control");
+        fs::write(&release, b"continue\n").expect("release the spawn-boundary check");
+
+        let status = session.wait().expect("the held session remains waitable");
+        let mut remaining = String::new();
+        diagnostics
+            .read_to_string(&mut remaining)
+            .expect("the held session diagnostics remain readable");
+
+        assert_eq!(status.code(), Some(64), "{agent}: {remaining}");
+        assert!(remaining.contains(expected_error), "{agent}: {remaining}");
+        assert!(
+            !remaining.contains("Launching"),
+            "the Agent child must not start: {agent}: {remaining}"
+        );
+        assert!(
+            marker.is_file(),
+            "the external control is not transaction-owned"
+        );
+        assert!(
+            fixture.journals().is_empty(),
+            "matching-evidence cleanup retires the {agent} transaction"
+        );
+        match agent {
+            "codex" => {
+                assert!(!exists(&fixture.project.join(".agents")));
+                assert!(!exists(&fixture.project.join(".codex")));
+            }
+            "claude" => assert!(fixture.session_tree().is_empty()),
+            _ => unreachable!("the fixture table names both supported Agents"),
+        }
+    }
+}
+
+#[test]
 fn a_cleanup_that_cannot_finish_keeps_its_journal_and_its_evidence() {
     let fixture = Fixture::new("cleanup-blocked");
     fixture.skill("alpha");

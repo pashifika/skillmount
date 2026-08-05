@@ -126,8 +126,11 @@ Preview a Codex session plan, still read-only:
 asm codex --skills-dir ~/agent-skills --dry-run -- exec "Summarize this project's build steps"
 ```
 
-Run the session for real. SkillMount mounts the Skills, launches Codex, and cleans up after the
-agent exits:
+The preview prints the adapter's dated last-tested banner but does not query the installed Agent.
+
+Run the session for real. SkillMount observes the Agent version once, mounts the Skills, launches
+Codex, and cleans up after the Agent exits. A banner that differs from the last-tested evidence, or
+cannot be read, produces one compatibility warning but does not block an otherwise valid session:
 
 ```bash
 asm codex --skills-dir ~/agent-skills -- exec "Summarize this project's build steps"
@@ -140,9 +143,9 @@ to Claude through `--add-dir`, so the project itself is not modified:
 asm claude --skills-dir ~/agent-skills -- -p "Review the staged diff with the team review Skill"
 ```
 
-Everything after the standalone `--` is passed to the agent unchanged. Repeat `--skills-dir` to
-overlay collections, and add `--agent-bin path/to/codex` to pin a specific agent executable
-instead of searching `PATH`.
+Everything after the standalone `--` is passed to the Agent unchanged. Repeat `--skills-dir` to
+overlay collections, and add `--agent-bin path/to/codex` to select a specific executable instead of
+searching `PATH`.
 
 Treat mounted Skills as code you chose to run: review their contents and provenance before making
 them visible to an agent.
@@ -211,17 +214,23 @@ asm doctor --project-root ~/projects/webapp
 asm cleanup --project-root ~/projects/webapp
 ```
 
-`doctor` reports agent versions, discovery layout, link capability, locks, and leftover journals
-without changing project or SkillMount state. `cleanup` releases mounts left behind by an
-interrupted session; run it only after confirming no agent process still uses them, or sweep every
-recorded transaction with `asm cleanup --all`. The recovery rules and their guarantees are
-documented in [docs/architecture.md](docs/architecture.md).
+`doctor` reports Agent version evidence, discovery layout, link capability, locks, and leftover
+journals without changing project or SkillMount state. The last-tested banner is a `pass`; a
+different or unavailable banner is `unverified` and does not fail `doctor` unless another check
+fails. `cleanup` releases mounts left behind by an interrupted session; run it only after confirming
+no Agent process still uses them, or sweep every recorded transaction with
+`asm cleanup --all`. The recovery rules and their guarantees are documented in
+[docs/architecture.md](docs/architecture.md).
 
 ## Requirements
 
 - Supported hosts: Windows 10 version 1709 or later (x64 and x86) and macOS on Apple Silicon.
-- Sessions launch exactly the pinned agent releases: Codex CLI 0.146.0 and Claude Code 2.1.220.
-  Dated compatibility observations live in [docs/compatibility.md](docs/compatibility.md).
+- The adapters' dated last-tested banners are `codex-cli 0.146.0` and
+  `2.1.220 (Claude Code)`. These are evidence baselines, not an exact-version allowlist. A different
+  or unavailable banner warns and continues; it remains unverified compatibility evidence until
+  the live-agent workflow is recorded in [docs/compatibility.md](docs/compatibility.md).
+- Release-independent discovery, configuration, and foreground-lifecycle controls still fail
+  closed for every observed version.
 - Building from source requires Rust 1.85.0 or newer.
 
 ## Documentation
@@ -229,7 +238,7 @@ documented in [docs/architecture.md](docs/architecture.md).
 | Document | What it covers |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | Module boundaries, safety invariants, implementation status |
-| [docs/compatibility.md](docs/compatibility.md) | Pinned agent versions and dated observations |
+| [docs/compatibility.md](docs/compatibility.md) | Last-tested Agent evidence and dated observations |
 | [docs/packaging.md](docs/packaging.md) | Package channels, availability, maintainer runbook |
 | [docs/releasing.md](docs/releasing.md) | Building and publishing a stable release |
 

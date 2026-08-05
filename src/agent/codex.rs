@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
+use crate::agent::version::VersionSpec;
 use crate::agent::{
     AgentAdapter, DiscoveryScope, DiscoverySnapshot, ExistingSkill, ScopeKind,
     dedupe_scopes_by_terminal, discovery_indexes, insert_direct_deterministically,
@@ -38,10 +38,13 @@ const MAX_DISCOVERY_DEPTH: usize = 6;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Per-entry accounting used by Codex in addition to the serialized path.
 const DISCOVERY_RESPONSE_ITEM_OVERHEAD_BYTES: usize = 64;
-/// Codex release whose discovery and embedded-Skill contract this adapter implements.
-pub(crate) const SUPPORTED_CODEX_VERSION: &str = "0.146.0";
-const SUPPORTED_CODEX_VERSION_OUTPUT: &str = "codex-cli 0.146.0";
-const VERSION_OUTPUT_LIMIT: usize = 1024;
+/// Codex banner attached to the adapter's last-tested discovery evidence.
+const LAST_TESTED_CODEX_BANNER: &str = "codex-cli 0.146.0";
+const CODEX_VERSION_SPEC: VersionSpec = VersionSpec::new(
+    "Codex CLI",
+    LAST_TESTED_CODEX_BANNER,
+    "SKILLMOUNT_TEST_CODEX_VERSION",
+);
 /// Local fail-closed bound for a plugin manifest used only to determine namespace behavior.
 const MAX_PLUGIN_MANIFEST_BYTES: u64 = 64 * 1024;
 const SYSTEM_SKILL_NAMES: [&str; 6] = [
@@ -214,51 +217,31 @@ impl CodexAdapter {
     }
 }
 
-/// Proves that the executable and higher-precedence configuration match the loader contract.
-pub(crate) fn verify_supported_launch(context: &RunContext) -> Result<(), AppError> {
-    verify_managed_configuration(context)?;
-    verify_version_text(&reported_version(context)?)
-}
-
-/// Captures the bounded, text version banner used by operator diagnostics and launch checks.
-pub(crate) fn reported_version(context: &RunContext) -> Result<String, AppError> {
-    // Integration suites reuse test executables whose real version banners intentionally are not
-    // Codex. The escape hatch is absent from release builds, like failure checkpoints and the
-    // isolated administrator-root override.
-    #[cfg(debug_assertions)]
-    if let Some(version) = std::env::var_os("SKILLMOUNT_TEST_CODEX_VERSION") {
-        return Ok(version.to_string_lossy().trim().to_owned());
-    }
-
-    let output = Command::new(&context.agent_bin)
-        .arg("--version")
-        .current_dir(&context.invocation_cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| AppError::MissingInput {
-            path: context.agent_bin.clone(),
-            reason: format!("cannot query Codex version: {error}"),
-        })?;
-    if !output.status.success() {
-        return Err(AppError::MissingInput {
-            path: context.agent_bin.clone(),
-            reason: format!("Codex --version exited with {}", output.status),
-        });
-    }
-    if output.stdout.len() > VERSION_OUTPUT_LIMIT || output.stderr.len() > VERSION_OUTPUT_LIMIT {
-        return Err(AppError::Usage(format!(
-            "Codex --version output exceeds the {VERSION_OUTPUT_LIMIT}-byte compatibility bound"
-        )));
-    }
-    let version = std::str::from_utf8(&output.stdout)
-        .map_err(|_| AppError::Usage("Codex --version output is not valid UTF-8".to_owned()))?;
-    Ok(version.trim().to_owned())
+/// Verifies the Codex launch invariants that remain mandatory for every observed release.
+pub(crate) fn verify_launch_invariants(context: &RunContext) -> Result<(), AppError> {
+    verify_managed_configuration(context)
 }
 
 /// Verifies higher-precedence configuration that can change the inspected discovery model.
 pub(crate) fn verify_managed_configuration(context: &RunContext) -> Result<(), AppError> {
+    // A debug-only marker lets the process-level transaction suite introduce the same hard
+    // condition after planning. Release binaries contain neither the lookup nor this test seam.
+    #[cfg(debug_assertions)]
+    if let Some(path) =
+        std::env::var_os("SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG_PATH").map(PathBuf::from)
+    {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Err(unsupported_managed_configuration()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Usage(format!(
+                    "cannot inspect the deterministic Codex managed-configuration marker {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
     #[cfg(debug_assertions)]
     if let Some(value) = std::env::var_os("SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG") {
         return match value.to_str() {
@@ -307,17 +290,9 @@ fn unsupported_managed_configuration() -> AppError {
     )
 }
 
-/// Checks a captured version banner against the adapter-pinned release.
-pub(crate) fn verify_version_text(version: &str) -> Result<(), AppError> {
-    if version.trim() == SUPPORTED_CODEX_VERSION_OUTPUT {
-        Ok(())
-    } else {
-        Err(AppError::Usage(format!(
-            "Codex {} is required by this adapter, but --version reported {:?}",
-            SUPPORTED_CODEX_VERSION,
-            version.trim()
-        )))
-    }
+/// Returns the dated version evidence used by the shared advisory observer.
+pub(crate) const fn version_spec() -> VersionSpec {
+    CODEX_VERSION_SPEC
 }
 
 /// Reserves the embedded names installed by the supported Codex before it loads any Skill root.
@@ -1370,9 +1345,9 @@ impl AgentAdapter for CodexAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        DISCOVERY_RESPONSE_ITEM_OVERHEAD_BYTES, MAX_DISCOVERY_RESPONSE_BYTES,
-        codex_directory_entry_name_is_representable, codex_path_uri_upper_bound,
-        reserve_codex_response_bytes, verify_version_text,
+        DISCOVERY_RESPONSE_ITEM_OVERHEAD_BYTES, LAST_TESTED_CODEX_BANNER,
+        MAX_DISCOVERY_RESPONSE_BYTES, codex_directory_entry_name_is_representable,
+        codex_path_uri_upper_bound, reserve_codex_response_bytes, version_spec,
     };
     use std::ffi::OsString;
     use std::path::Path;
@@ -1393,14 +1368,11 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_gate_accepts_only_the_pinned_codex_release() {
-        verify_version_text("codex-cli 0.146.0\n").expect("supported Codex version");
-        for unsupported in ["codex-cli 0.145.0", "codex-cli 0.147.0", "SkillMount 0.1.0"] {
-            assert!(
-                verify_version_text(unsupported).is_err(),
-                "{unsupported} must not borrow the 0.146.0 discovery contract"
-            );
-        }
+    fn version_spec_names_the_last_tested_codex_evidence() {
+        assert_eq!(
+            version_spec().last_tested_banner(),
+            LAST_TESTED_CODEX_BANNER
+        );
     }
 
     #[cfg(unix)]
