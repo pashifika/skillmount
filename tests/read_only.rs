@@ -355,7 +355,15 @@ fn a_selected_claude_session_ignores_codex_configuration_that_fails_codex() {
     );
 
     let codex = fixture
-        .command(&["codex", "--dry-run", "--skills-dir", &sources])
+        .command(&[
+            "codex",
+            "--dry-run",
+            "--skills-dir",
+            &sources,
+            "--",
+            "exec",
+            "fixture",
+        ])
         .env("CODEX_HOME", &missing)
         .output()
         .expect("asm should run");
@@ -380,7 +388,15 @@ fn a_selected_codex_session_ignores_a_drive_relative_claude_config_dir() {
     let sources = fixture.sources.to_string_lossy().into_owned();
 
     let codex = fixture
-        .command(&["codex", "--dry-run", "--skills-dir", &sources])
+        .command(&[
+            "codex",
+            "--dry-run",
+            "--skills-dir",
+            &sources,
+            "--",
+            "exec",
+            "fixture",
+        ])
         .env("CLAUDE_CONFIG_DIR", "C:relative-claude")
         .output()
         .expect("asm should run");
@@ -432,7 +448,15 @@ fn a_non_unicode_claude_config_dir_reaches_claude_only() {
     .expect("relocated SKILL.md");
 
     let codex = fixture
-        .command(&["codex", "--dry-run", "--skills-dir", &sources])
+        .command(&[
+            "codex",
+            "--dry-run",
+            "--skills-dir",
+            &sources,
+            "--",
+            "exec",
+            "fixture",
+        ])
         .env("CLAUDE_CONFIG_DIR", &relocated)
         .output()
         .expect("asm should run");
