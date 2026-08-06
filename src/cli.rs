@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
-use crate::domain::{AgentId, ConflictPolicy, LinkMode, MountMode, RunOptions, ValidationLevel};
+use crate::domain::{
+    AgentDescriptor, AgentId, ConflictPolicy, LinkMode, MountMode, RunOptions, ValidationLevel,
+};
 use crate::error::AppError;
 
 #[derive(Debug, Parser)]
@@ -289,8 +291,8 @@ pub(crate) struct InspectInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DoctorInput {
     pub(crate) project_root: Option<PathBuf>,
-    pub(crate) codex_bin: Option<PathBuf>,
-    pub(crate) claude_bin: Option<PathBuf>,
+    /// Explicit executable overrides, in registered Agent order.
+    pub(crate) agent_bins: Vec<(AgentId, Option<PathBuf>)>,
 }
 
 /// Parsed explicit-recovery values.
@@ -355,8 +357,16 @@ where
         })),
         CliCommand::Doctor(args) => Ok(ParsedCommand::Doctor(DoctorInput {
             project_root: args.project_root,
-            codex_bin: args.codex_bin,
-            claude_bin: args.claude_bin,
+            agent_bins: AgentId::ALL
+                .iter()
+                .map(|agent| {
+                    let explicit = match agent {
+                        AgentId::Codex => args.codex_bin.clone(),
+                        AgentId::Claude => args.claude_bin.clone(),
+                    };
+                    (*agent, explicit)
+                })
+                .collect(),
         })),
         CliCommand::Cleanup(args) => Ok(ParsedCommand::Cleanup(CleanupInput {
             project_root: args.project_root,
@@ -384,15 +394,11 @@ fn normalize_session(agent: AgentId, args: SessionArgs) -> Result<SessionInput, 
         }
     };
 
-    let mount_mode = match (agent, args.mount_mode) {
-        (AgentId::Codex, RawMountMode::Auto | RawMountMode::Project)
-        | (AgentId::Claude, RawMountMode::Project) => MountMode::Project,
-        (AgentId::Claude, RawMountMode::Auto | RawMountMode::Staging) => MountMode::Staging,
-        (AgentId::Codex, RawMountMode::Staging) => {
-            return Err(AppError::Usage(
-                "--mount-mode=staging is incompatible with Codex".to_owned(),
-            ));
-        }
+    let descriptor = agent.descriptor();
+    let mount_mode = match args.mount_mode {
+        RawMountMode::Auto => descriptor.default_mount_mode(),
+        RawMountMode::Project => explicit_mount_mode(descriptor, MountMode::Project)?,
+        RawMountMode::Staging => explicit_mount_mode(descriptor, MountMode::Staging)?,
     };
 
     Ok(SessionInput {
@@ -413,6 +419,28 @@ fn normalize_session(agent: AgentId, args: SessionArgs) -> Result<SessionInput, 
             verbosity: args.verbosity,
         },
     })
+}
+
+/// Accepts an explicitly named mount location only where the selected Agent supports it.
+fn explicit_mount_mode(
+    descriptor: &AgentDescriptor,
+    requested: MountMode,
+) -> Result<MountMode, AppError> {
+    if descriptor.supports_explicit_mount_mode(requested) {
+        return Ok(requested);
+    }
+    Err(AppError::Usage(format!(
+        "--mount-mode={} is incompatible with {}",
+        mount_mode_token(requested),
+        descriptor.display_name()
+    )))
+}
+
+const fn mount_mode_token(mode: MountMode) -> &'static str {
+    match mode {
+        MountMode::Project => "project",
+        MountMode::Staging => "staging",
+    }
 }
 
 impl From<RawConflictPolicy> for ConflictPolicy {

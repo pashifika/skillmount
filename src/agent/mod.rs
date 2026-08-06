@@ -13,21 +13,28 @@ pub(crate) mod version;
 mod tests;
 
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::domain::{AgentId, RunContext, SkillCatalog, SkillNameKey};
+use crate::domain::{AgentId, CatalogPolicy, RunContext, SkillCatalog, SkillNameKey};
 use crate::error::AppError;
 use crate::lock::LockResource;
 use crate::mount::MountPlan;
 use crate::mount::resolve::{PathKind, ResolvedEntry, classify};
-/// Returns the dated version evidence attached to one adapter.
-pub(crate) const fn version_spec(agent: AgentId) -> version::VersionSpec {
+
+/// Returns the single registered adapter for one supported Agent.
+///
+/// The reference is `'static` and allocation-free: every adapter is a stateless zero-sized value
+/// and the supported set is closed at compile time, so no `Box` is needed. Dynamic dispatch is
+/// confined to a handful of orchestration checkpoints whose cost is dominated by filesystem and
+/// process work. This is the one registration point: adding a compile-time Agent must not require
+/// an Agent-specific policy branch in any shared caller.
+pub(crate) fn adapter(agent: AgentId) -> &'static dyn AgentAdapter {
     match agent {
-        AgentId::Codex => codex::version_spec(),
-        AgentId::Claude => claude::version_spec(),
+        AgentId::Codex => &codex::CodexAdapter,
+        AgentId::Claude => &claude::ClaudeAdapter,
     }
 }
 
@@ -213,13 +220,21 @@ impl DiscoverySnapshot {
 ///
 /// Command mutation is intentionally absent from this trait. An adapter describes a
 /// [`crate::mount::LaunchPlan`], while the shared application and process layers create and own the
-/// child after the transaction is active.
-pub trait AgentAdapter {
-    /// Returns the adapter's agent.
-    fn id(&self) -> AgentId;
+/// child after the transaction is active. An adapter never opens a journal, acquires a lock,
+/// applies or removes a link, spawns a child, or selects error precedence; the application decides
+/// when each method below runs.
+pub(crate) trait AgentAdapter {
+    /// Returns the dated compatibility evidence this adapter was last tested against.
+    ///
+    /// Stable identity is not restated here: [`AgentId::descriptor`] is the single metadata source,
+    /// and version evidence is deliberately separate from it because it is evidence, not identity.
+    fn version_spec(&self) -> version::VersionSpec;
 
-    /// Returns the executable name looked up through `PATH` when none was supplied.
-    fn default_executable(&self) -> &'static OsStr;
+    /// Returns the Agent-required catalog facts for one selected Skill.
+    fn catalog_policy(&self) -> CatalogPolicy;
+
+    /// Returns every future destination store, used only for source/destination cycle rejection.
+    fn destination_stores(&self, context: &RunContext) -> Vec<PathBuf>;
 
     /// Checks passthrough arguments for combinations that would defeat Skill loading.
     ///
@@ -227,6 +242,16 @@ pub trait AgentAdapter {
     ///
     /// Returns [`AppError::Usage`] when an argument is incompatible with mounting Skills.
     fn validate_passthrough_args(&self, args: &[OsString]) -> Result<Vec<Diagnostic>, AppError>;
+
+    /// Re-checks release-independent hazards that can invalidate the inspected launch contract.
+    ///
+    /// This is read-only and repeatable. The application calls it before `SkillMount` state access
+    /// and again after the lock set stabilizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when configuration outside this release's supported contract is present.
+    fn validate_launch_invariants(&self, context: &RunContext) -> Result<(), AppError>;
 
     /// Returns agent-specific observations that depend on the selected catalog.
     fn catalog_diagnostics(
@@ -260,6 +285,25 @@ pub trait AgentAdapter {
         catalog: &SkillCatalog,
         discovery: &DiscoverySnapshot,
     ) -> Result<MountPlan, AppError>;
+
+    /// Revalidates the launch contract after apply and immediately before the child is spawned.
+    ///
+    /// The snapshot and plan are the locked pre-apply values, so an adapter can ignore exactly the
+    /// transaction-owned actions it just asked for. Version evidence is deliberately not observed
+    /// again here: an Agent update during apply is not launch authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a hard invariant changed after the plan was applied.
+    fn validate_spawn_boundary(
+        &self,
+        context: &RunContext,
+        _catalog: &SkillCatalog,
+        _discovery: &DiscoverySnapshot,
+        _plan: &MountPlan,
+    ) -> Result<(), AppError> {
+        self.validate_launch_invariants(context)
+    }
 }
 
 /// Inspects one discovery namespace without modifying it.

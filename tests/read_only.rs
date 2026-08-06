@@ -331,6 +331,178 @@ fn inspect_can_be_filtered_to_one_agent() {
     assert!(!rendered.contains("Agent:          codex"));
 }
 
+/// A selected session must not be decided by configuration belonging to the other Agent.
+///
+/// The variable names a process this run will never launch, so honouring it would report a failure
+/// the operator cannot act on. The same value must still be fatal when its own Agent is selected,
+/// which is what keeps this isolation rather than a weakened check.
+#[test]
+fn a_selected_claude_session_ignores_codex_configuration_that_fails_codex() {
+    let fixture = Fixture::new("isolate-codex-home");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let missing = fixture.root.join("no-such-codex-home");
+
+    let claude = fixture
+        .command(&["claude", "--dry-run", "--skills-dir", &sources])
+        .env("CODEX_HOME", &missing)
+        .output()
+        .expect("asm should run");
+    assert!(
+        claude.status.success(),
+        "Claude must ignore CODEX_HOME: {}",
+        String::from_utf8_lossy(&claude.stderr)
+    );
+
+    let codex = fixture
+        .command(&[
+            "codex",
+            "--dry-run",
+            "--skills-dir",
+            &sources,
+            "--",
+            "exec",
+            "fixture",
+        ])
+        .env("CODEX_HOME", &missing)
+        .output()
+        .expect("asm should run");
+    assert_eq!(
+        codex.status.code(),
+        Some(66),
+        "Codex must still reject its own unusable configuration: {}",
+        String::from_utf8_lossy(&codex.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&codex.stderr).contains("CODEX_HOME"),
+        "the selected Agent's diagnostic must name the variable"
+    );
+    assert_no_read_only_residue(&fixture);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_selected_codex_session_ignores_a_drive_relative_claude_config_dir() {
+    let fixture = Fixture::new("isolate-claude-config");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let codex = fixture
+        .command(&[
+            "codex",
+            "--dry-run",
+            "--skills-dir",
+            &sources,
+            "--",
+            "exec",
+            "fixture",
+        ])
+        .env("CLAUDE_CONFIG_DIR", "C:relative-claude")
+        .output()
+        .expect("asm should run");
+    assert!(
+        codex.status.success(),
+        "Codex must ignore CLAUDE_CONFIG_DIR: {}",
+        String::from_utf8_lossy(&codex.stderr)
+    );
+
+    let claude = fixture
+        .command(&["claude", "--dry-run", "--skills-dir", &sources])
+        .env("CLAUDE_CONFIG_DIR", "C:relative-claude")
+        .output()
+        .expect("asm should run");
+    assert_eq!(
+        claude.status.code(),
+        Some(64),
+        "Claude must still reject an ambiguous drive-relative root: {}",
+        String::from_utf8_lossy(&claude.stderr)
+    );
+    assert_no_read_only_residue(&fixture);
+}
+
+/// Proves isolation without weakening the selected Agent's platform-native handling.
+///
+/// The relocated Claude user root holds a conflicting `alpha`, so Claude must fail on it while
+/// Codex succeeds — the value is honoured verbatim for its own Agent and never read for the other.
+// macOS rejects a non-UTF-8 filename outright, so the platform-native case is asserted where the
+// filesystem admits one. The Windows drive-relative case above covers that platform's own spelling.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_non_unicode_claude_config_dir_reaches_claude_only() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new("isolate-non-unicode-claude");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let mut relocated = fixture.root.clone().into_os_string().into_vec();
+    relocated.extend_from_slice(b"/claude-\xFF");
+    let relocated = PathBuf::from(OsString::from_vec(relocated));
+    let existing = relocated.join("skills/alpha");
+    fs::create_dir_all(&existing).expect("relocated Claude user scope");
+    fs::write(
+        existing.join("SKILL.md"),
+        "---\nname: alpha\ndescription: relocated user alpha\n---\n",
+    )
+    .expect("relocated SKILL.md");
+
+    let codex = fixture
+        .command(&[
+            "codex",
+            "--dry-run",
+            "--skills-dir",
+            &sources,
+            "--",
+            "exec",
+            "fixture",
+        ])
+        .env("CLAUDE_CONFIG_DIR", &relocated)
+        .output()
+        .expect("asm should run");
+    assert!(
+        codex.status.success(),
+        "Codex must never read CLAUDE_CONFIG_DIR: {}",
+        String::from_utf8_lossy(&codex.stderr)
+    );
+
+    let claude = fixture
+        .command(&["claude", "--dry-run", "--skills-dir", &sources])
+        .env("CLAUDE_CONFIG_DIR", &relocated)
+        .output()
+        .expect("asm should run");
+    assert_eq!(
+        claude.status.code(),
+        Some(73),
+        "Claude must honour the non-Unicode root it was given: {}",
+        String::from_utf8_lossy(&claude.stderr)
+    );
+    assert_no_read_only_residue(&fixture);
+}
+
+/// Asserts that a read-only path created no `SkillMount` state and launched no child.
+///
+/// A dry run resolves configuration, so a test that changes an Agent variable must still prove the
+/// resolution stayed read-only rather than only checking the exit code.
+fn assert_no_read_only_residue(fixture: &Fixture) {
+    assert!(
+        !fixture.root.join("state").exists(),
+        "a read-only path must not create SkillMount state"
+    );
+    assert!(
+        !fixture.launch_sentinel.exists(),
+        "a read-only path must not launch a child process"
+    );
+    assert!(
+        !fixture.project.join(".agents").exists(),
+        "a read-only path must not create a destination directory"
+    );
+    assert!(
+        !fixture.project.join(".claude").exists(),
+        "a read-only path must not create a destination directory"
+    );
+}
+
 #[cfg(feature = "test-fixtures")]
 #[test]
 fn inspect_and_both_dry_runs_launch_neither_version_observation_nor_child_process() {

@@ -1850,6 +1850,78 @@ fn a_claude_conflict_introduced_after_preliminary_discovery_is_seen_under_lock()
     assert!(fixture.session_tree().is_empty());
 }
 
+/// A hard control appearing while the locks are held must abort before any intent is durable.
+///
+/// The repeated post-lock check exists because acquisition can wait behind a long-running session.
+/// Failing there must leave no journal and no destination mutation at all, which is what separates
+/// it from the post-apply case below.
+#[test]
+fn hard_agent_controls_appearing_after_lock_stabilization_prevent_any_intent() {
+    for (agent, marker_variable, expected_error) in [
+        (
+            "codex",
+            "SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG_PATH",
+            "legacy managed configuration",
+        ),
+        (
+            "claude",
+            "SKILLMOUNT_TEST_CLAUDE_ENVIRONMENT_CONTROL_PATH",
+            "environment-control marker",
+        ),
+    ] {
+        let fixture = Fixture::new(&format!("{agent}-control-after-lock"));
+        fixture.skill("alpha");
+        let marker = fixture.root.join("late-agent-control");
+        let release = fixture.root.join("release-agent-control");
+        let mut session = fixture
+            .command(agent, &[])
+            .env(marker_variable, &marker)
+            .env("SKILLMOUNT_HOLD_AT", "journal-scan-complete")
+            .env("SKILLMOUNT_HOLD_MS", "10000")
+            .env("SKILLMOUNT_HOLD_UNTIL", &release)
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the session should reach its locked recovery scan");
+        let mut diagnostics = wait_for_hold(&mut session, "journal-scan-complete");
+
+        assert!(
+            fixture.journals().is_empty(),
+            "{agent}: nothing may be durable before the repeated hard check"
+        );
+        fs::write(&marker, b"present\n").expect("introduce the late hard Agent control");
+        fs::write(&release, b"continue\n").expect("release the locked replan");
+
+        let status = session.wait().expect("the held session remains waitable");
+        let mut remaining = String::new();
+        diagnostics
+            .read_to_string(&mut remaining)
+            .expect("the held session diagnostics remain readable");
+
+        assert_eq!(status.code(), Some(64), "{agent}: {remaining}");
+        assert!(remaining.contains(expected_error), "{agent}: {remaining}");
+        assert!(
+            !remaining.contains("Launching"),
+            "{agent}: the Agent child must not start: {remaining}"
+        );
+        assert!(
+            fixture.journals().is_empty(),
+            "{agent}: a pre-intent failure writes no journal"
+        );
+        assert!(
+            !exists(&fixture.project.join(".agents")),
+            "{agent}: no destination directory may be created"
+        );
+        assert!(
+            !exists(&fixture.project.join(".claude")),
+            "{agent}: no destination directory may be created"
+        );
+        assert!(
+            fixture.session_tree().is_empty(),
+            "{agent}: no staging entry may be created"
+        );
+    }
+}
+
 #[test]
 fn hard_agent_controls_appearing_after_apply_prevent_child_and_force_owned_cleanup() {
     for (agent, marker_variable, expected_error) in [

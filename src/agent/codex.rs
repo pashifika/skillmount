@@ -12,7 +12,7 @@ use crate::agent::{
     dedupe_scopes_by_terminal, discovery_indexes, insert_direct_deterministically,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::domain::{AgentId, RunContext, SkillCatalog, SkillNameKey};
+use crate::domain::{AgentId, CatalogPolicy, RunContext, SkillCatalog, SkillNameKey};
 use crate::error::{AppError, PlanError};
 use crate::lock::{LockResource, LockResourceKind};
 use crate::mount::plan::apply_conflict_policy;
@@ -194,23 +194,16 @@ impl CodexAdapter {
 
     /// Collects user, bundled-system, and administrator roots the supported Codex loader reads.
     fn global_scopes(context: &RunContext) -> Result<Vec<DiscoveryScope>, AppError> {
-        let mut system = inspect_codex_scope(
-            ScopeKind::CodexSystem,
-            &context.codex_home.join("skills/.system"),
-        )?;
-        reserve_embedded_system_skills(&mut system, &context.codex_home);
+        let codex = context.agent.codex()?;
+        let mut system =
+            inspect_codex_scope(ScopeKind::CodexSystem, &codex.home.join("skills/.system"))?;
+        reserve_embedded_system_skills(&mut system, &codex.home);
         let mut scopes = vec![
-            inspect_codex_scope(
-                ScopeKind::CodexUserAgents,
-                &context.user_home.join(PREFERRED),
-            )?,
-            inspect_codex_scope(
-                ScopeKind::CodexUserLegacy,
-                &context.codex_home.join("skills"),
-            )?,
+            inspect_codex_scope(ScopeKind::CodexUserAgents, &codex.user_home.join(PREFERRED))?,
+            inspect_codex_scope(ScopeKind::CodexUserLegacy, &codex.home.join("skills"))?,
             system,
         ];
-        if let Some(admin) = &context.codex_admin_skills {
+        if let Some(admin) = &codex.admin_skills {
             scopes.push(inspect_codex_scope(ScopeKind::CodexAdmin, admin)?);
         }
         Ok(scopes)
@@ -218,12 +211,12 @@ impl CodexAdapter {
 }
 
 /// Verifies the Codex launch invariants that remain mandatory for every observed release.
-pub(crate) fn verify_launch_invariants(context: &RunContext) -> Result<(), AppError> {
+fn verify_launch_invariants(context: &RunContext) -> Result<(), AppError> {
     verify_managed_configuration(context)
 }
 
 /// Verifies higher-precedence configuration that can change the inspected discovery model.
-pub(crate) fn verify_managed_configuration(context: &RunContext) -> Result<(), AppError> {
+fn verify_managed_configuration(context: &RunContext) -> Result<(), AppError> {
     // A debug-only marker lets the process-level transaction suite introduce the same hard
     // condition after planning. Release binaries contain neither the lookup nor this test seam.
     #[cfg(debug_assertions)]
@@ -254,7 +247,7 @@ pub(crate) fn verify_managed_configuration(context: &RunContext) -> Result<(), A
     }
 
     #[cfg(windows)]
-    let managed_file = context.codex_home.join("managed_config.toml");
+    let managed_file = context.agent.codex()?.home.join("managed_config.toml");
     #[cfg(unix)]
     let managed_file = PathBuf::from("/etc/codex/managed_config.toml");
     match fs::symlink_metadata(&managed_file) {
@@ -291,7 +284,7 @@ fn unsupported_managed_configuration() -> AppError {
 }
 
 /// Returns the dated version evidence used by the shared advisory observer.
-pub(crate) const fn version_spec() -> VersionSpec {
+const fn version_spec() -> VersionSpec {
     CODEX_VERSION_SPEC
 }
 
@@ -762,7 +755,7 @@ fn inspect_codex_skill(
 /// change `name` into `plugin:name`, while `SkillMount`'s injected enable rule still addresses the
 /// portable base name. Existing discovered Skills may be indexed conservatively by that base name,
 /// but a selected source must never cross the launch boundary under a different logical name.
-pub(crate) fn verify_selected_plugin_namespaces(catalog: &SkillCatalog) -> Result<(), AppError> {
+fn verify_selected_plugin_namespaces(catalog: &SkillCatalog) -> Result<(), AppError> {
     for resolution in &catalog.resolutions {
         let source = &resolution.selected.origin.source_canonical;
         if let Some(manifest) = nearest_plugin_manifest(source)? {
@@ -1127,12 +1120,41 @@ fn scope_root_lock(context: &RunContext, scope: &DiscoveryScope) -> Result<LockR
 }
 
 impl AgentAdapter for CodexAdapter {
-    fn id(&self) -> AgentId {
-        AgentId::Codex
+    fn version_spec(&self) -> VersionSpec {
+        version_spec()
     }
 
-    fn default_executable(&self) -> &'static OsStr {
-        OsStr::new("codex")
+    fn catalog_policy(&self) -> CatalogPolicy {
+        // Codex indexes a Skill by its frontmatter name and discovers only an exact regular
+        // `SKILL.md` directory entry, so these requirements hold even when generic metadata
+        // validation is disabled: the injected enable rule must address the same logical name the
+        // child loads.
+        CatalogPolicy {
+            requires_exact_skill_md_entry: true,
+            always_parses_metadata: true,
+            requires_name: true,
+            requires_description: true,
+            requires_matching_name: true,
+        }
+    }
+
+    fn destination_stores(&self, context: &RunContext) -> Vec<PathBuf> {
+        vec![Self::preferred_entry(context)]
+    }
+
+    fn validate_launch_invariants(&self, context: &RunContext) -> Result<(), AppError> {
+        verify_launch_invariants(context)
+    }
+
+    fn validate_spawn_boundary(
+        &self,
+        context: &RunContext,
+        catalog: &SkillCatalog,
+        _discovery: &DiscoverySnapshot,
+        _plan: &MountPlan,
+    ) -> Result<(), AppError> {
+        verify_launch_invariants(context)?;
+        verify_selected_plugin_namespaces(catalog)
     }
 
     fn validate_passthrough_args(&self, args: &[OsString]) -> Result<Vec<Diagnostic>, AppError> {
@@ -1324,11 +1346,11 @@ impl AgentAdapter for CodexAdapter {
             actions: actions.into_actions(),
             preserved,
             launch: LaunchPlan {
-                executable: context.agent_bin.clone(),
+                executable: context.executable().to_path_buf(),
                 cwd: context.launch_cwd.clone(),
                 injected_args,
                 passthrough_args: context.passthrough_args.clone(),
-                environment_overrides: context.codex_home_override.as_ref().map_or_else(
+                environment_overrides: context.agent.codex()?.home_override.as_ref().map_or_else(
                     Vec::new,
                     |path| {
                         vec![(

@@ -5,7 +5,9 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use crate::cli::SessionInput;
-use crate::domain::{AgentId, RunContext, SourceOccurrence};
+use crate::domain::{
+    AgentId, ClaudeAgent, CodexAgent, ResolvedAgent, RunContext, SourceOccurrence,
+};
 use crate::error::AppError;
 
 #[cfg(windows)]
@@ -15,6 +17,7 @@ pub(crate) fn resolve_session(
     input: SessionInput,
     invocation_cwd: &Path,
 ) -> Result<RunContext, AppError> {
+    let descriptor = input.agent.descriptor();
     let invocation_cwd = canonical_directory(invocation_cwd)?;
     let launch_cwd = match input.cwd.as_deref() {
         Some(path) => canonical_directory(&absolute_from(&invocation_cwd, path)?)?,
@@ -31,7 +34,7 @@ pub(crate) fn resolve_session(
     if !launch_cwd.starts_with(&project_root) {
         return Err(AppError::Usage(format!(
             "{} project root {} does not contain launch CWD {}",
-            agent_label(input.agent),
+            descriptor.display_name(),
             project_root.display(),
             launch_cwd.display()
         )));
@@ -39,61 +42,78 @@ pub(crate) fn resolve_session(
     if project_root != inferred_project_root {
         return Err(AppError::Usage(format!(
             "{} project root {} does not match the default root {} inferred from launch CWD {}; --project-root cannot change the root used by the child",
-            agent_label(input.agent),
+            descriptor.display_name(),
             project_root.display(),
             inferred_project_root.display(),
             launch_cwd.display()
         )));
     }
 
-    let user_home = agent_user_home(input.agent)?;
-    let (codex_home, codex_home_override) = if input.agent == AgentId::Codex {
-        codex_home(&user_home, &invocation_cwd)?
-    } else {
-        (user_home.join(".codex"), None)
-    };
-    let claude_config_dir = claude_config_dir(&user_home, &launch_cwd)?;
-
     let skill_sources = resolve_source_occurrences(&input.skills_dirs, &invocation_cwd)?;
     let resolve_agent_executable = !input.options.dry_run;
-    let agent_bin = match input.agent_bin {
-        Some(path) => {
-            let resolved = absolute_from(&invocation_cwd, &path)?;
-            if resolve_agent_executable {
-                validate_explicit_executable(&resolved)?
-            } else {
-                resolved
+    let agent = resolve_agent(input.agent, &invocation_cwd, &launch_cwd, || {
+        match input.agent_bin {
+            Some(path) => {
+                let resolved = absolute_from(&invocation_cwd, &path)?;
+                if resolve_agent_executable {
+                    validate_explicit_executable(&resolved)
+                } else {
+                    Ok(resolved)
+                }
             }
+            None if resolve_agent_executable => {
+                resolve_path_executable(descriptor.executable_name(), &invocation_cwd)
+            }
+            None => Ok(PathBuf::from(descriptor.executable_name())),
         }
-        None if resolve_agent_executable => {
-            resolve_path_executable(input.agent.executable_name(), &invocation_cwd)?
-        }
-        None => PathBuf::from(input.agent.executable_name()),
-    };
+    })?;
 
     Ok(RunContext {
-        agent: input.agent,
+        agent,
         invocation_cwd,
         launch_cwd,
         project_root,
-        user_home,
-        codex_home,
-        codex_home_override,
-        codex_admin_skills: codex_admin_skills(),
-        claude_config_dir,
-        claude_managed_skills: claude_managed_skills(),
         skill_sources,
         session_id: None,
-        agent_bin,
         passthrough_args: input.passthrough_args,
         options: input.options,
     })
 }
 
-const fn agent_label(agent: AgentId) -> &'static str {
+/// Resolves only the selected Agent's configuration roots.
+///
+/// Configuration belonging solely to an Agent that was not selected is never read, canonicalized,
+/// validated, or diagnosed here: that variable belongs to a process this run will not launch, so
+/// letting it fail the selected session would be a false negative rather than isolation.
+fn resolve_agent(
+    agent: AgentId,
+    invocation_cwd: &Path,
+    config_cwd: &Path,
+    executable: impl FnOnce() -> Result<PathBuf, AppError>,
+) -> Result<ResolvedAgent, AppError> {
     match agent {
-        AgentId::Codex => "Codex",
-        AgentId::Claude => "Claude",
+        AgentId::Codex => {
+            let user_home = codex_user_home()?;
+            let (home, home_override) = codex_home(&user_home, invocation_cwd)?;
+            let admin_skills = codex_admin_skills();
+            Ok(ResolvedAgent::Codex(CodexAgent {
+                executable: executable()?,
+                user_home,
+                home,
+                home_override,
+                admin_skills,
+            }))
+        }
+        AgentId::Claude => {
+            let user_home = crate::state::user_home()?;
+            let config_dir = claude_config_dir(&user_home, config_cwd)?;
+            let managed_skills = claude_managed_skills();
+            Ok(ResolvedAgent::Claude(ClaudeAgent {
+                executable: executable()?,
+                config_dir,
+                managed_skills,
+            }))
+        }
     }
 }
 
@@ -238,36 +258,23 @@ pub(crate) fn resolve_inspection(
     validation: crate::domain::ValidationLevel,
     invocation_cwd: &Path,
 ) -> Result<RunContext, AppError> {
+    let descriptor = agent.descriptor();
     let invocation_cwd = canonical_directory(invocation_cwd)?;
     let project_root = nearest_git_root(&invocation_cwd)?.unwrap_or_else(|| invocation_cwd.clone());
-    let user_home = agent_user_home(agent)?;
-    let (codex_home, codex_home_override) = if agent == AgentId::Codex {
-        codex_home(&user_home, &invocation_cwd)?
-    } else {
-        (user_home.join(".codex"), None)
-    };
-    let claude_config_dir = claude_config_dir(&user_home, &invocation_cwd)?;
+    let agent = resolve_agent(agent, &invocation_cwd, &invocation_cwd, || {
+        Ok(PathBuf::from(descriptor.executable_name()))
+    })?;
     Ok(RunContext {
         agent,
         launch_cwd: invocation_cwd.clone(),
         skill_sources: resolve_source_occurrences(skills_dirs, &invocation_cwd)?,
         invocation_cwd,
         project_root,
-        user_home,
-        codex_home,
-        codex_home_override,
-        codex_admin_skills: codex_admin_skills(),
-        claude_config_dir,
-        claude_managed_skills: claude_managed_skills(),
         session_id: None,
-        agent_bin: PathBuf::from(agent.executable_name()),
         passthrough_args: Vec::new(),
         options: crate::domain::RunOptions {
             link_mode: crate::domain::LinkMode::Auto,
-            mount_mode: match agent {
-                AgentId::Codex => crate::domain::MountMode::Project,
-                AgentId::Claude => crate::domain::MountMode::Staging,
-            },
+            mount_mode: descriptor.default_mount_mode(),
             conflict: crate::domain::ConflictPolicy::Error,
             validation,
             dry_run: true,
@@ -297,38 +304,24 @@ pub(crate) fn resolve_operator_context(
     explicit_agent_bin: Option<&Path>,
     invocation_cwd: &Path,
 ) -> Result<RunContext, AppError> {
+    let descriptor = agent.descriptor();
     let invocation_cwd = canonical_directory(invocation_cwd)?;
     let project_root = canonical_directory(project_root)?;
-    let user_home = agent_user_home(agent)?;
-    let (codex_home, codex_home_override) = if agent == AgentId::Codex {
-        codex_home(&user_home, &invocation_cwd)?
-    } else {
-        (user_home.join(".codex"), None)
-    };
-    let claude_config_dir = claude_config_dir(&user_home, &project_root)?;
-    let agent_bin = resolve_agent_executable(agent, explicit_agent_bin, &invocation_cwd)?;
+    let agent = resolve_agent(agent, &invocation_cwd, &project_root, || {
+        resolve_agent_executable(agent, explicit_agent_bin, &invocation_cwd)
+    })?;
 
     Ok(RunContext {
         agent,
         invocation_cwd,
         launch_cwd: project_root.clone(),
         project_root,
-        user_home,
-        codex_home,
-        codex_home_override,
-        codex_admin_skills: codex_admin_skills(),
-        claude_config_dir,
-        claude_managed_skills: claude_managed_skills(),
         skill_sources: Vec::new(),
         session_id: None,
-        agent_bin,
         passthrough_args: Vec::new(),
         options: crate::domain::RunOptions {
             link_mode: crate::domain::LinkMode::Auto,
-            mount_mode: match agent {
-                AgentId::Codex => crate::domain::MountMode::Project,
-                AgentId::Claude => crate::domain::MountMode::Staging,
-            },
+            mount_mode: descriptor.default_mount_mode(),
             conflict: crate::domain::ConflictPolicy::Error,
             validation: crate::domain::ValidationLevel::Basic,
             dry_run: true,
@@ -337,13 +330,6 @@ pub(crate) fn resolve_operator_context(
             verbosity: 0,
         },
     })
-}
-
-fn agent_user_home(agent: AgentId) -> Result<PathBuf, AppError> {
-    match agent {
-        AgentId::Codex => codex_user_home(),
-        AgentId::Claude => crate::state::user_home(),
-    }
 }
 
 /// Mirrors the home resolver used by Codex's user-wide `.agents/skills` root.
@@ -733,7 +719,7 @@ mod tests {
             fs::canonicalize(fixture.0.join("project")).unwrap()
         );
         assert_eq!(
-            context.agent_bin,
+            context.executable(),
             absolute_from(&context.invocation_cwd, Path::new("bin/claude")).unwrap()
         );
         assert_eq!(

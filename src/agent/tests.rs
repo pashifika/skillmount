@@ -14,7 +14,7 @@ use crate::error::ExitCategory;
 use crate::mount::resolve::{PathKind, classify};
 use crate::mount::{MountAction, MountPlan};
 use crate::test_support::{
-    TestDir, assert_no_side_effects, remove_directory_link, symlink_dir_or_skip,
+    TestDir, assert_no_side_effects, remove_directory_link, resolved_agent, symlink_dir_or_skip,
     symlink_file_or_skip,
 };
 
@@ -74,19 +74,12 @@ impl Project {
         conflict: ConflictPolicy,
     ) -> RunContext {
         RunContext {
-            agent,
+            agent: resolved_agent(agent, &self.root),
             invocation_cwd: self.root.clone(),
             launch_cwd: self.root.clone(),
             project_root: self.root.clone(),
-            user_home: self.root.join("home"),
-            codex_home: self.root.join("codex-home"),
-            codex_home_override: None,
-            codex_admin_skills: Some(self.root.join("admin/skills")),
-            claude_config_dir: self.root.join("home/.claude"),
-            claude_managed_skills: self.root.join("claude-managed/skills"),
             skill_sources: Vec::new(),
             session_id: None,
-            agent_bin: PathBuf::from(agent.executable_name()),
             passthrough_args: Vec::new(),
             options: RunOptions {
                 link_mode: LinkMode::Auto,
@@ -115,6 +108,7 @@ impl Project {
             &occurrences,
             &CatalogRequest {
                 agent,
+                policy: crate::agent::adapter(agent).catalog_policy(),
                 validation: ValidationLevel::Basic,
                 destination_stores: &[],
             },
@@ -173,6 +167,7 @@ fn codex_permission_diagnostics_are_typed_and_only_cover_external_skills() {
         }],
         &CatalogRequest {
             agent: AgentId::Codex,
+            policy: crate::agent::adapter(AgentId::Codex).catalog_policy(),
             validation: ValidationLevel::Basic,
             destination_stores: &[],
         },
@@ -224,6 +219,7 @@ fn a_skipped_external_skill_does_not_claim_that_codex_will_follow_a_new_link() {
         }],
         &CatalogRequest {
             agent: AgentId::Codex,
+            policy: crate::agent::adapter(AgentId::Codex).catalog_policy(),
             validation: ValidationLevel::Basic,
             destination_stores: &[],
         },
@@ -663,6 +659,7 @@ fn skipping_a_winner_never_reveals_a_shadowed_source() {
         &occurrences,
         &CatalogRequest {
             agent: AgentId::Codex,
+            policy: crate::agent::adapter(AgentId::Codex).catalog_policy(),
             validation: ValidationLevel::Basic,
             destination_stores: &[],
         },
@@ -1063,7 +1060,7 @@ fn system_and_admin_scopes_sharing_a_terminal_keep_their_traversal_policies() {
         return;
     }
     let mut context = project.codex_context(ConflictPolicy::Error);
-    context.codex_admin_skills = Some(system);
+    context.agent.codex_mut().admin_skills = Some(system);
 
     let snapshot = CodexAdapter
         .inspect_discovery(&context)
@@ -1102,6 +1099,7 @@ fn bundled_cache_entries_are_never_reused_as_stable_selected_sources() {
         &occurrences,
         &CatalogRequest {
             agent: AgentId::Codex,
+            policy: crate::agent::adapter(AgentId::Codex).catalog_policy(),
             validation: ValidationLevel::Basic,
             destination_stores: &[],
         },
@@ -1486,7 +1484,7 @@ fn claude_config_dir_relocates_the_user_skill_scope() {
     )
     .expect("relocated user Skill metadata");
     let mut context = project.context(AgentId::Claude, MountMode::Staging, ConflictPolicy::Error);
-    context.claude_config_dir = project.root.join("custom-claude");
+    context.agent.claude_mut().config_dir = project.root.join("custom-claude");
 
     let error = plan_claude(&project, &context)
         .expect_err("CLAUDE_CONFIG_DIR replaces the default user discovery root");
@@ -1813,4 +1811,103 @@ fn planning_is_deterministic_for_unchanged_input() {
     let second = plan_codex(&project, &context).unwrap();
 
     assert_eq!(first, second);
+}
+
+#[test]
+fn the_registry_serves_one_static_adapter_for_every_supported_agent() {
+    // Static references, not boxed values: adapters are stateless and the set is compile-time
+    // closed, so lookup must allocate nothing and must be stable across calls.
+    for agent in AgentId::ALL {
+        let first = crate::agent::adapter(*agent);
+        let second = crate::agent::adapter(*agent);
+        assert!(
+            std::ptr::eq(
+                std::ptr::from_ref::<dyn AgentAdapter>(first).cast::<u8>(),
+                std::ptr::from_ref::<dyn AgentAdapter>(second).cast::<u8>()
+            ),
+            "registry lookup must return one shared value"
+        );
+    }
+}
+
+#[test]
+fn each_registered_adapter_reports_its_own_dated_evidence() {
+    assert_eq!(
+        crate::agent::adapter(AgentId::Codex)
+            .version_spec()
+            .last_tested_banner(),
+        "codex-cli 0.146.0"
+    );
+    assert_eq!(
+        crate::agent::adapter(AgentId::Claude)
+            .version_spec()
+            .last_tested_banner(),
+        "2.1.220 (Claude Code)"
+    );
+}
+
+#[test]
+fn declarative_catalog_policy_records_each_agents_own_requirements() {
+    let codex = crate::agent::adapter(AgentId::Codex).catalog_policy();
+    assert!(codex.requires_exact_skill_md_entry);
+    assert!(codex.always_parses_metadata);
+    assert!(codex.requires_name);
+
+    let claude = crate::agent::adapter(AgentId::Claude).catalog_policy();
+    assert!(!claude.requires_exact_skill_md_entry);
+    assert!(!claude.always_parses_metadata);
+    assert!(!claude.requires_name);
+
+    // Neither policy may relax a rule the catalog owns unconditionally.
+    for policy in [codex, claude] {
+        assert!(policy.requires_description);
+        assert!(policy.requires_matching_name);
+    }
+}
+
+#[test]
+fn declarative_destination_stores_match_each_agents_planned_namespace() {
+    let project = Project::new("destination-stores");
+    let codex = project.context(AgentId::Codex, MountMode::Project, ConflictPolicy::Error);
+    assert_eq!(
+        crate::agent::adapter(AgentId::Codex).destination_stores(&codex),
+        vec![project.preferred()]
+    );
+
+    let staging = project.context(AgentId::Claude, MountMode::Staging, ConflictPolicy::Error);
+    assert!(
+        crate::agent::adapter(AgentId::Claude)
+            .destination_stores(&staging)
+            .is_empty(),
+        "an isolated staging root cannot sit inside a selected source"
+    );
+
+    let claude_project =
+        project.context(AgentId::Claude, MountMode::Project, ConflictPolicy::Error);
+    assert_eq!(
+        crate::agent::adapter(AgentId::Claude).destination_stores(&claude_project),
+        vec![project.root.join(".claude/skills")]
+    );
+}
+
+/// A concrete adapter called with another Agent's resolved context is an internal invariant break.
+///
+/// Normal parsing and registry lookup make the mismatch unconstructable, so this can only be
+/// reached by calling an adapter directly — and it must fail closed rather than inspect the wrong
+/// roots.
+#[test]
+fn an_adapter_rejects_a_resolved_context_belonging_to_another_agent() {
+    let project = Project::new("wrong-variant");
+    let claude = project.context(AgentId::Claude, MountMode::Staging, ConflictPolicy::Error);
+    let codex = project.codex_context(ConflictPolicy::Error);
+
+    let error = CodexAdapter
+        .inspect_discovery(&claude)
+        .expect_err("the Codex adapter must refuse a resolved Claude context");
+    assert_eq!(error.category(), ExitCategory::Internal);
+
+    let error = ClaudeAdapter
+        .inspect_discovery(&codex)
+        .expect_err("the Claude adapter must refuse a resolved Codex context");
+    assert_eq!(error.category(), ExitCategory::Internal);
 }

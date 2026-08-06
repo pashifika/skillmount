@@ -2,14 +2,12 @@
 
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::error::ErrorKind;
 
-use crate::agent::claude::ClaudeAdapter;
-use crate::agent::codex::CodexAdapter;
-use crate::agent::{AgentAdapter, DiscoverySnapshot};
+use crate::agent::{AgentAdapter, DiscoverySnapshot, adapter};
 use crate::catalog::{CatalogRequest, resolve_catalog};
 use crate::cli::{CompletionInput, InspectAgent, ParsedCommand, parse_command_from};
 use crate::domain::{AgentId, LinkMode, MountMode, RunContext, SkillCatalog};
@@ -175,14 +173,15 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     // Root-changing arguments and release-independent Agent controls are rejected before reading
     // or creating SkillMount state. Version evidence is observed once and can warn, but never
     // authorizes the launch or enters transaction ownership state.
-    adapter_for(context.agent).validate_passthrough_args(&context.passthrough_args)?;
-    verify_agent_launch_invariants(context)?;
+    let adapter = adapter(context.agent_id());
+    adapter.validate_passthrough_args(&context.passthrough_args)?;
+    adapter.validate_launch_invariants(context)?;
     let version = crate::agent::version::observe(
-        &context.agent_bin,
+        context.executable(),
         &context.invocation_cwd,
-        crate::agent::version_spec(context.agent),
+        adapter.version_spec(),
     );
-    if let Some(message) = version.session_warning(&context.agent_bin) {
+    if let Some(message) = version.session_warning(context.executable()) {
         warn(&[message]);
     }
 
@@ -214,7 +213,7 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     let owner = LockOwner::for_transaction(&transaction_id);
     let policy = LockPolicy::from_env();
 
-    let preliminary = adapter_for(context.agent).inspect_discovery(&context)?;
+    let preliminary = adapter.inspect_discovery(&context)?;
     crate::checkpoint::reached(crate::checkpoint::Checkpoint::DiscoveryInspected, 1);
     let mut required_resources = preliminary.lock_resources;
     let mut locks = HeldLocks::acquire(&required_resources, policy, &owner)?;
@@ -256,7 +255,7 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     // Lock acquisition may wait behind a long-running session while managed configuration or
     // another hard launch control changes. Repeat those release-independent checks after the lock
     // set stabilizes; version evidence remains the single advisory observation made before state.
-    verify_agent_launch_invariants(&context)?;
+    adapter.validate_launch_invariants(&context)?;
 
     warn(&render::render_warnings(
         &rebuilt.catalog,
@@ -283,7 +282,7 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     // Apply can itself take time. Repeat only the hard launch invariants at the child boundary. If
     // one changed, no child is spawned and the active transaction is released through the normal
     // evidence-checked cleanup path.
-    verify_spawn_boundary(&context, &rebuilt.catalog, &mut transaction)?;
+    verify_spawn_boundary(adapter, &context, &rebuilt, &mut transaction)?;
 
     if let Err(error) = transaction.begin_supervision() {
         match transaction.cleanup_required() {
@@ -345,7 +344,7 @@ fn automatic_junction_warning(
                 && action.kind == crate::journal::RecordedKind::Junction
         });
     junction_policy_warning(
-        context.agent,
+        context.agent_id(),
         context.options.link_mode,
         used_junction_fallback,
     )
@@ -357,7 +356,7 @@ fn junction_policy_warning(
     used_junction: bool,
 ) -> Option<String> {
     (requested == LinkMode::Auto && used_junction).then(|| {
-        let last_tested = crate::agent::version_spec(agent).last_tested_banner();
+        let last_tested = adapter(agent).version_spec().last_tested_banner();
         format!(
             "automatic symlink fallback selected a Windows junction, but live {} junction compatibility is unverified: docs/compatibility.md has no passing evidence for this Agent/platform/link combination. The adapter's dated last-tested banner is {last_tested:?}, not evidence that this junction was exercised. This session will continue with the ownership-verified junction. Run the opt-in native smoke before claiming compatibility, or request --link-mode=symlink to fail instead of falling back",
             agent.label()
@@ -365,23 +364,23 @@ fn junction_policy_warning(
     })
 }
 
-fn verify_agent_launch_invariants(context: &RunContext) -> Result<(), AppError> {
-    match context.agent {
-        AgentId::Codex => crate::agent::codex::verify_launch_invariants(context),
-        AgentId::Claude => crate::agent::claude::verify_launch_invariants(),
-    }
-}
-
+/// Repeats only the hard launch invariants at the child boundary.
+///
+/// The locked pre-apply snapshot and plan let an adapter ignore exactly the transaction-owned
+/// actions it asked for. If one invariant changed, no child is spawned and the active transaction is
+/// released through the normal evidence-checked cleanup path.
 fn verify_spawn_boundary(
+    adapter: &'static dyn AgentAdapter,
     context: &RunContext,
-    catalog: &SkillCatalog,
+    outcome: &ReadOnlyOutcome,
     transaction: &mut Transaction,
 ) -> Result<(), AppError> {
-    let compatibility =
-        verify_agent_launch_invariants(context).and_then(|()| match context.agent {
-            AgentId::Codex => crate::agent::codex::verify_selected_plugin_namespaces(catalog),
-            AgentId::Claude => Ok(()),
-        });
+    let compatibility = adapter.validate_spawn_boundary(
+        context,
+        &outcome.catalog,
+        &outcome.snapshot,
+        &outcome.plan,
+    );
     if let Err(error) = compatibility {
         match transaction.cleanup_required() {
             Ok(report) => warn(&report.describe()),
@@ -672,16 +671,17 @@ fn build_read_only(
     context: &RunContext,
     validate_launch_command: bool,
 ) -> Result<ReadOnlyOutcome, AppError> {
-    let adapter = adapter_for(context.agent);
+    let adapter = adapter(context.agent_id());
     if validate_launch_command {
         adapter.validate_passthrough_args(&context.passthrough_args)?;
     }
 
-    let destination_stores = destination_stores(context);
+    let destination_stores = adapter.destination_stores(context);
     let catalog = resolve_catalog(
         &context.skill_sources,
         &CatalogRequest {
-            agent: context.agent,
+            agent: context.agent_id(),
+            policy: adapter.catalog_policy(),
             validation: context.options.validation,
             destination_stores: &destination_stores,
         },
@@ -698,18 +698,12 @@ fn build_read_only(
     })
 }
 
-fn adapter_for(agent: AgentId) -> Box<dyn AgentAdapter> {
-    match agent {
-        AgentId::Codex => Box::new(CodexAdapter),
-        AgentId::Claude => Box::new(ClaudeAdapter),
-    }
-}
-
+/// Expands one `--agent` selection into registered Agents, in the single deterministic order.
 fn inspected_agents(selection: InspectAgent) -> Vec<AgentId> {
     match selection {
         InspectAgent::Codex => vec![AgentId::Codex],
         InspectAgent::Claude => vec![AgentId::Claude],
-        InspectAgent::All => vec![AgentId::Codex, AgentId::Claude],
+        InspectAgent::All => AgentId::ALL.to_vec(),
     }
 }
 
@@ -748,16 +742,6 @@ fn warn(messages: &[String]) {
 fn inform(messages: &[String]) {
     for message in messages {
         let _ = writeln!(io::stderr().lock(), "info: {}", render::text_value(message));
-    }
-}
-
-fn destination_stores(context: &crate::domain::RunContext) -> Vec<PathBuf> {
-    match (context.agent, context.options.mount_mode) {
-        (AgentId::Codex, _) => vec![context.project_root.join(".agents/skills")],
-        (AgentId::Claude, MountMode::Project) => {
-            vec![context.project_root.join(".claude/skills")]
-        }
-        (AgentId::Claude, MountMode::Staging) => Vec::new(),
     }
 }
 
