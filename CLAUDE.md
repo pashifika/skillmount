@@ -42,7 +42,7 @@ reserved ownership binding and release work. Each session adapter pins one Agent
 ## Commands
 
 ```bash
-SKILLMOUNT_REQUIRE_LINKS=1 cargo test --locked --all-targets
+SKILLMOUNT_REQUIRE_LINKS=1 cargo test --locked --all-targets --all-features
 cargo test --locked --test read_only
 cargo test --locked --test transaction
 cargo test --locked --all-features --test process_supervision
@@ -57,7 +57,10 @@ cargo run --locked --bin asm -- omp --skills-dir path/to/skills --dry-run --verb
 
 `SKILLMOUNT_REQUIRE_LINKS=1` turns an unavailable directory-link fixture into a failure. A skipped
 fixture otherwise reports test success, so use the guard whenever claiming link coverage. CI sets
-it for every job.
+it for every job. `--all-features` is required because the Codex, Claude, and OMP session
+acceptance suites and the supervisor harness are compiled only under the `test-fixtures` feature,
+so a run without it reports success while silently skipping them; CI's gate is
+`cargo test --locked --all-features`.
 
 `tests/transaction.rs` kills and stalls real `asm` processes at named checkpoints. A test that runs
 a mutating session must redirect both the project through `--project-root` and SkillMount state
@@ -78,11 +81,14 @@ not prove native link, console, or filesystem behavior.
 The read-only pipeline is:
 
 ```text
-cli -> paths -> catalog -> agent discovery -> mount plan -> render
+cli -> paths -> launch gates (dry-run) -> catalog -> agent discovery -> mount plan -> render
 ```
 
 `inspect` and `--dry-run` stop there and create no directories, links, locks, journals, recovery
-mutations, or child processes. Extend `tests/read_only.rs` whenever adding a read-only path.
+mutations, or child processes. A session `--dry-run` runs the adapter's passthrough and hard
+launch-invariant checks before building any plan; `inspect` certifies no launch and reports each
+requested Agent independently (ADR 0035). Extend `tests/read_only.rs` whenever adding a read-only
+path.
 
 A mutating session performs discovery, locks the observed resources, recovers incomplete
 transactions, builds the complete plan under locks, stabilizes any expanded lock set, persists the

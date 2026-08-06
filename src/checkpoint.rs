@@ -65,6 +65,8 @@ pub enum Checkpoint {
     ActionApplied,
     /// Every action is applied and the transaction is durably active.
     JournalActive,
+    /// Every action is applied and the pre-spawn launch-invariant recheck has not run yet.
+    SpawnBoundary,
     /// Child supervision intent is durable; process-domain death has not been proved.
     JournalSupervising,
     /// Cleanup has durably begun and nothing has been removed yet.
@@ -94,6 +96,7 @@ impl Checkpoint {
             Self::FinalPlaced => "final-placed",
             Self::ActionApplied => "action-applied",
             Self::JournalActive => "journal-active",
+            Self::SpawnBoundary => "spawn-boundary",
             Self::JournalSupervising => "journal-supervising",
             Self::JournalCleaning => "journal-cleaning",
             Self::EntryRemoved => "entry-removed",
@@ -104,7 +107,7 @@ impl Checkpoint {
     }
 
     /// Every boundary, so a test suite can assert it covers all of them.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::DiscoveryInspected,
         Self::JournalScanComplete,
         Self::JournalPlanned,
@@ -115,6 +118,7 @@ impl Checkpoint {
         Self::FinalPlaced,
         Self::ActionApplied,
         Self::JournalActive,
+        Self::SpawnBoundary,
         Self::JournalSupervising,
         Self::JournalCleaning,
         Self::EntryRemoved,

@@ -30,7 +30,6 @@ const REQUIRED_VALUE_FLAGS: &[&str] = &[
     "--mode",
     "--model",
     "--models",
-    "--plan",
     "--plan-yolo-into",
     "--plugin-dir",
     "--prewalk-into",
@@ -51,6 +50,13 @@ const REQUIRED_VALUE_FLAGS: &[&str] = &[
 
 /// Flags that consume the next token only when it exists, is non-empty, and is not flag-shaped.
 const OPTIONAL_VALUE_FLAGS: &[&str] = &["--resume", "--session", "-r"];
+
+/// Built-ins a same-named boolean extension flag may shadow, so OMP applies extension-style
+/// consumption: a flag-shaped successor stays a fresh flag instead of becoming this flag's value.
+///
+/// Mirrors `EXTENSION_SHADOWABLE_STRING_FLAGS` in OMP's `cli/flag-tables.ts`. Treating `--plan` as
+/// unconditionally value-consuming let `--plan --profile work` hide a rejected root-changing flag.
+const SHADOWABLE_VALUE_FLAGS: &[&str] = &["--plan"];
 
 /// Flags that never consume a value.
 const NO_VALUE_FLAGS: &[&str] = &[
@@ -164,6 +170,14 @@ pub(super) const ALLOW_HOME_FLAG: &str = "--allow-home";
 enum Arity {
     Required,
     Optional,
+    /// Consumes any successor that exists, but only when it is not flag-shaped.
+    ///
+    /// OMP keeps these built-ins shadowable by a same-named boolean extension flag, so its
+    /// tokenizer applies extension-style consumption rather than the unconditional built-in rule
+    /// (`cli/flag-tables.ts`: `if (EXTENSION_SHADOWABLE_STRING_FLAGS.has(flag)) return valueLike;`,
+    /// mirrored in `cli/profile-bootstrap.ts`). Unlike [`Arity::Optional`] an empty successor is
+    /// still consumed, because `valueLike` only tests the leading `-`.
+    Shadowable,
     None,
 }
 
@@ -288,6 +302,13 @@ fn classify(args: &[OsString]) -> Vec<Token> {
                 }
                 _ => None,
             },
+            Arity::Shadowable => match args.get(index) {
+                Some(next) if !is_flag_shaped(next) => {
+                    index += 1;
+                    Some(next.clone())
+                }
+                _ => None,
+            },
             Arity::None => None,
         };
         tokens.push(Token::Flag { name, value });
@@ -344,6 +365,7 @@ fn known_flag(argument: &OsStr) -> Option<(&'static str, Arity)> {
     };
     lookup(REQUIRED_VALUE_FLAGS)
         .map(|name| (name, Arity::Required))
+        .or_else(|| lookup(SHADOWABLE_VALUE_FLAGS).map(|name| (name, Arity::Shadowable)))
         .or_else(|| lookup(OPTIONAL_VALUE_FLAGS).map(|name| (name, Arity::Optional)))
         .or_else(|| lookup(NO_VALUE_FLAGS).map(|name| (name, Arity::None)))
 }
@@ -581,6 +603,31 @@ mod tests {
             message.contains("relocates the discovery root"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn a_shadowable_value_flag_does_not_swallow_a_flag_shaped_token() {
+        // OMP keeps `--plan` shadowable by a boolean extension flag, so its tokenizer only takes a
+        // successor that is not flag-shaped. Consuming unconditionally hid the rejected flag
+        // behind it: `omp --plan --profile work` really does select profile `work`, which
+        // relocates every OMP root away from the ones this plan inspected.
+        let message = rejected(&["--plan", "--profile", "work"]);
+        assert!(
+            message.contains("--profile") && message.contains("relocates the discovery root"),
+            "{message}"
+        );
+        let message = rejected(&["--plan", "--alias", "omp-work"]);
+        assert!(message.contains("--alias"), "{message}");
+        let message = rejected(&["--plan", "--no-skills"]);
+        assert!(message.contains("--no-skills"), "{message}");
+
+        // A value-like successor is still the flag's value, so the built-in form keeps working and
+        // a bare `--plan` at the end of the list consumes nothing.
+        assert!(validate(&args(&["--plan", "opus"])).is_ok());
+        assert!(validate(&args(&["--plan"])).is_ok());
+        // `valueLike` only tests the leading `-`, so an empty successor is consumed - unlike an
+        // optional-value flag, which refuses it.
+        assert!(validate(&args(&["--plan", ""])).is_ok());
     }
 
     #[test]

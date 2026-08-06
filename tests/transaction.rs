@@ -19,6 +19,12 @@ use skillmount::domain::LinkMode;
 use skillmount::link::{LinkRequest, PlacementOutcome, platform_backend};
 
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
+/// Recording stand-in for an Agent, used where a test must prove no child ever started.
+///
+/// The reused `asm` child can only prove an exit status. Proving the negative — that no child was
+/// ever launched — needs a child that leaves a file behind when it runs.
+#[cfg(feature = "test-fixtures")]
+const FAKE_AGENT: &str = env!("CARGO_BIN_EXE_skillmount-fake-agent");
 /// The reused `asm` child rejects Codex-native injected arguments with this usage status.
 const FIXTURE_CHILD_STATUS: i32 = 64;
 /// Real-process startup includes durable filesystem I/O on the selected native volume.
@@ -29,7 +35,7 @@ const HOLD_START_TIMEOUT: Duration = Duration::from_secs(10);
 /// Kept as literals rather than imported from the crate on purpose: the names are a contract
 /// between the library and this suite, and a rename that silently updated both sides would turn a
 /// crash test into a no-crash test without anyone noticing.
-const BOUNDARIES: [&str; 13] = [
+const BOUNDARIES: [&str; 14] = [
     "discovery-inspected",
     "journal-scan-complete",
     "journal-planned",
@@ -40,6 +46,7 @@ const BOUNDARIES: [&str; 13] = [
     "final-placed",
     "action-applied",
     "journal-active",
+    "spawn-boundary",
     "journal-cleaning",
     "entry-removed",
     "directory-removed",
@@ -65,6 +72,10 @@ struct Fixture {
     project: PathBuf,
     sources: PathBuf,
     state: PathBuf,
+    /// Where the recording fake agent notes that it started.
+    record: PathBuf,
+    /// Executable the session launches as the Agent.
+    agent_bin: PathBuf,
 }
 
 impl Fixture {
@@ -81,6 +92,8 @@ impl Fixture {
             project: root.join("project"),
             sources: root.join("sources"),
             state: root.join("state"),
+            record: root.join("agent.record"),
+            agent_bin: PathBuf::from(ASM),
             root,
         };
         for path in [&fixture.project, &fixture.sources] {
@@ -97,6 +110,24 @@ impl Fixture {
             format!("---\nname: {name}\ndescription: {name} description\n---\n"),
         )
         .expect("SKILL.md");
+        self
+    }
+
+    /// Anchors the project so OMP's provider-root ancestor walk stops inside the fixture.
+    ///
+    /// OMP's Skill-root walk stops at the nearest ancestor holding `.git`, else the user home
+    /// (`capability/fs.ts:84-95`). Without an anchor a fixture under the shared temporary root
+    /// walks to the filesystem root, and whatever lives above it decides the inspected namespace.
+    #[cfg(feature = "test-fixtures")]
+    fn anchor_repository(&self) -> &Self {
+        fs::create_dir_all(self.project.join(".git")).expect("project repository anchor");
+        self
+    }
+
+    /// Launches the recording fake agent instead of the reused `asm` child.
+    #[cfg(feature = "test-fixtures")]
+    fn with_recording_agent(mut self) -> Self {
+        self.agent_bin = PathBuf::from(FAKE_AGENT);
         self
     }
 
@@ -149,12 +180,12 @@ impl Fixture {
             .arg("--cwd")
             .arg(project)
             .arg("--agent-bin")
-            .arg(ASM)
+            .arg(&self.agent_bin)
             .args(extra)
-            // Reuse the already-built cross-platform `asm` executable as a harmless agent child.
-            // Each adapter validates the operator's own passthrough before anything is mounted, so
-            // the shape has to be one that Agent accepts; the child then rejects whatever it
-            // receives with usage 64.
+            // The default child is the already-built cross-platform `asm` executable, which is
+            // harmless. Each adapter validates the operator's own passthrough before anything is
+            // mounted, so the shape has to be one that Agent accepts; the `asm` child then rejects
+            // whatever it receives with usage 64.
             .arg("--")
             .args(fixture_child_args(agent))
             .env("HOME", home)
@@ -186,6 +217,8 @@ impl Fixture {
             .env_remove("PI_CODING_AGENT_DIR")
             .env_remove("XDG_DATA_HOME")
             .env("SKILLMOUNT_STATE_DIR", &self.state)
+            // Only the recording fake agent reads this; the reused `asm` child ignores it.
+            .env("SKILLMOUNT_FAKE_RECORD", &self.record)
             // Contention must be reported rather than waited out, so a serialization test finishes
             // in milliseconds instead of the production timeout.
             .env("SKILLMOUNT_LOCK_WAIT_MS", "200")
@@ -2844,6 +2877,218 @@ fn an_unsettled_omp_configuration_after_apply_prevents_the_child_and_forces_owne
         "the whole applied OMP scope is released: {:?}",
         fixture.project_tree()
     );
+}
+
+/// Parks a real OMP session at the spawn boundary with its mounts already applied.
+///
+/// The recheck ADR 0034 specifies reads the namespace *after* apply, so the state it has to catch
+/// can only be written while a session is genuinely parked between the two. A held process is the
+/// only way to reach that window; nothing about it is observable from a serialized journal.
+#[cfg(feature = "test-fixtures")]
+fn omp_session_held_at_spawn_boundary(
+    fixture: &Fixture,
+    release: &Path,
+) -> (Child, BufReader<ChildStderr>) {
+    let mut session = fixture
+        .command("omp", &[])
+        .env("SKILLMOUNT_HOLD_AT", "spawn-boundary")
+        .env("SKILLMOUNT_HOLD_MS", "10000")
+        .env("SKILLMOUNT_HOLD_UNTIL", release)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the OMP session should reach its spawn boundary");
+    let diagnostics = wait_for_hold(&mut session, "spawn-boundary");
+
+    assert!(
+        exists(&fixture.project.join(".omp/skills/alpha")),
+        "the hold must observe the applied mount, or the mutation below tests nothing"
+    );
+    assert!(
+        !fixture.record.exists(),
+        "no child may start before the recheck runs"
+    );
+    (session, diagnostics)
+}
+
+/// Releases a held session and requires a refusal that launched nothing and kept nothing.
+#[cfg(feature = "test-fixtures")]
+fn assert_spawn_boundary_refusal(
+    fixture: &Fixture,
+    mut session: Child,
+    mut diagnostics: BufReader<ChildStderr>,
+    release: &Path,
+    expected_code: i32,
+    expected_reason: &str,
+) {
+    fs::write(release, b"continue\n").expect("release the spawn-boundary hold");
+
+    let status = session.wait().expect("the held session remains waitable");
+    let mut remaining = String::new();
+    diagnostics
+        .read_to_string(&mut remaining)
+        .expect("the held session diagnostics remain readable");
+
+    assert_eq!(status.code(), Some(expected_code), "{remaining}");
+    assert!(remaining.contains(expected_reason), "{remaining}");
+    assert!(
+        !fixture.record.exists(),
+        "the recording Agent child must never have started: {remaining}"
+    );
+    assert!(
+        !remaining.contains("Launching"),
+        "no launch may even be announced: {remaining}"
+    );
+    assert!(
+        !exists(&fixture.project.join(".omp")),
+        "the applied OMP scope is released through evidence-checked cleanup: {:?}",
+        fixture.project_tree()
+    );
+    assert!(
+        fixture.journals().is_empty(),
+        "a refused session retires its transaction: {:?}",
+        fixture.journals()
+    );
+}
+
+/// A destination that stops resolving to the planned source refuses the session without a child.
+///
+/// ADR 0034 lines 122-128 name this class separately from the non-owned fingerprint because the
+/// fingerprint cannot see it: the owned-entry filter matches on the destination path, so an entry
+/// still sitting at its planned path is excluded from the comparison exactly as the genuine mount
+/// is. Only resolving each owned entry back to the source the plan recorded catches a retarget.
+///
+/// The retarget replaces the recorded source with a link to a different one rather than rewriting
+/// the mount link itself. Rewriting the link would also destroy the ownership evidence cleanup
+/// needs, which is the separate retained-residue outcome already covered above; leaving the link
+/// object untouched isolates the resolve check and still requires the scope to be released.
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn a_retargeted_omp_destination_at_the_spawn_boundary_launches_nothing() {
+    let fixture = Fixture::new("omp-spawn-retargeted-destination").with_recording_agent();
+    fixture.skill("alpha");
+    fixture.anchor_repository();
+    let other = fixture.root.join("other-source");
+    fs::create_dir_all(&other).expect("a second Skill source");
+    fs::write(
+        other.join("SKILL.md"),
+        "---\nname: alpha\ndescription: a source this run never selected\n---\n",
+    )
+    .expect("the retarget target metadata");
+    let release = fixture.root.join("release-retargeted-destination");
+    let (session, diagnostics) = omp_session_held_at_spawn_boundary(&fixture, &release);
+
+    let recorded = fixture.sources.join("alpha");
+    let moved = fixture.root.join("alpha-original");
+    fs::rename(&recorded, &moved).expect("move the recorded Skill source aside");
+    let backend = platform_backend();
+    let staged = backend
+        .create_directory_link(&LinkRequest {
+            source: backend
+                .canonical_directory(&other)
+                .expect("canonical retarget source"),
+            staged_path: fixture.sources.join(".alpha.skillmount-retarget"),
+            mode: LinkMode::Auto,
+        })
+        .expect("retarget link fixture");
+    let outcome = backend
+        .place_no_replace(&staged, &recorded)
+        .expect("place the retarget link");
+    assert!(matches!(outcome, PlacementOutcome::Placed(_)));
+
+    assert_spawn_boundary_refusal(
+        &fixture,
+        session,
+        diagnostics,
+        &release,
+        75,
+        "no longer resolves to the Skill this run linked",
+    );
+    assert!(
+        moved.join("SKILL.md").is_file(),
+        "a refusal never touches a Skill source"
+    );
+}
+
+/// A configuration edit that hides the selected Skill refuses the session without a child.
+///
+/// This is the class the non-owned fingerprint provably cannot see: hiding a name leaves every
+/// inspected entry byte-identical, so only re-reading the settings and re-running the visibility
+/// gate prevents the silent success of a mount OMP would then ignore.
+///
+/// `<project>/.codex/config.toml` is one of OMP's own project settings inputs, and unlike
+/// `.omp/settings.json` it sits outside the scope this transaction owns, so the refusal can still
+/// release everything it created rather than retaining a non-empty `.omp`.
+///
+/// The status is the transient 75 the two sibling rechecks report, not the data status the same
+/// refusal carries at plan time: here the operator's configuration was moved by an external writer
+/// after the plan was applied, so a caller sees one category for "the ground moved before spawn".
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn an_omp_configuration_hiding_the_selection_at_the_spawn_boundary_launches_nothing() {
+    let fixture = Fixture::new("omp-spawn-hidden-selection").with_recording_agent();
+    fixture.skill("alpha");
+    fixture.anchor_repository();
+    let release = fixture.root.join("release-hidden-selection");
+    let (session, diagnostics) = omp_session_held_at_spawn_boundary(&fixture, &release);
+
+    let codex = fixture.project.join(".codex");
+    fs::create_dir_all(&codex).expect("project Codex settings directory");
+    fs::write(
+        codex.join("config.toml"),
+        "[skills]\nignoredSkills = [\"*\"]\n",
+    )
+    .expect("hide every selected Skill from OMP");
+
+    assert_spawn_boundary_refusal(
+        &fixture,
+        session,
+        diagnostics,
+        &release,
+        75,
+        "hides selected Skill alpha",
+    );
+    assert!(
+        codex.join("config.toml").is_file(),
+        "the operator's OMP settings are not transaction-owned"
+    );
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+}
+
+/// A non-owned Skill appearing in another provider root refuses the session without a child.
+///
+/// `<launch-cwd>/.claude/skills` is the `claude` provider's project root, which the ancestor walk
+/// reaches because the fixture is anchored. Nothing about it is transaction-owned, so the change is
+/// invisible to the owned-entry and visibility checks and only the non-owned comparison sees it.
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn non_owned_omp_namespace_drift_at_the_spawn_boundary_launches_nothing() {
+    let fixture = Fixture::new("omp-spawn-namespace-drift").with_recording_agent();
+    fixture.skill("alpha");
+    fixture.anchor_repository();
+    let release = fixture.root.join("release-namespace-drift");
+    let (session, diagnostics) = omp_session_held_at_spawn_boundary(&fixture, &release);
+
+    let drifted = fixture.project.join(".claude/skills/drifted");
+    fs::create_dir_all(&drifted).expect("non-owned provider Skill directory");
+    fs::write(
+        drifted.join("SKILL.md"),
+        "---\nname: drifted\ndescription: appeared after the plan was applied\n---\n",
+    )
+    .expect("non-owned Skill metadata");
+
+    assert_spawn_boundary_refusal(
+        &fixture,
+        session,
+        diagnostics,
+        &release,
+        75,
+        "the OMP settings, provider, or extension-package state that decided this plan changed",
+    );
+    assert!(
+        drifted.join("SKILL.md").is_file(),
+        "another provider's Skill is never transaction-owned"
+    );
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
 }
 
 /// Explicit cleanup of an OMP journal reads the journal, never OMP itself.
