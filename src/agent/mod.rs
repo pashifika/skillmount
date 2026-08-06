@@ -223,6 +223,13 @@ pub struct DiscoverySnapshot {
     pub backing_store: PathBuf,
     /// Observed state of the backing store.
     pub backing_store_state: PathKind,
+    /// Canonical directory the backing store resolves to, when it resolves through a link.
+    ///
+    /// `None` when the store is the canonical directory itself or does not exist yet. Diagnostics
+    /// must show this whenever it is present: a mount planned through a directory link is applied to
+    /// a directory the logical path does not name, and an operator who cannot see that path cannot
+    /// tell which project the mount became visible to.
+    pub backing_store_canonical: Option<PathBuf>,
     /// Resources the transaction locks; acquisition derives a deduplicated, sorted key set.
     pub lock_resources: Vec<LockResource>,
     /// Non-fatal observations.
@@ -237,6 +244,20 @@ impl DiscoverySnapshot {
             .iter()
             .find(|scope| scope.state.entry == self.backing_store)
     }
+}
+
+/// Returns the canonical directory `store` resolves to, but only when that differs from `store`.
+///
+/// A store that is already the canonical directory needs no second path in a diagnostic, and a
+/// missing store has no identity to report yet. Every adapter uses this so the reported shape is the
+/// same for all three Agents.
+#[must_use]
+pub(crate) fn canonical_backing(store: &Path, state: &ResolvedEntry) -> Option<PathBuf> {
+    state
+        .terminal
+        .as_ref()
+        .filter(|terminal| terminal.as_path() != store)
+        .cloned()
 }
 
 /// A read-only agent adapter.

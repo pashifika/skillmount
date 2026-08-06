@@ -79,6 +79,8 @@ pub(crate) struct CodexDestination {
     pub(crate) entry: PathBuf,
     /// Observed state of that path.
     pub(crate) entry_state: PathKind,
+    /// Canonical directory that path resolves to, when it resolves through a link.
+    pub(crate) entry_canonical: Option<PathBuf>,
     /// Directories the plan must create first, parents before children.
     pub(crate) create_directories: Vec<PathBuf>,
 }
@@ -120,6 +122,7 @@ pub(crate) fn resolve_destination(
         PathKind::Directory | PathKind::DirectoryLink => Ok(CodexDestination {
             entry: preferred.entry.clone(),
             entry_state: preferred.kind,
+            entry_canonical: super::canonical_backing(&preferred.entry, preferred),
             create_directories: Vec::new(),
         }),
         PathKind::Missing => resolve_missing_preferred(project_root, preferred),
@@ -143,11 +146,13 @@ fn resolve_missing_preferred(
         PathKind::Directory | PathKind::DirectoryLink => Ok(CodexDestination {
             entry: preferred.entry.clone(),
             entry_state: PathKind::Missing,
+            entry_canonical: None,
             create_directories: vec![preferred.entry.clone()],
         }),
         PathKind::Missing => Ok(CodexDestination {
             entry: preferred.entry.clone(),
             entry_state: PathKind::Missing,
+            entry_canonical: None,
             create_directories: vec![agents_parent, preferred.entry.clone()],
         }),
         other => Err(PlanError::AmbiguousDiscoveryEntry {
@@ -1306,6 +1311,7 @@ impl AgentAdapter for CodexAdapter {
             visible_skills,
             mount_entries,
             discovery_entry: preferred_path,
+            backing_store_canonical: destination.entry_canonical,
             backing_store: destination.entry,
             backing_store_state: destination.entry_state,
             lock_resources,

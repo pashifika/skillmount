@@ -195,6 +195,10 @@ impl AgentAdapter for OmpAdapter {
             visible_skills,
             mount_entries,
             discovery_entry: inspection.destination.clone(),
+            backing_store_canonical: crate::agent::canonical_backing(
+                &inspection.destination,
+                &inspection.destination_state,
+            ),
             backing_store: inspection.destination,
             backing_store_state: inspection.destination_state.kind,
             lock_resources: inspection.lock_resources,

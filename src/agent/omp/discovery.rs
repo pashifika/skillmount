@@ -4,6 +4,7 @@
 //! contract recorded in ADR 0034. Traversal is one directory level per root, no-follow at the
 //! classification boundary, and never recursive.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -60,6 +61,15 @@ pub(super) struct Inspection {
     pub(super) warnings: Vec<Diagnostic>,
 }
 
+/// The two folds OMP applies to the discovered superset, carried across every provider root.
+#[derive(Default)]
+struct Claims {
+    /// Canonical entry directories already loaded, so one physical Skill is never counted twice.
+    physical: BTreeSet<PathBuf>,
+    /// Logical names already claimed, and whether the claim came from a custom directory.
+    logical: BTreeMap<SkillNameKey, bool>,
+}
+
 /// Loads only the Skill-affecting OMP settings, without scanning any provider root.
 ///
 /// The visibility gate needs the merged settings but not the namespace, and every settings input is
@@ -98,7 +108,7 @@ pub(super) fn inspect(context: &RunContext) -> Result<Inspection, AppError> {
 
     let mut scopes = Vec::new();
     let mut warnings = Vec::new();
-    let mut claimed: BTreeSet<SkillNameKey> = BTreeSet::new();
+    let mut claims = Claims::default();
     let mut physical: BTreeSet<PathBuf> = BTreeSet::new();
 
     // `skills.enabled == false` means OMP discovers nothing at all, so a mount would be inert. The
@@ -117,7 +127,7 @@ pub(super) fn inspect(context: &RunContext) -> Result<Inspection, AppError> {
     };
 
     for root in roots {
-        let mut scope = scan(&root, &settings, &mut claimed)?;
+        let mut scope = scan(&root, &settings, &mut claims)?;
         for warning in &mut scope.warnings {
             warning.kind = DiagnosticKind::General;
         }
@@ -400,7 +410,7 @@ fn ancestors_to(launch_cwd: &Path, boundary: Option<&Path>) -> Vec<PathBuf> {
 fn scan(
     root: &ProviderRoot,
     settings: &SkillSettings,
-    claimed: &mut BTreeSet<SkillNameKey>,
+    claims: &mut Claims,
 ) -> Result<DiscoveryScope, AppError> {
     let state = classify(&root.path)?;
     let mut scope = DiscoveryScope {
@@ -423,9 +433,6 @@ fn scan(
     }
 
     let candidates = candidates_in(root)?;
-    // A disabled source contributes no logical name. Its filesystem entries are still never
-    // mutated, and the destination's own direct occupancy is recorded regardless.
-    let source_enabled = settings.source_enabled(root.provider, root.project_level);
 
     for (entry, raw_name) in candidates {
         let skill_md = entry.join("SKILL.md");
@@ -474,52 +481,110 @@ fn scan(
                 source_canonical: existing.source_canonical.clone(),
             });
 
-        if !source_enabled {
-            continue;
-        }
-        if !settings.name_visible(&metadata.name) {
-            // An explicit operator filter hiding an entry that exists on disk is the one filter
-            // decision worth naming: without it, a same-named entry that quietly stops being a
-            // conflict looks like SkillMount overlooked it.
-            scope.warnings.push(Diagnostic::warning_with_kind(
-                DiagnosticKind::General,
-                format!(
-                    "OMP configuration hides existing Skill {} in this scope through \
-                     disabledExtensions, skills.ignoredSkills, or skills.includeSkills, so it does \
-                     not claim that logical name",
-                    metadata.name
-                ),
-                entry.clone(),
-            ));
-            continue;
-        }
-        // OMP resolves auto-learned Skills dead last and always defers them to a same-named
-        // enabled authored Skill. A mounted Skill is exactly that, so a managed entry can never
-        // shadow one; counting it as a conflict would fail a session OMP would have satisfied, and
-        // `--conflict=skip` would omit a Skill that actually wins. Its directory is outside every
-        // destination, so excluding it authorizes no mutation.
-        if root.provider == "omp-managed" {
-            scope.warnings.push(Diagnostic::warning_with_kind(
-                DiagnosticKind::General,
-                format!(
-                    "OMP auto-learned Skill {} defers to any same-named authored Skill, so it is \
-                     not treated as a conflict",
-                    metadata.name
-                ),
-                entry.clone(),
-            ));
-            continue;
-        }
-        // OMP's dedup is first wins across providers, except that a custom directory overrides an
-        // already-seen provider Skill.
-        let custom = root.provider == "custom";
-        if !claimed.insert(key.clone()) && !custom {
+        if !claim_logical_name(
+            root,
+            settings,
+            claims,
+            &existing,
+            &metadata.name,
+            &key,
+            &mut scope.warnings,
+        ) {
             continue;
         }
         scope.existing_skills.entry(key).or_default().push(existing);
     }
 
     Ok(scope)
+}
+
+/// Decides whether one discovered entry claims its logical OMP name.
+///
+/// Returns `false` for every reason OMP would not load the entry under that name, warning where the
+/// reason is one an operator would otherwise mistake for an oversight. The entry's own filesystem
+/// state is never touched either way; only the claim is withheld.
+fn claim_logical_name(
+    root: &ProviderRoot,
+    settings: &SkillSettings,
+    claims: &mut Claims,
+    existing: &ExistingSkill,
+    name: &str,
+    key: &SkillNameKey,
+    warnings: &mut Vec<Diagnostic>,
+) -> bool {
+    if !settings.source_enabled(root.provider, root.project_level) {
+        // A disabled source is one reason a same-named entry stops being a conflict. Saying so is
+        // what distinguishes "OMP will not see this" from "SkillMount overlooked it".
+        warnings.push(Diagnostic::warning_with_kind(
+            DiagnosticKind::General,
+            format!(
+                "OMP source {} is disabled in this scope, so existing Skill {name} is not visible \
+                 to OMP and does not claim that logical name",
+                root.provider
+            ),
+            existing.entry.clone(),
+        ));
+        return false;
+    }
+    if !settings.name_visible(name) {
+        // An explicit operator filter hiding an entry that exists on disk is the other filter
+        // decision worth naming.
+        warnings.push(Diagnostic::warning_with_kind(
+            DiagnosticKind::General,
+            format!(
+                "OMP configuration hides existing Skill {name} in this scope through \
+                 disabledExtensions, skills.ignoredSkills, or skills.includeSkills, so it does not \
+                 claim that logical name"
+            ),
+            existing.entry.clone(),
+        ));
+        return false;
+    }
+    // OMP resolves auto-learned Skills dead last and always defers them to a same-named enabled
+    // authored Skill. A mounted Skill is exactly that, so a managed entry can never shadow one;
+    // counting it as a conflict would fail a session OMP would have satisfied, and
+    // `--conflict=skip` would omit a Skill that actually wins. Its directory is outside every
+    // destination, so excluding it authorizes no mutation.
+    if root.provider == "omp-managed" {
+        warnings.push(Diagnostic::warning_with_kind(
+            DiagnosticKind::General,
+            format!(
+                "OMP auto-learned Skill {name} defers to any same-named authored Skill, so it is \
+                 not treated as a conflict"
+            ),
+            existing.entry.clone(),
+        ));
+        return false;
+    }
+
+    // OMP folds the loaded set twice, and both folds are reproduced here.
+    //
+    // The physical fold comes first: `skills.ts:220-227` resolves each entry's `SKILL.md` through
+    // `realpath` and silently skips one already loaded, so two roots that reach the same directory
+    // contribute one Skill rather than a false duplicate. Custom directories share that same set
+    // (`skills.ts:301`).
+    if let Some(terminal) = &existing.source_canonical {
+        if !claims.physical.insert(terminal.clone()) {
+            return false;
+        }
+    }
+    // The logical fold is first-wins by name, with one exception: a custom directory overrides a
+    // name already claimed by an ordinary provider (`skills.ts:303-314`), while two custom
+    // directories keep first-wins between themselves (`skills.ts:316-318`).
+    let custom = root.provider == "custom";
+    match claims.logical.entry(key.clone()) {
+        Entry::Vacant(slot) => {
+            slot.insert(custom);
+            true
+        }
+        Entry::Occupied(mut slot) => {
+            if !custom || *slot.get() {
+                return false;
+            }
+            slot.insert(custom);
+            true
+        }
+    }
 }
 
 /// Enumerates the entries one OMP Skill root admits, one directory level, in path order.

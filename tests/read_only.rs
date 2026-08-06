@@ -1486,6 +1486,68 @@ fn an_omp_dry_run_plans_the_project_scope_without_creating_it() {
     assert_no_omp_residue(&fixture);
 }
 
+/// A destination reached through a directory link must report its canonical target too.
+///
+/// The logical path and the directory the mount is actually applied to are different paths here.
+/// Printing only the logical one would hide which project the mount became visible to, which is the
+/// shared-backing hazard ADR 0034 records.
+#[test]
+fn an_omp_dry_run_reports_the_canonical_backing_of_a_linked_scope() {
+    let fixture = Fixture::new("omp-linked-scope");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let shared = fixture.root.join("shared-store");
+    fs::create_dir_all(&shared).expect("shared backing directory");
+    let scope = fixture.project.join(".omp");
+    fs::create_dir_all(&scope).expect("OMP project scope");
+    if !create_broken_directory_link(&scope.join("skills"), &shared) {
+        return;
+    }
+    let canonical_shared = fs::canonicalize(&shared).expect("canonical shared backing");
+
+    let output = fixture.assert_unchanged(&["omp", "--skills-dir", &sources, "--dry-run"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    // The logical entry stays the path OMP reads, and the canonical backing is reported beside it.
+    assert!(
+        rendered.contains("Backing store:  .omp/skills")
+            || rendered.contains("Backing store:  .omp\\skills"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Store state:    directory link"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&format!(
+            "Store target:   {}",
+            canonical_shared.to_string_lossy()
+        )),
+        "the canonical backing directory must be named: {rendered}"
+    );
+    // The link itself is never a planned mutation, so only the Skill is linked.
+    assert!(!rendered.contains("MKDIR  .omp"), "{rendered}");
+    assert!(
+        rendered.contains("LINK   .omp/skills/alpha")
+            || rendered.contains("LINK   .omp\\skills\\alpha"),
+        "{rendered}"
+    );
+    assert!(
+        !fixture.root.join("state").exists(),
+        "a read-only path must not create SkillMount state"
+    );
+    assert!(
+        !fixture.launch_sentinel.exists(),
+        "a read-only path must not launch a child process"
+    );
+}
+
 #[test]
 fn both_executables_render_an_identical_omp_dry_run() {
     let fixture = Fixture::new("omp-dry-run-both-names");

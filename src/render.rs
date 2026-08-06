@@ -142,6 +142,11 @@ fn header(out: &mut String, report: &ReadOnlyReport<'_>) {
         "Store state:",
         report.snapshot.backing_store_state.label()
     );
+    // A store reached through a directory link is applied to a directory its own path does not
+    // name. Printing only the logical path would hide which project the mount became visible to.
+    if let Some(canonical) = &report.snapshot.backing_store_canonical {
+        let _ = writeln!(out, "{:<15} {}", "Store target:", report.path(canonical));
+    }
 }
 
 fn sources(out: &mut String, report: &ReadOnlyReport<'_>) {

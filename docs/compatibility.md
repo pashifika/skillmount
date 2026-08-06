@@ -25,11 +25,10 @@ green CI job.
 | Codex CLI | 0.146.0 | Windows / i686 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-03 | unverified | No native live-agent run recorded |
 | Claude Code | 2.1.220 | Windows / x86_64 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through the injected staging root | 2026-08-03 | unverified | No native live-agent run recorded |
 | Claude Code | 2.1.220 | Windows / i686 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through the injected staging root | 2026-08-03 | unverified | No native live-agent run recorded |
-| OMP | 17.2.9 | macOS / Apple Silicon | n/a | `omp --version` reports the adapter's last-tested banner | 2026-08-06 | observed | Local command output from the Homebrew-installed binary: `omp/17.2.9`; contract read from source tag `v17.2.9`, commit `f7f8e040ee04710414fbd775431091fa301b9786` |
-| OMP | 17.2.9 | macOS / Apple Silicon | directory symlink | Deterministic fake-agent read-only, session, and transaction suites reproduce the recorded 17.2.9 contract | 2026-08-06 | pass | Deterministic fake-agent suites in this checkout; no live OMP process ran |
-| OMP | 17.2.9 | macOS / Apple Silicon | directory symlink | Rightmost overlay and non-shadowed base Skills are discoverable in a real authenticated session | 2026-08-06 | unverified | Live smoke has not run |
-| OMP | 17.2.9 | Windows / x86_64 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-06 | unverified | No native live-agent run recorded; the opt-in smoke has not run against the published `omp-windows-x64.exe` |
-| OMP | 17.2.9 | Windows / i686 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-06 | unverified | OMP publishes no 32-bit Windows asset for 17.2.9, so no native run is possible for this version; a missing asset, not a failed scenario |
+| OMP | 17.2.9 | macOS / Apple Silicon | n/a | `omp --version` reports the adapter's last-tested banner | 2026-08-06 | observed | Local command output at SkillMount revision `5807efdc4ae0e843f4c4c79a24ba46ed088a6f06` from the Homebrew-installed binary: `omp/17.2.9`; contract read from source tag `v17.2.9`, commit `f7f8e040ee04710414fbd775431091fa301b9786` |
+| OMP | 17.2.9 | macOS / Apple Silicon | directory symlink | Rightmost overlay and non-shadowed base Skills are discoverable in a real authenticated session | 2026-08-06 | unverified | Live smoke has not run at SkillMount revision `5807efdc4ae0e843f4c4c79a24ba46ed088a6f06` |
+| OMP | 17.2.9 | Windows / x86_64 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-06 | unverified | No native live-agent run recorded at SkillMount revision `5807efdc4ae0e843f4c4c79a24ba46ed088a6f06`; the opt-in smoke has not run against the published `omp-windows-x64.exe` |
+| OMP | 17.2.9 | Windows / i686 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-06 | unverified | At SkillMount revision `5807efdc4ae0e843f4c4c79a24ba46ed088a6f06`, OMP publishes no 32-bit Windows asset for 17.2.9, so no native run is possible for this version; a missing asset, not a failed scenario |
 
 ## Documentation review
 
@@ -78,7 +77,10 @@ published digest file. Windows x86 OMP evidence is therefore permanently unavail
 version, while every other native OMP cell — macOS Apple Silicon and Windows x64 junction loading
 included — is `unverified` only because the opt-in native smoke has not run, not because the
 platform is unsupported. No authenticated OMP session ran during this review and no live OMP row
-was promoted; the deterministic fake-agent suites in this checkout remain the release gate.
+was promoted. The deterministic fake-agent read-only, session, and transaction suites at SkillMount
+revision `5807efdc4ae0e843f4c4c79a24ba46ed088a6f06` reproduce the recorded 17.2.9 contract over real
+directory symlinks and remain the release gate; like the Codex and Claude suites they are a gate
+rather than a matrix row, because they exercise no OMP process.
 
 The documentation does not establish real Windows junction discovery for any listed
 Agent/platform combination. Those rows remain `unverified` until the manual smoke workflow records
