@@ -6,7 +6,7 @@
 //! `.claude-plugin/plugin.json`, `marketplace.json`, and one `readdir`. See ADR 0034.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::settings::read_regular;
 use crate::error::AppError;
@@ -161,16 +161,32 @@ fn push_omp_root(
 }
 
 /// Returns the nearest project extension-package root, using OMP's own anchor walk.
+///
+/// The walk is `resolveActiveProjectRegistryPath` (`discovery/helpers.ts:821-855`): the nearest
+/// ancestor holding a `.omp/` directory wins, else the nearest holding `.git`, stopping before the
+/// user home.
+///
+/// `<launch_cwd>/.omp` counts as present even when it does not exist yet, because every OMP session
+/// creates it before the child starts — it is the parent of the mount destination. Reading the
+/// filesystem literally here made the anchor a function of state the plan itself mutates: launched
+/// from `repo/sub` in a repository whose registry lives at `repo/.omp/plugins`, planning inspected
+/// `repo/.omp/plugins` while the child, seeing the freshly created `repo/sub/.omp`, resolved
+/// `repo/sub/.omp/plugins` instead. The conflict inventory then described a namespace the child
+/// provably does not load, and the pre-spawn recheck refused every such session while blaming an
+/// external writer for `SkillMount`'s own directory.
 fn project_plugins_dir(launch_cwd: &Path, user_home: &Path) -> Result<Option<PathBuf>, AppError> {
     let mut with_git = None;
-    for ancestor in launch_cwd.ancestors() {
+    for (index, ancestor) in launch_cwd.ancestors().enumerate() {
         if ancestor == user_home {
             break;
         }
-        if matches!(
-            classify(&ancestor.join(OMP_CONFIG_DIR_NAME))?.kind,
-            PathKind::Directory | PathKind::DirectoryLink
-        ) {
+        let guaranteed = index == 0;
+        if guaranteed
+            || matches!(
+                classify(&ancestor.join(OMP_CONFIG_DIR_NAME))?.kind,
+                PathKind::Directory | PathKind::DirectoryLink
+            )
+        {
             return Ok(Some(ancestor.join(OMP_CONFIG_DIR_NAME).join("plugins")));
         }
         if with_git.is_none() && classify(&ancestor.join(".git"))?.kind != PathKind::Missing {
@@ -304,7 +320,14 @@ fn packages_at(
         if !lock_states.get(&name).copied().unwrap_or(true) || disabled.contains(&name) {
             continue;
         }
-        let package_root = node_modules.join(&name);
+        let package_root =
+            node_join(&node_modules, &name).ok_or_else(|| AppError::MissingInput {
+                path: node_modules.join("package.json"),
+                reason: format!(
+                    "OMP extension package name {name:?} resolves outside node_modules, so this \
+                 release cannot prove which root OMP would read"
+                ),
+            })?;
         let manifest_path = package_root.join("package.json");
         let Some(text) = read_regular(&manifest_path)? else {
             continue;
@@ -572,6 +595,30 @@ fn absolute_under(base: &Path, entry: &str) -> PathBuf {
     } else {
         crate::paths::lexical_normalize(&base.join(candidate))
     }
+}
+
+/// Joins an untrusted package name onto `base` the way Node's `path.join` does.
+///
+/// Returns `None` when the name resolves outside `base`, which no installable package name does.
+///
+/// Two divergences make the naive join unsafe. Node treats a leading separator as an ordinary
+/// separator — `path.join("/a/node_modules", "/etc")` is `/a/node_modules/etc` — while Rust's
+/// `Path::join` lets an absolute argument replace the base outright, so an attacker-authored
+/// dependency name of `/etc` would point inspection and locking at a path OMP never reads. And
+/// Node normalizes `..`, so a name that climbs out escapes in both runtimes; a hostile document
+/// must not be able to direct `SkillMount` at an arbitrary tree, so that case fails closed instead.
+fn node_join(base: &Path, name: &str) -> Option<PathBuf> {
+    let mut joined = base.to_path_buf();
+    for component in Path::new(name).components() {
+        match component {
+            // A root or drive prefix inside a package name is only ever a separator to Node.
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => joined.push(".."),
+            Component::Normal(part) => joined.push(part),
+        }
+    }
+    let joined = crate::paths::lexical_normalize(&joined);
+    joined.starts_with(base).then_some(joined)
 }
 
 /// Returns the identity used to compare two roots that may be reached through a link.
@@ -899,5 +946,35 @@ mod tests {
             .map(|root| root.skills_dir.clone())
             .collect();
         assert_eq!(dirs, [cache.join("extra")]);
+    }
+
+    #[test]
+    fn an_untrusted_package_name_joins_the_way_node_joins_it() {
+        // Measured against Node 24: `path.join("/base/node_modules", "/etc")` is
+        // `/base/node_modules/etc`. Rust's `Path::join` would return `/etc` instead, letting a
+        // dependency name in an attacker-authored package.json point inspection and locking at an
+        // arbitrary absolute path OMP never reads.
+        let base = Path::new("/base/node_modules");
+        assert_eq!(
+            super::node_join(base, "/etc").as_deref(),
+            Some(Path::new("/base/node_modules/etc"))
+        );
+        assert_eq!(
+            super::node_join(base, "@scope/pkg").as_deref(),
+            Some(Path::new("/base/node_modules/@scope/pkg")),
+            "a scoped package name is ordinary"
+        );
+        assert_eq!(
+            super::node_join(base, "demo").as_deref(),
+            Some(Path::new("/base/node_modules/demo"))
+        );
+        assert_eq!(
+            super::node_join(base, "./demo").as_deref(),
+            Some(Path::new("/base/node_modules/demo"))
+        );
+        // Node normalizes `..` and would escape too, so no installable name reaches here; a
+        // hostile document must not direct SkillMount at an arbitrary tree.
+        assert_eq!(super::node_join(base, "../../x"), None);
+        assert_eq!(super::node_join(base, "..").as_deref(), None);
     }
 }

@@ -64,7 +64,7 @@ pub(super) struct Inspection {
 /// The two folds OMP applies to the discovered superset, carried across every provider root.
 #[derive(Default)]
 struct Claims {
-    /// Canonical entry directories already loaded, so one physical Skill is never counted twice.
+    /// Canonical `SKILL.md` files already loaded, so one physical Skill is never counted twice.
     physical: BTreeSet<PathBuf>,
     /// Logical names already claimed, and whether the claim came from a custom directory.
     logical: BTreeMap<SkillNameKey, bool>,
@@ -371,12 +371,25 @@ fn compatibility_root(provider: &'static str, project_level: bool, path: PathBuf
 }
 
 /// Expands a leading `~` the way OMP expands a custom-directory entry.
+///
+/// `expandTilde` (`tools/path-utils.ts:142-152`) has three branches, and `skills.ts:251` applies it
+/// to every `skills.customDirectories` entry. Handling only `~/` left `~\my-skills` - the natural
+/// Windows spelling - and `~my-skills` as literal relative paths, so the directory contributed
+/// nothing to the conflict inventory and nothing to the lock set while OMP still scanned it. A
+/// custom directory overrides a same-named provider Skill, so a mount could then be applied,
+/// reported as successful, and silently overridden.
 fn expand_home(entry: &str, user_home: &Path) -> PathBuf {
-    if let Some(relative) = entry.strip_prefix("~/") {
-        return user_home.join(relative);
-    }
     if entry == "~" {
         return user_home.to_path_buf();
+    }
+    if let Some(relative) = entry
+        .strip_prefix("~/")
+        .or_else(|| entry.strip_prefix("~\\"))
+    {
+        return user_home.join(relative);
+    }
+    if let Some(relative) = entry.strip_prefix('~') {
+        return user_home.join(relative);
     }
     PathBuf::from(entry)
 }
@@ -432,26 +445,49 @@ fn scan(
         scope.observed_directories.push(terminal.clone());
     }
 
-    let candidates = candidates_in(root)?;
+    let entries = root_entries(root)?;
+
+    for entry in &entries {
+        // Destination occupancy answers whether a path is physically free, so it is recorded for
+        // every immediate child under its on-disk name - before OMP's dot-name, entry-kind,
+        // `SKILL.md`, `enabled`, and description filters, none of which free the path. This is the
+        // same rule `agent::inspect_scope` applies for Codex and Claude. Recording it after those
+        // filters left a real directory at the destination invisible to `apply_conflict_policy`,
+        // so `--conflict=skip` could not preserve it and `--conflict=error` only failed once the
+        // transaction was already open.
+        crate::agent::insert_direct_deterministically(
+            &mut scope,
+            ExistingSkill {
+                comparison_key: SkillNameKey::new(&entry.raw_name),
+                raw_name: entry.raw_name.clone(),
+                entry: entry.path.clone(),
+                kind: entry.kind,
+                source_canonical: entry.terminal.clone(),
+            },
+        );
+    }
+
+    let mut candidates = Vec::new();
+    if root.includes_self {
+        candidates.push((root.path.clone(), directory_name(&root.path)));
+    }
+    candidates.extend(
+        entries
+            .into_iter()
+            .filter(|entry| entry.scannable)
+            .map(|entry| (entry.path, entry.raw_name)),
+    );
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
 
     for (entry, raw_name) in candidates {
         let skill_md = entry.join("SKILL.md");
-        // A root without `SKILL.md` is silently not a Skill in OMP.
-        if classify(&skill_md)?.kind == PathKind::Missing {
-            continue;
-        }
-        let metadata =
-            read_metadata(&skill_md, &raw_name).map_err(|reason| AppError::MissingInput {
-                path: skill_md.clone(),
-                reason: format!(
-                    "cannot prove the OMP Skill identity of this entry, so the conflict inventory \
-                     would be incomplete: {reason}"
-                ),
-            })?;
-        let Some(metadata) = metadata else {
-            // `enabled: false`, or a missing description where the provider requires one.
+        let Some(metadata) = read_metadata(&skill_md, &raw_name)? else {
+            // No readable `SKILL.md` at all - every reason OMP's `readFile` returns null.
             continue;
         };
+        if metadata.enabled == Some(false) {
+            continue;
+        }
         if root.requires_description && metadata.description.is_none() {
             continue;
         }
@@ -466,28 +502,15 @@ fn scan(
             source_canonical: entry_state.terminal,
         };
 
-        // Direct occupancy answers whether a destination path is physically free and is recorded
-        // under the on-disk entry name, independent of the logical OMP name.
-        let direct_key = SkillNameKey::new(&raw_name);
-        scope
-            .direct_entries
-            .entry(direct_key)
-            .or_default()
-            .push(ExistingSkill {
-                comparison_key: SkillNameKey::new(&raw_name),
-                raw_name: raw_name.clone(),
-                entry: entry.clone(),
-                kind: existing.kind,
-                source_canonical: existing.source_canonical.clone(),
-            });
-
         if !claim_logical_name(
             root,
             settings,
             claims,
-            &existing,
-            &metadata.name,
-            &key,
+            &Candidate {
+                existing: &existing,
+                name: &metadata.name,
+                skill_md: &skill_md,
+            },
             &mut scope.warnings,
         ) {
             continue;
@@ -496,6 +519,15 @@ fn scan(
     }
 
     Ok(scope)
+}
+
+/// One discovered entry, as the claim decision sees it.
+struct Candidate<'a> {
+    existing: &'a ExistingSkill,
+    /// Effective OMP name: the trimmed frontmatter `name`, else the directory basename.
+    name: &'a str,
+    /// The `SKILL.md` OMP would load, which is also the physical dedup key.
+    skill_md: &'a Path,
 }
 
 /// Decides whether one discovered entry claims its logical OMP name.
@@ -507,11 +539,15 @@ fn claim_logical_name(
     root: &ProviderRoot,
     settings: &SkillSettings,
     claims: &mut Claims,
-    existing: &ExistingSkill,
-    name: &str,
-    key: &SkillNameKey,
+    candidate: &Candidate<'_>,
     warnings: &mut Vec<Diagnostic>,
 ) -> bool {
+    let Candidate {
+        existing,
+        name,
+        skill_md,
+    } = *candidate;
+    let key = &existing.comparison_key;
     if !settings.source_enabled(root.provider, root.project_level) {
         // A disabled source is one reason a same-named entry stops being a conflict. Saying so is
         // what distinguishes "OMP will not see this" from "SkillMount overlooked it".
@@ -557,58 +593,81 @@ fn claim_logical_name(
         return false;
     }
 
-    // OMP folds the loaded set twice, and both folds are reproduced here.
+    // OMP folds the loaded set twice, and the two passes run the folds in opposite orders.
     //
-    // The physical fold comes first: `skills.ts:220-227` resolves each entry's `SKILL.md` through
-    // `realpath` and silently skips one already loaded, so two roots that reach the same directory
-    // contribute one Skill rather than a false duplicate. Custom directories share that same set
-    // (`skills.ts:301`).
-    if let Some(terminal) = &existing.source_canonical {
-        if !claims.physical.insert(terminal.clone()) {
-            return false;
-        }
+    // The physical key is the `realpath` of the `SKILL.md` file itself (`skills.ts:212` over
+    // `capSkill.path`, which `helpers.ts:397` sets to the `SKILL.md` path), not the entry
+    // directory: two real directories whose `SKILL.md` are links to one shared file are one Skill
+    // to OMP. A failed resolution falls back to the literal path, as OMP's `catch` does.
+    let physical = fs::canonicalize(skill_md).unwrap_or_else(|_| skill_md.to_path_buf());
+    let custom = root.provider == "custom";
+
+    // The custom pass checks the realpath before it overrides a name (`skills.ts:301-314`).
+    if custom && claims.physical.contains(&physical) {
+        return false;
     }
+
     // The logical fold is first-wins by name, with one exception: a custom directory overrides a
     // name already claimed by an ordinary provider (`skills.ts:303-314`), while two custom
     // directories keep first-wins between themselves (`skills.ts:316-318`).
-    let custom = root.provider == "custom";
-    match claims.logical.entry(key.clone()) {
+    //
+    // For an ordinary provider this fold runs inside the pre-realpath filter
+    // (`skills.ts:203-204`), so it comes first and a name-duplicate never reaches - or burns - the
+    // realpath set. Recording the realpath before the name fold used to drop a later entry that
+    // OMP does load, which under-reports the namespace and lets a mount shadow it.
+    let claimed = match claims.logical.entry(key.clone()) {
         Entry::Vacant(slot) => {
             slot.insert(custom);
             true
         }
         Entry::Occupied(mut slot) => {
             if !custom || *slot.get() {
-                return false;
+                false
+            } else {
+                slot.insert(custom);
+                true
             }
-            slot.insert(custom);
-            true
         }
+    };
+    if !claimed {
+        return false;
     }
+
+    // A realpath is recorded only for an entry that is actually stored (`skills.ts:245`, `:313`,
+    // `:322`). The name claim above stays either way, matching `seenAuthoredSkillNames`.
+    claims.physical.insert(physical)
 }
 
-/// Enumerates the entries one OMP Skill root admits, one directory level, in path order.
+/// One immediate child of a Skill root, classified once.
+struct RootEntry {
+    path: PathBuf,
+    raw_name: OsString,
+    kind: PathKind,
+    terminal: Option<PathBuf>,
+    /// Whether OMP would look for `<entry>/SKILL.md` here.
+    scannable: bool,
+}
+
+/// Enumerates every immediate child of one OMP Skill root, one directory level, in path order.
 ///
-/// OMP skips a dotted name, admits a directory or a symbolic link and then follows it — which is
-/// what makes a transaction-owned directory link loadable — and reads nothing but
-/// `<entry>/SKILL.md`.
-fn candidates_in(root: &ProviderRoot) -> Result<Vec<(PathBuf, OsString)>, AppError> {
-    let mut candidates = Vec::new();
-    if root.includes_self {
-        candidates.push((root.path.clone(), directory_name(&root.path)));
-    }
-    let entries = fs::read_dir(&root.path).map_err(|error| AppError::MissingInput {
-        path: root.path.clone(),
-        reason: format!("cannot enumerate the OMP Skill root: {error}"),
-    })?;
-    let mut inspected = 0usize;
+/// Every child is returned, because a child that OMP ignores still occupies its path. `scannable`
+/// carries OMP's own admission test: it skips a dotted name (`helpers.ts:417`) and admits only a
+/// directory or a symbolic link, which it then follows (`helpers.ts:418,420`) — the rule that makes
+/// a transaction-owned directory link loadable.
+///
+/// An unreadable root is not fatal. OMP warns once and contributes nothing from it
+/// (`helpers.ts:376-381`), so refusing the whole run would fail a session OMP would have started;
+/// the inventory is complete without entries OMP provably never loads.
+fn root_entries(root: &ProviderRoot) -> Result<Vec<RootEntry>, AppError> {
+    let Ok(entries) = fs::read_dir(&root.path) else {
+        return Ok(Vec::new());
+    };
+    let mut collected = Vec::new();
     for child in entries {
-        let child = child.map_err(|error| AppError::MissingInput {
-            path: root.path.clone(),
-            reason: format!("cannot enumerate the OMP Skill root: {error}"),
-        })?;
-        inspected += 1;
-        if inspected > MAX_ROOT_ENTRIES {
+        let Ok(child) = child else {
+            continue;
+        };
+        if collected.len() >= MAX_ROOT_ENTRIES {
             return Err(AppError::MissingInput {
                 path: root.path.clone(),
                 reason: format!(
@@ -618,42 +677,91 @@ fn candidates_in(root: &ProviderRoot) -> Result<Vec<(PathBuf, OsString)>, AppErr
             });
         }
         let raw_name = child.file_name();
-        if raw_name.as_encoded_bytes().first() == Some(&b'.') {
-            continue;
-        }
-        if !matches!(
-            classify(&child.path())?.kind,
-            PathKind::Directory | PathKind::DirectoryLink
-        ) {
-            continue;
-        }
-        candidates.push((child.path(), raw_name));
+        let state = classify(&child.path())?;
+        let dotted = raw_name.as_encoded_bytes().first() == Some(&b'.');
+        collected.push(RootEntry {
+            path: child.path(),
+            raw_name,
+            kind: state.kind,
+            terminal: state.terminal,
+            scannable: !dotted
+                && matches!(state.kind, PathKind::Directory | PathKind::DirectoryLink),
+        });
     }
-    candidates.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(candidates)
+    collected.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(collected)
 }
 
 /// The OMP frontmatter facts that decide a Skill's identity and visibility.
 struct SkillFrontmatter {
     name: String,
     description: Option<String>,
+    /// `enabled: false` drops the entry (`helpers.ts:387`); absent or any other value keeps it.
+    enabled: Option<bool>,
+}
+
+/// Returns whether the selected Skill's own frontmatter would make OMP drop it.
+///
+/// The mount links the source directory into the destination, so the child reads exactly this
+/// `SKILL.md`. `enabled: false` there means OMP loads nothing under that name, which is a mount
+/// applied and then ignored. Generic catalog validation has no notion of `enabled`, so the check
+/// belongs to the adapter that knows the rule.
+pub(super) fn selected_is_disabled(skill_md: &Path) -> Result<bool, AppError> {
+    let name = directory_name(skill_md.parent().unwrap_or(skill_md));
+    Ok(read_metadata(skill_md, &name)?
+        .is_some_and(|frontmatter| frontmatter.enabled == Some(false)))
 }
 
 /// Reads the OMP frontmatter contract from one `SKILL.md`.
 ///
-/// Returns `Ok(None)` when OMP would drop the entry through `enabled: false`. A read that cannot
-/// establish the effective name is an error, because an unnamed entry would silently leave the
-/// conflict inventory incomplete.
-fn read_metadata(skill_md: &Path, raw_name: &OsStr) -> Result<Option<SkillFrontmatter>, String> {
+/// Returns `Ok(None)` for every reason OMP itself drops the entry silently: no `SKILL.md`, a
+/// dangling link, a non-regular file, an unreadable one, an empty one, or `enabled: false`. OMP's
+/// `readFile` returns null on any error and for any non-regular path (`capability/fs.ts:23-33`) and
+/// `loadSkill` then returns without loading (`discovery/helpers.ts:384-385`). Such an entry is
+/// provably absent from OMP's namespace, so skipping keeps the conflict inventory complete, while
+/// refusing would fail a session OMP would have started — and these paths are reachable from any of
+/// the ~20 scanned roots, including ancestors and project-named plugin roots.
+///
+/// A file OMP *would* load but this release cannot model stays fatal, because an unmodelled entry
+/// would silently leave the inventory incomplete: over [`MAX_SKILL_MD_BYTES`], not UTF-8, or a
+/// containing directory name that is not Unicode.
+fn read_metadata(skill_md: &Path, raw_name: &OsStr) -> Result<Option<SkillFrontmatter>, AppError> {
+    let fatal = |reason: String| AppError::MissingInput {
+        path: skill_md.to_path_buf(),
+        reason: format!(
+            "cannot prove the OMP Skill identity of this entry, so the conflict inventory would be \
+             incomplete: {reason}"
+        ),
+    };
+
+    // `fs::metadata` follows the link, so a dangling `SKILL.md` link reports an error here exactly
+    // as `existsSync` reports false for it (`helpers.ts:420`).
+    let Ok(state) = fs::metadata(skill_md) else {
+        return Ok(None);
+    };
+    if !state.is_file() || state.len() == 0 {
+        return Ok(None);
+    }
+    if state.len() > MAX_SKILL_MD_BYTES {
+        return Err(fatal(format!(
+            "SKILL.md exceeds {MAX_SKILL_MD_BYTES} bytes"
+        )));
+    }
+
     let bytes = crate::catalog::frontmatter::read_bounded_regular_file(
         skill_md,
         "SKILL.md",
         MAX_SKILL_MD_BYTES,
-    )?;
-    let content = String::from_utf8(bytes).map_err(|_| "SKILL.md is not valid UTF-8".to_owned())?;
+    )
+    .map_err(fatal)?;
+    let content =
+        String::from_utf8(bytes).map_err(|_| fatal("SKILL.md is not valid UTF-8".to_owned()))?;
     let fallback = raw_name.to_str().ok_or_else(|| {
-        "the containing directory name is not Unicode, so OMP's name fallback cannot be reproduced"
-            .to_owned()
+        fatal(
+            "the containing directory name is not Unicode, so OMP's name fallback cannot be \
+             reproduced"
+                .to_owned(),
+        )
     })?;
 
     let Some(raw) = envelope(&content) else {
@@ -662,6 +770,7 @@ fn read_metadata(skill_md: &Path, raw_name: &OsStr) -> Result<Option<SkillFrontm
         return Ok(Some(SkillFrontmatter {
             name: fallback.to_owned(),
             description: None,
+            enabled: None,
         }));
     };
 
@@ -690,9 +799,6 @@ fn read_metadata(skill_md: &Path, raw_name: &OsStr) -> Result<Option<SkillFrontm
             )
         };
 
-    if enabled == Some(false) {
-        return Ok(None);
-    }
     let name = name
         .map(|name| name.trim().to_owned())
         .filter(|name| !name.is_empty())
@@ -702,6 +808,7 @@ fn read_metadata(skill_md: &Path, raw_name: &OsStr) -> Result<Option<SkillFrontm
         description: description
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty()),
+        enabled,
     }))
 }
 
@@ -849,10 +956,16 @@ mod tests {
     }
 
     #[test]
-    fn a_custom_directory_expands_a_leading_home_marker_only() {
+    fn a_custom_directory_expands_every_tilde_form_omp_expands() {
+        // `expandTilde` (`tools/path-utils.ts:142-152`) has three branches. Handling only `~/`
+        // left the natural Windows spelling `~\x` and the bare `~name` form as literal relative
+        // paths, so that directory contributed nothing to the conflict inventory and nothing to the
+        // lock set while OMP still scanned it.
         let home = Path::new("/home/user");
-        assert_eq!(expand_home("~/skills", home), home.join("skills"));
         assert_eq!(expand_home("~", home), home);
+        assert_eq!(expand_home("~/skills", home), home.join("skills"));
+        assert_eq!(expand_home("~\\skills", home), home.join("skills"));
+        assert_eq!(expand_home("~skills", home), home.join("skills"));
         assert_eq!(
             expand_home("/abs/skills", home),
             PathBuf::from("/abs/skills")
@@ -861,6 +974,51 @@ mod tests {
             expand_home("rel/~/skills", home),
             PathBuf::from("rel/~/skills"),
             "a tilde that is not the first component stays literal"
+        );
+    }
+
+    #[test]
+    fn every_immediate_child_is_returned_and_only_some_are_scannable() {
+        // Destination occupancy answers whether a path is free, so a dot-prefixed name and a plain
+        // file must both be reported even though OMP never looks for a `SKILL.md` inside them
+        // (`helpers.ts:417-418`). Recording occupancy only for scannable entries left a real
+        // occupant invisible to `apply_conflict_policy`, so `--conflict=skip` could not preserve it
+        // and `--conflict=error` only failed once the transaction was already open. The dotted case
+        // is unreachable from an integration fixture, because a portable mount name can never begin
+        // with a dot.
+        let fixture = crate::test_support::TestDir::new("omp-root-entries");
+        let root = fixture.0.join("skills");
+        std::fs::create_dir_all(root.join("visible")).expect("visible entry");
+        std::fs::create_dir_all(root.join(".hidden")).expect("dotted entry");
+        std::fs::write(root.join("plain.txt"), b"x").expect("regular file entry");
+
+        let entries = super::root_entries(&super::ProviderRoot {
+            scope: crate::agent::ScopeKind::OmpProject,
+            provider: "native",
+            project_level: true,
+            path: root,
+            requires_description: true,
+            includes_self: false,
+        })
+        .expect("the root enumerates");
+
+        let reported: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.raw_name.to_string_lossy().into_owned(),
+                    entry.scannable,
+                )
+            })
+            .collect();
+        assert_eq!(
+            reported,
+            [
+                (".hidden".to_owned(), false),
+                ("plain.txt".to_owned(), false),
+                ("visible".to_owned(), true),
+            ],
+            "every child is reported for occupancy; only a non-dotted directory is scanned"
         );
     }
 

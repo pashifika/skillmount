@@ -269,13 +269,29 @@ impl AgentAdapter for OmpAdapter {
     ) -> Result<(), AppError> {
         verify_launch_invariants(context)?;
         // Re-read the settings rather than trust the pre-apply read. A configuration edit that
-        // hides a selected Skill leaves the non-owned namespace byte-identical, so the fingerprint
-        // below cannot see it, and launching would produce exactly the silent success
+        // hides a selected Skill leaves the non-owned namespace byte-identical, so the evidence
+        // comparison below cannot see it, and launching would produce exactly the silent success
         // `verify_selected_visibility` exists to prevent.
-        verify_selected_visibility(catalog, &discovery::load_settings(context)?, context)?;
+        //
+        // At plan time the same refusal is a data error: the operator's own configuration hides the
+        // Skill and a retry cannot help. Here it means an external writer moved the configuration
+        // after the plan was applied, which is transient — the same category its two sibling
+        // rechecks already report, so a caller sees one consistent status for "the ground moved
+        // before spawn".
+        verify_selected_visibility(catalog, &discovery::load_settings(context)?, context)
+            .map_err(|error| spawn_boundary_drift(&error))?;
         verify_owned_entries_resolve(plan)?;
         verify_non_owned_evidence(context, discovery, plan)
     }
+}
+
+/// Re-reports a plan-time refusal as the transient drift it is at the child boundary.
+fn spawn_boundary_drift(error: &AppError) -> AppError {
+    AppError::Temporary(format!(
+        "the OMP configuration that decided this plan changed after it was applied, so the child \
+         would load a namespace SkillMount did not inspect; nothing was launched and the \
+         transaction was released: {error}"
+    ))
 }
 
 /// Requires every mount link this run created to still resolve to the source the plan recorded.
@@ -388,6 +404,14 @@ fn verify_selected_visibility(
                 "OMP configuration hides selected Skill {name} through disabledExtensions, \
                  skills.ignoredSkills, or skills.includeSkills, so mounting it would have no \
                  effect; adjust that configuration in OMP or deselect the Skill"
+            )));
+        }
+        // The mount links the source directory in, so the child reads the source's own frontmatter.
+        if discovery::selected_is_disabled(&resolution.selected.skill_md)? {
+            return Err(reject(format!(
+                "selected Skill {name} sets enabled: false in its own SKILL.md, so OMP would load \
+                 nothing under that name and mounting it would have no effect; remove that key or \
+                 deselect the Skill"
             )));
         }
     }

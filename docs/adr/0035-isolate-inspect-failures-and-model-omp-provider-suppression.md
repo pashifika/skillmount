@@ -44,6 +44,20 @@ success the design exists to prevent.
    per-level toggle, and `verify_selected_visibility` refuses a session whose `native` provider the
    list removes, naming that setting rather than `enablePiProject`. `custom` is not a provider id,
    so the list can never reach a `skills.customDirectories` entry.
+3. **A root's occupancy is separate from its Skills, and an entry OMP skips is skipped, not fatal.**
+   Every immediate child of a Skill root is recorded as a destination occupant under its on-disk
+   name, before OMP's dot-name, entry-kind, `SKILL.md`, `enabled`, and description filters — the
+   rule `agent::inspect_scope` already applies for Codex and Claude. Conversely, every condition
+   under which OMP's own `readFile` returns null — missing, dangling, non-regular, unreadable, or
+   empty `SKILL.md` — is a silent skip rather than a refusal of the whole run. Only a file OMP
+   would load but this release cannot model stays fatal: oversize, not UTF-8, or a non-Unicode
+   containing directory name.
+4. **The project extension-package anchor is the launch CWD.** `<launch-cwd>/.omp` counts as
+   present during the anchor walk even before it exists, because every OMP session creates it
+   before the child starts.
+5. **The spawn boundary reports drift as transient.** A refusal raised by re-running the
+   selected-visibility gate after apply is re-reported as `AppError::Temporary`, matching the two
+   sibling rechecks. The same refusal at plan time stays a data error.
 
 ## Alternatives
 

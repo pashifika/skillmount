@@ -513,66 +513,152 @@ impl SkillSettings {
     }
 }
 
-/// Matches one glob pattern against a Skill name.
+/// Matches one glob pattern against a Skill name, reproducing `Bun.Glob`.
 ///
-/// OMP matches `skills.ignoredSkills` and `skills.includeSkills` against the bare Skill name with a
-/// shell-style glob, never against a path, so only `*`, `?`, and character classes matter here.
+/// OMP matches `skills.ignoredSkills` and `skills.includeSkills` against the bare Skill name with
+/// `new Bun.Glob(pattern).match(name)` (`extensibility/skills.ts:181,187`). Supporting only `*`,
+/// `?`, and `[...]` left brace alternation, leading `!` negation, `\` escapes, and `[^...]`
+/// unhandled, so an operator pattern that hides a Skill in OMP reported it visible here — and a
+/// mount planned against that reading is applied and then silently ignored.
+///
+/// Every rule below was measured against `Bun.Glob` 1.3.14, which is the runtime OMP 17.2.9 pins.
 fn glob_matches(pattern: &str, name: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let name: Vec<char> = name.chars().collect();
-    matches_from(&pattern, &name)
+    // A leading `!` negates the whole match and stacks: `!!a` matches `a`. It is special only at
+    // the start, so `a!b` is literal, and `\!a` escapes it.
+    let mut negated = false;
+    let mut start = 0;
+    while pattern.get(start) == Some(&'!') {
+        negated = !negated;
+        start += 1;
+    }
+    matches_from(&pattern[start..], &name) != negated
 }
 
 fn matches_from(pattern: &[char], name: &[char]) -> bool {
-    let mut pattern_index = 0;
-    let mut name_index = 0;
-    let mut star: Option<(usize, usize)> = None;
+    match pattern.first() {
+        None => name.is_empty(),
+        Some('{') => match_alternation(pattern, name),
+        Some('*') => {
+            // `**` crosses a separator, `*` does not. A Skill name rarely holds one, but a
+            // frontmatter `name` is arbitrary text and OMP applies the same rule to it.
+            let (crosses, rest) = if pattern.get(1) == Some(&'*') {
+                (true, &pattern[2..])
+            } else {
+                (false, &pattern[1..])
+            };
+            for split in 0..=name.len() {
+                if matches_from(rest, &name[split..]) {
+                    return true;
+                }
+                if !crosses && name.get(split) == Some(&'/') {
+                    break;
+                }
+            }
+            false
+        }
+        Some('?') => {
+            matches!(name.first(), Some(head) if *head != '/')
+                && matches_from(&pattern[1..], &name[1..])
+        }
+        Some('[') => match (name.first(), match_class(pattern, 0, name)) {
+            (Some(_), Some(next)) => matches_from(&pattern[next..], &name[1..]),
+            _ => false,
+        },
+        // An escape binds the next character literally; a trailing `\` matches nothing.
+        Some('\\') => match (pattern.get(1), name.first()) {
+            (Some(literal), Some(head)) if literal == head => {
+                matches_from(&pattern[2..], &name[1..])
+            }
+            _ => false,
+        },
+        Some(literal) => name.first() == Some(literal) && matches_from(&pattern[1..], &name[1..]),
+    }
+}
 
-    while name_index < name.len() {
-        match pattern.get(pattern_index) {
-            Some('*') => {
-                star = Some((pattern_index, name_index));
-                pattern_index += 1;
-            }
-            Some('?') => {
-                pattern_index += 1;
-                name_index += 1;
-            }
-            Some('[') => match match_class(pattern, pattern_index, name[name_index]) {
-                Some(next) => {
-                    pattern_index = next;
-                    name_index += 1;
-                }
-                None => match star {
-                    Some((star_pattern, star_name)) => {
-                        pattern_index = star_pattern + 1;
-                        name_index = star_name + 1;
-                        star = Some((star_pattern, star_name + 1));
-                    }
-                    None => return false,
-                },
-            },
-            Some(literal) if *literal == name[name_index] => {
-                pattern_index += 1;
-                name_index += 1;
-            }
-            _ => match star {
-                Some((star_pattern, star_name)) => {
-                    pattern_index = star_pattern + 1;
-                    name_index = star_name + 1;
-                    star = Some((star_pattern, star_name + 1));
-                }
-                None => return false,
-            },
+/// Matches a `{a,b}` group against `name`, trying each top-level alternative with the same tail.
+///
+/// Alternatives are substituted rather than pre-expanded, so a pattern with several groups costs
+/// backtracking rather than a combinatorial rewrite. An unterminated `{` matches nothing at all,
+/// which is what `Bun.Glob` does — `{a,b` does not even match itself.
+fn match_alternation(pattern: &[char], name: &[char]) -> bool {
+    let Some(close) = closing_brace(pattern) else {
+        return false;
+    };
+    let tail = &pattern[close + 1..];
+    for alternative in top_level_alternatives(&pattern[1..close]) {
+        let mut candidate = alternative;
+        candidate.extend_from_slice(tail);
+        if matches_from(&candidate, name) {
+            return true;
         }
     }
-    pattern[pattern_index..].iter().all(|token| *token == '*')
+    false
+}
+
+/// Returns the index of the `}` closing the group opened at index 0, honouring nesting and escapes.
+fn closing_brace(pattern: &[char]) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut index = 0;
+    while index < pattern.len() {
+        match pattern[index] {
+            '\\' => index += 1,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Splits a group body on its top-level commas, keeping nested groups and escapes intact.
+fn top_level_alternatives(body: &[char]) -> Vec<Vec<char>> {
+    let mut alternatives = Vec::new();
+    let mut current = Vec::new();
+    let mut depth = 0usize;
+    let mut index = 0;
+    while index < body.len() {
+        let token = body[index];
+        match token {
+            '\\' => {
+                current.push(token);
+                if let Some(escaped) = body.get(index + 1) {
+                    current.push(*escaped);
+                    index += 1;
+                }
+            }
+            '{' => {
+                depth += 1;
+                current.push(token);
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                current.push(token);
+            }
+            ',' if depth == 0 => alternatives.push(std::mem::take(&mut current)),
+            _ => current.push(token),
+        }
+        index += 1;
+    }
+    alternatives.push(current);
+    alternatives
 }
 
 /// Matches one `[...]` class and returns the pattern index just past it.
-fn match_class(pattern: &[char], open: usize, candidate: char) -> Option<usize> {
+///
+/// Both `[!...]` and `[^...]` negate, and an escape binds inside the class. Unlike `?`, a class may
+/// match a separator.
+fn match_class(pattern: &[char], open: usize, name: &[char]) -> Option<usize> {
+    let candidate = *name.first()?;
     let mut index = open + 1;
-    let negated = pattern.get(index) == Some(&'!');
+    let negated = matches!(pattern.get(index), Some('!' | '^'));
     if negated {
         index += 1;
     }
@@ -584,22 +670,29 @@ fn match_class(pattern: &[char], open: usize, candidate: char) -> Option<usize> 
             return (matched != negated).then_some(index);
         }
         members += 1;
-        if pattern.get(index + 1) == Some(&'-')
-            && pattern.get(index + 2).is_some_and(|end| *end != ']')
-        {
-            let end = pattern[index + 2];
-            if (*token..=end).contains(&candidate) {
-                matched = true;
-            }
-            index += 3;
+        let (token, width) = if *token == '\\' {
+            (*pattern.get(index + 1)?, 2)
         } else {
-            if *token == candidate {
+            (*token, 1)
+        };
+        if pattern.get(index + width) == Some(&'-')
+            && pattern
+                .get(index + width + 1)
+                .is_some_and(|end| *end != ']')
+        {
+            let end = pattern[index + width + 1];
+            if (token..=end).contains(&candidate) {
                 matched = true;
             }
-            index += 1;
+            index += width + 2;
+        } else {
+            if token == candidate {
+                matched = true;
+            }
+            index += width;
         }
     }
-    // An unterminated class is a literal `[`, which cannot match a single scanned character.
+    // An unterminated class is a literal `[`, which `Bun.Glob` never matches.
     None
 }
 
@@ -912,6 +1005,87 @@ mod tests {
             ("exact", "exactly", false),
             ("a*b*c", "azzbzzc", true),
             ("a*b*c", "azzc", false),
+        ] {
+            assert_eq!(
+                glob_matches(pattern, name),
+                expected,
+                "{pattern:?} against {name:?}"
+            );
+        }
+    }
+
+    /// Every row was measured against `Bun.Glob` 1.3.14, the runtime OMP 17.2.9 pins.
+    ///
+    /// The constructs below were previously unhandled. Direction matters: a pattern OMP matches but
+    /// this release does not reports a hidden Skill as visible, which is the silent no-op mount
+    /// `verify_selected_visibility` exists to prevent.
+    #[test]
+    fn glob_matching_reproduces_bun_glob_for_every_measured_construct() {
+        for (pattern, name, expected) in [
+            // Brace alternation, including nesting and empty alternatives.
+            ("{git,docker}", "git", true),
+            ("{git,docker}", "docker", true),
+            ("{git,docker}", "npm", false),
+            ("{git,docker}-*", "git-flow", true),
+            ("a{b,c}d", "abd", true),
+            ("a{b,c}d", "azd", false),
+            ("a{b,c}", "a", false),
+            ("{a,{b,c}}", "b", true),
+            ("{a,{b,c}}", "a", true),
+            ("{}", "", true),
+            ("{,a}", "", true),
+            ("{,a}", "a", true),
+            ("{a,b}*", "ax", true),
+            ("*-{x,y}", "n-x", true),
+            ("*-{x,y}", "n-z", false),
+            ("{a,b}}", "a}", true),
+            // An unterminated or literal-looking group matches nothing, not even itself.
+            ("{a,b", "{a,b", false),
+            ("{a,b}", "{a,b}", false),
+            ("{a}", "a", true),
+            ("{a}", "{a}", false),
+            // Leading `!` negates and stacks; it is literal anywhere else and escapable.
+            ("!keep", "keep", false),
+            ("!keep", "other", true),
+            ("!keep-*", "keep-me", false),
+            ("!keep-*", "drop-me", true),
+            ("!", "x", true),
+            ("!*", "anything", false),
+            ("!!a", "a", true),
+            ("!!a", "!a", false),
+            ("a!b", "a!b", true),
+            ("a!b", "axb", false),
+            ("\\!a", "!a", true),
+            ("\\!a", "a", false),
+            // Escapes bind the next character, including inside a class; a trailing `\` matches
+            // nothing.
+            ("\\*", "*", true),
+            ("\\*", "x", false),
+            ("a\\*b", "a*b", true),
+            ("a\\*b", "axb", false),
+            ("\\{a\\}", "{a}", true),
+            ("\\\\", "\\", true),
+            ("a\\", "a", false),
+            ("[a\\]b]", "]", true),
+            // `^` negates a class exactly as `!` does.
+            ("[^ab]", "c", true),
+            ("[^ab]", "a", false),
+            // A class may match a separator; `?` may not, and `*` does not cross one while `**`
+            // does.
+            ("[a/b]", "/", true),
+            ("?", "/", false),
+            ("a?b", "a/b", false),
+            ("*", "a/b", false),
+            ("**", "a/b", true),
+            ("*", "", true),
+            ("?", "", false),
+            // A bare or empty class never matches.
+            ("[", "[", false),
+            ("[]", "[", false),
+            ("}", "}", true),
+            // Matching is case sensitive.
+            ("{git,docker}", "GIT", false),
+            ("[a-c]", "B", false),
         ] {
             assert_eq!(
                 glob_matches(pattern, name),

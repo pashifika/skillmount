@@ -117,15 +117,15 @@ Concretely, for the `omp` command in `src/agent/omp/`:
   version warnings route operators to `docs/compatibility.md` rather than implying coverage.
 - OMP 17.2.9 publishes a 64-bit Windows binary but no 32-bit one, and no `SHA256SUMS.txt` for that
   exact release. Windows x86 OMP evidence is therefore permanently unavailable for this version, and
-  every native OMP cell — including Windows x64 junction loading — stays `unknown` until an opt-in
-  smoke run records it.
+  every native OMP cell — including Windows x64 junction loading — stays `unverified` until an
+  opt-in smoke run records it.
 - External writers do not honour SkillMount locks. Lock stabilization plus a pre-spawn recheck of
   non-owned settings and provider evidence narrows the final read-to-start race but cannot remove it,
   and the adapter never compensates by overriding configuration. The pre-spawn recheck covers three
   distinct classes, because the non-owned comparison alone cannot see all of them: non-owned
-  namespace drift through the fingerprint, a configuration edit that would hide a selected Skill
-  through a re-run visibility gate, and a retargeted destination through each owned entry still
-  resolving to the source the plan recorded.
+  namespace drift through the non-owned evidence comparison, a configuration edit that would hide a
+  selected Skill through a re-run visibility gate, and a retargeted destination through each owned
+  entry still resolving to the source the plan recorded.
 - A read-only run enforces the same launch invariants as a mutating one. `--dry-run` describes the
   session the mutating run would start, so an invariant that refuses the session refuses the
   description; otherwise the plan would describe a namespace no child would load.
@@ -150,15 +150,24 @@ Concretely, for the `omp` command in `src/agent/omp/`:
 
 - `tests/read_only.rs` fails if `inspect --agent omp` or `asm omp --dry-run` creates a directory,
   link, lock, journal, recovery change, version process, or child.
-- `src/agent/omp/` unit fixtures fail if provider order, priority, registration order, description
-  requirements, entry layout, settings merge order, array-replacement semantics, source toggles, or
-  filter order diverge from the recorded contract.
+- `src/agent/omp/settings.rs` unit fixtures fail if settings merge order, array-replacement
+  semantics, source toggles, or filter order diverge from the recorded contract, and
+  `src/agent/omp/discovery.rs` unit fixtures cover the ancestor walk, tilde expansion, frontmatter
+  identity, and destination occupancy. Provider order, priority, registration order, per-provider
+  description requirements, entry layout, symlink admission, realpath dedup, and custom-directory
+  override are pinned by integration fixtures in `tests/omp_session.rs`, which assert the rendered
+  discovery-scope sequence rather than one function's return value.
 - Passthrough and environment rejection tests fail if any listed token or variable reaches a child,
   or if a rejection creates project or SkillMount state; each asserts usage status `64`.
 - `tests/transaction.rs` fails if an OMP session mutates outside its journal, replaces a non-owned
-  entry, removes an entry without matching recorded evidence, or spawns a child after a spawn-boundary
-  change.
-- The static-derivability rule is enforced by a fixture whose extension would execute if imported;
-  the test fails if its sentinel is ever touched.
+  entry, removes an entry without matching recorded evidence, or spawns a child after a
+  spawn-boundary change. The `spawn-boundary` checkpoint stalls a real session in that window, and
+  one case per recheck class — retargeted destination, hidden selection, non-owned drift — asserts
+  no child was launched and the transaction was released.
+- The static-derivability rule is enforced by
+  `tests/omp_session.rs::no_declared_extension_plugin_or_hook_entry_point_is_ever_executed`, whose
+  declared extension, plugin manifest, and project-owned registry hook all point at a script that
+  writes a sentinel if it is ever spawned, sourced, or imported; the test fails if any sentinel
+  appears.
 - Live compatibility is not verified by any of the above. `docs/compatibility.md` records the OMP
-  cells, and an unverified cell stays `unknown` until the opt-in native smoke passes.
+  cells, and a cell stays `unverified` until the opt-in native smoke passes.

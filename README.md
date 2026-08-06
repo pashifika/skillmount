@@ -180,10 +180,13 @@ asm doctor --project-root . --omp-bin /opt/homebrew/bin/omp
 ```
 
 Because the mount destination outranks every other Skill source in OMP's own precedence,
-SkillMount checks the complete OMP namespace before touching anything — the nine provider scopes,
-including `.claude/skills`, marketplace plugin caches, `.agents/skills`, and `.codex/skills`, plus
-your `skills.customDirectories` — and never replaces an existing Skill: `--conflict=error` stops
-the session and `--conflict=skip` keeps the existing winner. A Skill that your own OMP
+SkillMount checks the complete OMP namespace before touching anything: all nine of OMP's Skill
+providers — including `.claude/skills`, marketplace plugin caches, `.agents/skills`, and
+`.codex/skills` — plus your `skills.customDirectories`. A provider is a Skill source, not a single
+directory: most contribute both a user root and a project root, so even a minimal project renders
+fourteen scanned roots under `asm omp --dry-run --verbose`, and project ancestors or installed
+plugins add more. SkillMount never replaces an existing Skill: `--conflict=error` stops the
+session and `--conflict=skip` keeps the existing winner. A Skill that your own OMP
 configuration hides (`skills.enabled: false`, a source toggle, `ignoredSkills`, `includeSkills`,
 or `disabledExtensions`) fails the plan instead of mounting something OMP would silently ignore.
 

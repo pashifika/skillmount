@@ -117,18 +117,26 @@ argv -> CLI parsing + recognized product identity -> fresh shared clap graph
      -> fixed-shell static generator + opaque-passthrough guard -> stdout
 ```
 
-The read-only path is a strict composition of pure observation and planning:
+The read-only path is a strict composition of validation, pure observation, and planning:
 
 ```text
 argv
   -> cli parsing
   -> invocation / launch / project path resolution
+  -> adapter passthrough validation + hard launch-invariant gate (session dry runs only)
   -> catalog discovery -> rightmost-wins selection -> winner validation
   -> agent discovery inspection
   -> deterministic mount plan
   -> inspect / dry-run rendering
 ```
 
+A session `--dry-run` describes the launch a real session would perform, so every adapter's
+passthrough validation and repeatable hard launch-invariant check run before the catalog is
+resolved or any plan is built: a gate that would refuse the real session refuses its description
+too. `inspect` certifies no launch, so it skips that gate, and it treats each requested Agent
+independently — one Agent's refusal becomes a named warning and the exit category while every
+other Agent's section still renders, per
+[ADR 0035](adr/0035-isolate-inspect-failures-and-model-omp-provider-suppression.md).
 `inspect` and `--dry-run` stop at rendering. `tests/read_only.rs` snapshots the project, Skill
 sources, and redirected user state around success and error paths, and fails if version observation
 or an Agent child executable is reached.
@@ -175,24 +183,32 @@ as required by [ADR 0027](adr/0027-reload-recovery-journals-under-lock.md).
 The mutating path deliberately does not build a complete plan before locking:
 
 ```text
-hard launch-control preflight -> one bounded advisory version observation
+adapter passthrough validation -> hard launch-control preflight
+  -> one bounded advisory version observation
   -> read-only journal preflight
   -> ensure the staging-state base when staging is required
   -> mint transaction / staging identity
   -> discovery-only inspection
   -> acquire logical and physical resource locks
   -> recover eligible incomplete transactions
-  -> catalog + discovery + full plan under the locks
+  -> catalog + discovery + full plan under the locks, through the same gated read-only pipeline
   -> expand or reacquire the lock set until it stabilizes
   -> repeat hard launch controls
   -> persist planned journal
   -> write-ahead apply
   -> journal active
-  -> repeat hard launch controls and Codex selected-plugin namespace checks
+  -> repeat hard launch controls in the adapter's spawn-boundary revalidation
+     of the locked snapshot and plan
   -> persist supervising intent, then shell-free child supervision
   -> after proven process-domain death: one reverse-order cleanup operation or terminal kept state
      after uncertain liveness: retain the supervising journal and every mount
 ```
+
+The spawn-boundary step is the adapter's revalidation, not a per-Agent branch in the shared
+sequencer: the default repeats the hard launch invariants, Codex additionally repeats its
+selected-plugin namespace checks, and OMP additionally rechecks the non-owned settings and
+provider discovery evidence its locked plan depends on. A failed invariant spawns no child and
+releases the active transaction through the normal evidence-checked cleanup path.
 
 Discovery can run before the lock because it independently identifies the resources that may be
 mutated. The conflict-producing plan cannot: crash residue may look like an ordinary destination

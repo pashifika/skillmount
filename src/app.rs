@@ -403,6 +403,9 @@ fn verify_spawn_boundary(
     outcome: &ReadOnlyOutcome,
     transaction: &mut Transaction,
 ) -> Result<(), AppError> {
+    // Named so a test can stall a real session in exactly the window an external writer would use:
+    // the mounts are applied and the recheck has not yet re-read the namespace.
+    crate::checkpoint::reached(crate::checkpoint::Checkpoint::SpawnBoundary, 1);
     let compatibility = adapter.validate_spawn_boundary(
         context,
         &outcome.catalog,
