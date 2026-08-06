@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::catalog::frontmatter;
 use crate::catalog::{CatalogRequest, RawCandidate};
 use crate::diagnostic::Diagnostic;
-use crate::domain::{AgentId, Skill, SkillMetadata, SkillName, ValidationLevel};
+use crate::domain::{CatalogPolicy, Skill, SkillMetadata, SkillName, ValidationLevel};
 use crate::error::{AppError, CatalogError};
 use crate::paths::{canonical_anchor, lexical_normalize};
 
@@ -21,7 +21,8 @@ pub(super) fn validate_candidate(
             reason: error.to_string(),
         })?;
 
-    if request.agent == AgentId::Codex {
+    if request.policy.requires_exact_skill_md_entry {
+        let display = request.agent.descriptor().display_name();
         let exact_entry = super::find_exact_entry(
             &candidate.origin.source_entry,
             std::ffi::OsStr::new("SKILL.md"),
@@ -32,7 +33,7 @@ pub(super) fn validate_candidate(
         })?
         .ok_or_else(|| CatalogError::InvalidSelectedSkill {
             path: candidate.origin.source_entry.clone(),
-            reason: "Codex requires an exact SKILL.md directory-entry name".to_owned(),
+            reason: format!("{display} requires an exact SKILL.md directory-entry name"),
         })?;
         if exact_entry.path() != candidate.skill_md {
             return Err(CatalogError::InvalidSelectedSkill {
@@ -51,8 +52,9 @@ pub(super) fn validate_candidate(
         if !entry_metadata.file_type().is_file() {
             return Err(CatalogError::InvalidSelectedSkill {
                 path: candidate.origin.source_entry.clone(),
-                reason: "Codex discovers only regular SKILL.md entries, not file links or other special files"
-                    .to_owned(),
+                reason: format!(
+                    "{display} discovers only regular SKILL.md entries, not file links or other special files"
+                ),
             }
             .into());
         }
@@ -97,7 +99,7 @@ pub(super) fn validate_candidate(
     let (metadata, warning) = validate_metadata(
         &candidate.skill_md,
         &mount_name,
-        request.agent,
+        request.policy,
         request.validation,
     )?;
     let mut origin = candidate.origin.clone();
@@ -193,10 +195,10 @@ fn validate_destination_cycles(
 fn validate_metadata(
     skill_md: &Path,
     mount_name: &SkillName,
-    agent: AgentId,
+    policy: CatalogPolicy,
     level: ValidationLevel,
 ) -> Result<(SkillMetadata, Option<Diagnostic>), AppError> {
-    if level == ValidationLevel::None && agent != AgentId::Codex {
+    if level == ValidationLevel::None && !policy.always_parses_metadata {
         frontmatter::readable(skill_md).map_err(|reason| CatalogError::InvalidSelectedSkill {
             path: skill_md.to_path_buf(),
             reason: format!("SKILL.md is not readable: {reason}"),
@@ -216,7 +218,7 @@ fn validate_metadata(
             reason,
         })?;
     let metadata = parsed.metadata;
-    let requires_name = level == ValidationLevel::Strict || agent == AgentId::Codex;
+    let requires_name = level == ValidationLevel::Strict || policy.requires_name;
     if requires_name && metadata.name.as_deref().is_none_or(blank) {
         return Err(CatalogError::InvalidSelectedSkill {
             path: skill_md.to_path_buf(),
@@ -224,7 +226,7 @@ fn validate_metadata(
         }
         .into());
     }
-    if metadata.description.as_deref().is_none_or(blank) {
+    if policy.requires_description && metadata.description.as_deref().is_none_or(blank) {
         return Err(CatalogError::InvalidSelectedSkill {
             path: skill_md.to_path_buf(),
             reason: "SKILL.md is missing non-empty field \"description\"".to_owned(),
@@ -232,7 +234,7 @@ fn validate_metadata(
         .into());
     }
     if let Some(name) = &metadata.name {
-        if name != mount_name.as_str() {
+        if policy.requires_matching_name && name != mount_name.as_str() {
             return Err(CatalogError::InvalidSelectedSkill {
                 path: skill_md.to_path_buf(),
                 reason: format!(

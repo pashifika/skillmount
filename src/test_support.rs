@@ -6,6 +6,30 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::domain::{AgentId, ClaudeAgent, CodexAgent, ResolvedAgent};
+
+/// Builds the resolved roots for exactly one Agent beneath a fixture root.
+///
+/// A fixture cannot describe two Agents at once, which is the point of the closed context: the
+/// unselected Agent has no roots to set and therefore nothing that could leak into the result.
+pub(crate) fn resolved_agent(agent: AgentId, root: &Path) -> ResolvedAgent {
+    let executable = PathBuf::from(agent.executable_name());
+    match agent {
+        AgentId::Codex => ResolvedAgent::Codex(CodexAgent {
+            executable,
+            user_home: root.join("home"),
+            home: root.join("codex-home"),
+            home_override: None,
+            admin_skills: Some(root.join("admin/skills")),
+        }),
+        AgentId::Claude => ResolvedAgent::Claude(ClaudeAgent {
+            executable,
+            config_dir: root.join("home/.claude"),
+            managed_skills: root.join("claude-managed/skills"),
+        }),
+    }
+}
+
 /// A temporary directory that removes itself when the test ends.
 pub(crate) struct TestDir(pub(crate) PathBuf);
 

@@ -10,7 +10,7 @@ use crate::agent::{
     inspect_scope,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::domain::{AgentId, MountMode, RunContext, SkillCatalog};
+use crate::domain::{AgentId, CatalogPolicy, MountMode, RunContext, SkillCatalog};
 use crate::error::AppError;
 use crate::lock::{LockResource, LockResourceKind};
 use crate::mount::plan::apply_conflict_policy;
@@ -400,12 +400,12 @@ fn inspect_claude_scope(
 }
 
 /// Verifies the Claude launch invariants that remain mandatory for every observed release.
-pub(crate) fn verify_launch_invariants() -> Result<(), AppError> {
+fn verify_launch_invariants() -> Result<(), AppError> {
     verify_environment()
 }
 
 /// Verifies environment switches that change the discovery model this adapter inspected.
-pub(crate) fn verify_environment() -> Result<(), AppError> {
+fn verify_environment() -> Result<(), AppError> {
     // Debug builds expose a filesystem marker so the real-process transaction suite can introduce
     // a discovery-changing control after apply. Release builds contain no such lookup.
     #[cfg(debug_assertions)]
@@ -446,7 +446,7 @@ pub(crate) fn verify_environment() -> Result<(), AppError> {
 }
 
 /// Returns the dated version evidence used by the shared advisory observer.
-pub(crate) const fn version_spec() -> VersionSpec {
+const fn version_spec() -> VersionSpec {
     CLAUDE_VERSION_SPEC
 }
 
@@ -457,12 +457,34 @@ fn env_flag_enabled(value: Option<&OsStr>) -> bool {
 }
 
 impl AgentAdapter for ClaudeAdapter {
-    fn id(&self) -> AgentId {
-        AgentId::Claude
+    fn version_spec(&self) -> VersionSpec {
+        version_spec()
     }
 
-    fn default_executable(&self) -> &'static OsStr {
-        OsStr::new("claude")
+    fn catalog_policy(&self) -> CatalogPolicy {
+        // Claude Code loads a direct `SKILL.md` entry and falls back to the directory name, so it
+        // needs neither an exact entry name nor a frontmatter name at basic validation. A present
+        // name must still address the mounted directory, and a description is still required.
+        CatalogPolicy {
+            requires_exact_skill_md_entry: false,
+            always_parses_metadata: false,
+            requires_name: false,
+            requires_description: true,
+            requires_matching_name: true,
+        }
+    }
+
+    fn destination_stores(&self, context: &RunContext) -> Vec<PathBuf> {
+        // A staging root lives under SkillMount's own state, never inside a selected source, so
+        // only an explicit project mount contributes a cycle candidate.
+        match context.options.mount_mode {
+            MountMode::Project => vec![context.project_root.join(SKILLS_SUFFIX)],
+            MountMode::Staging => Vec::new(),
+        }
+    }
+
+    fn validate_launch_invariants(&self, _context: &RunContext) -> Result<(), AppError> {
+        verify_launch_invariants()
     }
 
     fn validate_passthrough_args(&self, args: &[OsString]) -> Result<Vec<Diagnostic>, AppError> {
@@ -491,6 +513,7 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     fn inspect_discovery(&self, context: &RunContext) -> Result<DiscoverySnapshot, AppError> {
+        let claude = context.agent.claude()?;
         let (discovery_entry, backing_store, layout) = Self::destination(context)?;
         let backing_state = classify(&backing_store)?;
 
@@ -509,11 +532,11 @@ impl AgentAdapter for ClaudeAdapter {
         }
         scopes.push(inspect_claude_scope(
             ScopeKind::ClaudeManaged,
-            &context.claude_managed_skills,
+            &claude.managed_skills,
         )?);
         scopes.push(inspect_claude_scope(
             ScopeKind::ClaudeUser,
-            &context.claude_config_dir.join("skills"),
+            &claude.config_dir.join("skills"),
         )?);
         for directory in parse_add_dirs(&context.passthrough_args)? {
             let directory = crate::paths::absolute_from(&context.launch_cwd, &directory)?;
@@ -627,7 +650,7 @@ impl AgentAdapter for ClaudeAdapter {
             actions: actions.into_actions(),
             preserved,
             launch: LaunchPlan {
-                executable: context.agent_bin.clone(),
+                executable: context.executable().to_path_buf(),
                 cwd: context.launch_cwd.clone(),
                 injected_args,
                 passthrough_args: context.passthrough_args.clone(),

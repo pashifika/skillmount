@@ -202,9 +202,9 @@ conflict until recovery removes it. This ordering is the accepted decision in
 |---|---|
 | `src/cli.rs` | Shared `clap` contract and conversion into typed commands. |
 | `src/completion.rs` | Static Bash, Zsh, Fish, and PowerShell generation from the shared command graph, exact product-name binding, literal filesystem candidates, executable filtering, and cold-start opaque-passthrough guards. |
-| `src/paths.rs` | Invocation CWD, launch CWD, project root, source occurrence, and executable resolution. |
-| `src/catalog/` | No-follow source discovery, ordered overlay selection, and selected-winner validation. |
-| `src/agent/` | Codex and Claude discovery inspection, declarative plan construction, release-independent launch checks, and the shared bounded advisory version observer. |
+| `src/paths.rs` | Invocation CWD, launch CWD, project root, source occurrence, executable resolution, and construction of the one selected Agent's resolved configuration roots. |
+| `src/catalog/` | No-follow source discovery, ordered overlay selection, and selected-winner validation against declarative Agent catalog policy. |
+| `src/agent/` | The closed adapter registry, Codex and Claude discovery inspection, declarative plan construction, the read-only adapter lifecycle contract, and the shared bounded advisory version observer. |
 | `src/mount/` | Destination conflict policy and deterministic, read-only mount actions. |
 | `src/render.rs` | Read-only plans, normal/verbose session diagnostics, warnings, and reversible native-value rendering. |
 | `src/lock/` | Logical/physical resource identities and sorted operating-system advisory locks. |
@@ -214,7 +214,7 @@ conflict until recovery removes it. This ordering is the accepted decision in
 | `src/link/` | Sealed platform boundary for no-follow inspection, link creation, no-replace placement, and verified entry removal. |
 | `src/state.rs` | Computes state locations and, only after the mutation boundary, creates their requested final directories with platform-specific access restrictions. |
 | `src/native.rs` | Lossless platform-native path encoding for journals and lock keys. |
-| `src/domain.rs` | Shared values crossing the catalog, adapter, plan, lock, and transaction boundaries. |
+| `src/domain.rs` | Shared values crossing the catalog, adapter, plan, lock, and transaction boundaries, including the closed Agent identity, its stable descriptor, the typed resolved-Agent context, and declarative catalog policy. |
 | `src/error.rs` | Typed failures and stable sysexits-style wrapper categories. |
 | `src/diagnostic.rs` | Non-fatal structured observations returned by lower layers. |
 | `src/operator/` | Typed `doctor` observations, isolated capability probes, and explicit-cleanup presentation over shared lower-layer engines. |
@@ -231,6 +231,37 @@ The catalog, adapters, and mount planner describe state; they do not change it. 
 `AgentAdapter` observes agent-specific discovery and returns `DiscoverySnapshot` and `MountPlan`
 values. Discovery classification reaches the sealed link backend through `mount::resolve` for
 no-follow inspection, but the adapter never invokes a mutating platform operation.
+
+`AgentId` is the closed public CLI, catalog-attribution, diagnostic, and journal identity. One
+`AgentDescriptor` per identity is the single source of the persistent journal label, operator
+display name, default executable basename, declarative mount-mode support, and project-relative
+discovery layouts an operator command inspects; no other module restates those literals. One
+registry in `src/agent/` maps each identity to a `&'static dyn AgentAdapter` and exposes the single
+ordered supported-Agent list used by `inspect --agent=all` and normalized `doctor` iteration. The
+registry allocates nothing because every adapter is a stateless zero-sized value and the supported
+set is closed at compile time; this is not a plugin ABI.
+
+The read-only adapter contract is the only place Agent policy is expressed. Beyond discovery
+inspection and plan construction, an adapter supplies its dated last-tested version evidence, its
+declarative `CatalogPolicy`, its destination stores for source/destination cycle rejection, its
+passthrough-argument validation, its repeatable hard launch-invariant check, its catalog
+diagnostics, and its spawn-boundary revalidation over the locked snapshot and plan. Adding a
+compile-time Agent therefore requires explicit CLI and journal identity plus one registry entry, and
+must not require an Agent-specific launch, version, catalog, path-selection, `doctor`, or render
+policy branch in a shared caller.
+
+A `RunContext` carries the values every session shares plus one closed `ResolvedAgent` variant, so
+two Agents' configuration roots cannot coexist in one context. `src/paths.rs` canonicalizes the
+shared paths once, then resolves only the selected variant: it never reads, canonicalizes,
+validates, or diagnoses configuration belonging solely to an Agent this run will not launch. A
+concrete adapter handed another Agent's resolved context fails as an internal invariant, which
+normal parsing and registry lookup make unconstructable.
+
+`CatalogPolicy` may only strengthen an Agent's compatibility requirements — an exact regular
+`SKILL.md` directory entry, metadata parsed even when optional validation is disabled, a required
+frontmatter name or description, and agreement between a present name and the portable mount name.
+It cannot weaken the structural, canonicalization, destination-cycle, portable-name,
+selection-order, or no-fallback rules the catalog owns unconditionally.
 
 The version observer is a sibling of `AgentAdapter`, not a transaction participant. It may launch
 only the resolved executable with literal `--version`, null stdin, bounded captured streams, and
@@ -372,6 +403,11 @@ directory and is canonicalized relative to SkillMount's invocation CWD; the cano
 is then set explicitly for the child so `current_dir(launch_cwd)` cannot reinterpret a relative
 override. An absent, empty, or non-Unicode value is not replaced; Codex ignores it in both
 processes and uses the user-home default, which it does not require to exist before startup.
+
+`CODEX_HOME` is read only for a selected Codex command, and `CLAUDE_CONFIG_DIR` only for a selected
+Claude command. An unusable value belongs to a process the run will not launch, so it can neither
+change nor fail the other Agent's session; `doctor` still inspects each requested Agent
+independently and reports that Agent's own malformed configuration.
 
 Codex's discovery walk omits a `SKILL.md` file link even when its terminal target is a readable
 regular file. Existing scopes therefore ignore those entries, and Codex catalog validation rejects

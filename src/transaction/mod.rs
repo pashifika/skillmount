@@ -129,7 +129,7 @@ impl Transaction {
 
         let journal = TransactionJournal {
             transaction_id,
-            agent: context.agent,
+            agent: context.agent_id(),
             owner_pid: std::process::id(),
             status: TransactionStatus::Planned,
             project_root: context.project_root.clone(),

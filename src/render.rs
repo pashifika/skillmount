@@ -79,10 +79,7 @@ pub(crate) fn render_session_start(report: &ReadOnlyReport<'_>) -> String {
     let skill_count = selected.len();
     let source_count = report.context.skill_sources.len();
     let override_count = report.catalog.override_count();
-    let agent = match report.context.agent {
-        crate::domain::AgentId::Codex => "Codex",
-        crate::domain::AgentId::Claude => "Claude",
-    };
+    let agent = report.context.descriptor().display_name();
     let mut output = String::new();
     let _ = writeln!(
         output,
@@ -94,7 +91,11 @@ pub(crate) fn render_session_start(report: &ReadOnlyReport<'_>) -> String {
     for resolution in selected {
         let _ = writeln!(output, "  {}", resolution.selected.mount_name);
     }
-    let _ = writeln!(output, "Launching {}...", report.context.agent.label());
+    let _ = writeln!(
+        output,
+        "Launching {}...",
+        report.context.descriptor().label()
+    );
     output
 }
 
@@ -107,15 +108,7 @@ fn header(out: &mut String, report: &ReadOnlyReport<'_>) {
     let field = |out: &mut String, label: &str, value: &Path| {
         let _ = writeln!(out, "{label:<15} {}", path_value(value, report.verbose()));
     };
-    let _ = writeln!(
-        out,
-        "{:<15} {}",
-        "Agent:",
-        match context.agent {
-            crate::domain::AgentId::Codex => "codex",
-            crate::domain::AgentId::Claude => "claude",
-        }
-    );
+    let _ = writeln!(out, "{:<15} {}", "Agent:", context.descriptor().label());
     let evidence_note = if report.version_observation_attempted {
         "advisory evidence; bounded --version observation attempted before state access"
     } else {
@@ -125,7 +118,9 @@ fn header(out: &mut String, report: &ReadOnlyReport<'_>) {
         out,
         "{:<15} {:?} ({evidence_note})",
         "Last tested:",
-        crate::agent::version_spec(context.agent).last_tested_banner()
+        crate::agent::adapter(context.agent_id())
+            .version_spec()
+            .last_tested_banner()
     );
     field(out, "Launch CWD:", &context.launch_cwd);
     field(out, "Project root:", &context.project_root);

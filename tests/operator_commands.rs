@@ -282,6 +282,39 @@ fn enforced_launch_configuration_fails_doctor_without_suppressing_other_checks()
     );
 }
 
+/// `doctor` inspects each requested Agent independently.
+///
+/// An unusable `CODEX_HOME` is fatal for Codex and irrelevant to Claude, so it must produce exactly
+/// one failure while every Claude, layout, link, lock, and transaction finding still runs.
+#[test]
+fn one_agents_unusable_configuration_does_not_decide_the_other_agent() {
+    let fixture = Fixture::new("doctor-agent-isolation");
+    let project_before = snapshot(&fixture.project);
+
+    let output = fixture
+        .doctor_command()
+        .env("CODEX_HOME", fixture.root.join("no-such-codex-home"))
+        .output()
+        .expect("isolated-configuration doctor should run");
+
+    assert_eq!(output.status.code(), Some(65));
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("[FAIL] codex executable"), "{rendered}");
+    assert!(rendered.contains("CODEX_HOME"), "{rendered}");
+    assert!(rendered.contains("[PASS] claude executable"), "{rendered}");
+    assert!(rendered.contains("[PASS] claude discovery"), "{rendered}");
+    assert!(
+        rendered.contains("[PASS] project .claude/skills"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("1 failure"), "{rendered}");
+    assert_eq!(snapshot(&fixture.project), project_before);
+    assert!(
+        !fixture.state.exists(),
+        "doctor must not create transaction state"
+    );
+}
+
 #[test]
 fn duplicate_visible_skill_is_a_warning_without_failing_doctor() {
     let fixture = Fixture::new("doctor-warning");

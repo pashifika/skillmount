@@ -5,9 +5,7 @@ use std::fs::OpenOptions;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 
-use crate::agent::claude::ClaudeAdapter;
-use crate::agent::codex::CodexAdapter;
-use crate::agent::{AgentAdapter, DiscoverySnapshot};
+use crate::agent::{AgentAdapter, DiscoverySnapshot, adapter};
 use crate::cli::DoctorInput;
 use crate::domain::{AgentId, LinkMode, RunContext};
 use crate::error::{AppError, ExitCategory};
@@ -78,34 +76,37 @@ pub(crate) fn run(input: &DoctorInput, invocation_cwd: &Path) -> Result<CommandO
         resolve_operator_project_root(input.project_root.as_deref(), invocation_cwd)?;
     let mut findings = Vec::new();
 
-    let codex = check_agent(
-        AgentId::Codex,
-        input.codex_bin.as_deref(),
-        &project_root,
-        invocation_cwd,
-        &mut findings,
-    );
-    let claude = check_agent(
-        AgentId::Claude,
-        input.claude_bin.as_deref(),
-        &project_root,
-        invocation_cwd,
-        &mut findings,
-    );
-
-    for (label, relative) in [
-        ("project .agents/skills", ".agents/skills"),
-        ("project .codex/skills", ".codex/skills"),
-        ("project .claude/skills", ".claude/skills"),
-    ] {
-        check_layout(label, &project_root.join(relative), &mut findings);
+    // Registered order is the one deterministic report order, so adding an Agent never reorders an
+    // existing finding. Every request is independent: one Agent's failure must not suppress
+    // another Agent's, or any layout, link, lock, or transaction finding.
+    let mut contexts = Vec::new();
+    for (agent, explicit) in &input.agent_bins {
+        contexts.push((
+            *agent,
+            check_agent(
+                *agent,
+                explicit.as_deref(),
+                &project_root,
+                invocation_cwd,
+                &mut findings,
+            ),
+        ));
     }
 
-    if let Some(context) = codex.as_ref() {
-        check_discovery(context, &CodexAdapter, &mut findings);
+    for agent in AgentId::ALL {
+        for relative in agent.descriptor().project_layout_paths() {
+            check_layout(
+                &format!("project {relative}"),
+                &project_root.join(relative),
+                &mut findings,
+            );
+        }
     }
-    if let Some(context) = claude.as_ref() {
-        check_discovery(context, &ClaudeAdapter, &mut findings);
+
+    for (agent, context) in &contexts {
+        if let Some(context) = context.as_ref() {
+            check_discovery(context, adapter(*agent), &mut findings);
+        }
     }
     check_link_capabilities(&mut findings);
     check_transactions(&mut findings);
@@ -480,6 +481,7 @@ fn check_agent(
     invocation_cwd: &Path,
     findings: &mut Vec<DoctorFinding>,
 ) -> Option<RunContext> {
+    let adapter = adapter(agent);
     let component = format!("{} executable", agent.label());
     let context = match resolve_operator_context(agent, project_root, explicit, invocation_cwd) {
         Ok(context) => context,
@@ -496,26 +498,22 @@ fn check_agent(
         }
     };
 
-    let invariant = match agent {
-        AgentId::Codex => crate::agent::codex::verify_launch_invariants(&context),
-        AgentId::Claude => crate::agent::claude::verify_launch_invariants(),
-    };
-    if let Err(error) = invariant {
+    if let Err(error) = adapter.validate_launch_invariants(&context) {
         findings.push(DoctorFinding::new(
             FindingSeverity::Failure,
             component,
             format!(
                 "{}: {error}; correct the enforced launch configuration before starting a mounted session",
-                path_value(&context.agent_bin, true)
+                path_value(context.executable(), true)
             ),
         ));
         return Some(context);
     }
 
     let observation = crate::agent::version::observe(
-        &context.agent_bin,
+        context.executable(),
         &context.invocation_cwd,
-        crate::agent::version_spec(agent),
+        adapter.version_spec(),
     );
     let severity = match observation.kind() {
         crate::agent::version::VersionEvidenceKind::LastTested => FindingSeverity::Pass,
@@ -525,7 +523,7 @@ fn check_agent(
     findings.push(DoctorFinding::new(
         severity,
         component,
-        observation.doctor_detail(&context.agent_bin),
+        observation.doctor_detail(context.executable()),
     ));
     Some(context)
 }
@@ -580,7 +578,7 @@ fn check_discovery(
     adapter: &dyn AgentAdapter,
     findings: &mut Vec<DoctorFinding>,
 ) {
-    let component = format!("{} discovery", context.agent.label());
+    let component = format!("{} discovery", context.agent_id().label());
     match adapter.inspect_discovery(context) {
         Ok(snapshot) => {
             findings.push(DoctorFinding::new(
@@ -596,10 +594,10 @@ fn check_discovery(
             check_resource_locks(&component, &snapshot, findings);
             findings.push(DoctorFinding::new(
                 FindingSeverity::Unverified,
-                format!("{} live compatibility", context.agent.label()),
+                format!("{} live compatibility", context.agent_id().label()),
                 format!(
                     "filesystem inspection does not prove that an authenticated {} process loads mounted Skills; run the live-agent smoke workflow and record the result in docs/compatibility.md",
-                    context.agent.label()
+                    context.agent_id().label()
                 ),
             ));
         }

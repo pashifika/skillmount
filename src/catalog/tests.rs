@@ -67,6 +67,7 @@ fn resolve(
         &occurrences(paths),
         &CatalogRequest {
             agent,
+            policy: crate::agent::adapter(agent).catalog_policy(),
             validation,
             destination_stores: &[],
         },
@@ -402,6 +403,79 @@ fn validation_levels_follow_adapter_metadata_rules() {
     );
 }
 
+/// Pins the complete metadata outcome matrix the declarative catalog policy must reproduce.
+///
+/// Codex needs a matching frontmatter name and description at every level because its injected
+/// enable rule addresses that exact logical name. Claude falls back to the directory name, so a
+/// missing name is fine at basic validation, and disabling optional validation stops at a
+/// readability check.
+#[test]
+fn declarative_catalog_policy_reproduces_every_agent_metadata_outcome() {
+    let fixture = TestDir::new("policy-matrix");
+    let cases: &[(&str, &str)] = &[
+        (
+            "complete",
+            "---\nname: complete\ndescription: complete description\n---\nbody\n",
+        ),
+        ("no-name", "---\ndescription: nameless\n---\nbody\n"),
+        (
+            "blank-name",
+            "---\nname: \"   \"\ndescription: blank name\n---\nbody\n",
+        ),
+        (
+            "mismatched",
+            "---\nname: other\ndescription: mismatched name\n---\nbody\n",
+        ),
+        ("no-description", "---\nname: no-description\n---\nbody\n"),
+        (
+            "blank-description",
+            "---\nname: blank-description\ndescription: \"  \"\n---\nbody\n",
+        ),
+    ];
+    let paths = cases
+        .iter()
+        .map(|(name, contents)| (*name, skill_with(&fixture.0, name, contents)))
+        .collect::<BTreeMap<_, _>>();
+
+    // Accepted, per case, in the order Codex none/basic/strict then Claude none/basic/strict.
+    let matrix: &[(&str, [bool; 6])] = &[
+        ("complete", [true, true, true, true, true, true]),
+        ("no-name", [false, false, false, true, true, false]),
+        ("blank-name", [false, false, false, true, false, false]),
+        ("mismatched", [false, false, false, true, false, false]),
+        ("no-description", [false, false, false, true, false, false]),
+        (
+            "blank-description",
+            [false, false, false, true, false, false],
+        ),
+    ];
+    let requests = [AgentId::Codex, AgentId::Claude]
+        .into_iter()
+        .flat_map(|agent| {
+            [
+                ValidationLevel::None,
+                ValidationLevel::Basic,
+                ValidationLevel::Strict,
+            ]
+            .map(move |level| (agent, level))
+        });
+
+    for (case, accepted) in matrix {
+        let path = paths[case].clone();
+        for ((agent, level), accepted) in requests.clone().zip(*accepted) {
+            let result = resolve(std::slice::from_ref(&path), agent, level);
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "{case} under {agent:?}/{level:?}: {result:?}"
+            );
+            if let Err(error) = result {
+                assert_eq!(error.category(), ExitCategory::Data, "{case}");
+            }
+        }
+    }
+}
+
 #[test]
 fn metadata_none_never_disables_safe_name_or_regular_skill_checks() {
     let fixture = TestDir::new("always-on");
@@ -647,6 +721,7 @@ fn source_destination_overlap_is_rejected() {
         &occurrences(std::slice::from_ref(&catalog)),
         &CatalogRequest {
             agent: AgentId::Codex,
+            policy: crate::agent::adapter(AgentId::Codex).catalog_policy(),
             validation: ValidationLevel::Basic,
             destination_stores: &[destination],
         },
