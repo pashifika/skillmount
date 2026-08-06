@@ -121,7 +121,30 @@ Concretely, for the `omp` command in `src/agent/omp/`:
   smoke run records it.
 - External writers do not honour SkillMount locks. Lock stabilization plus a pre-spawn recheck of
   non-owned settings and provider evidence narrows the final read-to-start race but cannot remove it,
-  and the adapter never compensates by overriding configuration.
+  and the adapter never compensates by overriding configuration. The pre-spawn recheck covers three
+  distinct classes, because the non-owned comparison alone cannot see all of them: non-owned
+  namespace drift through the fingerprint, a configuration edit that would hide a selected Skill
+  through a re-run visibility gate, and a retargeted destination through each owned entry still
+  resolving to the source the plan recorded.
+- A read-only run enforces the same launch invariants as a mutating one. `--dry-run` describes the
+  session the mutating run would start, so an invariant that refuses the session refuses the
+  description; otherwise the plan would describe a namespace no child would load.
+- The `claude-plugins` provider root is whatever `installPath` an `installed_plugins.json` entry
+  names, and one of the three registries OMP consults lives inside the project. OMP validates only
+  that the value is a non-empty string, so a repository can name any absolute path that SkillMount
+  then inspects, reports, and locks. SkillMount reproduces that domain rather than narrowing it,
+  because narrowing would under-report a pre-existing Skill and let a mount silently shadow it; the
+  value is lexically normalized so containment checks compare like with like, and no path outside the
+  `<launch-cwd>/.omp` destination is ever mutated.
+- Every comparison against the user home normalizes both operands the way OMP normalizes them -
+  resolve, then realpath, then a case fold on Windows. Comparing a canonicalized launch CWD against
+  the raw `HOME`/`USERPROFILE` value would leave the `--allow-home` consent gate inert on Windows,
+  where canonicalization yields a verbatim path prefix, and defeated anywhere the home directory is
+  reached through a symbolic link.
+- Untrusted arrays and registries are bounded: the total provider-root count, the per-registry install
+  path count, and each settings string array. OMP is unbounded there, but an untrusted document would
+  otherwise decide how much work planning does. Crossing a bound fails closed with the same
+  incomplete-inventory reason a too-large Skill root uses.
 
 ## Verification
 

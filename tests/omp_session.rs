@@ -769,6 +769,70 @@ fn a_staging_mount_mode_is_incompatible_with_omp() {
     );
 }
 
+/// The guard has to survive a `$HOME` that names the launch CWD only after resolution.
+///
+/// OMP compares `normalizePathForComparison` of both sides (`startup-cwd.ts:16-20`), which resolves
+/// through `fs.realpathSync`, so it escapes the home directory here. Comparing `SkillMount`'s
+/// canonical launch CWD against the raw environment value would not match, the consent gate would
+/// never fire, and the session would mount into the user's home scope for a child that immediately
+/// moves away from it.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_home_still_needs_omps_own_allow_home() {
+    let fixture = Fixture::new("home-escape-link");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+    let linked_home = fixture.root.join("home-link");
+    std::os::unix::fs::symlink(&fixture.home, &linked_home).expect("home symlink fixture");
+
+    let rejected = fixture
+        .wrapper_command(&fixture.home)
+        .env("HOME", &linked_home)
+        .env("USERPROFILE", &linked_home)
+        .arg("--")
+        .arg("prompt")
+        .output()
+        .expect("asm should refuse a home launch CWD reached through a link");
+
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert_eq!(rejected.status.code(), Some(64), "{stderr}");
+    assert!(stderr.contains("--allow-home"), "{stderr}");
+    assert!(
+        !exists(&fixture.home.join(".omp")),
+        "no project directory is created"
+    );
+    assert!(!fixture.state.exists(), "no state directory is created");
+    assert!(!fixture.record.exists(), "no child is launched");
+}
+
+/// A dry run must refuse what the mutating run refuses, rather than describe it.
+///
+/// `--dry-run` prints the plan the session would apply. Printing a plan for a namespace the child
+/// relocates away from before loading any Skill would be a confident description of something that
+/// never happens.
+#[test]
+fn a_dry_run_in_the_home_directory_is_refused_like_a_session() {
+    let fixture = Fixture::new("home-escape-dry-run");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+
+    let rejected = fixture
+        .wrapper_command(&fixture.home)
+        .arg("--dry-run")
+        .arg("--")
+        .arg("prompt")
+        .output()
+        .expect("asm should refuse a home launch CWD on the read-only path too");
+
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert_eq!(rejected.status.code(), Some(64), "{stderr}");
+    assert!(stderr.contains("--allow-home"), "{stderr}");
+    assert!(
+        !exists(&fixture.home.join(".omp")),
+        "a refused dry run creates nothing"
+    );
+    assert!(!fixture.state.exists(), "no state directory is created");
+    assert!(!fixture.version_record.exists(), "no version is probed");
+}
+
 #[test]
 fn a_home_launch_cwd_needs_omps_own_allow_home_passthrough() {
     let fixture = Fixture::new("home-escape");

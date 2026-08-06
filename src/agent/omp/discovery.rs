@@ -28,6 +28,14 @@ const MAX_SKILL_MD_BYTES: u64 = 256 * 1024;
 /// OMP itself is unbounded here. A bound keeps planning finite without changing any outcome for a
 /// root of realistic size, and crossing it fails closed rather than truncating the inventory.
 const MAX_ROOT_ENTRIES: usize = 20_000;
+/// Maximum provider roots inspected in one session.
+///
+/// The registered providers and the ancestor walk are bounded by path depth, but
+/// `skills.customDirectories` and the extension registries are arrays in untrusted documents, so
+/// their length would otherwise decide how much work planning does. Each root costs a `classify`, a
+/// `read_dir`, a retained scope, and a lock resource, and the whole fan-out is paid once per
+/// inspection. Crossing the bound fails closed for the same reason [`MAX_ROOT_ENTRIES`] does.
+const MAX_PROVIDER_ROOTS: usize = 4_096;
 
 /// One OMP provider root, in the order OMP scans it.
 struct ProviderRoot {
@@ -40,14 +48,29 @@ struct ProviderRoot {
 }
 
 /// Everything one OMP inspection observed.
+///
+/// The merged settings are deliberately absent. Building a plan from them would mix this
+/// observation with the one whose lock set was verified, so a caller that needs them reads them
+/// separately through [`load_settings`].
 pub(super) struct Inspection {
     pub(super) scopes: Vec<DiscoveryScope>,
     pub(super) destination: PathBuf,
     pub(super) destination_state: ResolvedEntry,
-    pub(super) missing_directories: Vec<PathBuf>,
     pub(super) lock_resources: Vec<LockResource>,
     pub(super) warnings: Vec<Diagnostic>,
-    pub(super) settings: SkillSettings,
+}
+
+/// Loads only the Skill-affecting OMP settings, without scanning any provider root.
+///
+/// The visibility gate needs the merged settings but not the namespace, and every settings input is
+/// inside the session's lock set, so this reads far less than a full [`inspect`].
+///
+/// # Errors
+///
+/// Returns an error when a settings layer cannot be read or is malformed.
+pub(super) fn load_settings(context: &RunContext) -> Result<SkillSettings, AppError> {
+    let omp = context.agent.omp()?;
+    settings::load(&omp.agent_dir, &context.launch_cwd)
 }
 
 /// Inspects the complete effective OMP Skill namespace without modifying any of it.
@@ -104,7 +127,6 @@ pub(super) fn inspect(context: &RunContext) -> Result<Inspection, AppError> {
         scopes.push(scope);
     }
 
-    let missing_directories = missing_destination_chain(&context.launch_cwd, &destination_state);
     let lock_resources = lock_resources(
         context,
         &destination,
@@ -123,10 +145,8 @@ pub(super) fn inspect(context: &RunContext) -> Result<Inspection, AppError> {
         scopes,
         destination,
         destination_state,
-        missing_directories,
         lock_resources,
         warnings,
-        settings,
     })
 }
 
@@ -253,6 +273,15 @@ fn provider_roots(
         });
     }
 
+    if roots.len() > MAX_PROVIDER_ROOTS {
+        return Err(AppError::MissingInput {
+            path: context.launch_cwd.clone(),
+            reason: format!(
+                "OMP configuration names more than {MAX_PROVIDER_ROOTS} Skill roots, so this \
+                 release cannot prove a complete conflict inventory"
+            ),
+        });
+    }
     Ok(roots)
 }
 
@@ -645,9 +674,15 @@ fn directory_name(path: &Path) -> OsString {
 }
 
 /// Returns the missing `.omp` and `skills` directories a plan must create, outermost first.
-fn missing_destination_chain(launch_cwd: &Path, destination_state: &ResolvedEntry) -> Vec<PathBuf> {
+///
+/// The destination kind is taken as a value rather than read again, so a caller holding a snapshot
+/// builds the chain from that same observation instead of a fresh one.
+pub(super) fn missing_destination_chain(
+    launch_cwd: &Path,
+    destination_kind: PathKind,
+) -> Vec<PathBuf> {
     if matches!(
-        destination_state.kind,
+        destination_kind,
         PathKind::Directory | PathKind::DirectoryLink
     ) {
         return Vec::new();

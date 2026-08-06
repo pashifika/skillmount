@@ -11,6 +11,7 @@ mod plugins;
 mod settings;
 
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::agent::version::VersionSpec;
@@ -18,6 +19,7 @@ use crate::agent::{AgentAdapter, DiscoverySnapshot, discovery_indexes};
 use crate::diagnostic::Diagnostic;
 use crate::domain::{AgentId, CatalogPolicy, RunContext, SkillCatalog};
 use crate::error::{AppError, CatalogError};
+use crate::link::resolve::ComparablePath;
 use crate::mount::plan::apply_conflict_policy;
 use crate::mount::{
     ActionSequence, DiscoveryPlan, LaunchPlan, MountAction, MountPlan, PathPrecondition,
@@ -80,9 +82,18 @@ fn verify_environment() -> Result<(), AppError> {
 ///
 /// Without it OMP changes directory into a temporary directory before it loads any Skill, so the
 /// plan would describe a namespace the child never reads.
+///
+/// Both operands are normalized the way OMP normalizes them. `startup-cwd.ts:16-20` compares
+/// `normalizePathForComparison` of both sides, which is `path.resolve` then `fs.realpathSync` then
+/// a lowercase fold on Windows (`dirs.ts:149-161`). `launch_cwd` is already canonical, but
+/// `user_home` is the raw environment value, so comparing them directly would miss the guard
+/// entirely on Windows - where canonicalization yields the verbatim `\\?\C:\...` prefix that never
+/// equals `C:\...` - and on any platform where the home directory is reached through a symlink.
+/// A match on either the raw or the resolved form fails closed, because OMP's escape only has to
+/// agree once.
 fn verify_home_escape(context: &RunContext, allows_home: bool) -> Result<(), AppError> {
     let omp = context.agent.omp()?;
-    if allows_home || context.launch_cwd != omp.user_home {
+    if allows_home || !names_launch_cwd(&context.launch_cwd, &omp.user_home) {
         return Ok(());
     }
     Err(AppError::Usage(format!(
@@ -91,6 +102,22 @@ fn verify_home_escape(context: &RunContext, allows_home: bool) -> Result<(), App
          Pass --allow-home through to OMP, or start the session in a project directory",
         omp.user_home.display()
     )))
+}
+
+/// Returns whether `home` names the launch CWD, under OMP's own comparison rules.
+///
+/// `ComparablePath` folds the Windows namespace prefix, the case difference OMP's lowercase fold
+/// absorbs, and lexical `.`/`..` components. The extra `canonicalize` pass adds the `realpathSync`
+/// step, which is what makes a symlinked home directory compare equal. Canonicalization failure is
+/// not fatal: the raw comparison already ran, and a home directory that cannot be resolved cannot
+/// be the canonical launch CWD either.
+fn names_launch_cwd(launch_cwd: &Path, home: &Path) -> bool {
+    let launch = ComparablePath::new(launch_cwd);
+    if launch.names_same_path(&ComparablePath::new(home)) {
+        return true;
+    }
+    fs::canonicalize(home)
+        .is_ok_and(|resolved| launch.names_same_path(&ComparablePath::new(&resolved)))
 }
 
 /// Refuses to plan against OMP global state whose effective settings are not yet in a YAML file.
@@ -181,15 +208,20 @@ impl AgentAdapter for OmpAdapter {
         catalog: &SkillCatalog,
         discovery: &DiscoverySnapshot,
     ) -> Result<MountPlan, AppError> {
-        let inspection = discovery::inspect(context)?;
-        verify_selected_visibility(catalog, &inspection.settings, context)?;
+        // The plan is derived from `discovery` alone. That snapshot is the one observation whose
+        // `lock_resources` the stabilization loop verified are held, so re-inspecting the namespace
+        // here and planning from the result could mount into a root this run holds no lock on, and
+        // could take conflict decisions from a different filesystem observation than the directory
+        // chain. Only the settings are re-read, because the visibility gate needs them and every
+        // settings input is already inside the held lock set.
+        verify_selected_visibility(catalog, &discovery::load_settings(context)?, context)?;
         let mut actions = ActionSequence::default();
         // Dependency order: the `.omp` scope, then its `skills` directory, then Skills.
-        for directory in &inspection.missing_directories {
+        for directory in
+            discovery::missing_destination_chain(&context.launch_cwd, discovery.backing_store_state)
+        {
             actions.push(
-                MountAction::CreateDirectory {
-                    path: directory.clone(),
-                },
+                MountAction::CreateDirectory { path: directory },
                 PathPrecondition::Missing,
             );
         }
@@ -220,13 +252,50 @@ impl AgentAdapter for OmpAdapter {
     fn validate_spawn_boundary(
         &self,
         context: &RunContext,
-        _catalog: &SkillCatalog,
+        catalog: &SkillCatalog,
         discovery: &DiscoverySnapshot,
         plan: &MountPlan,
     ) -> Result<(), AppError> {
         verify_launch_invariants(context)?;
+        // Re-read the settings rather than trust the pre-apply read. A configuration edit that
+        // hides a selected Skill leaves the non-owned namespace byte-identical, so the fingerprint
+        // below cannot see it, and launching would produce exactly the silent success
+        // `verify_selected_visibility` exists to prevent.
+        verify_selected_visibility(catalog, &discovery::load_settings(context)?, context)?;
+        verify_owned_entries_resolve(plan)?;
         verify_non_owned_evidence(context, discovery, plan)
     }
+}
+
+/// Requires every mount link this run created to still resolve to the source the plan recorded.
+///
+/// The non-owned fingerprint cannot cover this. Its owned-entry filter matches on the visible
+/// destination path, so an entry planted at a planned path is excluded from the comparison exactly
+/// as the genuine mount would be - which is what a retargeted `.omp/skills` produces. Comparing the
+/// resolved terminal against the planned source instead is decisive: after a retarget the
+/// destination resolves into a tree the plan never named, and no child is spawned.
+fn verify_owned_entries_resolve(plan: &MountPlan) -> Result<(), AppError> {
+    for action in &plan.actions {
+        let MountAction::CreateDirectoryLink {
+            source,
+            destination,
+            ..
+        } = &action.operation
+        else {
+            continue;
+        };
+        let resolved = crate::mount::resolve::classify(destination)?;
+        let terminal = resolved.terminal.as_deref();
+        if terminal != Some(source.as_path()) {
+            return Err(AppError::Temporary(format!(
+                "the OMP mount at {} no longer resolves to the Skill this run linked, so the child \
+                 would load a Skill SkillMount did not select; nothing was launched and the \
+                 transaction was released",
+                destination.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Rechecks the non-owned part of the inspected namespace immediately before spawn.

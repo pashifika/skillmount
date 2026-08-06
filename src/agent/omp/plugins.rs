@@ -13,6 +13,12 @@ use crate::error::AppError;
 use crate::mount::resolve::{PathKind, classify};
 use crate::paths::OMP_CONFIG_DIR_NAME;
 
+/// Maximum install paths admitted from one plugin registry.
+///
+/// OMP is unbounded here, but the project-level registry lives inside the repository, so its length
+/// would otherwise decide how many roots `SkillMount` classifies, reads, reports, and locks.
+const MAX_REGISTRY_ROOTS: usize = 1_024;
+
 /// One package root whose sibling `skills/` an OMP provider scans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PluginSkillRoot {
@@ -371,6 +377,7 @@ fn registry_entries(
     };
 
     let mut roots = Vec::new();
+    let mut seen = BTreeSet::new();
     for (id, entries) in plugins {
         let Some(entries) = entries.as_array() else {
             continue;
@@ -393,11 +400,12 @@ fn registry_entries(
             // under-report one, which would let a mount silently shadow it.
             let scoped_project = project_level
                 || entry.get("scope").and_then(serde_json::Value::as_str) == Some("local");
-            let path = PathBuf::from(install_path);
-            if roots
-                .iter()
-                .any(|root: &MarketplaceRoot| root.id == *id && root.path == path)
-            {
+            // OMP joins this value with `path.join`, which folds `.` and `..`, so the stored form
+            // has to be normalized too. Leaving it raw would make the containment check below
+            // compare a normalized child against an unnormalized root and silently drop every
+            // manifest-declared directory.
+            let path = crate::paths::lexical_normalize(Path::new(install_path));
+            if !seen.insert((id.clone(), path.clone())) {
                 continue;
             }
             roots.push(MarketplaceRoot {
@@ -407,6 +415,15 @@ fn registry_entries(
                 project_level: scoped_project,
             });
         }
+    }
+    if roots.len() > MAX_REGISTRY_ROOTS {
+        return Err(AppError::MissingInput {
+            path: path.to_path_buf(),
+            reason: format!(
+                "OMP plugin registry names more than {MAX_REGISTRY_ROOTS} install paths, so this \
+                 release cannot prove a complete conflict inventory"
+            ),
+        });
     }
     Ok(roots)
 }

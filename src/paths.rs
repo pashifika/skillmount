@@ -125,7 +125,7 @@ fn resolve_agent(
             // so the adapter rejects `OMP_PROFILE` and `PI_PROFILE` as a hard launch invariant
             // before any SkillMount state is read; these roots are never used in that case.
             let config_root = user_home.join(omp_config_dir_name());
-            let agent_dir = omp_agent_dir(&config_root);
+            let agent_dir = omp_agent_dir(&config_root, config_cwd);
             let plugins_dir = omp_plugins_dir(&config_root, &agent_dir);
             Ok(ResolvedAgent::Omp(OmpAgent {
                 executable: executable()?,
@@ -150,28 +150,43 @@ fn omp_config_dir_name() -> OsString {
 
 /// Mirrors OMP's agent-directory resolution for the default profile.
 ///
-/// `PI_CODING_AGENT_DIR` is applied exactly as OMP applies it: absolute-resolved against the
-/// process CWD with no tilde expansion, so a literal `~/...` value stays relative like it does
-/// there.
-fn omp_agent_dir(config_root: &Path) -> PathBuf {
-    match std::env::var_os("PI_CODING_AGENT_DIR").filter(|value| !value.is_empty()) {
-        Some(value) => lexical_normalize(&std::path::absolute(value).unwrap_or_default()),
-        None => config_root.join("agent"),
+/// `PI_CODING_AGENT_DIR` is applied exactly as OMP applies it: `dirs.ts:246` runs `path.resolve` on
+/// the value with no tilde expansion, so a literal `~/...` value stays relative like it does there.
+/// The base is the child's own process CWD, which is `launch_cwd` - not `SkillMount`'s invocation
+/// directory. `--cwd` can move them apart, and resolving against the wrong one would inspect a
+/// different `<agentDir>/skills`, `managed-skills`, `config.yml`, and `settings.json` than the
+/// child reads.
+///
+/// Joining onto the already-absolute `launch_cwd` cannot fail, so no fallible resolution against
+/// the ambient process CWD is needed - and none is used, because defaulting on failure would
+/// silently make every user-scope OMP root relative to wherever `SkillMount` happened to run.
+fn omp_agent_dir(config_root: &Path, launch_cwd: &Path) -> PathBuf {
+    let Some(value) = std::env::var_os("PI_CODING_AGENT_DIR").filter(|value| !value.is_empty())
+    else {
+        return config_root.join("agent");
+    };
+    let requested = PathBuf::from(value);
+    if requested.is_absolute() {
+        lexical_normalize(&requested)
+    } else {
+        lexical_normalize(&launch_cwd.join(requested))
     }
 }
 
 /// Mirrors OMP's user extension-package root.
 ///
 /// The XDG data base is consulted only on the platforms OMP consults it on, only while the agent
-/// directory is still the default, and only when the target already exists — OMP's own existence
-/// gate. Nothing about this root affects a Skill scope; it only decides where enabled packages are
+/// directory is still the default, and only when the target already exists. `dirs.ts:277` gates on
+/// `fs.existsSync`, not on the entry being a directory, so this reproduces existence exactly:
+/// requiring a directory would send `SkillMount` to the fallback root while OMP used the XDG one.
+/// Nothing about this root affects a Skill scope; it only decides where enabled packages are
 /// enumerated from.
 fn omp_plugins_dir(config_root: &Path, agent_dir: &Path) -> PathBuf {
     let default_agent_dir = config_root.join("agent");
     if cfg!(any(target_os = "linux", target_os = "macos")) && agent_dir == default_agent_dir {
         if let Some(base) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
             let app_root = PathBuf::from(base).join(OMP_APP_NAME);
-            if app_root.is_dir() {
+            if app_root.exists() {
                 return app_root.join("plugins");
             }
         }

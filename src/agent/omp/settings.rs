@@ -7,7 +7,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, CatalogError};
@@ -18,6 +17,8 @@ use crate::mount::resolve::{PathKind, classify};
 /// A settings file is hand-written configuration. A larger input is refused rather than streamed,
 /// so a hostile or corrupt file cannot make planning unbounded.
 const MAX_SETTINGS_BYTES: u64 = 1 << 20;
+/// Maximum entries read from one untrusted string array.
+const MAX_LIST_ENTRIES: usize = 1_024;
 
 /// The two global configuration filenames OMP tries, first existing wins.
 const MAIN_CONFIG_FILENAMES: [&str; 2] = ["config.yml", "config.yaml"];
@@ -72,6 +73,27 @@ impl Value {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    /// Reads a string array, refusing one longer than this release will process.
+    ///
+    /// OMP itself is unbounded here, but every entry is either a Skill root to scan or a glob
+    /// matched against every discovered name, so an untrusted document would otherwise decide the
+    /// cost of planning. Crossing the bound fails closed rather than truncating, because a
+    /// truncated filter list would model a namespace OMP does not have.
+    fn bounded_strings_at(&self, path: &str) -> Result<Vec<String>, AppError> {
+        let values = self.strings_at(path);
+        if values.len() > MAX_LIST_ENTRIES {
+            return Err(AppError::MissingInput {
+                path: PathBuf::from(path),
+                reason: format!(
+                    "OMP setting {path} names {} entries, which exceeds the \
+                     {MAX_LIST_ENTRIES}-entry inspection bound",
+                    values.len()
+                ),
+            });
+        }
+        Ok(values)
     }
 }
 
@@ -202,7 +224,7 @@ pub(super) fn load(agent_dir: &Path, launch_cwd: &Path) -> Result<SkillSettings,
         merge(&mut merged, value);
     }
 
-    Ok(project(&merged, inputs))
+    project(&merged, inputs)
 }
 
 /// Loads the first existing global configuration file, exactly as OMP picks it.
@@ -248,11 +270,18 @@ fn load_project(launch_cwd: &Path) -> Result<Vec<(PathBuf, Value)>, AppError> {
     Ok(layers)
 }
 
-/// Reads one bounded, no-follow settings or manifest input.
+/// Reads one bounded settings or manifest input without blocking on a FIFO or device.
 ///
-/// A link chain into the file is refused rather than followed, and a file larger than the
-/// inspection bound is refused rather than streamed, so a hostile or corrupt input cannot make
-/// planning unbounded.
+/// A file larger than the inspection bound is refused rather than streamed, so a hostile or corrupt
+/// input cannot make planning unbounded.
+///
+/// A symbolic link to a regular file is followed, because OMP's own loader follows it and a
+/// dotfile-managed `config.yml` is an ordinary setup; refusing it would fail sessions OMP serves.
+/// What is refused is anything that is not a regular file once opened. `classify` cannot decide
+/// that on its own - it folds a regular file, a FIFO, a socket, and a device into one
+/// [`PathKind::NotDirectory`] state - so the read goes through the same helper the `SKILL.md` path
+/// uses: `O_NONBLOCK` on Unix, and a regular-file check *after* opening, which also closes the
+/// window a path swapped after `classify` would otherwise leave.
 pub(super) fn read_regular(path: &Path) -> Result<Option<String>, AppError> {
     let resolved = classify(path)?;
     match resolved.kind {
@@ -269,39 +298,19 @@ pub(super) fn read_regular(path: &Path) -> Result<Option<String>, AppError> {
         }
     }
 
-    let file = fs::File::open(path).map_err(|error| AppError::MissingInput {
+    let bytes = crate::catalog::frontmatter::read_bounded_regular_file(
+        path,
+        "OMP settings input",
+        MAX_SETTINGS_BYTES,
+    )
+    .map_err(|reason| AppError::MissingInput {
         path: path.to_path_buf(),
-        reason: format!("cannot open OMP settings input: {error}"),
+        reason,
     })?;
-    let metadata = file.metadata().map_err(|error| AppError::MissingInput {
+    let text = String::from_utf8(bytes).map_err(|_| AppError::MissingInput {
         path: path.to_path_buf(),
-        reason: format!("cannot inspect OMP settings input: {error}"),
+        reason: "OMP settings input is not valid UTF-8".to_owned(),
     })?;
-    if !metadata.is_file() {
-        return Err(AppError::MissingInput {
-            path: path.to_path_buf(),
-            reason: "OMP settings input stopped being a regular file while it was opened"
-                .to_owned(),
-        });
-    }
-    if metadata.len() > MAX_SETTINGS_BYTES {
-        return Err(AppError::MissingInput {
-            path: path.to_path_buf(),
-            reason: format!(
-                "OMP settings input is {} bytes, which exceeds the {MAX_SETTINGS_BYTES}-byte \
-                 inspection bound",
-                metadata.len()
-            ),
-        });
-    }
-
-    let mut text = String::new();
-    file.take(MAX_SETTINGS_BYTES)
-        .read_to_string(&mut text)
-        .map_err(|error| AppError::MissingInput {
-            path: path.to_path_buf(),
-            reason: format!("cannot read OMP settings input: {error}"),
-        })?;
     Ok(Some(text))
 }
 
@@ -400,7 +409,12 @@ fn from_toml(value: toml::Value) -> Value {
 }
 
 /// Projects the merged tree onto the fields that decide Skill visibility.
-fn project(merged: &Value, inputs: Vec<PathBuf>) -> SkillSettings {
+///
+/// # Errors
+///
+/// Returns [`AppError::MissingInput`] when an untrusted array names more entries than this release
+/// will match against, so a 1 MiB document cannot decide how much work planning does.
+fn project(merged: &Value, inputs: Vec<PathBuf>) -> Result<SkillSettings, AppError> {
     let mut settings = SkillSettings {
         inputs,
         ..SkillSettings::default()
@@ -413,15 +427,15 @@ fn project(merged: &Value, inputs: Vec<PathBuf>) -> SkillSettings {
             settings.toggles.insert((*key).to_owned(), value);
         }
     }
-    settings.custom_directories = merged.strings_at("skills.customDirectories");
-    settings.ignored_skills = merged.strings_at("skills.ignoredSkills");
-    settings.include_skills = merged.strings_at("skills.includeSkills");
+    settings.custom_directories = merged.bounded_strings_at("skills.customDirectories")?;
+    settings.ignored_skills = merged.bounded_strings_at("skills.ignoredSkills")?;
+    settings.include_skills = merged.bounded_strings_at("skills.includeSkills")?;
     settings.disabled_skills = merged
-        .strings_at("disabledExtensions")
+        .bounded_strings_at("disabledExtensions")?
         .into_iter()
         .filter_map(|entry| entry.strip_prefix("skill:").map(str::to_owned))
         .collect();
-    settings
+    Ok(settings)
 }
 
 impl SkillSettings {

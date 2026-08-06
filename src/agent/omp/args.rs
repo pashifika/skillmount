@@ -350,11 +350,14 @@ fn known_flag(argument: &OsStr) -> Option<(&'static str, Arity)> {
 
 /// Returns whether OMP's tokenizer would treat this token as a flag rather than a positional.
 ///
+/// The predicate is exactly OMP's: `cli-commands.ts:272` scans for the first token that does not
+/// start with `-` and only that token becomes the subcommand candidate. A bare `-` therefore has to
+/// count as flag-shaped, or the token after it silently escapes the command check.
+///
 /// Only the leading ASCII byte is inspected. `OsStr::as_encoded_bytes` is an ASCII-compatible
 /// superset of UTF-8 on both supported platforms, so this is exact for `-` without decoding.
 fn is_flag_shaped(argument: &OsStr) -> bool {
-    let bytes = argument.as_encoded_bytes();
-    bytes.first() == Some(&b'-') && bytes.len() > 1
+    argument.as_encoded_bytes().first() == Some(&b'-')
 }
 
 fn reject_flag(name: &str) -> Result<(), AppError> {
@@ -523,6 +526,24 @@ mod tests {
             let message = rejected(&[command]);
             assert!(message.contains("does not start a supervised"), "{message}");
         }
+    }
+
+    #[test]
+    fn a_bare_dash_does_not_consume_the_command_position() {
+        // `cli-commands.ts:272` skips every token starting with `-`, so OMP still reads `acp` as
+        // the subcommand here. Treating `-` as a positional would close the gate one token early
+        // and launch the protocol server SkillMount believes it rejected.
+        let message = rejected(&["-", "acp"]);
+        assert!(message.contains("does not start a supervised"), "{message}");
+
+        // A required value consumes any successor, `-` included (`flag-tables.ts:352-354`), so the
+        // command candidate is still the token after it.
+        let message = rejected(&["--model", "-", "acp"]);
+        assert!(message.contains("does not start a supervised"), "{message}");
+
+        // A leading `-` before an ordinary prompt stays accepted: it is an unknown flag to both
+        // OMP and SkillMount, and the prompt after it is not a command.
+        assert!(validate(&args(&["-", "hello"])).is_ok());
     }
 
     #[test]
