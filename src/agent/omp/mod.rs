@@ -10,14 +10,15 @@ mod discovery;
 mod plugins;
 mod settings;
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::agent::version::VersionSpec;
-use crate::agent::{AgentAdapter, DiscoverySnapshot, discovery_indexes};
+use crate::agent::{AgentAdapter, DiscoverySnapshot, VisibleSkill, discovery_indexes};
 use crate::diagnostic::Diagnostic;
-use crate::domain::{AgentId, CatalogPolicy, RunContext, SkillCatalog};
+use crate::domain::{AgentId, CatalogPolicy, RunContext, SkillCatalog, SkillNameKey};
 use crate::error::{AppError, CatalogError};
 use crate::link::resolve::ComparablePath;
 use crate::mount::plan::apply_conflict_policy;
@@ -122,10 +123,18 @@ fn names_launch_cwd(launch_cwd: &Path, home: &Path) -> bool {
 
 /// Refuses to plan against OMP global state whose effective settings are not yet in a YAML file.
 ///
-/// OMP migrates a legacy `settings.json` and the `settings` table of `agent.db` into `config.yml`
-/// on its next persisting start. Until then the values it will use are visible in no YAML file, so
-/// reading an empty configuration would silently model the wrong namespace. The database is never
-/// opened.
+/// OMP migrates a legacy `settings.json` into `config.yml` on its next persisting start. Until
+/// then the values it will use are visible in no YAML file, so reading an empty configuration
+/// would silently model the wrong namespace.
+///
+/// `agent.db` is deliberately *not* a trigger. Its mere existence is not evidence of unmigrated
+/// settings: `AgentStorage.getSettings` returns null for an empty `settings` table
+/// (`session/agent-storage.ts:415-418`), so `#migrateFromLegacy` leaves `migrated` false and
+/// `config.yml` is never written (`config/settings.ts:1323`). Every OMP start creates `agent.db`
+/// for sessions and usage, and 17.2.9 has no live write path into that table - the only two
+/// `INSERT INTO settings` sites are schema migrations moving pre-existing rows. Treating the file
+/// as a trigger therefore refused every install that had simply never customized a global setting,
+/// and the refusal was permanent because no OMP run could clear it. The database is never opened.
 fn verify_settled_configuration(context: &RunContext) -> Result<(), AppError> {
     let omp = context.agent.omp()?;
     if ["config.yml", "config.yaml"]
@@ -134,16 +143,14 @@ fn verify_settled_configuration(context: &RunContext) -> Result<(), AppError> {
     {
         return Ok(());
     }
-    for legacy in ["settings.json", "agent.db"] {
-        let path = omp.agent_dir.join(legacy);
-        if path.exists() {
-            return Err(AppError::Usage(format!(
-                "OMP has not yet migrated {} into config.yml, so the Skill settings it will use are \
-                 not visible in any configuration file and SkillMount cannot prove the selected \
-                 Skills stay visible; run omp once directly to settle that state, then retry",
-                path.display()
-            )));
-        }
+    let legacy = omp.agent_dir.join("settings.json");
+    if legacy.exists() {
+        return Err(AppError::Usage(format!(
+            "OMP has not yet migrated {} into config.yml, so the Skill settings it will use are \
+             not visible in any configuration file and SkillMount cannot prove the selected \
+             Skills stay visible; run omp once directly to settle that state, then retry",
+            legacy.display()
+        )));
     }
     Ok(())
 }
@@ -315,12 +322,12 @@ fn verify_non_owned_evidence(
     plan: &MountPlan,
 ) -> Result<(), AppError> {
     let owned = owned_destination_entries(plan);
-    let before = non_owned_fingerprint(discovery, &owned, &discovery.backing_store);
+    let before = non_owned_evidence(&discovery.visible_skills, &owned);
     let rebuilt = discovery::inspect(context)?;
     let (visible, _) = discovery_indexes(&rebuilt.scopes, &rebuilt.destination);
-    let after = non_owned_fingerprint_from_parts(&visible, &rebuilt, &owned);
+    let after = non_owned_evidence(&visible, &owned);
 
-    if before == after {
+    if before == after && discovery.backing_store == rebuilt.destination {
         return Ok(());
     }
     Err(AppError::Temporary(
@@ -355,6 +362,17 @@ fn verify_selected_visibility(
                 .to_owned(),
         ));
     }
+    // `disabledProviders` drops the provider from OMP's capability registry before any root is
+    // scanned, so the destination becomes unreadable while every per-level toggle still reads as
+    // enabled. Naming it explicitly keeps the diagnostic honest about which setting is at fault.
+    if settings.provider_disabled("native") {
+        return Err(reject(
+            "OMP setting disabledProviders lists the native provider, which serves the project \
+             scope this session mounts into, so a mounted Skill would never be loaded; remove it \
+             in OMP or run the agent directly"
+                .to_owned(),
+        ));
+    }
     // The destination is the project level of OMP's own `native` provider.
     if !settings.source_enabled("native", true) {
         return Err(reject(
@@ -377,80 +395,43 @@ fn verify_selected_visibility(
 }
 
 /// Returns the destination entry paths this plan owns.
+///
+/// Only link destinations qualify. The plan's `CreateDirectory` actions are the `.omp` and
+/// `.omp/skills` containers, never Skill entries — but `claude-plugins` roots are scanned with
+/// `includes_self`, so a registry naming the destination directory can turn it into a visible
+/// entry. Excluding a container from the recheck would hide exactly that entry.
 fn owned_destination_entries(plan: &MountPlan) -> Vec<PathBuf> {
     plan.actions
         .iter()
         .filter_map(|action| match &action.operation {
             MountAction::CreateDirectoryLink { destination, .. } => Some(destination.clone()),
-            MountAction::CreateDirectory { path } => Some(path.clone()),
-            MountAction::ReuseExistingLink { .. } => None,
+            MountAction::CreateDirectory { .. } | MountAction::ReuseExistingLink { .. } => None,
         })
         .collect()
 }
 
-/// Builds a bounded, deterministic description of every non-owned observation.
-fn non_owned_fingerprint(
-    discovery: &DiscoverySnapshot,
+/// Returns every non-owned observation, keyed and ordered for an exact structural comparison.
+///
+/// The values are compared as [`OsStr`]-backed structures rather than rendered into one delimited
+/// string. `Path::display` substitutes U+FFFD for every non-Unicode byte, so two different
+/// symlink targets could render identically, and U+001F is itself a legal byte in a filename and
+/// in a frontmatter name, so no delimiter could separate the fields safely either. Both defects
+/// made the recheck return "unchanged" for a namespace an external writer had moved.
+fn non_owned_evidence(
+    visible: &BTreeMap<SkillNameKey, Vec<VisibleSkill>>,
     owned: &[PathBuf],
-    destination: &Path,
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    for (key, occupants) in &discovery.visible_skills {
-        for occupant in occupants {
-            if owned.contains(&occupant.skill.entry) {
-                continue;
-            }
-            lines.push(format!(
-                "{}\u{1f}{}\u{1f}{}\u{1f}{}",
-                key,
-                occupant.scope.label(),
-                occupant.skill.entry.display(),
-                occupant
-                    .skill
-                    .source_canonical
-                    .as_ref()
-                    .map_or_else(String::new, |path| path.display().to_string())
-            ));
-        }
-    }
-    lines.push(format!("destination\u{1f}{}", destination.display()));
-    lines.sort();
-    lines
-}
-
-fn non_owned_fingerprint_from_parts(
-    visible: &std::collections::BTreeMap<
-        crate::domain::SkillNameKey,
-        Vec<crate::agent::VisibleSkill>,
-    >,
-    rebuilt: &discovery::Inspection,
-    owned: &[PathBuf],
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    for (key, occupants) in visible {
-        for occupant in occupants {
-            if owned.contains(&occupant.skill.entry) {
-                continue;
-            }
-            lines.push(format!(
-                "{}\u{1f}{}\u{1f}{}\u{1f}{}",
-                key,
-                occupant.scope.label(),
-                occupant.skill.entry.display(),
-                occupant
-                    .skill
-                    .source_canonical
-                    .as_ref()
-                    .map_or_else(String::new, |path| path.display().to_string())
-            ));
-        }
-    }
-    lines.push(format!(
-        "destination\u{1f}{}",
-        rebuilt.destination.display()
-    ));
-    lines.sort();
-    lines
+) -> BTreeMap<SkillNameKey, Vec<VisibleSkill>> {
+    visible
+        .iter()
+        .filter_map(|(key, occupants)| {
+            let retained = occupants
+                .iter()
+                .filter(|occupant| !owned.contains(&occupant.skill.entry))
+                .cloned()
+                .collect::<Vec<_>>();
+            (!retained.is_empty()).then(|| (key.clone(), retained))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -495,6 +476,75 @@ mod tests {
         assert!(
             !descriptor.supports_explicit_mount_mode(crate::domain::MountMode::Staging),
             "OMP has no isolated staging namespace"
+        );
+    }
+
+    #[test]
+    fn non_owned_evidence_separates_paths_a_lossy_render_would_merge() {
+        use crate::agent::{ExistingSkill, ScopeKind, VisibleSkill};
+        use crate::domain::SkillNameKey;
+        use crate::mount::resolve::PathKind;
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        // Two distinct byte sequences that `Path::display` renders identically: every invalid
+        // UTF-8 byte becomes U+FFFD, so a delimited `Display` string could not tell a retargeted
+        // symlink from the original.
+        let target = |byte: u8| -> PathBuf {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+                PathBuf::from(std::ffi::OsString::from_vec(
+                    [b"/tmp/z/".as_slice(), &[byte], b"/s".as_slice()].concat(),
+                ))
+            }
+            #[cfg(not(unix))]
+            {
+                PathBuf::from(format!("C:/tmp/z/{byte}/s"))
+            }
+        };
+        #[cfg(unix)]
+        assert_eq!(
+            target(0x80).display().to_string(),
+            target(0x81).display().to_string(),
+            "the two targets must be indistinguishable once rendered"
+        );
+
+        let visible = |canonical: PathBuf| {
+            let key = SkillNameKey::new(std::ffi::OsStr::new("tool"));
+            let mut map = BTreeMap::new();
+            map.insert(
+                key.clone(),
+                vec![VisibleSkill {
+                    scope: ScopeKind::OmpCompatibility,
+                    skill: ExistingSkill {
+                        comparison_key: key,
+                        raw_name: "tool".into(),
+                        entry: PathBuf::from("/p/.claude/skills/tool"),
+                        kind: PathKind::DirectoryLink,
+                        source_canonical: Some(canonical),
+                    },
+                }],
+            );
+            map
+        };
+
+        let before = super::non_owned_evidence(&visible(target(0x80)), &[]);
+        let after = super::non_owned_evidence(&visible(target(0x81)), &[]);
+        assert_ne!(
+            before, after,
+            "a retargeted non-owned entry must be observable before spawn"
+        );
+        assert_eq!(
+            before,
+            super::non_owned_evidence(&visible(target(0x80)), &[])
+        );
+
+        // An owned destination entry is the one authorized difference and drops out entirely.
+        let owned = [PathBuf::from("/p/.claude/skills/tool")];
+        assert!(
+            super::non_owned_evidence(&visible(target(0x80)), &owned).is_empty(),
+            "an owned entry must not contribute evidence"
         );
     }
 }

@@ -226,6 +226,31 @@ fn an_unsettled_omp_configuration_fails_only_the_omp_finding() {
     assert!(!fixture.state.exists());
 }
 
+/// An `agent.db` with no `config.yml` is OMP's ordinary steady state, not unmigrated settings.
+///
+/// Every OMP start creates `agent.db` for sessions and usage, and 17.2.9 writes settings only to
+/// `config.yml`: `AgentStorage.getSettings` returns null for an empty `settings` table, so
+/// `#migrateFromLegacy` never writes the YAML file. Treating the database as evidence of pending
+/// migration refused every install that had simply never customized a global setting, and no OMP
+/// run could clear the refusal.
+#[test]
+fn an_omp_database_without_a_config_file_is_not_an_unsettled_configuration() {
+    let fixture = Fixture::new("doctor-omp-database-only");
+    let agent_dir = fixture.home.join(".omp/agent");
+    fs::create_dir_all(&agent_dir).expect("OMP agent directory");
+    fs::write(agent_dir.join("agent.db"), b"SQLite format 3\0").expect("OMP session database");
+
+    let output = fixture.doctor();
+
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !rendered.contains("has not yet migrated"),
+        "an OMP database alone must not refuse the session: {rendered}"
+    );
+    assert!(rendered.contains("[PASS] omp discovery"), "{rendered}");
+    assert_eq!(output.status.code(), Some(0));
+}
+
 #[test]
 fn a_drifted_omp_banner_is_unverified_without_failing_doctor() {
     let fixture = Fixture::new("doctor-omp-drift");

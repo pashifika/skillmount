@@ -24,7 +24,7 @@ Three facts from that review force decisions rather than merely informing them:
   makes an already-running process reload a temporary Skill root and later prove it released it.
 - The highest-priority provider, `native` at priority 100, scans `<cwd>/.omp/skills` first and admits
   a symlinked entry as a first-class discovery entry
-  (`packages/coding-agent/src/discovery/helpers.ts:416-419`). A directory link is therefore loadable
+  (`packages/coding-agent/src/discovery/helpers.ts:418-420`). A directory link is therefore loadable
   without transforming any Skill.
 - Several root flags silently move the ground the plan stands on. `--cwd` chdirs; the home escape
   chdirs into `/tmp` on its own when the launch cwd is the user home; `--profile` relocates the whole

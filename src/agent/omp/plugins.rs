@@ -19,6 +19,19 @@ use crate::paths::OMP_CONFIG_DIR_NAME;
 /// would otherwise decide how many roots `SkillMount` classifies, reads, reports, and locks.
 const MAX_REGISTRY_ROOTS: usize = 1_024;
 
+/// Upper bound on the Skill directories one plugin manifest may declare.
+///
+/// The manifest is attacker-authored and [`MAX_REGISTRY_ROOTS`] distinct plugin ids may all name
+/// the same `installPath`, so an unbounded `skills` array is multiplied by the registry fan-out.
+/// The total bound in `discovery::provider_roots` is enforced only after every root exists, which
+/// is too late to stop the allocation, so each manifest is bounded where it is parsed.
+const MAX_MANIFEST_SKILL_DIRS: usize = 256;
+
+/// Upper bound on the package-backed roots one run may accumulate across every registry.
+///
+/// Fails closed with the same incomplete-inventory reason before the roots reach discovery.
+const MAX_PACKAGE_ROOTS: usize = 4_096;
+
 /// One package root whose sibling `skills/` an OMP provider scans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PluginSkillRoot {
@@ -77,6 +90,11 @@ pub(super) fn resolve(
         excluded.insert(canonical_identity(&root.path));
         for skills_dir in claude_skills_dirs(root, &mut roots.inputs)? {
             roots.claude.push(skills_dir);
+            // Bound while accumulating, not after: the registry fan-out multiplies each
+            // manifest's declarations, so a check that runs once at the end allocates first.
+            if roots.claude.len() > MAX_PACKAGE_ROOTS {
+                return Err(too_many_package_roots(&root.path));
+            }
         }
     }
 
@@ -92,8 +110,22 @@ pub(super) fn resolve(
     )? {
         push_omp_root(&mut roots.omp, &mut seen, &excluded, installed)?;
     }
+    if roots.omp.len() > MAX_PACKAGE_ROOTS {
+        return Err(too_many_package_roots(user_plugins_dir));
+    }
 
     Ok(roots)
+}
+
+/// The shared incomplete-inventory refusal for a package-root bound.
+fn too_many_package_roots(path: &Path) -> AppError {
+    AppError::MissingInput {
+        path: path.to_path_buf(),
+        reason: format!(
+            "OMP plugin packages declare more than {MAX_PACKAGE_ROOTS} Skill roots, so this \
+             release cannot prove a complete conflict inventory"
+        ),
+    }
 }
 
 /// Adds one `omp-plugins` root, keeping OMP's first-seen-wins and marketplace-exclusion rules.
@@ -372,6 +404,16 @@ fn registry_entries(
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Ok(Vec::new());
     };
+    // `parseClaudePluginsRegistry` discards the whole document unless `version` is a JSON number
+    // (`discovery/helpers.ts:798-804`). Accepting a registry OMP rejects is not a harmless
+    // over-read: a non-empty project registry drops every user root sharing a plugin id, so the
+    // user's real roots would vanish from the inventory while OMP still loads them.
+    if !value
+        .get("version")
+        .is_some_and(serde_json::Value::is_number)
+    {
+        return Ok(Vec::new());
+    }
     let Some(plugins) = value.get("plugins").and_then(|value| value.as_object()) else {
         return Ok(Vec::new());
     };
@@ -444,6 +486,16 @@ fn claude_skills_dirs(
                     configured.push(entry.trim().to_owned());
                 }
                 Some(serde_json::Value::Array(entries)) => {
+                    if entries.len() > MAX_MANIFEST_SKILL_DIRS {
+                        return Err(AppError::MissingInput {
+                            path: root.path.join(".claude-plugin/plugin.json"),
+                            reason: format!(
+                                "OMP plugin manifest declares more than \
+                                 {MAX_MANIFEST_SKILL_DIRS} Skill directories, so this release \
+                                 cannot prove a complete conflict inventory"
+                            ),
+                        });
+                    }
                     for entry in entries {
                         if let Some(entry) = entry.as_str() {
                             if !entry.trim().is_empty() {
@@ -699,7 +751,7 @@ mod tests {
         write(
             &fixture.plugins_dir.join("installed_plugins.json"),
             &format!(
-                "{{\"plugins\":{{\"demo@shop\":[{{\"installPath\":{:?},\"enabled\":true}}]}}}}",
+                "{{\"version\":1,\"plugins\":{{\"demo@shop\":[{{\"installPath\":{:?},\"enabled\":true}}]}}}}",
                 cache.to_string_lossy()
             ),
         );
@@ -729,12 +781,83 @@ mod tests {
         write(
             &fixture.plugins_dir.join("installed_plugins.json"),
             &format!(
-                "{{\"plugins\":{{\"demo@shop\":[{{\"installPath\":{:?},\"enabled\":false}}]}}}}",
+                "{{\"version\":1,\"plugins\":{{\"demo@shop\":[{{\"installPath\":{:?},\"enabled\":false}}]}}}}",
                 cache.to_string_lossy()
             ),
         );
 
         assert!(fixture.resolve().expect("roots resolve").claude.is_empty());
+    }
+
+    #[test]
+    fn a_registry_without_a_numeric_version_contributes_nothing() {
+        // `parseClaudePluginsRegistry` discards the whole document unless `version` is a JSON
+        // number (`discovery/helpers.ts:798-804`). Reading one OMP rejects would let an in-repo
+        // registry delete the operator's real user-scope roots from the inventory, because a
+        // non-empty project registry shadows every user root sharing a plugin id.
+        let fixture = Fixture::new("omp-plugins-registry-version");
+        let cache = fixture
+            .plugins_dir
+            .join("cache/plugins/shop___demo___1.0.0");
+        fs::create_dir_all(cache.join("skills")).expect("cached plugin");
+        for registry in [
+            "{{\"plugins\":{{\"demo@shop\":[{{\"installPath\":{:?},\"enabled\":true}}]}}}}",
+            "{{\"version\":\"1\",\"plugins\":{{\"demo@shop\":[{{\"installPath\":{:?},\"enabled\":true}}]}}}}",
+        ] {
+            write(
+                &fixture.plugins_dir.join("installed_plugins.json"),
+                &registry.replace("{:?}", &format!("{:?}", cache.to_string_lossy())),
+            );
+            assert!(
+                fixture.resolve().expect("roots resolve").claude.is_empty(),
+                "a registry OMP discards must contribute nothing: {registry}"
+            );
+        }
+
+        write(
+            &fixture.plugins_dir.join("installed_plugins.json"),
+            &format!(
+                "{{\"version\":1,\"plugins\":{{\"demo@shop\":[{{\"installPath\":{:?},\"enabled\":true}}]}}}}",
+                cache.to_string_lossy()
+            ),
+        );
+        assert_eq!(fixture.resolve().expect("roots resolve").claude.len(), 1);
+    }
+
+    #[test]
+    fn an_oversized_manifest_skills_array_fails_closed() {
+        // The manifest is attacker-authored and the registry admits many ids naming one install
+        // path, so an unbounded array is multiplied by that fan-out. Bounding it only after every
+        // root exists would allocate first, which is what the total provider-root bound does.
+        let fixture = Fixture::new("omp-plugins-manifest-bound");
+        let cache = fixture
+            .plugins_dir
+            .join("cache/plugins/shop___demo___1.0.0");
+        fs::create_dir_all(cache.join("skills")).expect("cached plugin");
+        let entries = (0..=super::MAX_MANIFEST_SKILL_DIRS)
+            .map(|index| format!("\"./d{index}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        write(
+            &cache.join(".claude-plugin/plugin.json"),
+            &format!("{{\"name\":\"demo\",\"skills\":[{entries}]}}"),
+        );
+        write(
+            &fixture.plugins_dir.join("installed_plugins.json"),
+            &format!(
+                "{{\"version\":1,\"plugins\":{{\"demo@shop\":[{{\"installPath\":{:?},\"enabled\":true}}]}}}}",
+                cache.to_string_lossy()
+            ),
+        );
+
+        let error = fixture
+            .resolve()
+            .expect_err("an unbounded manifest must fail closed");
+        assert_eq!(error.category(), ExitCategory::MissingInput);
+        assert!(
+            format!("{error}").contains("complete conflict inventory"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -751,7 +874,7 @@ mod tests {
         write(
             &fixture.plugins_dir.join("installed_plugins.json"),
             &format!(
-                "{{\"plugins\":{{\"demo@shop\":[{{\"installPath\":{:?}}}]}}}}",
+                "{{\"version\":1,\"plugins\":{{\"demo@shop\":[{{\"installPath\":{:?}}}]}}}}",
                 cache.to_string_lossy()
             ),
         );

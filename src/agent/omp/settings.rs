@@ -161,6 +161,14 @@ pub(super) struct SkillSettings {
     pub(super) include_skills: Vec<String>,
     /// Skill names disabled through the top-level `disabledExtensions` list.
     pub(super) disabled_skills: Vec<String>,
+    /// Provider ids removed by the top-level `disabledProviders` list.
+    ///
+    /// OMP loads this into the capability registry before any Skill root is scanned
+    /// (`capability/index.ts:285-289`), and `filterProviders` then drops every provider whose id
+    /// it names (`capability/index.ts:239`). Because `<launch-cwd>/.omp/skills` is served only by
+    /// `native`, listing that id makes the mount destination unreadable while every other check
+    /// still passes.
+    pub(super) disabled_providers: Vec<String>,
     /// Every settings input that existed and contributed, in load order.
     pub(super) inputs: Vec<PathBuf>,
 }
@@ -179,6 +187,7 @@ impl Default for SkillSettings {
             ignored_skills: Vec::new(),
             include_skills: Vec::new(),
             disabled_skills: Vec::new(),
+            disabled_providers: Vec::new(),
             inputs: Vec::new(),
         }
     }
@@ -435,6 +444,7 @@ fn project(merged: &Value, inputs: Vec<PathBuf>) -> Result<SkillSettings, AppErr
         .into_iter()
         .filter_map(|entry| entry.strip_prefix("skill:").map(str::to_owned))
         .collect();
+    settings.disabled_providers = merged.bounded_strings_at("disabledProviders")?;
     Ok(settings)
 }
 
@@ -445,8 +455,17 @@ impl SkillSettings {
 
     /// Returns whether a `(provider, level)` pair is enabled, exactly as OMP decides it.
     pub(super) fn source_enabled(&self, provider: &str, project_level: bool) -> bool {
+        // `disabledProviders` removes the provider from the registry before any scan, so it
+        // outranks every per-level toggle.
+        if self.provider_disabled(provider) {
+            return false;
+        }
         match (provider, project_level) {
-            ("omp-managed", _) => true,
+            // `omp-managed` has no toggle, and `skills.customDirectories` is scanned outside the
+            // provider registry altogether, so OMP never applies a source toggle to either
+            // (`extensibility/skills.ts:266-271` filters a custom directory only on disabled names
+            // and the ignore/include patterns).
+            ("omp-managed" | "custom", _) => true,
             ("codex", false) => self.toggle("enableCodexUser"),
             ("claude", false) => self.toggle("enableClaudeUser"),
             ("claude", true) => self.toggle("enableClaudeProject"),
@@ -457,6 +476,17 @@ impl SkillSettings {
             // A provider with no dedicated toggle is enabled when any third-party toggle is on.
             _ => THIRD_PARTY_TOGGLE_KEYS.iter().any(|key| self.toggle(key)),
         }
+    }
+
+    /// Returns whether `disabledProviders` removes this provider id from OMP's registry.
+    ///
+    /// `custom` is not a provider id, so the list can never reach a custom directory.
+    pub(super) fn provider_disabled(&self, provider: &str) -> bool {
+        provider != "custom"
+            && self
+                .disabled_providers
+                .iter()
+                .any(|entry| entry == provider)
     }
 
     /// Returns whether a Skill name survives every configured filter.
@@ -783,6 +813,60 @@ mod tests {
             settings.source_enabled("omp-managed", false),
             "managed Skills have no toggle"
         );
+    }
+
+    #[test]
+    fn disabled_providers_outranks_every_source_toggle() {
+        // OMP drops a listed provider from the capability registry before any root is scanned
+        // (`capability/index.ts:239,285-289`), so `native` being listed makes the mount
+        // destination unreadable while `enablePiProject` still reads as true.
+        let mut settings = SkillSettings {
+            disabled_providers: vec!["native".to_owned()],
+            ..SkillSettings::default()
+        };
+        assert!(settings.provider_disabled("native"));
+        assert!(!settings.source_enabled("native", true));
+        assert!(!settings.source_enabled("native", false));
+        assert!(
+            settings.source_enabled("claude", true),
+            "an unlisted provider keeps its own toggle"
+        );
+
+        // `custom` is not a provider id, so the list can never reach a custom directory.
+        settings.disabled_providers = vec!["custom".to_owned()];
+        assert!(!settings.provider_disabled("custom"));
+        assert!(settings.source_enabled("custom", false));
+    }
+
+    #[test]
+    fn a_custom_directory_is_not_gated_by_a_source_toggle() {
+        // `skills.customDirectories` is scanned outside the provider registry, so OMP never
+        // applies `isSourceEnabled` to it (`extensibility/skills.ts:266-271`). Folding it into the
+        // third-party fallback hid every custom Skill from `inspect` for the natural
+        // "only my own curated directory" configuration.
+        let mut settings = SkillSettings::default();
+        for key in super::TOGGLE_KEYS {
+            settings.toggles.insert((*key).to_owned(), false);
+        }
+        assert!(
+            settings.source_enabled("custom", false),
+            "a disabled provider set must not hide a custom directory"
+        );
+        assert!(!settings.source_enabled("github", false));
+    }
+
+    #[test]
+    fn disabled_providers_is_read_from_the_merged_top_level_key() {
+        let fixture = TestDir::new("omp-settings-disabled-providers");
+        let agent_dir = fixture.0.join("agent");
+        write(
+            &agent_dir.join("config.yml"),
+            "disabledProviders: [\"native\"]\nskills:\n  enabled: true\n",
+        );
+
+        let settings = load(&agent_dir, &fixture.0.join("project")).expect("global loads");
+        assert_eq!(settings.disabled_providers, ["native"]);
+        assert!(!settings.source_enabled("native", true));
     }
 
     #[test]

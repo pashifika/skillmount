@@ -112,14 +112,25 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError
         ParsedCommand::Inspect(input) => {
             let mut rendered = String::new();
             let mut warnings = Vec::new();
+            // Every request is independent, exactly as `doctor` treats its Agents: one Agent's
+            // refusal must not discard the reports the others already produced. Widening the
+            // default selection to every Agent otherwise let a single Agent-specific environment
+            // gate - OMP's `OMP_PROFILE`/`PI_PROFILE`/`PI_CONFIG_FILES` rejection - blank the
+            // whole report for Codex and Claude too.
+            let mut failures = Vec::new();
             for agent in inspected_agents(input.agent) {
-                let context = resolve_inspection(
-                    agent,
-                    &input.skills_dirs,
-                    input.validation,
-                    invocation_cwd,
-                )?;
-                let report = plan_inspection(&context)?;
+                let report =
+                    resolve_inspection(agent, &input.skills_dirs, input.validation, invocation_cwd)
+                        .and_then(|context| {
+                            plan_inspection(&context).map(|report| (context, report))
+                        });
+                let (context, report) = match report {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        failures.push((agent, error));
+                        continue;
+                    }
+                };
                 if !rendered.is_empty() {
                     rendered.push('\n');
                 }
@@ -133,9 +144,26 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError
                 }));
                 warnings.extend(render::render_warnings(&report.catalog, &report.snapshot));
             }
+            // Nothing was reportable, so the refusal is the whole result and keeps its own message
+            // and exit category rather than being restated as a warning about a missing section.
+            let Some(first) = failures.first().map(|(_, error)| error.category().code()) else {
+                emit(&rendered)?;
+                warn(&warnings);
+                return Ok(0);
+            };
+            if rendered.is_empty() {
+                let (_, error) = failures.remove(0);
+                return Err(error);
+            }
+            for (agent, error) in &failures {
+                warnings.push(format!(
+                    "{} inspection was skipped: {error}",
+                    agent.descriptor().display_name()
+                ));
+            }
             emit(&rendered)?;
             warn(&warnings);
-            Ok(0)
+            Ok(first)
         }
         ParsedCommand::Doctor(input) => {
             let outcome = crate::operator::doctor::run(&input, invocation_cwd)?;

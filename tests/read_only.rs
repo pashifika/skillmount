@@ -1851,6 +1851,42 @@ fn omp_refuses_its_root_relocating_environment_on_every_read_only_path() {
     }
 }
 
+/// One Agent's refusal must not discard the reports the other Agents already produced.
+///
+/// The default `inspect` selection is every Agent, and OMP is the only one with an environment
+/// gate inside its discovery. Propagating that refusal blanked the Codex and Claude sections too,
+/// so an operator who simply exports `OMP_PROFILE` lost the whole diagnostic.
+#[test]
+fn one_agents_inspect_refusal_keeps_the_other_agents_reports() {
+    let fixture = Fixture::new("inspect-agent-isolation");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    for variable in ["OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_FILES"] {
+        let output = fixture
+            .command(["inspect", "--skills-dir", &sources].as_slice())
+            .env(variable, "relocated")
+            .output()
+            .expect("asm should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(stdout.contains("Agent:          codex"), "{stdout}");
+        assert!(stdout.contains("Agent:          claude"), "{stdout}");
+        assert!(
+            !stdout.contains("Agent:          omp"),
+            "the refusing Agent must not be reported: {stdout}"
+        );
+        assert!(
+            stderr.contains("OMP inspection was skipped") && stderr.contains(variable),
+            "the refusal must still be named: {stderr}"
+        );
+        // The refusal keeps its own exit category, so a script still sees the failure.
+        assert_eq!(output.status.code(), Some(64), "{stderr}");
+        assert_no_omp_residue(&fixture);
+    }
+}
+
 #[test]
 fn a_corrupt_omp_global_configuration_is_a_data_error_that_changes_nothing() {
     let fixture = Fixture::new("omp-corrupt-global-config");
