@@ -25,6 +25,11 @@ green CI job.
 | Codex CLI | 0.146.0 | Windows / i686 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-03 | unverified | No native live-agent run recorded |
 | Claude Code | 2.1.220 | Windows / x86_64 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through the injected staging root | 2026-08-03 | unverified | No native live-agent run recorded |
 | Claude Code | 2.1.220 | Windows / i686 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through the injected staging root | 2026-08-03 | unverified | No native live-agent run recorded |
+| OMP | 17.2.9 | macOS / Apple Silicon | n/a | `omp --version` reports the adapter's last-tested banner | 2026-08-06 | observed | Local command output from the Homebrew-installed binary: `omp/17.2.9`; contract read from source tag `v17.2.9`, commit `f7f8e040ee04710414fbd775431091fa301b9786` |
+| OMP | 17.2.9 | macOS / Apple Silicon | directory symlink | Deterministic fake-agent read-only, session, and transaction suites reproduce the recorded 17.2.9 contract | 2026-08-06 | pass | Deterministic fake-agent suites in this checkout; no live OMP process ran |
+| OMP | 17.2.9 | macOS / Apple Silicon | directory symlink | Rightmost overlay and non-shadowed base Skills are discoverable in a real authenticated session | 2026-08-06 | unverified | Live smoke has not run |
+| OMP | 17.2.9 | Windows / x86_64 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-06 | unverified | No native live-agent run recorded; the opt-in smoke has not run against the published `omp-windows-x64.exe` |
+| OMP | 17.2.9 | Windows / i686 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-06 | unverified | OMP publishes no 32-bit Windows asset for 17.2.9, so no native run is possible for this version; a missing asset, not a failed scenario |
 
 ## Documentation review
 
@@ -61,6 +66,20 @@ The 2026-08-05 implementation review observed `codex-cli 0.146.0` and
 No authenticated mounted-session smoke ran during that review. Deterministic fake-agent tests are
 the release gate and no live compatibility row was promoted.
 
+The 2026-08-06 OMP review read the tagged source rather than documentation: `oh-my-pi` tag
+`v17.2.9`, commit `f7f8e040ee04710414fbd775431091fa301b9786`, with the installed Homebrew binary
+reporting `omp/17.2.9`.
+[ADR 0034](adr/0034-pin-the-omp-session-discovery-contract.md) pins the recorded discovery and
+launch contract. The GitHub release for the tag publishes `omp-darwin-arm64`, `omp-darwin-x64`,
+`omp-linux-arm64`, `omp-linux-x64`, `omp-linux-musl-arm64`, `omp-linux-musl-x64`, and
+`omp-windows-x64.exe`; there is no 32-bit Windows asset, and 17.2.9 publishes no `SHA256SUMS.txt`
+— that file first appears at 17.2.10 — so this exact release cannot be integrity-locked from a
+published digest file. Windows x86 OMP evidence is therefore permanently unavailable for this
+version, while every other native OMP cell — macOS Apple Silicon and Windows x64 junction loading
+included — is `unverified` only because the opt-in native smoke has not run, not because the
+platform is unsupported. No authenticated OMP session ran during this review and no live OMP row
+was promoted; the deterministic fake-agent suites in this checkout remain the release gate.
+
 The documentation does not establish real Windows junction discovery for any listed
 Agent/platform combination. Those rows remain `unverified` until the manual smoke workflow records
 a native run.
@@ -92,6 +111,9 @@ lacks passing live junction evidence in the matrix. The adapter's last-tested ba
 context, not proof that the junction was exercised. The warning is a compatibility boundary, not a
 cleanup warning: transaction-owned junctions still use the same journal, lock, and verified-removal
 path.
+For OMP, 17.2.9 publishes a 64-bit Windows binary but no 32-bit one: the x64 junction combination
+stays `unverified` until the opt-in native smoke records it, and no 17.2.9 junction evidence can
+ever exist on Windows x86.
 Operators who prefer fail-closed capability behavior can pass `--link-mode=symlink`; SkillMount
 does not request elevation or change Windows privilege policy.
 

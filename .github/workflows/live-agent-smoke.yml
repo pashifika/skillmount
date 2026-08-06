@@ -12,6 +12,14 @@ on:
           - all
           - macos-arm64
           - windows
+      include_omp:
+        description: >-
+          Also exercise the opt-in OMP case. OMP 17.2.9 publishes no SHA256SUMS.txt, so its release
+          asset is recorded by observed sha256 instead of being integrity-locked, and it publishes
+          no 32-bit asset, so the Windows x86 leg reports the case as unknown.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -35,6 +43,19 @@ jobs:
           python3 .github/scripts/prepare_live_agents.py
           --platform macos-arm64
           --output-dir "${{ runner.temp }}/live-agents"
+      - name: Fetch the opt-in OMP release asset
+        if: ${{ inputs.include_omp }}
+        env:
+          OMP_TAG: v17.2.9
+          OMP_ASSET: omp-darwin-arm64
+        run: |
+          # Unlike the npm-packaged agents, this tag has no published SHA256SUMS.txt, so there is no
+          # digest to lock against: the smoke records the sha256 it observes as evidence instead.
+          mkdir -p "${{ runner.temp }}/live-agents/omp"
+          curl -fsSL --retry 3 --retry-connrefused \
+            -o "${{ runner.temp }}/live-agents/omp/omp" \
+            "https://github.com/can1357/oh-my-pi/releases/download/$OMP_TAG/$OMP_ASSET"
+          chmod +x "${{ runner.temp }}/live-agents/omp/omp"
       - name: Build native SkillMount
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
@@ -52,6 +73,7 @@ jobs:
           --claude-bin "${{ runner.temp }}/live-agents/claude/claude"
           --agent-manifest "${{ runner.temp }}/live-agents/manifest.json"
           --evidence-dir "${{ runner.temp }}/live-agent-evidence"
+          ${{ inputs.include_omp && format('--omp-bin "{0}/live-agents/omp/omp"', runner.temp) || '' }}
       - name: Upload evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -84,6 +106,21 @@ jobs:
           python .github/scripts/prepare_live_agents.py `
             --platform windows-x64 `
             --output-dir "$env:RUNNER_TEMP/live-agents"
+      - name: Fetch the opt-in OMP release asset
+        if: ${{ inputs.include_omp && matrix.arch == 'x64' }}
+        shell: pwsh
+        env:
+          OMP_TAG: v17.2.9
+          OMP_ASSET: omp-windows-x64.exe
+        run: |
+          # 17.2.9 ships no 32-bit OMP asset, so only this x64 leg can select the case, and the tag
+          # has no published SHA256SUMS.txt to lock the download against; the smoke records the
+          # sha256 it observes as evidence instead.
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP/live-agents/omp" | Out-Null
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -MaximumRetryCount 3 -RetryIntervalSec 5 `
+            -Uri "https://github.com/can1357/oh-my-pi/releases/download/$env:OMP_TAG/$env:OMP_ASSET" `
+            -OutFile "$env:RUNNER_TEMP/live-agents/omp/omp.exe"
       - name: Build native SkillMount target
         shell: bash
         run: |
@@ -103,6 +140,7 @@ jobs:
           --claude-bin "${{ runner.temp }}/live-agents/claude/claude.exe"
           --agent-manifest "${{ runner.temp }}/live-agents/manifest.json"
           --evidence-dir "${{ runner.temp }}/live-agent-evidence"
+          ${{ inputs.include_omp && matrix.arch == 'x64' && format('--omp-bin "{0}/live-agents/omp/omp.exe"', runner.temp) || '' }}
       - name: Upload evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

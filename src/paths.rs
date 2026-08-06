@@ -6,9 +6,14 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::cli::SessionInput;
 use crate::domain::{
-    AgentId, ClaudeAgent, CodexAgent, ResolvedAgent, RunContext, SourceOccurrence,
+    AgentId, ClaudeAgent, CodexAgent, OmpAgent, ResolvedAgent, RunContext, SourceOccurrence,
 };
 use crate::error::AppError;
+
+/// Literal OMP configuration-directory name, used verbatim for a project scope.
+pub(crate) const OMP_CONFIG_DIR_NAME: &str = ".omp";
+/// Application name OMP appends to an XDG base directory.
+const OMP_APP_NAME: &str = "omp";
 
 #[cfg(windows)]
 mod windows_ffi;
@@ -114,7 +119,64 @@ fn resolve_agent(
                 managed_skills,
             }))
         }
+        AgentId::Omp => {
+            let user_home = crate::state::user_home()?;
+            // Only the default profile is resolved here. A named profile relocates every OMP root,
+            // so the adapter rejects `OMP_PROFILE` and `PI_PROFILE` as a hard launch invariant
+            // before any SkillMount state is read; these roots are never used in that case.
+            let config_root = user_home.join(omp_config_dir_name());
+            let agent_dir = omp_agent_dir(&config_root);
+            let plugins_dir = omp_plugins_dir(&config_root, &agent_dir);
+            Ok(ResolvedAgent::Omp(OmpAgent {
+                executable: executable()?,
+                user_home,
+                config_root,
+                agent_dir,
+                plugins_dir,
+            }))
+        }
     }
+}
+
+/// Mirrors OMP's configuration-root directory name.
+///
+/// OMP reads `PI_CONFIG_DIR` for the user root but uses the literal `.omp` constant for a project
+/// scope, so this name must never be applied to `<project>/.omp/skills`.
+fn omp_config_dir_name() -> OsString {
+    std::env::var_os("PI_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from(OMP_CONFIG_DIR_NAME))
+}
+
+/// Mirrors OMP's agent-directory resolution for the default profile.
+///
+/// `PI_CODING_AGENT_DIR` is applied exactly as OMP applies it: absolute-resolved against the
+/// process CWD with no tilde expansion, so a literal `~/...` value stays relative like it does
+/// there.
+fn omp_agent_dir(config_root: &Path) -> PathBuf {
+    match std::env::var_os("PI_CODING_AGENT_DIR").filter(|value| !value.is_empty()) {
+        Some(value) => lexical_normalize(&std::path::absolute(value).unwrap_or_default()),
+        None => config_root.join("agent"),
+    }
+}
+
+/// Mirrors OMP's user extension-package root.
+///
+/// The XDG data base is consulted only on the platforms OMP consults it on, only while the agent
+/// directory is still the default, and only when the target already exists — OMP's own existence
+/// gate. Nothing about this root affects a Skill scope; it only decides where enabled packages are
+/// enumerated from.
+fn omp_plugins_dir(config_root: &Path, agent_dir: &Path) -> PathBuf {
+    let default_agent_dir = config_root.join("agent");
+    if cfg!(any(target_os = "linux", target_os = "macos")) && agent_dir == default_agent_dir {
+        if let Some(base) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+            let app_root = PathBuf::from(base).join(OMP_APP_NAME);
+            if app_root.is_dir() {
+                return app_root.join("plugins");
+            }
+        }
+    }
+    config_root.join("plugins")
 }
 
 fn validate_explicit_executable(path: &Path) -> Result<PathBuf, AppError> {

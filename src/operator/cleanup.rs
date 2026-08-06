@@ -112,7 +112,8 @@ fn render_cleanup_outcomes(output: &mut String, report: &ExplicitCleanupReport) 
             let noun = if count == 1 { "entry" } else { "entries" };
             let _ = writeln!(
                 output,
-                "[RECOVERED] transaction {} from {}: {count} {noun} removed",
+                "[RECOVERED] {} transaction {} from {}: {count} {noun} removed",
+                entry.agent.label(),
                 entry.transaction,
                 path_value(&entry.journal, true)
             );
@@ -142,7 +143,8 @@ fn render_cleanup_outcomes(output: &mut String, report: &ExplicitCleanupReport) 
     for active in &report.active {
         let _ = writeln!(
             output,
-            "[ACTIVE] transaction {} at {}: {}",
+            "[ACTIVE] {} transaction {} at {}: {}",
+            active.agent.label(),
             active.transaction,
             path_value(&active.journal, true),
             text_value(&active.contention.describe())
@@ -151,7 +153,8 @@ fn render_cleanup_outcomes(output: &mut String, report: &ExplicitCleanupReport) 
     for failure in &report.failures {
         let _ = writeln!(
             output,
-            "[FAILED] transaction {} at {}: {}; its journal and unverified entries were retained",
+            "[FAILED] {} transaction {} at {}: {}; its journal and unverified entries were retained",
+            failure.agent.label(),
             failure.transaction,
             path_value(&failure.journal, true),
             text_value(&failure.error.to_string())

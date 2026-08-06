@@ -703,6 +703,7 @@ fn inspected_agents(selection: InspectAgent) -> Vec<AgentId> {
     match selection {
         InspectAgent::Codex => vec![AgentId::Codex],
         InspectAgent::Claude => vec![AgentId::Claude],
+        InspectAgent::Omp => vec![AgentId::Omp],
         InspectAgent::All => AgentId::ALL.to_vec(),
     }
 }

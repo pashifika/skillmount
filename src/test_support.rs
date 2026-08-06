@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::domain::{AgentId, ClaudeAgent, CodexAgent, ResolvedAgent};
+use crate::domain::{AgentId, ClaudeAgent, CodexAgent, OmpAgent, ResolvedAgent};
 
 /// Builds the resolved roots for exactly one Agent beneath a fixture root.
 ///
@@ -26,6 +26,13 @@ pub(crate) fn resolved_agent(agent: AgentId, root: &Path) -> ResolvedAgent {
             executable,
             config_dir: root.join("home/.claude"),
             managed_skills: root.join("claude-managed/skills"),
+        }),
+        AgentId::Omp => ResolvedAgent::Omp(OmpAgent {
+            executable,
+            user_home: root.join("home"),
+            config_root: root.join("home/.omp"),
+            agent_dir: root.join("home/.omp/agent"),
+            plugins_dir: root.join("home/.omp/plugins"),
         }),
     }
 }

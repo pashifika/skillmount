@@ -15,13 +15,18 @@ import unittest
 from pathlib import Path
 
 from live_agent_smoke import (
+    AGENT_CASES,
     EXPECTED_RESPONSE,
+    PROMPT_TOKEN,
+    case_command,
     evaluate_output,
     load_agent_manifest,
     run_agent,
     run_command,
     sha256_file,
+    skip_reason,
     split_environment,
+    unknown_result,
     verify_evidence_safe,
 )
 from prepare_live_agents import extract_regular_file, sri, verify_archive
@@ -176,6 +181,192 @@ class LiveAgentSmokeTests(unittest.TestCase):
             self.assertTrue(started.exists(), "the descendant was not started by the fixture")
             time.sleep(2.2)
             self.assertFalse(marker.exists(), "the exited parent left a live descendant")
+
+
+class OptInOmpCaseTests(unittest.TestCase):
+    def checkout_snapshot(self) -> dict[str, str]:
+        """Digests the harness sources and lists the discovery roots a leaked mount would create."""
+        checkout = Path(__file__).resolve().parents[2]
+        snapshot = {
+            str(entry.relative_to(checkout)): sha256_file(entry)
+            for entry in sorted((checkout / ".github" / "scripts").iterdir())
+            if entry.is_file()
+        }
+        for root in (".omp", ".claude", ".agents"):
+            observed = checkout / root
+            snapshot[root] = (
+                ",".join(sorted(child.name for child in observed.iterdir()))
+                if observed.is_dir()
+                else "absent"
+            )
+        return snapshot
+
+    def omp_stub_run(self, root: Path, argv_dump: Path, secret: str) -> dict[str, object]:
+        """Runs the OMP case with its real command line, but a stub in place of the wrapper."""
+        project = root / "project"
+        project.mkdir(exist_ok=True)
+        script = (
+            "import os, sys; from pathlib import Path; "
+            "Path(sys.argv[1]).write_text(chr(10).join(sys.argv[2:]), encoding='utf-8'); "
+            f"print({EXPECTED_RESPONSE!r} if os.environ.get('ANTHROPIC_API_KEY') else 'unauthenticated')"
+        )
+        command = case_command(
+            asm=root / "asm",
+            case=AGENT_CASES["omp"],
+            sources=[root / "source-1", root / "source-2", root / "source-3"],
+            project=project,
+            binary=root / "omp",
+            link_mode="symlink",
+            prompt="Use the live discovery probe Skills now.",
+        )
+        command[0:1] = [sys.executable, "-c", script, str(argv_dump)]
+        base, secrets = split_environment({**os.environ, "ANTHROPIC_API_KEY": secret})
+        return run_agent(
+            name="omp",
+            command=command,
+            state=root / "omp-state",
+            evidence=root / "evidence",
+            binary=Path(sys.executable),
+            expected_binary_sha256=sha256_file(Path(sys.executable)),
+            base_environment=base,
+            credential_name="ANTHROPIC_API_KEY",
+            credential=secret,
+            secrets=secrets,
+        )
+
+    def test_omp_is_registered_as_an_opt_in_project_case_mounting_into_dot_omp_skills(self) -> None:
+        case = AGENT_CASES["omp"]
+        self.assertEqual(case.executable, "omp")
+        self.assertEqual(case.banner, "omp/17.2.9")
+        self.assertTrue(case.banner.startswith("omp/"))
+        self.assertEqual(case.destination, ".omp/skills")
+        self.assertEqual(case.credential_name, "ANTHROPIC_API_KEY")
+        self.assertTrue(case.opt_in)
+        self.assertFalse(AGENT_CASES["codex"].opt_in or AGENT_CASES["claude"].opt_in)
+        # OMP answers `--mode text` in prose, so its response is read as text, not as JSON records.
+        self.assertEqual(evaluate_output("omp", EXPECTED_RESPONSE + "\n"), (True, False, True))
+        self.assertIn("SHA256SUMS.txt", case.integrity)
+
+    def test_an_unselected_or_uncredentialed_omp_case_is_unknown_rather_than_failed(self) -> None:
+        case = AGENT_CASES["omp"]
+        unselected = skip_reason(
+            case,
+            wrapper_target="aarch64-apple-darwin",
+            binary=None,
+            credential="unit-credential",
+            banner_reason=None,
+        )
+        assert unselected is not None
+        self.assertIn("--omp-bin", unselected)
+        uncredentialed = skip_reason(
+            case,
+            wrapper_target="aarch64-apple-darwin",
+            binary=Path(sys.executable),
+            credential=None,
+            banner_reason=None,
+        )
+        assert uncredentialed is not None
+        self.assertIn("ANTHROPIC_API_KEY", uncredentialed)
+        for reason in (unselected, uncredentialed):
+            self.assertEqual(unknown_result(case, reason)["outcome"], "unknown")
+        self.assertIsNone(
+            skip_reason(
+                case,
+                wrapper_target="aarch64-apple-darwin",
+                binary=Path(sys.executable),
+                credential="unit-credential",
+                banner_reason=None,
+            )
+        )
+
+    def test_windows_x86_is_skipped_because_17_2_9_publishes_no_32_bit_asset(self) -> None:
+        case = AGENT_CASES["omp"]
+        skipped = skip_reason(
+            case,
+            wrapper_target="i686-pc-windows-msvc",
+            binary=Path(sys.executable),
+            credential="unit-credential",
+            banner_reason=None,
+        )
+        self.assertEqual(skipped, "no 32-bit OMP asset is published for 17.2.9")
+        self.assertEqual(unknown_result(case, skipped)["outcome"], "unknown")
+        # The x86 workflow leg supplies no binary either, and the published-asset reason still wins
+        # over the unselected one so the evidence names why that runner can never exercise OMP.
+        self.assertEqual(
+            skip_reason(
+                case,
+                wrapper_target="i686-pc-windows-msvc",
+                binary=None,
+                credential=None,
+                banner_reason=None,
+            ),
+            skipped,
+        )
+        # 17.2.9 does publish omp-windows-x64.exe, so the 64-bit Windows leg stays exercised.
+        self.assertIsNone(
+            skip_reason(
+                case,
+                wrapper_target="x86_64-pc-windows-msvc",
+                binary=Path(sys.executable),
+                credential="unit-credential",
+                banner_reason=None,
+            )
+        )
+
+    def test_no_built_command_line_carries_the_credential_the_child_reads_from_its_environment(
+        self,
+    ) -> None:
+        secret = "sk-omp-unit-credential-value"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "evidence").mkdir()
+            argv_dump = root / "argv.txt"
+            result = self.omp_stub_run(root, argv_dump, secret)
+
+            forwarded = argv_dump.read_text(encoding="utf-8").splitlines()
+            self.assertNotIn(secret, "\n".join(forwarded))
+            self.assertNotIn(PROMPT_TOKEN, forwarded)
+            # A mutating OMP session forwards the operator's passthrough and nothing else.
+            self.assertEqual(
+                forwarded[forwarded.index("--") + 1 :],
+                [
+                    "--print",
+                    "--mode",
+                    "text",
+                    "--no-session",
+                    "--auto-approve",
+                    "Use the live discovery probe Skills now.",
+                ],
+            )
+            self.assertEqual(result["outcome"], "pass")
+            for case in AGENT_CASES.values():
+                command = case_command(
+                    asm=root / "asm",
+                    case=case,
+                    sources=[root / "source-1"],
+                    project=root / "project",
+                    binary=root / case.executable,
+                    link_mode="symlink",
+                    prompt="Use the live discovery probe Skills now.",
+                )
+                self.assertNotIn(secret, " ".join(command))
+                self.assertNotIn(PROMPT_TOKEN, command)
+
+    def test_the_omp_case_leaves_the_repository_checkout_untouched(self) -> None:
+        checkout = Path(__file__).resolve().parents[2]
+        before = self.checkout_snapshot()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "evidence").mkdir()
+            self.omp_stub_run(root, root / "argv.txt", "sk-omp-unit-credential-value")
+
+            project = root / "project"
+            destination = project / AGENT_CASES["omp"].destination
+            self.assertTrue(destination.is_relative_to(project))
+            self.assertFalse(destination.is_relative_to(checkout))
+            self.assertTrue((root / "omp-state").is_relative_to(root))
+            self.assertTrue((root / "evidence" / "omp.stdout.log").is_file())
+        self.assertEqual(self.checkout_snapshot(), before)
 
 
 class AgentPackageTests(unittest.TestCase):

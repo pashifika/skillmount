@@ -32,6 +32,8 @@ enum CliCommand {
     Codex(SessionArgs),
     /// Resolve Skills for a future Claude Code session.
     Claude(SessionArgs),
+    /// Run an Oh My Pi session with the selected Skills.
+    Omp(SessionArgs),
     /// Generate a shell completion script on standard output.
     Completions(CompletionArgs),
     /// Inspect and validate a catalog without modifying the filesystem.
@@ -154,6 +156,14 @@ struct DoctorArgs {
         value_hint = clap::ValueHint::ExecutablePath
     )]
     claude_bin: Option<PathBuf>,
+
+    /// Explicit Oh My Pi executable path; otherwise search PATH.
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_hint = clap::ValueHint::ExecutablePath
+    )]
+    omp_bin: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -264,6 +274,7 @@ enum RawValidationLevel {
 pub(crate) enum InspectAgent {
     Codex,
     Claude,
+    Omp,
     All,
 }
 
@@ -337,6 +348,7 @@ where
     match cli.command {
         CliCommand::Codex(args) => session_input(AgentId::Codex, args),
         CliCommand::Claude(args) => session_input(AgentId::Claude, args),
+        CliCommand::Omp(args) => session_input(AgentId::Omp, args),
         CliCommand::Completions(args) => {
             let product = product.ok_or_else(|| {
                 command().error(
@@ -363,6 +375,7 @@ where
                     let explicit = match agent {
                         AgentId::Codex => args.codex_bin.clone(),
                         AgentId::Claude => args.claude_bin.clone(),
+                        AgentId::Omp => args.omp_bin.clone(),
                     };
                     (*agent, explicit)
                 })
@@ -551,6 +564,57 @@ mod tests {
     }
 
     #[test]
+    fn omp_staging_is_rejected_and_project_is_its_default() {
+        let error = parse_command_from([
+            "asm",
+            "omp",
+            "--skills-dir",
+            "skills",
+            "--mount-mode=staging",
+        ])
+        .expect_err("OMP has no isolated staging namespace");
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        assert!(error.to_string().contains("incompatible with OMP"));
+
+        let ParsedCommand::Session(input) =
+            parse_command_from(["asm", "omp", "--skills-dir", "skills"])
+                .expect("an OMP session parses")
+        else {
+            panic!("the omp command must produce a session");
+        };
+        assert_eq!(input.agent, AgentId::Omp);
+        assert_eq!(input.options.mount_mode, MountMode::Project);
+    }
+
+    #[test]
+    fn doctor_normalizes_one_ordered_request_per_registered_agent() {
+        let ParsedCommand::Doctor(input) =
+            parse_command_from(["asm", "doctor", "--omp-bin", "/bin/omp"]).expect("doctor parses")
+        else {
+            panic!("the doctor command must produce a doctor request");
+        };
+        assert_eq!(
+            input
+                .agent_bins
+                .iter()
+                .map(|(agent, _)| *agent)
+                .collect::<Vec<_>>(),
+            AgentId::ALL.to_vec(),
+            "requests follow the single registered order"
+        );
+        assert_eq!(
+            input
+                .agent_bins
+                .iter()
+                .filter(|(_, explicit)| explicit.is_some())
+                .map(|(agent, _)| *agent)
+                .collect::<Vec<_>>(),
+            vec![AgentId::Omp],
+            "each override stays independent"
+        );
+    }
+
+    #[test]
     fn copy_mode_is_hidden_and_rejected() {
         let help = parse_command_from(["asm", "codex", "--help"]).expect_err("help exits");
         let rendered = help.to_string();
@@ -682,10 +746,15 @@ mod tests {
             ("claude", "cwd", ValueHint::DirPath),
             ("claude", "project_root", ValueHint::DirPath),
             ("claude", "agent_bin", ValueHint::ExecutablePath),
+            ("omp", "skills_dirs", ValueHint::DirPath),
+            ("omp", "cwd", ValueHint::DirPath),
+            ("omp", "project_root", ValueHint::DirPath),
+            ("omp", "agent_bin", ValueHint::ExecutablePath),
             ("inspect", "skills_dirs", ValueHint::DirPath),
             ("doctor", "project_root", ValueHint::DirPath),
             ("doctor", "codex_bin", ValueHint::ExecutablePath),
             ("doctor", "claude_bin", ValueHint::ExecutablePath),
+            ("doctor", "omp_bin", ValueHint::ExecutablePath),
             ("cleanup", "project_root", ValueHint::DirPath),
         ];
 

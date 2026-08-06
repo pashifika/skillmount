@@ -7,6 +7,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod omp;
 pub(crate) mod version;
 
 #[cfg(test)]
@@ -35,6 +36,7 @@ pub(crate) fn adapter(agent: AgentId) -> &'static dyn AgentAdapter {
     match agent {
         AgentId::Codex => &codex::CodexAdapter,
         AgentId::Claude => &claude::ClaudeAdapter,
+        AgentId::Omp => &omp::OmpAdapter,
     }
 }
 
@@ -69,6 +71,20 @@ pub enum ScopeKind {
     ClaudeStaging,
     /// A namespace made visible by a passthrough `--add-dir`.
     ClaudeAddDir,
+    /// The launch CWD's own `.omp/skills`, which an OMP session mounts into.
+    OmpProject,
+    /// An ancestor `.omp/skills` between the launch CWD and the OMP walk boundary.
+    OmpAncestor,
+    /// The active OMP agent directory's `skills/` root.
+    OmpUser,
+    /// A `skills/` root beside an enabled OMP extension package.
+    OmpPlugin,
+    /// A configured `skills.customDirectories` entry.
+    OmpCustom,
+    /// A compatibility provider root OMP reads for another Agent's layout.
+    OmpCompatibility,
+    /// Auto-learned Skills under the OMP agent directory's `managed-skills`.
+    OmpManaged,
 }
 
 impl ScopeKind {
@@ -90,6 +106,13 @@ impl ScopeKind {
             Self::ClaudeUser => "claude user",
             Self::ClaudeStaging => "claude staging",
             Self::ClaudeAddDir => "claude add-dir",
+            Self::OmpProject => "omp project",
+            Self::OmpAncestor => "omp ancestor",
+            Self::OmpUser => "omp user",
+            Self::OmpPlugin => "omp plugin",
+            Self::OmpCustom => "omp custom",
+            Self::OmpCompatibility => "omp compatibility",
+            Self::OmpManaged => "omp managed",
         }
     }
 }
