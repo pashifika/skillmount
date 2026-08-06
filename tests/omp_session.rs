@@ -1418,7 +1418,9 @@ fn discovery_scopes(rendered: &str) -> Vec<RenderedScope> {
                 .unwrap_or_else(|| panic!("scope row is not in the rendered columns: {line}"));
             scopes.push(RenderedScope {
                 kind: kind.trim_end().to_owned(),
-                root: root.to_owned(),
+                // Fold the host separator here as well as in `rendered_root`, so both sides of
+                // every comparison speak one form and a Windows run compares like with like.
+                root: root.replace('\\', "/"),
                 entries: Vec::new(),
             });
             continue;
