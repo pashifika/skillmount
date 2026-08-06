@@ -44,6 +44,15 @@ fn run(executable: &str, arguments: &[&str]) -> Output {
             "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
             home.join("admin-skills"),
         )
+        .env("SKILLMOUNT_TEST_OMP_VERSION", "omp/17.2.9")
+        // OMP resolves its roots from the environment, so the developer's real profile,
+        // configuration overlay, and XDG bases must never reach a fixture.
+        .env_remove("OMP_PROFILE")
+        .env_remove("PI_PROFILE")
+        .env_remove("PI_CONFIG_FILES")
+        .env_remove("PI_CONFIG_DIR")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("XDG_DATA_HOME")
         .output()
         .expect("smoke-test executable should run")
 }
@@ -94,6 +103,15 @@ fn run_session(
             "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
             home.join("admin-skills"),
         )
+        .env("SKILLMOUNT_TEST_OMP_VERSION", "omp/17.2.9")
+        // OMP resolves its roots from the environment, so the developer's real profile,
+        // configuration overlay, and XDG bases must never reach a fixture.
+        .env_remove("OMP_PROFILE")
+        .env_remove("PI_PROFILE")
+        .env_remove("PI_CONFIG_FILES")
+        .env_remove("PI_CONFIG_DIR")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("XDG_DATA_HOME")
         .env("SKILLMOUNT_STATE_DIR", state)
         .current_dir(project)
         .output()

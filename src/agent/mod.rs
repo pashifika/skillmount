@@ -7,6 +7,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod omp;
 pub(crate) mod version;
 
 #[cfg(test)]
@@ -35,6 +36,7 @@ pub(crate) fn adapter(agent: AgentId) -> &'static dyn AgentAdapter {
     match agent {
         AgentId::Codex => &codex::CodexAdapter,
         AgentId::Claude => &claude::ClaudeAdapter,
+        AgentId::Omp => &omp::OmpAdapter,
     }
 }
 
@@ -69,6 +71,20 @@ pub enum ScopeKind {
     ClaudeStaging,
     /// A namespace made visible by a passthrough `--add-dir`.
     ClaudeAddDir,
+    /// The launch CWD's own `.omp/skills`, which an OMP session mounts into.
+    OmpProject,
+    /// An ancestor `.omp/skills` between the launch CWD and the OMP walk boundary.
+    OmpAncestor,
+    /// The active OMP agent directory's `skills/` root.
+    OmpUser,
+    /// A `skills/` root beside an enabled OMP extension package.
+    OmpPlugin,
+    /// A configured `skills.customDirectories` entry.
+    OmpCustom,
+    /// A compatibility provider root OMP reads for another Agent's layout.
+    OmpCompatibility,
+    /// Auto-learned Skills under the OMP agent directory's `managed-skills`.
+    OmpManaged,
 }
 
 impl ScopeKind {
@@ -90,6 +106,13 @@ impl ScopeKind {
             Self::ClaudeUser => "claude user",
             Self::ClaudeStaging => "claude staging",
             Self::ClaudeAddDir => "claude add-dir",
+            Self::OmpProject => "omp project",
+            Self::OmpAncestor => "omp ancestor",
+            Self::OmpUser => "omp user",
+            Self::OmpPlugin => "omp plugin",
+            Self::OmpCustom => "omp custom",
+            Self::OmpCompatibility => "omp compatibility",
+            Self::OmpManaged => "omp managed",
         }
     }
 }
@@ -200,6 +223,13 @@ pub struct DiscoverySnapshot {
     pub backing_store: PathBuf,
     /// Observed state of the backing store.
     pub backing_store_state: PathKind,
+    /// Canonical directory the backing store resolves to, when it resolves through a link.
+    ///
+    /// `None` when the store is the canonical directory itself or does not exist yet. Diagnostics
+    /// must show this whenever it is present: a mount planned through a directory link is applied to
+    /// a directory the logical path does not name, and an operator who cannot see that path cannot
+    /// tell which project the mount became visible to.
+    pub backing_store_canonical: Option<PathBuf>,
     /// Resources the transaction locks; acquisition derives a deduplicated, sorted key set.
     pub lock_resources: Vec<LockResource>,
     /// Non-fatal observations.
@@ -214,6 +244,20 @@ impl DiscoverySnapshot {
             .iter()
             .find(|scope| scope.state.entry == self.backing_store)
     }
+}
+
+/// Returns the canonical directory `store` resolves to, but only when that differs from `store`.
+///
+/// A store that is already the canonical directory needs no second path in a diagnostic, and a
+/// missing store has no identity to report yet. Every adapter uses this so the reported shape is the
+/// same for all three Agents.
+#[must_use]
+pub(crate) fn canonical_backing(store: &Path, state: &ResolvedEntry) -> Option<PathBuf> {
+    state
+        .terminal
+        .as_ref()
+        .filter(|terminal| terminal.as_path() != store)
+        .cloned()
 }
 
 /// A read-only agent adapter.

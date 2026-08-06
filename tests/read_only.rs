@@ -90,6 +90,15 @@ impl Fixture {
             )
             .env_remove("CLAUDE_CODE_SAFE_MODE")
             .env_remove("CLAUDE_CODE_SIMPLE")
+            .env("SKILLMOUNT_TEST_OMP_VERSION", "omp/17.2.9")
+            // OMP resolves its roots from the environment, so the developer's real profile,
+            // configuration overlay, and XDG bases must never reach a fixture.
+            .env_remove("OMP_PROFILE")
+            .env_remove("PI_PROFILE")
+            .env_remove("PI_CONFIG_FILES")
+            .env_remove("PI_CONFIG_DIR")
+            .env_remove("PI_CODING_AGENT_DIR")
+            .env_remove("XDG_DATA_HOME")
             .env("SKILLMOUNT_STATE_DIR", self.root.join("state"))
             .env(
                 "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
@@ -176,7 +185,12 @@ fn fake_agent_executable(root: &Path, sentinel: &Path) -> PathBuf {
     }
 }
 
-fn create_broken_directory_link(link: &Path, missing_target: &Path) {
+/// Creates a broken directory link, returning whether the host allowed it.
+///
+/// Windows needs Developer Mode or an elevated process, so a contributor without either still gets
+/// a usable suite while `SKILLMOUNT_REQUIRE_LINKS` keeps CI from silently losing link coverage.
+#[must_use]
+fn create_broken_directory_link(link: &Path, missing_target: &Path) -> bool {
     #[cfg(unix)]
     let result = std::os::unix::fs::symlink(missing_target, link);
     #[cfg(windows)]
@@ -188,7 +202,9 @@ fn create_broken_directory_link(link: &Path, missing_target: &Path) {
             "required broken-link fixture could not be created at {}: {error}",
             link.display()
         );
+        return false;
     }
+    true
 }
 
 /// Records a tree without following links, so a replaced link shows up as a difference.
@@ -253,7 +269,9 @@ fn completions_ignore_invalid_state_and_leave_every_sentinel_unchanged() {
     fs::write(fixture.sources.join("source-sentinel"), b"source bytes").expect("source sentinel");
     let discovery = fixture.project.join(".agents/skills");
     fs::create_dir_all(&discovery).expect("discovery directory");
-    create_broken_directory_link(
+    // Completion generation must ignore this entry whether or not the host admits the link, so a
+    // skipped fixture only narrows the state this case presents, never its expectation.
+    let _ = create_broken_directory_link(
         &discovery.join("broken-skill"),
         &fixture.root.join("missing-discovery-target"),
     );
@@ -299,21 +317,47 @@ fn completions_ignore_invalid_state_and_leave_every_sentinel_unchanged() {
 }
 
 #[test]
-fn inspect_reports_both_agents_without_touching_anything() {
+fn inspect_reports_every_registered_agent_without_touching_anything() {
     let fixture = Fixture::new("inspect");
     fixture.skill("alpha");
     let sources = fixture.sources.to_string_lossy().into_owned();
 
     let output = fixture.assert_unchanged(&["inspect", "--skills-dir", &sources]);
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let rendered = String::from_utf8_lossy(&output.stdout);
     assert!(rendered.contains("Agent:          codex"));
     assert!(rendered.contains("Agent:          claude"));
+    assert!(rendered.contains("Agent:          omp"));
     assert!(rendered.contains("Overlay: 1 Skill(s)"));
     assert!(rendered.contains("codex-cli 0.146.0"));
     assert!(rendered.contains("2.1.220 (Claude Code)"));
-    assert_eq!(rendered.matches("executable not queried").count(), 2);
+    assert!(rendered.contains("omp/17.2.9"));
+    assert_eq!(rendered.matches("executable not queried").count(), 3);
+}
+
+#[test]
+fn inspect_can_be_filtered_to_omp() {
+    let fixture = Fixture::new("inspect-omp");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let output = fixture.assert_unchanged(&["inspect", "--skills-dir", &sources, "--agent", "omp"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("Agent:          omp"), "{rendered}");
+    assert!(rendered.contains("LINK"), "{rendered}");
+    assert!(!rendered.contains("Agent:          codex"));
+    assert!(!rendered.contains("Agent:          claude"));
 }
 
 #[test]
@@ -1388,4 +1432,558 @@ fn read_only_output_is_identical_across_runs() {
 
     assert_eq!(first.stdout, second.stdout);
     assert_eq!(first.stderr, second.stderr);
+}
+
+/// Asserts that no OMP read-only path left a destination, state, or child behind.
+fn assert_no_omp_residue(fixture: &Fixture) {
+    assert!(
+        !fixture.project.join(".omp").exists(),
+        "an OMP read-only path must not create the project scope it plans"
+    );
+    assert!(
+        !fixture.root.join("state").exists(),
+        "an OMP read-only path must not create SkillMount state"
+    );
+    assert!(
+        !fixture.launch_sentinel.exists(),
+        "an OMP read-only path must not launch a child process"
+    );
+}
+
+#[test]
+fn an_omp_dry_run_plans_the_project_scope_without_creating_it() {
+    let fixture = Fixture::new("dry-run-omp");
+    let source = fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let canonical_source = fs::canonicalize(&source).expect("canonical Skill source");
+
+    let output = fixture.assert_unchanged(&["omp", "--skills-dir", &sources, "--dry-run"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    // The whole chain is planned in dependency order: the `.omp` scope, its `skills` directory,
+    // then the Skill itself. Nothing else is created, because OMP receives no injected argument.
+    assert!(rendered.contains("MKDIR  .omp\n"), "{rendered}");
+    assert!(
+        rendered.contains("MKDIR  .omp/skills") || rendered.contains("MKDIR  .omp\\skills"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("LINK   .omp/skills/alpha")
+            || rendered.contains("LINK   .omp\\skills\\alpha"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(canonical_source.to_string_lossy().as_ref()),
+        "the planned link must name the canonical source: {rendered}"
+    );
+    assert!(rendered.contains("omp/17.2.9"), "{rendered}");
+    assert!(rendered.contains("advisory evidence; executable not queried"));
+    assert_no_omp_residue(&fixture);
+}
+
+/// A destination reached through a directory link must report its canonical target too.
+///
+/// The logical path and the directory the mount is actually applied to are different paths here.
+/// Printing only the logical one would hide which project the mount became visible to, which is the
+/// shared-backing hazard ADR 0034 records.
+#[test]
+fn an_omp_dry_run_reports_the_canonical_backing_of_a_linked_scope() {
+    let fixture = Fixture::new("omp-linked-scope");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let shared = fixture.root.join("shared-store");
+    fs::create_dir_all(&shared).expect("shared backing directory");
+    let scope = fixture.project.join(".omp");
+    fs::create_dir_all(&scope).expect("OMP project scope");
+    if !create_broken_directory_link(&scope.join("skills"), &shared) {
+        return;
+    }
+    let canonical_shared = fs::canonicalize(&shared).expect("canonical shared backing");
+
+    let output = fixture.assert_unchanged(&["omp", "--skills-dir", &sources, "--dry-run"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    // The logical entry stays the path OMP reads, and the canonical backing is reported beside it.
+    assert!(
+        rendered.contains("Backing store:  .omp/skills")
+            || rendered.contains("Backing store:  .omp\\skills"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Store state:    directory link"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&format!(
+            "Store target:   {}",
+            canonical_shared.to_string_lossy()
+        )),
+        "the canonical backing directory must be named: {rendered}"
+    );
+    // The link itself is never a planned mutation, so only the Skill is linked.
+    assert!(!rendered.contains("MKDIR  .omp"), "{rendered}");
+    assert!(
+        rendered.contains("LINK   .omp/skills/alpha")
+            || rendered.contains("LINK   .omp\\skills\\alpha"),
+        "{rendered}"
+    );
+    assert!(
+        !fixture.root.join("state").exists(),
+        "a read-only path must not create SkillMount state"
+    );
+    assert!(
+        !fixture.launch_sentinel.exists(),
+        "a read-only path must not launch a child process"
+    );
+}
+
+#[test]
+fn both_executables_render_an_identical_omp_dry_run() {
+    let fixture = Fixture::new("omp-dry-run-both-names");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let arguments = ["omp", "--skills-dir", &sources, "--dry-run"];
+
+    let [asm, skillmount] = [ASM, SKILLMOUNT].map(|binary| {
+        fixture
+            .command_for(binary, &arguments)
+            .output()
+            .expect("an OMP dry run should run under either installed name")
+    });
+
+    assert!(
+        asm.status.success() && skillmount.status.success(),
+        "{}",
+        String::from_utf8_lossy(&asm.stderr)
+    );
+    // The plan describes the OMP session, never the wrapper that printed it, so the installed name
+    // may not leak into a single byte of it.
+    assert_eq!(asm.stdout, skillmount.stdout);
+    assert_eq!(asm.stderr, skillmount.stderr);
+    assert_no_omp_residue(&fixture);
+}
+
+#[test]
+fn omp_read_only_output_is_identical_across_runs() {
+    let fixture = Fixture::new("omp-deterministic");
+    fixture.skill("gamma");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    for arguments in [
+        ["inspect", "--skills-dir", &sources, "--agent", "omp"].as_slice(),
+        ["omp", "--skills-dir", &sources, "--dry-run"].as_slice(),
+    ] {
+        let first = fixture.run(arguments);
+        let second = fixture.run(arguments);
+
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(first.stdout, second.stdout, "{arguments:?}");
+        assert_eq!(first.stderr, second.stderr, "{arguments:?}");
+    }
+    assert_no_omp_residue(&fixture);
+}
+
+#[test]
+fn a_missing_omp_executable_fails_before_any_project_or_state_is_created() {
+    let fixture = Fixture::new("omp-missing-executable");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let empty_bin = fixture.root.join("empty-bin");
+    fs::create_dir(&empty_bin).expect("PATH fixture");
+    let search_path = std::env::join_paths([&empty_bin]).expect("PATH fixture encoding");
+    let before = fixture
+        .watched()
+        .into_iter()
+        .map(|root| (root.clone(), snapshot(&root)))
+        .collect::<Vec<_>>();
+
+    // A mutating session resolves the executable, and OMP is the only Agent whose destination lives
+    // in the launch CWD, so an unresolvable executable must be refused before that scope appears.
+    let output = fixture
+        .command(&["omp", "--skills-dir", &sources])
+        .env("PATH", &search_path)
+        .output()
+        .expect("asm should run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(66), "{stderr}");
+    assert!(stderr.contains("input omp is unavailable"), "{stderr}");
+    for (root, expected) in before {
+        assert_eq!(snapshot(&root), expected, "{}", root.display());
+    }
+    assert_no_omp_residue(&fixture);
+}
+
+/// One OMP passthrough rejection class and the tokens that must reach it.
+struct OmpRejection {
+    /// Tokens forwarded after `--`, in the spelling an operator would type.
+    forwarded: &'static [&'static str],
+    /// The diagnostic fragment naming the contract that refused them.
+    fragment: &'static str,
+}
+
+/// Every OMP passthrough class `SkillMount` refuses, with both value spellings where they differ.
+const OMP_REJECTED_PASSTHROUGH: &[OmpRejection] = &[
+    OmpRejection {
+        forwarded: &["--cwd", "other"],
+        fragment: "relocates the discovery root",
+    },
+    OmpRejection {
+        forwarded: &["--cwd=other"],
+        fragment: "relocates the discovery root",
+    },
+    OmpRejection {
+        forwarded: &["--profile", "work"],
+        fragment: "relocates the discovery root",
+    },
+    OmpRejection {
+        forwarded: &["--alias", "shortcut"],
+        fragment: "relocates the discovery root",
+    },
+    OmpRejection {
+        forwarded: &["--config", "skills.enabled=false"],
+        fragment: "relocates the discovery root",
+    },
+    OmpRejection {
+        forwarded: &["--config=skills.enabled=false"],
+        fragment: "relocates the discovery root",
+    },
+    OmpRejection {
+        forwarded: &["--no-skills"],
+        fragment: "changes the Skill",
+    },
+    OmpRejection {
+        forwarded: &["--skills", "other-skills"],
+        fragment: "changes the Skill",
+    },
+    OmpRejection {
+        forwarded: &["-e", "extension"],
+        fragment: "changes the Skill",
+    },
+    OmpRejection {
+        forwarded: &["--extension", "extension"],
+        fragment: "changes the Skill",
+    },
+    OmpRejection {
+        forwarded: &["--hook", "hook"],
+        fragment: "changes the Skill",
+    },
+    OmpRejection {
+        forwarded: &["--no-extensions"],
+        fragment: "changes the Skill",
+    },
+    OmpRejection {
+        forwarded: &["--plugin-dir", "packages"],
+        fragment: "changes the Skill",
+    },
+    OmpRejection {
+        forwarded: &["-c"],
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--continue"],
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["-r"],
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--resume"],
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--session"],
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--fork", "01JEXAMPLE"],
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--from-claude"],
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--from-codex"],
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--export", "transcript.md"],
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--mode", "rpc"],
+        fragment: "protocol server",
+    },
+    OmpRejection {
+        forwarded: &["--mode=rpc-ui"],
+        fragment: "protocol server",
+    },
+    OmpRejection {
+        forwarded: &["--mode", "acp"],
+        fragment: "protocol server",
+    },
+    OmpRejection {
+        forwarded: &["acp"],
+        fragment: "does not start a supervised foreground session",
+    },
+    OmpRejection {
+        forwarded: &["config"],
+        fragment: "does not start a supervised foreground session",
+    },
+    OmpRejection {
+        forwarded: &["plugin"],
+        fragment: "does not start a supervised foreground session",
+    },
+    OmpRejection {
+        forwarded: &["shell"],
+        fragment: "does not start a supervised foreground session",
+    },
+    OmpRejection {
+        forwarded: &["worktree"],
+        fragment: "does not start a supervised foreground session",
+    },
+    OmpRejection {
+        forwarded: &["wt"],
+        fragment: "does not start a supervised foreground session",
+    },
+    OmpRejection {
+        forwarded: &["q"],
+        fragment: "does not start a supervised foreground session",
+    },
+    OmpRejection {
+        forwarded: &["gc"],
+        fragment: "does not start a supervised foreground session",
+    },
+];
+
+/// Both spellings of a session must refuse the same passthrough token at the same point.
+///
+/// A dry run never resolves an executable and a mutating run does, so only asserting the read-only
+/// path would leave open that validation moved behind lock and journal storage on the path that can
+/// actually mutate.
+#[test]
+fn omp_refuses_every_passthrough_class_on_the_read_only_and_the_mutating_path() {
+    let fixture = Fixture::new("omp-rejected-passthrough");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let agent_bin = fixture.agent_bin.to_string_lossy().into_owned();
+    let read_only = ["--dry-run"];
+    let mutating = ["--agent-bin", agent_bin.as_str()];
+
+    for case in OMP_REJECTED_PASSTHROUGH {
+        for mode in [read_only.as_slice(), mutating.as_slice()] {
+            let mut arguments = vec!["omp", "--skills-dir", &sources];
+            arguments.extend(mode.iter().copied());
+            arguments.push("--");
+            arguments.extend(case.forwarded.iter().copied());
+
+            let output = fixture.assert_unchanged(&arguments);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert_eq!(
+                output.status.code(),
+                Some(64),
+                "{:?} under {mode:?}: {stderr}",
+                case.forwarded
+            );
+            assert!(
+                stderr.contains(case.fragment),
+                "{:?} under {mode:?}: {stderr}",
+                case.forwarded
+            );
+            assert_no_omp_residue(&fixture);
+        }
+    }
+}
+
+/// The variables that relocate every OMP root must be fatal before anything is reported.
+///
+/// `inspect` and `--dry-run` only describe a namespace, which is exactly why they have to refuse:
+/// a relocated root would make them describe a namespace the child never reads.
+#[test]
+fn omp_refuses_its_root_relocating_environment_on_every_read_only_path() {
+    let fixture = Fixture::new("omp-rejected-environment");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    for variable in ["OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_FILES"] {
+        for arguments in [
+            ["inspect", "--skills-dir", &sources, "--agent", "omp"].as_slice(),
+            ["omp", "--skills-dir", &sources, "--dry-run"].as_slice(),
+        ] {
+            let output = fixture
+                .command(arguments)
+                .env(variable, "relocated")
+                .output()
+                .expect("asm should run");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert_eq!(
+                output.status.code(),
+                Some(64),
+                "{variable} under {arguments:?}: {stderr}"
+            );
+            assert!(stderr.contains(variable), "{stderr}");
+            assert!(
+                stderr.contains("unset it or run the agent directly"),
+                "{stderr}"
+            );
+            assert_no_omp_residue(&fixture);
+        }
+    }
+}
+
+#[test]
+fn a_corrupt_omp_global_configuration_is_a_data_error_that_changes_nothing() {
+    let fixture = Fixture::new("omp-corrupt-global-config");
+    fixture.skill("alpha");
+    let agent_dir = fixture.home.join(".omp/agent");
+    fs::create_dir_all(&agent_dir).expect("OMP agent directory");
+    fs::write(agent_dir.join("config.yml"), "skills: {enabled\n").expect("corrupt OMP config");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let output = fixture.assert_unchanged(&["omp", "--skills-dir", &sources, "--dry-run"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // OMP's own global file is trusted configuration it quarantines and then throws on, so planning
+    // against an empty reading of it would model the wrong namespace.
+    assert_eq!(output.status.code(), Some(65), "{stderr}");
+    assert!(
+        stderr.contains("OMP settings input cannot be interpreted"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("config.yml"), "{stderr}");
+    assert_no_omp_residue(&fixture);
+}
+
+/// A third-party provider file OMP only warns about must not fail a session OMP itself starts.
+#[test]
+fn a_malformed_third_party_omp_project_settings_layer_is_only_skipped() {
+    let fixture = Fixture::new("omp-malformed-third-party-settings");
+    fixture.skill("alpha");
+    fs::create_dir_all(fixture.project.join(".cursor")).expect("third-party project scope");
+    fs::write(fixture.project.join(".cursor/settings.json"), "{not json")
+        .expect("malformed third-party settings");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let output = fixture.assert_unchanged(&["omp", "--skills-dir", &sources, "--dry-run"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        rendered.contains("LINK   .omp/skills/alpha")
+            || rendered.contains("LINK   .omp\\skills\\alpha"),
+        "{rendered}"
+    );
+    assert_no_omp_residue(&fixture);
+}
+
+/// Proves the Codex project layer really is one of OMP's own settings inputs.
+///
+/// A `[skills] enabled = false` written for Codex disables every OMP Skill, so a mount would be
+/// applied and then ignored. Refusing it is what keeps the OMP path from succeeding silently.
+#[test]
+fn a_codex_project_configuration_disabling_skills_fails_the_omp_plan() {
+    let fixture = Fixture::new("omp-codex-project-gate");
+    fixture.skill("alpha");
+    fs::create_dir_all(fixture.project.join(".codex")).expect("Codex project scope");
+    fs::write(
+        fixture.project.join(".codex/config.toml"),
+        "[skills]\nenabled = false\n",
+    )
+    .expect("Codex project configuration");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let output = fixture.assert_unchanged(&["omp", "--skills-dir", &sources, "--dry-run"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(65), "{stderr}");
+    assert!(stderr.contains("invalid selected Skill"), "{stderr}");
+    assert!(stderr.contains("skills.enabled is false"), "{stderr}");
+    assert_no_omp_residue(&fixture);
+}
+
+/// An unresolvable destination has no identity a later mutation could rely on.
+///
+/// Planning a directory over a broken link would describe a change apply must then refuse, so the
+/// session fails here with the exact state instead, and the link is left exactly as it was.
+#[test]
+fn a_broken_omp_destination_link_fails_closed_without_mutation() {
+    let fixture = Fixture::new("omp-broken-destination-link");
+    fixture.skill("alpha");
+    let scope = fixture.project.join(".omp");
+    fs::create_dir(&scope).expect("OMP project scope");
+    if !create_broken_directory_link(&scope.join("skills"), &fixture.root.join("no-such-store")) {
+        return;
+    }
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let output = fixture.assert_unchanged(&["omp", "--skills-dir", &sources, "--dry-run"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(73), "{stderr}");
+    assert!(stderr.contains("resolves as broken link"), "{stderr}");
+    assert!(
+        stderr.contains("no safe mount destination exists"),
+        "{stderr}"
+    );
+    assert!(
+        !fixture.root.join("state").exists(),
+        "reporting an unresolvable destination must not create SkillMount state"
+    );
+}
+
+#[test]
+fn an_existing_transaction_record_is_reported_by_omp_inspect_and_left_alone() {
+    let fixture = Fixture::new("omp-recovery");
+    fixture.skill("alpha");
+    let transactions = fixture.root.join("state/transactions");
+    fs::create_dir_all(&transactions).expect("transaction directory");
+    let record = transactions.join("01JEXAMPLE.journal");
+    fs::write(&record, "not a journal this build wrote\n").expect("transaction record");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let output = fixture.assert_unchanged(&["inspect", "--skills-dir", &sources, "--agent", "omp"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("WOULD RETAIN"),
+        "a journal this build cannot interpret must be reported rather than ignored: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(&record).expect("record still readable"),
+        "not a journal this build wrote\n",
+        "an inspection must not recover, rewrite, or remove a transaction journal"
+    );
+    assert!(
+        !fixture.project.join(".omp").exists(),
+        "an inspection must not create the project scope it plans"
+    );
 }

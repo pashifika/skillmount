@@ -24,8 +24,9 @@ machine-local paths, but agents must still stage product files explicitly. Machi
 ## Product definition
 
 SkillMount is a Rust wrapper CLI that makes external Agent Skills visible for the intended lifetime
-of a Codex CLI or Claude Code CLI session. The package installs `asm` as the primary binary and
-`skillmount` as a behaviorally identical fallback; both delegate to `skillmount::run_from`.
+of a Codex CLI, Claude Code CLI, or Oh My Pi (OMP) session. The package installs `asm` as the
+primary binary and `skillmount` as a behaviorally identical fallback; both delegate to
+`skillmount::run_from`.
 
 The catalog is a deterministic rightmost-wins overlay. SkillMount validates only the selected
 winner, never falls back from an invalid winner, and never lets source precedence replace a
@@ -34,7 +35,9 @@ manage authentication, elevate privileges, or weaken agent permissions.
 
 Read `docs/architecture.md` before changing cross-module behavior. Its implementation-status
 section distinguishes working catalog/planning/transaction/process-supervision behavior from
-reserved agent-launch integration, operator commands, ownership binding, and release work.
+reserved ownership binding and release work. Each session adapter pins one Agent release: Codex
+`codex-cli 0.146.0` (ADR 0023), Claude Code `2.1.220 (Claude Code)` (ADR 0024), and OMP `omp/17.2.9`
+(ADR 0034). A banner is advisory evidence, never authorization (ADR 0033).
 
 ## Commands
 
@@ -49,6 +52,7 @@ env RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 cargo deny --locked check
 cargo run --locked --bin asm -- inspect --skills-dir path/to/skills
 cargo run --locked --bin asm -- codex --skills-dir path/to/skills --dry-run --verbose -- exec "prompt"
+cargo run --locked --bin asm -- omp --skills-dir path/to/skills --dry-run --verbose
 ```
 
 `SKILLMOUNT_REQUIRE_LINKS=1` turns an unavailable directory-link fixture into a failure. A skipped
@@ -59,6 +63,11 @@ it for every job.
 a mutating session must redirect both the project through `--project-root` and SkillMount state
 through `SKILLMOUNT_STATE_DIR`. Omitting either can modify this checkout or the developer's real
 application-support state. Failure injection is debug-only and lives in `src/checkpoint.rs`.
+
+OMP resolves every root from the process environment, so any fixture that exercises `omp` must
+redirect `HOME`/`USERPROFILE` and remove `OMP_PROFILE`, `PI_PROFILE`, `PI_CONFIG_FILES`,
+`PI_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, and `XDG_DATA_HOME`. Leaving one set lets the developer's
+real OMP profile decide a test result. `SKILLMOUNT_TEST_OMP_VERSION` pins the observed banner.
 
 CI additionally builds the MSRV, release binaries, Windows x64 and x86 targets, and Apple Silicon
 macOS. Platform-conditional behavior needs tests on each affected native side; a cross-compile does
@@ -86,6 +95,19 @@ Agent adapters observe and describe their discovery model; they never mutate. Sh
 and transaction code owns ordering and application. `src/link/` is the sealed boundary for
 platform-specific discovery-entry and mount-link classification and for every mount-link creation,
 placement, and removal. It exposes no recursive removal operation.
+
+`AgentId::descriptor()` is the single source of every Agent's journal label, display name, default
+executable, mount-mode support, and project layout paths, and `crate::agent::adapter()` is the one
+registry that maps an identity to its `&'static dyn AgentAdapter`. A `RunContext` carries one closed
+`ResolvedAgent` variant, and `paths` resolves only the selected Agent's roots — an unselected
+Agent's configuration must never decide or fail the selected command. Adding a compile-time Agent
+may need explicit CLI and journal identity plus one registry entry, and must not add an
+Agent-specific launch, version, catalog, path-selection, `doctor`, or render branch to a shared
+caller.
+
+An adapter never imports or executes third-party Agent extension, plugin, or hook code. Where a
+contribution cannot be proven from declarative manifests and on-disk state, fail closed instead of
+guessing.
 
 `unsafe_code` is denied crate-wide. Only `src/agent/codex/macos_ffi.rs`,
 `src/paths/windows_ffi.rs`, `src/link/unix_ffi.rs`, `src/link/windows_ffi.rs`,

@@ -15,6 +15,8 @@ pub enum AgentId {
     Codex,
     /// Anthropic Claude Code CLI.
     Claude,
+    /// Oh My Pi CLI.
+    Omp,
 }
 
 /// Stable declarative metadata for one supported Agent.
@@ -52,6 +54,16 @@ static CLAUDE_DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     default_mount_mode: MountMode::Staging,
     explicit_mount_modes: &[MountMode::Project, MountMode::Staging],
     project_layout_paths: &[".claude/skills"],
+};
+
+static OMP_DESCRIPTOR: AgentDescriptor = AgentDescriptor {
+    id: AgentId::Omp,
+    label: "omp",
+    display_name: "OMP",
+    executable: "omp",
+    default_mount_mode: MountMode::Project,
+    explicit_mount_modes: &[MountMode::Project],
+    project_layout_paths: &[".omp/skills"],
 };
 
 impl AgentDescriptor {
@@ -100,7 +112,7 @@ impl AgentDescriptor {
 
 impl AgentId {
     /// Every supported Agent, in the one deterministic order shared by inspection and diagnosis.
-    pub const ALL: &'static [Self] = &[Self::Codex, Self::Claude];
+    pub const ALL: &'static [Self] = &[Self::Codex, Self::Claude, Self::Omp];
 
     /// Returns the stable declarative metadata for this Agent.
     #[must_use]
@@ -108,6 +120,7 @@ impl AgentId {
         match self {
             Self::Codex => &CODEX_DESCRIPTOR,
             Self::Claude => &CLAUDE_DESCRIPTOR,
+            Self::Omp => &OMP_DESCRIPTOR,
         }
     }
 
@@ -247,6 +260,25 @@ pub struct ClaudeAgent {
     pub(crate) managed_skills: PathBuf,
 }
 
+/// Resolved configuration roots for the Oh My Pi CLI.
+///
+/// Only stable roots live here. Effective settings, enabled providers, and enabled extension
+/// packages are rebuilt in discovery under locks and are never carried across the mutation
+/// boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OmpAgent {
+    /// Explicit resolved executable path, or the bare executable name for `PATH` lookup.
+    pub(crate) executable: PathBuf,
+    /// User home used by the compatibility provider roots OMP reads for other Agents.
+    pub(crate) user_home: PathBuf,
+    /// OMP configuration root, after applying `PI_CONFIG_DIR`.
+    pub(crate) config_root: PathBuf,
+    /// Active OMP agent directory, after applying `PI_CODING_AGENT_DIR`.
+    pub(crate) agent_dir: PathBuf,
+    /// User-level extension-package root whose `node_modules` OMP enumerates.
+    pub(crate) plugins_dir: PathBuf,
+}
+
 /// Resolved configuration for the one selected Agent.
 ///
 /// A session resolves only the Agent it will launch. Two Agents' roots therefore cannot coexist in
@@ -258,6 +290,8 @@ pub enum ResolvedAgent {
     Codex(CodexAgent),
     /// Claude Code CLI was selected.
     Claude(ClaudeAgent),
+    /// Oh My Pi CLI was selected.
+    Omp(OmpAgent),
 }
 
 impl ResolvedAgent {
@@ -267,6 +301,7 @@ impl ResolvedAgent {
         match self {
             Self::Codex(_) => AgentId::Codex,
             Self::Claude(_) => AgentId::Claude,
+            Self::Omp(_) => AgentId::Omp,
         }
     }
 
@@ -282,6 +317,7 @@ impl ResolvedAgent {
         match self {
             Self::Codex(codex) => &codex.executable,
             Self::Claude(claude) => &claude.executable,
+            Self::Omp(omp) => &omp.executable,
         }
     }
 
@@ -309,6 +345,19 @@ impl ResolvedAgent {
             return Ok(claude);
         }
         Err(mismatched_agent(AgentId::Claude, self.id()))
+    }
+
+    /// Returns the OMP roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::Internal`] when a concrete adapter was called with another Agent's
+    /// resolved context. Normal parsing and registry lookup make that mismatch unconstructable.
+    pub(crate) fn omp(&self) -> Result<&OmpAgent, AppError> {
+        if let Self::Omp(omp) = self {
+            return Ok(omp);
+        }
+        Err(mismatched_agent(AgentId::Omp, self.id()))
     }
 
     /// Returns the Codex roots for in-place fixture adjustment.
@@ -694,7 +743,7 @@ mod tests {
             assert_eq!(AgentId::parse(agent.label()), Some(*agent));
         }
         // A journal written by a later release must be retained, not reinterpreted.
-        for unknown in ["", "omp", "CODEX", "codex ", "claude-code"] {
+        for unknown in ["", "OMP", "CODEX", "codex ", "claude-code", "oh-my-pi"] {
             assert_eq!(AgentId::parse(unknown), None, "{unknown:?}");
         }
     }
@@ -703,6 +752,7 @@ mod tests {
     fn the_default_executable_is_the_bare_basename_looked_up_through_path() {
         assert_eq!(AgentId::Codex.executable_name(), "codex");
         assert_eq!(AgentId::Claude.executable_name(), "claude");
+        assert_eq!(AgentId::Omp.executable_name(), "omp");
     }
 
     #[test]

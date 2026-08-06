@@ -9,9 +9,10 @@
 //! A mutating session checks release-independent launch invariants, observes one bounded advisory
 //! version banner before state access, acquires the discovery snapshot's resource locks, recovers
 //! incomplete transactions, builds and stabilizes the full plan under those locks, persists a
-//! write-ahead journal, and applies it. Implemented Codex and Claude sessions repeat only the hard
-//! invariants before launch, then use the generic process supervisor and clean up after the managed
-//! process domain is dead; see `docs/architecture.md` and ADR 0033 for the evidence boundary.
+//! write-ahead journal, and applies it. The implemented Codex, Claude, and OMP sessions repeat only
+//! the hard invariants before launch, then use the generic process supervisor and clean up after the
+//! managed process domain is dead; see `docs/architecture.md`, ADR 0033 for the evidence boundary,
+//! and ADR 0034 for the OMP discovery and launch contract.
 
 pub mod agent;
 mod app;

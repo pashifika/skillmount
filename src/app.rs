@@ -674,6 +674,11 @@ fn build_read_only(
     let adapter = adapter(context.agent_id());
     if validate_launch_command {
         adapter.validate_passthrough_args(&context.passthrough_args)?;
+        // A dry run describes the session the mutating run would start. An invariant that would
+        // refuse that session - a launch CWD the Agent relocates away from, configuration whose
+        // effective values are in no file this release can read - therefore has to refuse the
+        // description too, or `--dry-run` prints a plan for a namespace no child would ever load.
+        adapter.validate_launch_invariants(context)?;
     }
 
     let destination_stores = adapter.destination_stores(context);
@@ -703,6 +708,7 @@ fn inspected_agents(selection: InspectAgent) -> Vec<AgentId> {
     match selection {
         InspectAgent::Codex => vec![AgentId::Codex],
         InspectAgent::Claude => vec![AgentId::Claude],
+        InspectAgent::Omp => vec![AgentId::Omp],
         InspectAgent::All => AgentId::ALL.to_vec(),
     }
 }

@@ -1,10 +1,11 @@
 # SkillMount
 
-Mount external Agent Skills into one Codex CLI or Claude Code session, then clean up
+Mount external Agent Skills into one Codex CLI, Claude Code, or Oh My Pi session, then clean up
 automatically.
 
-Codex CLI and Claude Code discover Skills only in their own directories. When your Skills live in
-a shared or external folder, you end up copying them into every project and removing them by hand.
+Codex CLI, Claude Code, and Oh My Pi discover Skills only in their own directories. When your
+Skills live in a shared or external folder, you end up copying them into every project and
+removing them by hand.
 SkillMount removes that chore. It links the Skills you select into the place the agent searches,
 launches the agent for you, and deletes exactly the links it created once the session ends.
 
@@ -16,6 +17,7 @@ and `skillmount`, a descriptive fallback that behaves the same way.
 - [Features](#features)
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Oh My Pi sessions](#oh-my-pi-sessions)
 - [Commands and options](#commands-and-options)
 - [Shell completion](#shell-completion)
 - [Health checks and cleanup](#health-checks-and-cleanup)
@@ -143,6 +145,13 @@ to Claude through `--add-dir`, so the project itself is not modified:
 asm claude --skills-dir ~/agent-skills -- -p "Review the staged diff with the team review Skill"
 ```
 
+Oh My Pi mounts into the project's own `.omp/skills`, the first place OMP searches, and removes
+the links — and any `.omp` directories it created — when the session ends:
+
+```bash
+asm omp --skills-dir ~/agent-skills -- -p "Summarize this project's build steps"
+```
+
 Everything after the standalone `--` is passed to the Agent unchanged. Repeat `--skills-dir` to
 overlay collections, and add `--agent-bin path/to/codex` to select a specific executable instead of
 searching `PATH`.
@@ -150,18 +159,73 @@ searching `PATH`.
 Treat mounted Skills as code you chose to run: review their contents and provenance before making
 them visible to an agent.
 
+## Oh My Pi sessions
+
+`asm omp` and `skillmount omp` support exactly one scope: a new foreground Oh My Pi (OMP) session
+that SkillMount launches itself. The selected Skills are linked into `<launch CWD>/.omp/skills` —
+the first place OMP searches — and SkillMount creates the `.omp` and `.omp/skills` directories
+when they are missing, then removes everything it created after OMP exits:
+
+```bash
+asm omp --skills-dir ~/agent-skills -- -p "Summarize this project's build steps"
+skillmount omp --skills-dir ~/agent-skills -- --mode json "Summarize this project's build steps"
+```
+
+Preview and health checks stay read-only, like the other agents:
+
+```bash
+asm inspect --agent omp --skills-dir ~/agent-skills
+asm omp --skills-dir ~/agent-skills --dry-run
+asm doctor --project-root . --omp-bin /opt/homebrew/bin/omp
+```
+
+Because the mount destination outranks every other Skill source in OMP's own precedence,
+SkillMount checks the complete OMP namespace before touching anything — the nine provider scopes,
+including `.claude/skills`, marketplace plugin caches, `.agents/skills`, and `.codex/skills`, plus
+your `skills.customDirectories` — and never replaces an existing Skill: `--conflict=error` stops
+the session and `--conflict=skip` keeps the existing winner. A Skill that your own OMP
+configuration hides (`skills.enabled: false`, a source toggle, `ignoredSkills`, `includeSkills`,
+or `disabledExtensions`) fails the plan instead of mounting something OMP would silently ignore.
+
+Arguments that would move or reshape that namespace after planning are rejected before anything is
+created, and each rejection names the token and the safe new-session alternative:
+
+- launching from your home directory without your own `--allow-home`;
+- `--cwd`, `--profile`, `--alias`, `--config`, and the `OMP_PROFILE`, `PI_PROFILE`, and
+  `PI_CONFIG_FILES` environment variables;
+- Skill- and extension-set changes: `--no-skills`, `--skills`, `-e`/`--extension`, `--hook`,
+  `--no-extensions`, `--plugin-dir`;
+- session reuse: `-c`/`--continue`, `-r`/`--resume`, `--session`, `--fork`, `--from-claude`,
+  `--from-codex`, `--export`;
+- protocol-server modes (`--mode rpc`, `--mode rpc-ui`, `--mode acp`) and every OMP subcommand,
+  such as `omp config` or `omp plugin`.
+
+Everything else — prompt text, `--print`, `--mode text`, `--mode json`, model and thinking
+selection, and approval flags you supplied yourself — passes through unchanged. SkillMount injects
+no argument and no environment variable into an OMP launch, does not manage OMP authentication,
+and never weakens OMP's permission or approval model: it forwards `--auto-approve`, `--yolo`, and
+`--approval-mode` only when you supplied them.
+
+Cleanup uses the same journaled, crash-recoverable path as the other agents: after the session,
+SkillMount removes the links it created and any `.omp` directories it had to create, and
+`asm doctor` plus `asm cleanup` reconcile an interrupted session. Attaching to or hot-reloading
+Skills into an OMP process SkillMount did not launch is not supported — OMP loads Skills once at
+startup, so start a new session instead. The recorded OMP evidence, including the platforms it
+does and does not cover, lives in [docs/compatibility.md](docs/compatibility.md).
+
 ## Commands and options
 
 ```
 codex         Run a Codex session with the selected Skills
 claude        Resolve Skills for a future Claude Code session
+omp           Run an Oh My Pi session with the selected Skills
 completions   Generate a shell completion script on standard output
 inspect       Inspect and validate a catalog without modifying the filesystem
 doctor        Inspect agent, discovery, link, lock, and transaction health
 cleanup       Reconcile transaction-owned residue from durable evidence
 ```
 
-The session commands `codex` and `claude` share these options:
+The session commands `codex`, `claude`, and `omp` share these options:
 
 ```
 --skills-dir <PATH>    Skill directory or direct Skill; repeat for a rightmost-wins overlay
@@ -180,7 +244,8 @@ The session commands `codex` and `claude` share these options:
 
 `--conflict skip` keeps an existing Skill and quietly drops the colliding mount instead of
 failing. `--validation none` relaxes metadata checks only; structural and safety checks always
-run.
+run. `omp` mounts only into the project scope, so `--mount-mode=staging` is rejected as a usage
+error.
 
 ## Shell completion
 
@@ -225,8 +290,8 @@ no Agent process still uses them, or sweep every recorded transaction with
 ## Requirements
 
 - Supported hosts: Windows 10 version 1709 or later (x64 and x86) and macOS on Apple Silicon.
-- The adapters' dated last-tested banners are `codex-cli 0.146.0` and
-  `2.1.220 (Claude Code)`. These are evidence baselines, not an exact-version allowlist. A different
+- The adapters' dated last-tested banners are `codex-cli 0.146.0`, `2.1.220 (Claude Code)`, and
+  `omp/17.2.9`. These are evidence baselines, not an exact-version allowlist. A different
   or unavailable banner warns and continues; it remains unverified compatibility evidence until
   the live-agent workflow is recorded in [docs/compatibility.md](docs/compatibility.md).
 - Release-independent discovery, configuration, and foreground-lifecycle controls still fail

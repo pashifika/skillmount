@@ -152,11 +152,11 @@ impl Fixture {
             .arg(ASM)
             .args(extra)
             // Reuse the already-built cross-platform `asm` executable as a harmless agent child.
-            // The static `exec` shape passes the Codex adapter boundary; the child then rejects
-            // either adapter's injected native prefix with usage 64.
+            // Each adapter validates the operator's own passthrough before anything is mounted, so
+            // the shape has to be one that Agent accepts; the child then rejects whatever it
+            // receives with usage 64.
             .arg("--")
-            .arg("exec")
-            .arg("fixture")
+            .args(fixture_child_args(agent))
             .env("HOME", home)
             .env("USERPROFILE", home)
             .env("SKILLMOUNT_TEST_CODEX_USER_HOME", home)
@@ -176,6 +176,15 @@ impl Fixture {
                 "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
                 home.join("admin-skills"),
             )
+            .env("SKILLMOUNT_TEST_OMP_VERSION", "omp/17.2.9")
+            // OMP resolves its roots from the environment, so the developer's real profile,
+            // configuration overlay, and XDG bases must never reach a fixture.
+            .env_remove("OMP_PROFILE")
+            .env_remove("PI_PROFILE")
+            .env_remove("PI_CONFIG_FILES")
+            .env_remove("PI_CONFIG_DIR")
+            .env_remove("PI_CODING_AGENT_DIR")
+            .env_remove("XDG_DATA_HOME")
             .env("SKILLMOUNT_STATE_DIR", &self.state)
             // Contention must be reported rather than waited out, so a serialization test finishes
             // in milliseconds instead of the production timeout.
@@ -326,6 +335,20 @@ fn collect(root: &Path, current: &Path, entries: &mut Vec<String>) {
 /// Returns whether a path exists without following it.
 fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
+}
+
+/// Returns the Agent-native passthrough that reaches the reused `asm` child.
+///
+/// Codex and Claude both accept the static `exec` subcommand shape. OMP does not: it refuses any
+/// recognized-or-not subcommand in the first non-flag position as something that does not start a
+/// supervised foreground session, so it receives print mode plus a prompt instead. Both shapes end
+/// at the same harmless child.
+fn fixture_child_args(agent: &str) -> [&'static str; 2] {
+    if agent == "omp" {
+        ["--print", "fixture"]
+    } else {
+        ["exec", "fixture"]
+    }
 }
 
 #[test]
@@ -2251,6 +2274,637 @@ fn a_claude_session_removes_its_whole_staging_root_at_cleanup() {
             "removing a staged link must never reach the source it pointed at"
         );
     }
+}
+
+/// The three planned OMP entries, in the order the plan creates them.
+///
+/// Written as components rather than a literal path so the assertion text matches the platform's
+/// own separator, which is what the renderer and the project walk both produce.
+fn omp_scope_entries() -> [PathBuf; 3] {
+    [
+        PathBuf::from(".omp"),
+        PathBuf::from(".omp").join("skills"),
+        PathBuf::from(".omp").join("skills").join("alpha"),
+    ]
+}
+
+/// Writes a project-owned Skill directly into an already-existing OMP project scope.
+fn install_existing_omp_scope(project: &Path) {
+    let owned = project.join(".omp/skills/rasen");
+    fs::create_dir_all(&owned).expect("project-owned OMP Skill");
+    fs::write(
+        owned.join("SKILL.md"),
+        "---\nname: rasen\ndescription: project fixture\n---\n",
+    )
+    .expect("project-owned Skill metadata");
+}
+
+#[test]
+fn an_omp_session_creates_its_project_scope_marks_it_active_and_releases_all_of_it() {
+    let fixture = Fixture::new("omp-apply-and-release");
+    fixture.skill("alpha");
+    let mounted = fixture.project.join(".omp/skills/alpha");
+
+    let mut holder = fixture
+        .command("omp", &[])
+        .env("SKILLMOUNT_HOLD_AT", "journal-active")
+        .env("SKILLMOUNT_HOLD_MS", "4000")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the OMP session should reach its active transaction");
+    let mut holder_stderr = wait_for_hold(&mut holder, "journal-active");
+
+    assert_eq!(
+        fixture.project_tree(),
+        omp_scope_entries()
+            .iter()
+            .map(|entry| entry.display().to_string())
+            .collect::<Vec<_>>(),
+        "applying creates exactly the OMP scope, its store, and the selected link"
+    );
+    assert_eq!(
+        fs::read_to_string(mounted.join("SKILL.md")).expect("the mount resolves to its source"),
+        fs::read_to_string(fixture.sources.join("alpha/SKILL.md")).expect("the source is readable"),
+        "the mounted entry must reach the canonical Skill source"
+    );
+
+    // An operator cleanup proves the journal is durably active rather than merely planned: an
+    // active transaction is reported and left strictly alone.
+    let reported = fixture.cleanup(true);
+
+    assert_eq!(
+        reported.status.code(),
+        Some(75),
+        "{}",
+        String::from_utf8_lossy(&reported.stdout)
+    );
+    let rendered = String::from_utf8_lossy(&reported.stdout);
+    assert!(
+        rendered.contains("[ACTIVE] omp transaction"),
+        "the active journal names its own Agent: {rendered}"
+    );
+    assert!(exists(&mounted), "an active OMP mount is left untouched");
+    assert_eq!(fixture.journals().len(), 1);
+
+    let status = holder.wait().expect("the held session remains waitable");
+    let mut diagnostics = String::new();
+    holder_stderr
+        .read_to_string(&mut diagnostics)
+        .expect("the held session diagnostics remain readable");
+
+    assert_eq!(status.code(), Some(FIXTURE_CHILD_STATUS), "{diagnostics}");
+    assert!(
+        fixture.project_tree().is_empty(),
+        "cleanup removes the whole OMP scope it created: {:?}",
+        fixture.project_tree()
+    );
+    assert!(
+        fixture.journals().is_empty(),
+        "a completed OMP session retires its journal: {:?}",
+        fixture.journals()
+    );
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+}
+
+/// Every automatically recoverable boundary an OMP session reaches survives a second invocation.
+///
+/// The three remaining names in `Checkpoint::ALL` are deliberately outside this loop and are
+/// covered elsewhere: `journal-supervising` is quarantined rather than recovered,
+/// `journal-completed` describes an already-finished cleanup, and `journal-retired` is only
+/// reachable on the platform that needs a write-through rename.
+#[test]
+fn a_second_omp_invocation_recovers_every_boundary_and_leaves_the_project_clean() {
+    for boundary in BOUNDARIES {
+        let fixture = Fixture::new(&format!("recover-omp-{boundary}"));
+        fixture.skill("alpha");
+        let source_body = fs::read_to_string(fixture.sources.join("alpha/SKILL.md"))
+            .expect("the Skill source is readable");
+
+        let killed = fixture.run_stopping_at("omp", boundary, &[]);
+        assert!(
+            String::from_utf8_lossy(&killed.stderr)
+                .contains(&format!("stopping at {boundary} occurrence")),
+            "an OMP session never reaches {boundary}, so nothing about it is under test: {}",
+            String::from_utf8_lossy(&killed.stderr)
+        );
+
+        // A real second invocation, against whatever the first one left behind.
+        let recovered = fixture.run("omp", &[]);
+
+        assert_eq!(
+            recovered.status.code(),
+            Some(FIXTURE_CHILD_STATUS),
+            "the recovering OMP session must launch and clean up after its fixture child at \
+             {boundary}: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        // Removing a link must never be followed into the directory it pointed at, so the source
+        // has to be byte-identical rather than merely present.
+        assert_eq!(
+            fs::read_to_string(fixture.sources.join("alpha/SKILL.md"))
+                .expect("no boundary may ever cost a Skill source"),
+            source_body,
+            "recovery followed the OMP mount into its source at {boundary}"
+        );
+
+        let residue = fixture.project_tree();
+        if boundary == "temporary-created" {
+            // The one boundary that cannot be reconciled: the temporary entry exists and nothing
+            // proves which transaction made it, so both it and its journal stay, reported.
+            assert!(
+                residue.iter().any(|entry| entry.contains(".skillmount-")),
+                "the unprovable staged entry must still be present at {boundary}: {residue:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&recovered.stderr).contains("retained"),
+                "retained residue must be reported: {}",
+                String::from_utf8_lossy(&recovered.stderr)
+            );
+            assert_eq!(fixture.journals().len(), 1);
+        } else {
+            assert!(
+                residue.is_empty(),
+                "an OMP session stopped at {boundary} must leave the project clean once \
+                 recovered: {residue:?}"
+            );
+            assert!(
+                fixture.journals().is_empty(),
+                "recovery plus a completed session must leave no journal at {boundary}: {:?}",
+                fixture.journals()
+            );
+        }
+    }
+}
+
+#[test]
+fn an_existing_omp_project_scope_survives_every_reachable_recovery_boundary() {
+    for boundary in CURRENT_LAYOUT_BOUNDARIES {
+        let fixture = Fixture::new(&format!("recover-omp-existing-{boundary}"));
+        fixture.skill("alpha");
+        install_existing_omp_scope(&fixture.project);
+
+        let owned = fixture.project.join(".omp/skills/rasen/SKILL.md");
+        let owned_body = fs::read_to_string(&owned).expect("read the project-owned Skill");
+        let baseline = fixture.project_tree();
+
+        let killed = fixture.run_stopping_at("omp", boundary, &[]);
+        assert!(
+            String::from_utf8_lossy(&killed.stderr)
+                .contains(&format!("stopping at {boundary} occurrence")),
+            "an existing OMP scope never reaches {boundary}: {}",
+            String::from_utf8_lossy(&killed.stderr)
+        );
+
+        let recovered = fixture.run("omp", &[]);
+
+        assert_eq!(
+            recovered.status.code(),
+            Some(FIXTURE_CHILD_STATUS),
+            "the existing OMP scope must recover and launch at {boundary}: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&owned).expect("the project-owned Skill survives"),
+            owned_body,
+            "recovery rewrote a Skill the transaction never created at {boundary}"
+        );
+
+        let recovered_tree = fixture.project_tree();
+        if boundary == "temporary-created" {
+            assert!(
+                baseline.iter().all(|entry| recovered_tree.contains(entry)),
+                "the existing scope must remain a subset of retained residue at {boundary}: \
+                 {recovered_tree:?}"
+            );
+            assert!(
+                recovered_tree
+                    .iter()
+                    .any(|entry| entry.contains(".skillmount-")),
+                "the unrecorded staged entry must be retained at {boundary}: {recovered_tree:?}"
+            );
+            assert_eq!(fixture.journals().len(), 1);
+        } else {
+            assert_eq!(
+                recovered_tree, baseline,
+                "only the pre-existing OMP scope may remain after {boundary}"
+            );
+            assert!(fixture.journals().is_empty());
+        }
+    }
+}
+
+#[test]
+fn omp_recovery_never_removes_an_entry_a_user_replaced_after_the_crash() {
+    let fixture = Fixture::new("omp-replaced-after-crash");
+    fixture.skill("alpha");
+    fixture.run_stopping_at("omp", "journal-active", &[]);
+    let crashed = fixture.journals();
+    assert_eq!(
+        crashed.len(),
+        1,
+        "the crashed session must leave exactly one journal: {crashed:?}"
+    );
+
+    // The operator replaces the mount with work of their own before the next session runs.
+    let mounted = fixture.project.join(".omp/skills/alpha");
+    if cfg!(windows) {
+        fs::remove_dir(&mounted)
+    } else {
+        fs::remove_file(&mounted)
+    }
+    .expect("the crashed session left a link here");
+    fs::create_dir_all(mounted.join("their-own-work")).expect("replacement");
+
+    let recovered = fixture.run("omp", &[]);
+    let stderr = String::from_utf8_lossy(&recovered.stderr);
+
+    assert!(
+        exists(&mounted.join("their-own-work")),
+        "recovery must never delete something it cannot prove it created"
+    );
+    let reported = platform_backend()
+        .canonical_directory(&fixture.project)
+        .expect("canonical project root")
+        .join(".omp/skills/alpha");
+    assert!(
+        stderr.contains(&format!("retained {}", reported.display())),
+        "the mismatch must be reported against the replaced entry: {stderr}"
+    );
+    assert!(
+        crashed[0].is_file(),
+        "the journal describing unreconciled residue is kept: {:?}",
+        fixture.journals()
+    );
+}
+
+#[test]
+fn a_corrupt_journal_blocks_a_new_omp_session_before_any_project_mutation() {
+    let fixture = Fixture::new("omp-corrupt-journal");
+    fixture.skill("alpha");
+    fs::create_dir_all(fixture.transactions()).expect("transaction directory");
+    let corrupt = fixture.transactions().join("aaaa-bbbb.journal");
+    fs::write(&corrupt, "skillmount-journal 99 unix deadbeef\n").expect("corrupt journal");
+
+    let output = fixture.run("omp", &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(75),
+        "unknown recovery state must fail closed before an OMP scope is planned: {stderr}"
+    );
+    assert!(stderr.contains("cannot be interpreted"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&corrupt).expect("still readable"),
+        "skillmount-journal 99 unix deadbeef\n",
+        "a journal that cannot be read is never rewritten or removed"
+    );
+    assert!(
+        !exists(&fixture.project.join(".omp")),
+        "the unknown journal must block the OMP scope itself: {:?}",
+        fixture.project_tree()
+    );
+    assert!(
+        !fixture.state.join("locks").exists(),
+        "the read-only rejection preflight must run before new lock-state mutation"
+    );
+}
+
+#[test]
+fn a_kept_omp_transaction_stays_terminal_until_an_explicit_cleanup_releases_it() {
+    let fixture = Fixture::new("omp-kept");
+    fixture.skill("alpha");
+
+    let kept = fixture.run("omp", &["--keep-mounts"]);
+    let kept_stderr = String::from_utf8_lossy(&kept.stderr);
+
+    assert_eq!(
+        kept.status.code(),
+        Some(FIXTURE_CHILD_STATUS),
+        "{kept_stderr}"
+    );
+    assert!(
+        kept_stderr.contains("retained because --keep-mounts was requested"),
+        "intentional retention must be diagnosed as requested: {kept_stderr}"
+    );
+    assert!(
+        !kept_stderr.contains("cleanup could not finish"),
+        "intentional retention is not a cleanup failure: {kept_stderr}"
+    );
+    let mounted = fixture.project.join(".omp/skills/alpha");
+    assert!(exists(&mounted), "--keep-mounts retains the OMP mount");
+    assert_eq!(fixture.journals().len(), 1, "the kept journal is retained");
+
+    // A later session reuses the kept scope and must not treat its journal as stale.
+    let later = fixture.run("omp", &[]);
+
+    assert_eq!(
+        later.status.code(),
+        Some(FIXTURE_CHILD_STATUS),
+        "{}",
+        String::from_utf8_lossy(&later.stderr)
+    );
+    assert!(
+        exists(&mounted),
+        "a terminal kept transaction is never recovered automatically"
+    );
+    assert_eq!(
+        fixture.journals().len(),
+        1,
+        "only the kept journal remains: {:?}",
+        fixture.journals()
+    );
+
+    let released = fixture.cleanup(false);
+    let rendered = String::from_utf8_lossy(&released.stdout);
+
+    assert!(released.status.success(), "{rendered}");
+    assert!(
+        rendered.contains("[RECOVERED] omp transaction"),
+        "{rendered}"
+    );
+    assert!(
+        fixture.project_tree().is_empty(),
+        "an explicit cleanup releases the kept OMP scope: {:?}",
+        fixture.project_tree()
+    );
+    assert!(fixture.journals().is_empty(), "{:?}", fixture.journals());
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+}
+
+#[test]
+fn two_omp_sessions_on_one_project_destination_serialize() {
+    for checkpoint in ["journal-active", "journal-cleaning"] {
+        let fixture = Fixture::new(&format!("omp-serialized-{checkpoint}"));
+        fixture.skill("alpha");
+
+        // The first session pauses while holding its locks, once during apply and once immediately
+        // before cleanup/removal. A second session must not enter either mutation interval.
+        let mut holder: Child = fixture
+            .command("omp", &[])
+            .env("SKILLMOUNT_HOLD_AT", checkpoint)
+            .env("SKILLMOUNT_HOLD_MS", "4000")
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the first OMP session should start");
+        let mut holder_stderr = wait_for_hold(&mut holder, checkpoint);
+        let mounted = fixture.project.join(".omp/skills/alpha");
+        let held = platform_backend()
+            .inspect_no_follow(&mounted)
+            .expect("inspect the held OMP mount");
+
+        let contender = fixture.run("omp", &[]);
+
+        assert_eq!(
+            platform_backend()
+                .inspect_no_follow(&mounted)
+                .expect("reinspect the held OMP mount"),
+            held,
+            "the contender replaced or removed the holder's entry at {checkpoint}"
+        );
+
+        let holder_status = holder.wait().expect("the first session remains waitable");
+        let mut holder_diagnostics = String::new();
+        holder_stderr
+            .read_to_string(&mut holder_diagnostics)
+            .expect("the first session stderr remains readable");
+
+        assert_eq!(
+            holder_status.code(),
+            Some(FIXTURE_CHILD_STATUS),
+            "the first session must launch and finish after holding at \
+             {checkpoint}: {holder_diagnostics}"
+        );
+        assert_eq!(
+            contender.status.code(),
+            Some(75),
+            "a second OMP session on the same destination must report a temporary failure at \
+             {checkpoint}: {}",
+            String::from_utf8_lossy(&contender.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&contender.stderr);
+        assert!(
+            stderr.contains("another SkillMount session holds"),
+            "{checkpoint}: {stderr}"
+        );
+        assert!(
+            stderr.contains("nothing was changed"),
+            "{checkpoint}: {stderr}"
+        );
+        assert!(stderr.contains("asm doctor"), "{checkpoint}: {stderr}");
+        assert!(
+            fixture.project_tree().is_empty(),
+            "the holder released its own scope and only its own: {:?}",
+            fixture.project_tree()
+        );
+    }
+}
+
+#[test]
+fn omp_sessions_reaching_one_destination_through_distinct_links_serialize() {
+    let fixture = Fixture::new("omp-shared-destination-lock");
+    fixture.skill("alpha");
+    let second_project = fixture.root.join("second-project");
+    let first_home = fixture.root.join("first-home");
+    let second_home = fixture.root.join("second-home");
+    let shared = fixture.root.join("shared-destination");
+    fs::create_dir_all(&second_project).expect("second project");
+    fs::create_dir_all(&shared).expect("shared physical destination");
+    let backend = platform_backend();
+    let canonical = backend
+        .canonical_directory(&shared)
+        .expect("canonical shared destination");
+
+    for project in [&fixture.project, &second_project] {
+        // OMP walks ancestors only up to the nearest repository root. Without a boundary of its
+        // own each project would also share every ancestor-derived provider scope, and contention
+        // would prove nothing about the destination key.
+        fs::create_dir_all(project.join(".git")).expect("repository boundary");
+        fs::create_dir_all(project.join(".omp")).expect("OMP scope");
+        let staged = backend
+            .create_directory_link(&LinkRequest {
+                source: canonical.clone(),
+                staged_path: project.join(".omp/.skills.skillmount-fixture"),
+                mode: LinkMode::Auto,
+            })
+            .expect("shared destination link fixture");
+        let outcome = backend
+            .place_no_replace(&staged, &project.join(".omp/skills"))
+            .expect("place shared destination link fixture");
+        assert!(matches!(outcome, PlacementOutcome::Placed(_)));
+    }
+
+    let mut holder: Child = fixture
+        .command_for("omp", &[], &fixture.project, &first_home)
+        .env("SKILLMOUNT_HOLD_AT", "journal-active")
+        .env("SKILLMOUNT_HOLD_MS", "4000")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the first session should start");
+    let mut holder_stderr = wait_for_hold(&mut holder, "journal-active");
+    assert!(
+        exists(&shared.join("alpha")),
+        "the holder must own the shared destination entry while it is held"
+    );
+
+    let contender = fixture
+        .command_for("omp", &[], &second_project, &second_home)
+        .output()
+        .expect("the second session should report contention");
+    let contender_stderr = String::from_utf8_lossy(&contender.stderr);
+
+    assert_eq!(
+        contender.status.code(),
+        Some(75),
+        "distinct launch roots reaching one destination must share its physical lock: \
+         {contender_stderr}"
+    );
+    assert!(
+        contender_stderr.contains("another SkillMount session holds"),
+        "{contender_stderr}"
+    );
+    assert!(
+        contender_stderr.contains(&canonical.display().to_string()),
+        "contention must name the shared physical destination: {contender_stderr}"
+    );
+    assert!(
+        exists(&shared.join("alpha")),
+        "the contender must not replace or remove the holder's entry"
+    );
+
+    let holder_status = holder.wait().expect("the first session remains waitable");
+    let mut holder_diagnostics = String::new();
+    holder_stderr
+        .read_to_string(&mut holder_diagnostics)
+        .expect("the first session stderr remains readable");
+
+    assert_eq!(
+        holder_status.code(),
+        Some(FIXTURE_CHILD_STATUS),
+        "{holder_diagnostics}"
+    );
+    let mut remaining = Vec::new();
+    collect(&shared, &shared, &mut remaining);
+    assert!(
+        remaining.is_empty(),
+        "the holder released the shared destination and the contender left nothing: {remaining:?}"
+    );
+}
+
+/// Unsettled OMP global state appearing after apply must stop the child and release everything.
+///
+/// Unlike the Codex and Claude markers this one is a real OMP condition: a `settings.json` with no
+/// `config.yml` beside it means the settings OMP will actually use are in no file `SkillMount` can
+/// read, so the plan it just applied can no longer be proved correct.
+#[test]
+fn an_unsettled_omp_configuration_after_apply_prevents_the_child_and_forces_owned_cleanup() {
+    let fixture = Fixture::new("omp-unsettled-after-apply");
+    fixture.skill("alpha");
+    let agent_dir = fixture.root.join("home/.omp/agent");
+    let release = fixture.root.join("release-omp-configuration");
+    let mut session = fixture
+        .command("omp", &["--keep-mounts"])
+        .env("SKILLMOUNT_HOLD_AT", "journal-active")
+        .env("SKILLMOUNT_HOLD_MS", "10000")
+        .env("SKILLMOUNT_HOLD_UNTIL", &release)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the session should reach its active transaction");
+    let mut diagnostics = wait_for_hold(&mut session, "journal-active");
+
+    assert!(exists(&fixture.project.join(".omp/skills/alpha")));
+    fs::create_dir_all(&agent_dir).expect("OMP agent directory");
+    fs::write(agent_dir.join("settings.json"), b"{\"skills\":{}}\n")
+        .expect("introduce unmigrated OMP global state");
+    fs::write(&release, b"continue\n").expect("release the spawn-boundary check");
+
+    let status = session.wait().expect("the held session remains waitable");
+    let mut remaining = String::new();
+    diagnostics
+        .read_to_string(&mut remaining)
+        .expect("the held session diagnostics remain readable");
+
+    assert_eq!(status.code(), Some(64), "{remaining}");
+    assert!(remaining.contains("has not yet migrated"), "{remaining}");
+    assert!(
+        !remaining.contains("Launching"),
+        "the Agent child must not start: {remaining}"
+    );
+    assert!(
+        agent_dir.join("settings.json").is_file(),
+        "the operator's OMP state is not transaction-owned"
+    );
+    assert!(
+        fixture.journals().is_empty(),
+        "matching-evidence cleanup retires the OMP transaction despite --keep-mounts: {:?}",
+        fixture.journals()
+    );
+    assert!(
+        !exists(&fixture.project.join(".omp")),
+        "the whole applied OMP scope is released: {:?}",
+        fixture.project_tree()
+    );
+}
+
+/// Explicit cleanup of an OMP journal reads the journal, never OMP itself.
+///
+/// Cleanup runs long after the session that recorded the journal, on a machine where OMP may have
+/// been upgraded, reconfigured, or removed. If it needed the current version banner or the current
+/// configuration to decide what it owns, a reconfigured OMP would strand mounts forever.
+#[test]
+fn omp_cleanup_needs_neither_the_omp_version_nor_its_configuration() {
+    let fixture = Fixture::new("omp-cleanup-without-agent-state");
+    fixture.skill("alpha");
+    let home = fixture.root.join("home");
+    let agent_dir = home.join(".omp/agent");
+    fs::create_dir_all(&agent_dir).expect("OMP agent directory");
+    fs::write(agent_dir.join("config.yml"), "skills:\n  enabled: true\n")
+        .expect("settled OMP configuration");
+
+    let killed = fixture.run_stopping_at("omp", "journal-active", &[]);
+    assert!(
+        !killed.status.success(),
+        "the session must stop while active"
+    );
+    assert!(exists(&fixture.project.join(".omp/skills/alpha")));
+    assert_eq!(fixture.journals().len(), 1);
+
+    // Everything the OMP adapter reads is now gone: no configuration, no version evidence.
+    fs::remove_dir_all(home.join(".omp")).expect("remove the OMP global state");
+
+    let cleaned = fixture
+        .cleanup_command_for(&fixture.project, false)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env_remove("SKILLMOUNT_TEST_OMP_VERSION")
+        .output()
+        .expect("asm cleanup should run");
+    let rendered = String::from_utf8_lossy(&cleaned.stdout);
+
+    assert!(cleaned.status.success(), "{rendered}");
+    assert!(
+        rendered.contains("[RECOVERED] omp transaction"),
+        "cleanup names the journal's own Agent without consulting it: {rendered}"
+    );
+    // The renderer prints resolved absolute paths, so the expectation has to be resolved too.
+    let resolved = platform_backend()
+        .canonical_directory(&fixture.project)
+        .expect("canonical project root");
+    for entry in omp_scope_entries() {
+        let removed = resolved.join(&entry);
+        assert!(
+            rendered.contains(&format!("removed {}", removed.display())),
+            "cleanup must name {} as removed: {rendered}",
+            entry.display()
+        );
+    }
+    assert!(
+        fixture.project_tree().is_empty(),
+        "the whole OMP scope is reconciled from the journal alone: {:?}",
+        fixture.project_tree()
+    );
+    assert!(fixture.journals().is_empty(), "{:?}", fixture.journals());
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
 }
 
 /// Waits up to two seconds for `condition`, so a spawned session is observably underway.

@@ -64,6 +64,11 @@ serde_yaml_ng = "=0.10.0"
 # Lock filenames are SHA-256 digests of tagged identity bytes, so two spellings of one resource
 # reach the same file. Only `alloc`-free digesting is used.
 sha2 = { version = "=0.11.0", default-features = false }
+# OMP 17.2.9 merges `<project>/.codex/config.toml` into the project settings layer that decides
+# whether a selected Skill is visible at all, so that file has to be parsed rather than guessed at:
+# a Codex `[skills] enabled = false` really does disable every OMP Skill. Parsing only; the
+# serializer, error formatting, and order-preserving map are all disabled.
+toml = { version = "=1.1.4", default-features = false, features = ["parse", "serde"] }
 
 # Placement needs an atomic no-replace rename, which `std::fs::rename` does not provide: it
 # replaces. macOS reaches `renameatx_np(RENAME_EXCL)` and other Unix hosts reach

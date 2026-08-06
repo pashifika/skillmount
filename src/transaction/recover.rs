@@ -17,6 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::domain::AgentId;
 use crate::error::AppError;
 use crate::journal::store::{self, JournalScan, RejectedJournal, ScannedJournal};
 use crate::journal::{ActionOperation, TransactionJournal, TransactionStatus};
@@ -108,6 +109,8 @@ pub struct QuarantinedTransaction {
 pub struct ReconciledTransaction {
     /// Identity of the recovered transaction.
     pub transaction: String,
+    /// Agent that owned it, as recorded in its journal.
+    pub agent: AgentId,
     /// Journal that described it.
     pub journal: PathBuf,
     /// What the removal pass did.
@@ -129,6 +132,7 @@ pub(crate) struct ExplicitCleanupReport {
 #[derive(Debug)]
 pub(crate) struct ActiveTransaction {
     pub(crate) transaction: String,
+    pub(crate) agent: AgentId,
     pub(crate) journal: PathBuf,
     pub(crate) contention: LockContention,
 }
@@ -137,6 +141,7 @@ pub(crate) struct ActiveTransaction {
 #[derive(Debug)]
 pub(crate) struct ExplicitCleanupFailure {
     pub(crate) transaction: String,
+    pub(crate) agent: AgentId,
     pub(crate) journal: PathBuf,
     pub(crate) error: AppError,
 }
@@ -177,12 +182,14 @@ pub(crate) fn cleanup_explicit(
         }
 
         let transaction = scanned.journal.transaction_id.to_string();
+        let agent = scanned.journal.agent;
         let resources = scanned.journal.lock_resources();
         let owner = LockOwner::for_transaction(&scanned.journal.transaction_id);
         let locks = match claimed_locks.try_acquire_missing(&resources, &owner) {
             Err(error) => {
                 report.failures.push(ExplicitCleanupFailure {
                     transaction,
+                    agent,
                     journal: scanned.path,
                     error,
                 });
@@ -195,6 +202,7 @@ pub(crate) fn cleanup_explicit(
             Err(contention) => {
                 report.active.push(ActiveTransaction {
                     transaction,
+                    agent,
                     journal: scanned.path,
                     contention,
                 });
@@ -239,11 +247,13 @@ fn reconcile_explicit_claims(
             .take()
             .expect("every claimed journal is cleaned exactly once");
         let transaction = scanned.journal.transaction_id.to_string();
+        let agent = scanned.journal.agent;
         let mut adopted = match Transaction::adopt(scanned.journal, scanned.path.clone(), locks) {
             Ok(transaction) => transaction,
             Err(error) => {
                 report.failures.push(ExplicitCleanupFailure {
                     transaction,
+                    agent,
                     journal: scanned.path,
                     error,
                 });
@@ -253,11 +263,13 @@ fn reconcile_explicit_claims(
         match adopted.cleanup_required() {
             Ok(outcome) => report.reconciled.push(ReconciledTransaction {
                 transaction,
+                agent,
                 journal: scanned.path,
                 report: outcome,
             }),
             Err(error) => report.failures.push(ExplicitCleanupFailure {
                 transaction,
+                agent,
                 journal: scanned.path,
                 error,
             }),
@@ -394,12 +406,14 @@ pub fn recover_stale(already_held: &mut HeldLocks) -> Result<RecoveryReport, App
         // two agree for every journal this crate wrote; reconciling the derived one instead would
         // leave a mismatched file behind to be recovered again on every later run.
         let transaction_id = scanned.journal.transaction_id.to_string();
+        let agent = scanned.journal.agent;
         let journal_path = scanned.path.clone();
         let mut transaction =
             Transaction::adopt(scanned.journal, journal_path.clone(), already_held)?;
         let outcome = transaction.cleanup_recovered()?;
         report.reconciled.push(ReconciledTransaction {
             transaction: transaction_id,
+            agent,
             journal: journal_path,
             report: outcome,
         });

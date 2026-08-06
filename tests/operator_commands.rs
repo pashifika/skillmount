@@ -65,6 +65,15 @@ impl Fixture {
                 "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
                 self.root.join("admin-skills"),
             )
+            .env("SKILLMOUNT_TEST_OMP_VERSION", "omp/17.2.9")
+            // OMP resolves its roots from the environment, so the developer's real profile,
+            // configuration overlay, and XDG bases must never reach a fixture.
+            .env_remove("OMP_PROFILE")
+            .env_remove("PI_PROFILE")
+            .env_remove("PI_CONFIG_FILES")
+            .env_remove("PI_CONFIG_DIR")
+            .env_remove("PI_CODING_AGENT_DIR")
+            .env_remove("XDG_DATA_HOME")
             .env("SKILLMOUNT_STATE_DIR", &self.state);
         command
     }
@@ -84,6 +93,8 @@ impl Fixture {
             .arg("--codex-bin")
             .arg(ASM)
             .arg("--claude-bin")
+            .arg(ASM)
+            .arg("--omp-bin")
             .arg(ASM);
         command
     }
@@ -129,6 +140,7 @@ impl Fixture {
         fs::create_dir(&directory).expect("agent PATH fixture");
         install_agent_alias(&directory, "codex");
         install_agent_alias(&directory, "claude");
+        install_agent_alias(&directory, "omp");
         directory
     }
 }
@@ -158,8 +170,13 @@ fn healthy_doctor_reports_versions_and_leaves_project_and_state_untouched() {
     assert!(rendered.contains("codex-cli 0.146.0"));
     assert!(rendered.contains("[PASS] claude executable"));
     assert!(rendered.contains("2.1.220 (Claude Code)"));
+    assert!(rendered.contains("[PASS] omp executable"));
+    assert!(rendered.contains("omp/17.2.9"));
     assert!(rendered.contains("[UNVERIFIED] codex live compatibility"));
     assert!(rendered.contains("[UNVERIFIED] claude live compatibility"));
+    assert!(rendered.contains("[UNVERIFIED] omp live compatibility"));
+    assert!(rendered.contains("[PASS] project .omp/skills"));
+    assert!(rendered.contains("[PASS] omp discovery"));
     assert!(rendered.contains("docs/compatibility.md"));
     #[cfg(not(windows))]
     {
@@ -180,6 +197,81 @@ fn healthy_doctor_reports_versions_and_leaves_project_and_state_untouched() {
         !fixture.state.exists(),
         "a read-only doctor pass must not create SkillMount state"
     );
+}
+
+/// `doctor` must diagnose OMP without letting it decide another Agent's finding.
+///
+/// An unsettled OMP global configuration is an OMP-only hard failure, so it must produce exactly
+/// one failure while every Codex, Claude, layout, link, lock, and transaction finding still runs.
+#[test]
+fn an_unsettled_omp_configuration_fails_only_the_omp_finding() {
+    let fixture = Fixture::new("doctor-omp-unsettled");
+    let project_before = snapshot(&fixture.project);
+    let agent_dir = fixture.home.join(".omp/agent");
+    fs::create_dir_all(&agent_dir).expect("OMP agent directory");
+    fs::write(agent_dir.join("settings.json"), "{}").expect("legacy OMP settings");
+
+    let output = fixture.doctor();
+
+    assert_eq!(output.status.code(), Some(65));
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("[FAIL] omp executable"), "{rendered}");
+    assert!(rendered.contains("has not yet migrated"), "{rendered}");
+    assert!(rendered.contains("[PASS] codex executable"), "{rendered}");
+    assert!(rendered.contains("[PASS] claude executable"), "{rendered}");
+    assert!(rendered.contains("[PASS] codex discovery"), "{rendered}");
+    assert!(rendered.contains("[PASS] claude discovery"), "{rendered}");
+    assert!(rendered.contains("1 failure"), "{rendered}");
+    assert_eq!(snapshot(&fixture.project), project_before);
+    assert!(!fixture.state.exists());
+}
+
+#[test]
+fn a_drifted_omp_banner_is_unverified_without_failing_doctor() {
+    let fixture = Fixture::new("doctor-omp-drift");
+
+    let output = fixture
+        .doctor_command()
+        .env("SKILLMOUNT_TEST_OMP_VERSION", "omp/99.0.0")
+        .output()
+        .expect("drifted-version doctor should run");
+
+    assert!(output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        rendered.contains("[UNVERIFIED] omp executable"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("omp/99.0.0"), "{rendered}");
+    assert!(rendered.contains("omp/17.2.9"), "{rendered}");
+    assert!(rendered.contains("[PASS] codex executable"), "{rendered}");
+    assert!(rendered.contains("0 failure"), "{rendered}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_broken_omp_project_link_reports_its_chain_without_mutation() {
+    let fixture = Fixture::new("doctor-omp-broken-link");
+    fs::create_dir_all(fixture.project.join(".omp")).expect("OMP project scope");
+    std::os::unix::fs::symlink(
+        fixture.project.join("no-such-omp-store"),
+        fixture.project.join(".omp/skills"),
+    )
+    .expect("broken OMP discovery link");
+    let project_before = snapshot(&fixture.project);
+
+    let output = fixture.doctor();
+
+    assert_eq!(output.status.code(), Some(65));
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        rendered.contains("[FAIL] project .omp/skills"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("exact chain:"), "{rendered}");
+    assert!(rendered.contains("no changes were made"), "{rendered}");
+    assert_eq!(snapshot(&fixture.project), project_before);
+    assert!(!fixture.state.exists());
 }
 
 #[test]
@@ -204,6 +296,7 @@ fn doctor_resolves_both_agent_executables_from_path() {
     let rendered = String::from_utf8_lossy(&output.stdout);
     assert!(rendered.contains("[PASS] codex executable"));
     assert!(rendered.contains("[PASS] claude executable"));
+    assert!(rendered.contains("[PASS] omp executable"));
 }
 
 #[test]

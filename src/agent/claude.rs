@@ -587,6 +587,7 @@ impl AgentAdapter for ClaudeAdapter {
             visible_skills,
             mount_entries,
             discovery_entry,
+            backing_store_canonical: super::canonical_backing(&backing_store, &backing_state),
             backing_store,
             backing_store_state: backing_state.kind,
             lock_resources,
