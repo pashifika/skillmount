@@ -1,10 +1,10 @@
 //! Rendering for the read-only commands.
 //!
-//! Every value that could come from the operating system is written as its own indexed line. A
-//! joined command string is never produced: quoting inside one would be reinterpretable, and the
-//! whole point of these commands is that the reader can trust what they see.
+//! Every value that could come from the operating system is written as its own labelled or indexed
+//! line. A joined command string is never produced: quoting inside one would be reinterpretable, and
+//! the whole point of these commands is that the reader can trust what they see.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -280,11 +280,15 @@ fn plan(out: &mut String, report: &ReadOnlyReport<'_>) {
             }
         }
         if report.verbose() {
+            // The disposition is part of the plan, not a cleanup detail: it tells an operator which
+            // entries a later pass is obliged to reconcile and which ones are scaffolding it may
+            // leave behind. Reading it changes nothing on disk.
             let _ = writeln!(
                 out,
-                "         #{} precondition={}",
+                "         #{} precondition={} cleanup={}",
                 action.id,
-                action.expected_precondition.label()
+                action.expected_precondition.label(),
+                action.operation.cleanup_disposition().label()
             );
         }
     }
@@ -364,10 +368,10 @@ fn recovery(out: &mut String) {
         };
         let _ = writeln!(
             out,
-            "  {verb}  {}  ({}, {} owned action(s))",
+            "  {verb}  {}  ({}, {} pending action(s))",
             path_value(&scanned.path, false),
             scanned.journal.status.label(),
-            scanned.journal.reversible_actions().count()
+            scanned.journal.cleanup_candidates().count()
         );
     }
     for rejected in &scan.rejected {
@@ -433,6 +437,33 @@ pub(crate) fn render_warnings(catalog: &SkillCatalog, snapshot: &DiscoverySnapsh
 
 pub(crate) fn path_value(path: &Path, verbose: bool) -> String {
     os_value(path.as_os_str(), verbose)
+}
+
+/// Renders a recovery or retry argument vector as one labelled line per native value.
+///
+/// The first value is the executable and the rest are numbered from 1, each escaped on its own
+/// through [`os_value`]. Nothing is joined: no single quoting contract covers POSIX shells,
+/// PowerShell, and values that are not valid text, so a joined string would either be lossy or carry
+/// quoting a reader could reinterpret. The labels say what the lines are — an argument vector to
+/// invoke, not a command to paste.
+pub(crate) fn argument_vector(indent: &str, argv: &[OsString]) -> Vec<String> {
+    let mut values = argv.iter();
+    let Some(executable) = values.next() else {
+        return Vec::new();
+    };
+    let mut lines = Vec::with_capacity(argv.len());
+    lines.push(format!(
+        "{indent}executable: {}",
+        os_value(executable, true)
+    ));
+    for (index, argument) in values.enumerate() {
+        lines.push(format!(
+            "{indent}argument {}: {}",
+            index + 1,
+            os_value(argument, true)
+        ));
+    }
+    lines
 }
 
 /// Marks a value that had to be escaped because it is not representable as text.

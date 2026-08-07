@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use crate::domain::AgentId;
 use crate::link::PlatformIdentity;
 use crate::lock::{LockResource, LockResourceIdentity, LockResourceKind};
-use crate::mount::PathPrecondition;
+use crate::mount::{CleanupDisposition, PathPrecondition};
 
 use codec::Line;
 
@@ -113,7 +113,7 @@ pub enum TransactionStatus {
     Supervising,
     /// Ordinary cleanup is in progress.
     Cleaning,
-    /// Cleanup finished and nothing transaction-owned remains to reconcile.
+    /// Cleanup finished and nothing cleanup-critical remains to reconcile.
     Completed,
     /// The operator asked for the mounts to be retained.
     Kept,
@@ -189,7 +189,15 @@ pub enum ActionStatus {
     Applied,
     /// The entry already existed and belongs to someone else; cleanup never touches it.
     Reused,
-    /// The entry was verified and removed, or was already absent.
+    /// Cleanup has no remaining responsibility for the entry this action created.
+    ///
+    /// The exact claim depends on the operation's [`CleanupDisposition`]. For a
+    /// [`CleanupDisposition::Required`] link the entry was verified and removed, or was already
+    /// absent, so it is physically gone. For a [`CleanupDisposition::BestEffort`] helper directory
+    /// this records reconciliation only: the pass may have preserved a non-empty, replaced, or
+    /// unremovable directory, because nothing a child could load depends on it once every required
+    /// entry is reconciled. The label itself is unchanged, so an older build reads a newly written
+    /// journal exactly as before.
     RolledBack,
 }
 
@@ -240,7 +248,7 @@ pub enum ActionOperation {
     CreateDirectory,
     /// Create a directory link for a selected Skill.
     CreateDirectoryLink,
-    /// Record an entry that already satisfies the mount and is not transaction-owned.
+    /// Record an entry that already satisfies the mount and that this transaction did not create.
     ReuseExistingLink,
 }
 
@@ -266,10 +274,28 @@ impl ActionOperation {
         }
     }
 
-    /// Returns whether cleanup owns whatever this action produced.
+    /// Returns whether this operation creates an entry, and therefore needs a staged sibling and
+    /// write-ahead progress.
     #[must_use]
-    pub const fn is_transaction_owned(self) -> bool {
-        matches!(self, Self::CreateDirectory | Self::CreateDirectoryLink)
+    pub const fn creates_entry(self) -> bool {
+        match self {
+            Self::CreateDirectory | Self::CreateDirectoryLink => true,
+            Self::ReuseExistingLink => false,
+        }
+    }
+
+    /// Returns how much authority cleanup has over the entry this operation produced.
+    ///
+    /// The disposition is derived from the label already on disk rather than serialized beside it.
+    /// A journal written before this rule existed therefore receives the same policy without a
+    /// schema change, and no journal can record a kind and a disposition that disagree.
+    #[must_use]
+    pub const fn cleanup_disposition(self) -> CleanupDisposition {
+        match self {
+            Self::CreateDirectoryLink => CleanupDisposition::Required,
+            Self::CreateDirectory => CleanupDisposition::BestEffort,
+            Self::ReuseExistingLink => CleanupDisposition::None,
+        }
     }
 }
 
@@ -495,14 +521,15 @@ impl TransactionJournal {
         resources
     }
 
-    /// Returns the transaction-owned actions that may have created something, newest first.
+    /// Returns the actions that may have created something, newest first.
     ///
-    /// Reverse plan order is the only safe rollback order: a helper directory is created before the
-    /// links inside it, so undoing it first would leave a non-empty directory that cleanup then
-    /// refuses to remove.
-    pub fn reversible_actions(&self) -> impl Iterator<Item = &JournalAction> {
+    /// Reverse plan order is the only safe order: a helper directory is created before the links
+    /// inside it, so visiting the directory first would always find it non-empty. A best-effort
+    /// directory whose action is already reconciled is excluded exactly like a removed link — the
+    /// action, not the filesystem, records that cleanup has no remaining responsibility for it.
+    pub fn cleanup_candidates(&self) -> impl Iterator<Item = &JournalAction> {
         self.actions.iter().rev().filter(|action| {
-            action.operation.is_transaction_owned() && action.status.may_have_created_something()
+            action.operation.creates_entry() && action.status.may_have_created_something()
         })
     }
 

@@ -269,14 +269,6 @@ impl ComparablePath {
     pub fn names_same_path(&self, other: &Self) -> bool {
         self.key == other.key
     }
-
-    /// Returns whether `other` is this path or lies beneath it.
-    ///
-    /// Comparison is by component, so `/skills/ab` is not contained by `/skills/a`.
-    #[must_use]
-    pub fn contains(&self, other: &Self) -> bool {
-        other.key.starts_with(&self.key)
-    }
 }
 
 /// Returns whether two raw link targets name the same path.

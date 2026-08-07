@@ -302,8 +302,11 @@ fn journal_action(
         id: planned.id,
         operation,
         expected_precondition: planned.expected_precondition,
+        // Both create operations receive a transaction-unique staged sibling. Cleanup authority
+        // differs between a Skill link and a helper directory, but the write-ahead sequence that
+        // brings either into existence does not.
         temporary_path: operation
-            .is_transaction_owned()
+            .creates_entry()
             .then(|| staged_sibling(transaction_id, planned.id, &final_path)),
         final_path,
         source_canonical,

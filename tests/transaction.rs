@@ -593,6 +593,12 @@ fn scoped_cleanup_releases_kept_mounts_and_leaves_other_projects_out_of_scope() 
     assert!(fixture.sources.join("alpha/SKILL.md").is_file());
 }
 
+/// One explicit pass claims a shared lock set once and reconciles every overlapping kept journal.
+///
+/// Two kept sessions in one project share the discovery-directory chain and each own their own
+/// Skill link. The contract this pins is the shared-lock claim, the removal of every cleanup-critical
+/// link, and the retirement of both journals; the shared helper directories are scaffolding whose
+/// removal is best-effort housekeeping, so their final presence is deliberately not asserted here.
 #[test]
 fn cleanup_reconciles_overlapping_kept_journals_and_their_shared_helpers_in_one_pass() {
     let fixture = Fixture::new("explicit-cleanup-overlapping-kept");
@@ -604,16 +610,22 @@ fn cleanup_reconciles_overlapping_kept_journals_and_their_shared_helpers_in_one_
     let second = fixture.run("codex", &["--keep-mounts"]);
     assert_eq!(second.status.code(), Some(FIXTURE_CHILD_STATUS));
     assert_eq!(fixture.journals().len(), 2);
-    assert!(exists(&fixture.project.join(".agents/skills/alpha")));
-    assert!(exists(&fixture.project.join(".agents/skills/beta")));
+    let alpha = fixture.project.join(".agents/skills/alpha");
+    let beta = fixture.project.join(".agents/skills/beta");
+    assert!(exists(&alpha));
+    assert!(exists(&beta));
 
     let cleaned = fixture.cleanup(false);
     let output = String::from_utf8_lossy(&cleaned.stdout);
 
     assert!(cleaned.status.success(), "{output}");
     assert!(output.contains("2 recovered"), "{output}");
-    assert!(!output.contains("[ACTIVE]"), "{output}");
-    assert!(fixture.project_tree().is_empty());
+    assert!(
+        !output.contains("[ACTIVE]"),
+        "one pass claims the shared lock set once: {output}"
+    );
+    assert!(!exists(&alpha), "{output}");
+    assert!(!exists(&beta), "{output}");
     assert!(fixture.journals().is_empty());
     assert!(fixture.sources.join("alpha/SKILL.md").is_file());
     assert!(fixture.sources.join("beta/SKILL.md").is_file());
@@ -896,8 +908,9 @@ fn cleanup_uses_lock_state_not_a_reused_pid_in_holder_text() {
     assert!(fixture.journals().is_empty());
 }
 
+/// Explicit cleanup removes the mount, preserves the helper content, and retires the journal.
 #[test]
-fn cleanup_retains_a_non_empty_owned_helper_after_removing_its_mount() {
+fn cleanup_preserves_a_non_empty_helper_after_removing_its_mount() {
     let fixture = Fixture::new("explicit-cleanup-non-empty-helper");
     fixture.skill("alpha");
     fixture.run_stopping_at("codex", "journal-active", &[]);
@@ -906,12 +919,20 @@ fn cleanup_retains_a_non_empty_owned_helper_after_removing_its_mount() {
 
     let cleaned = fixture.cleanup(false);
 
-    assert_eq!(cleaned.status.code(), Some(73));
     let rendered = String::from_utf8_lossy(&cleaned.stdout);
+    assert_eq!(cleaned.status.code(), Some(0), "{rendered}");
+    assert!(rendered.contains("preserved scaffolding"), "{rendered}");
     assert!(rendered.contains("holds entries"), "{rendered}");
+    assert!(
+        !rendered.contains("retry these argv values"),
+        "preserved scaffolding is not a retryable condition: {rendered}"
+    );
     assert!(operator_file.is_file());
     assert!(!exists(&fixture.project.join(".agents/skills/alpha")));
-    assert_eq!(fixture.journals().len(), 1);
+    assert!(
+        fixture.journals().is_empty(),
+        "no cleanup-critical entry remains, so the journal is retired"
+    );
     assert!(fixture.sources.join("alpha/SKILL.md").is_file());
 }
 
@@ -1063,11 +1084,12 @@ fn a_second_invocation_recovers_every_boundary_and_leaves_the_project_clean() {
             "no boundary may ever cost a Skill source"
         );
 
-        // One boundary genuinely cannot be reconciled automatically. `temporary-created` stops
-        // between creating the temporary entry and recording its identity, so the entry exists and
-        // nothing proves which transaction made it. Retaining it is the specified outcome — residue
-        // over deleting an unowned entry — and both the entry and the journal describing it stay,
-        // reported, so an operator can finish the job.
+        // One boundary genuinely cannot be reconciled. `temporary-created` stops between creating
+        // the temporary entry and recording its identity, so the entry exists and nothing proves
+        // which transaction made it. Preserving it is the specified outcome — residue over deleting
+        // an unowned entry. The interrupted action is a helper directory, so the observation is
+        // reported once and the journal is still retired: no later pass could ever prove more about
+        // that path, and nothing selected is reachable through it.
         let residue = fixture.project_tree();
         if boundary == "temporary-created" {
             assert!(
@@ -1075,14 +1097,13 @@ fn a_second_invocation_recovers_every_boundary_and_leaves_the_project_clean() {
                 "the unprovable staged entry must still be present at {boundary}: {residue:?}"
             );
             assert!(
-                String::from_utf8_lossy(&recovered.stderr).contains("retained"),
-                "retained residue must be reported: {}",
+                String::from_utf8_lossy(&recovered.stderr).contains("preserved scaffolding"),
+                "preserved residue must be reported: {}",
                 String::from_utf8_lossy(&recovered.stderr)
             );
-            assert_eq!(
-                fixture.journals().len(),
-                1,
-                "the journal describing unreconciled residue is kept: {:?}",
+            assert!(
+                fixture.journals().is_empty(),
+                "scaffolding alone must not keep a journal: {:?}",
                 fixture.journals()
             );
         } else {
@@ -1132,11 +1153,15 @@ fn a_second_claude_invocation_recovers_every_staging_boundary() {
                     .session_tree()
                     .iter()
                     .any(|entry| entry.contains(".skillmount-")),
-                "unrecorded staging identity is retained at {boundary}: {:?}",
+                "unrecorded staging identity is preserved at {boundary}: {:?}",
                 fixture.session_tree()
             );
-            assert!(stderr.contains("retained"), "{stderr}");
-            assert_eq!(fixture.journals().len(), 1);
+            assert!(stderr.contains("preserved scaffolding"), "{stderr}");
+            assert!(
+                fixture.journals().is_empty(),
+                "scaffolding alone must not keep a journal: {:?}",
+                fixture.journals()
+            );
         } else {
             assert!(
                 fixture.session_tree().is_empty(),
@@ -1384,8 +1409,14 @@ fn claude_recovery_never_removes_a_replaced_staging_entry() {
     assert!(fixture.project_tree().is_empty());
 }
 
+/// A replaced Claude session root is preserved, reported once, and stops being an obligation.
+///
+/// The operator moved `SkillMount`'s private staging root away and left their own directory at the
+/// recorded path. The staged Skill link is therefore absent from every path the journal records, so
+/// no cleanup-critical entry remains: the replacement is preserved untouched and the journal, which
+/// no later pass could ever act on, is retired instead of blocking every future invocation.
 #[test]
-fn claude_recovery_retains_a_replaced_session_root() {
+fn claude_recovery_preserves_a_replaced_session_root() {
     let fixture = Fixture::new("claude-replaced-session-root");
     fixture.skill("alpha");
     fixture.run_stopping_at("claude", "journal-active", &[]);
@@ -1407,12 +1438,13 @@ fn claude_recovery_retains_a_replaced_session_root() {
 
     assert!(session.join("operator-owned.txt").is_file());
     assert!(moved.join("root/.claude/skills/alpha").is_dir());
-    assert!(stderr.contains("retained"), "{stderr}");
-    assert!(
-        !fixture.journals().is_empty(),
-        "root identity mismatch must retain its ownership journal"
-    );
+    assert!(stderr.contains("preserved scaffolding"), "{stderr}");
     assert!(fixture.project_tree().is_empty());
+    assert!(
+        fixture.journals().is_empty(),
+        "a journal describing only a replaced staging root is retired: {:?}",
+        fixture.journals()
+    );
 }
 
 #[test]
@@ -1467,7 +1499,12 @@ fn a_session_stopped_after_supervision_intent_is_quarantined_not_recovered() {
         stderr.contains("process-domain death was never proved"),
         "{stderr}"
     );
-    assert!(stderr.contains("recovery[0] argv[1] = cleanup"), "{stderr}");
+    assert!(stderr.contains("  quarantined journal: "), "{stderr}");
+    assert!(stderr.contains("    argument 1: cleanup"), "{stderr}");
+    assert!(
+        !stderr.contains("recovery[0]") && !stderr.contains("argv["),
+        "nested raw recovery fragments must be gone: {stderr}"
+    );
     assert!(
         stderr.contains("the quarantined mounts were not changed"),
         "{stderr}"
@@ -1476,8 +1513,9 @@ fn a_session_stopped_after_supervision_intent_is_quarantined_not_recovered() {
     assert_eq!(fixture.journals().len(), 1, "ownership evidence remains");
 }
 
+/// One quarantined journal names its own recorded project, never the unrelated current one.
 #[test]
-fn cross_project_quarantine_names_the_recorded_project_cleanup_argv() {
+fn cross_project_quarantine_names_the_recorded_project_recovery_vector() {
     let fixture = Fixture::new("cross-project-quarantine-guidance");
     fixture.skill("alpha");
     let stopped = fixture.run_stopping_at("codex", "journal-supervising", &[]);
@@ -1497,8 +1535,8 @@ fn cross_project_quarantine_names_the_recorded_project_cleanup_argv() {
     assert_eq!(refused.status.code(), Some(75), "{stderr}");
     let recovery_project = stderr
         .lines()
-        .find(|line| line.contains("recovery[0] argv[3] ="))
-        .expect("targeted project recovery argv");
+        .find(|line| line.starts_with("    argument 3: "))
+        .expect("targeted project recovery argument");
     assert!(
         recovery_project.contains(&recorded_project.to_string_lossy().into_owned()),
         "the recovery command must target the quarantined journal's project: {recovery_project}"
@@ -2046,14 +2084,17 @@ fn hard_agent_controls_appearing_after_apply_prevent_child_and_force_owned_clean
     }
 }
 
+/// Recovery reports the scaffolding it preserved, then retires the journal anyway.
+///
+/// The store directory can no longer be removed while the operator's file sits in it, but the mount
+/// inside it can. Once that Skill link is gone nothing selected is reachable, so the directory is an
+/// observation rather than unresolved mount ownership.
 #[test]
-fn a_cleanup_that_cannot_finish_keeps_its_journal_and_its_evidence() {
+fn recovery_reports_preserved_scaffolding_and_still_retires_its_journal() {
     let fixture = Fixture::new("cleanup-blocked");
     fixture.skill("alpha");
     fixture.run_stopping_at("codex", "journal-active", &[]);
 
-    // Something is added to the store, so the store directory can no longer be removed while the
-    // mount inside it still can.
     fs::write(fixture.project.join(".agents/skills/notes.md"), "mine").expect("user content");
     let recovered = fixture.run("codex", &[]);
 
@@ -2062,11 +2103,66 @@ fn a_cleanup_that_cannot_finish_keeps_its_journal_and_its_evidence() {
         "the operator's file must survive"
     );
     let stderr = String::from_utf8_lossy(&recovered.stderr);
+    assert!(stderr.contains("preserved scaffolding"), "{stderr}");
     assert!(stderr.contains("holds entries"), "{stderr}");
     assert!(
-        !fixture.journals().is_empty(),
-        "a cleanup that retained something keeps the journal describing it"
+        !stderr.contains("session cleanup failed"),
+        "preserved scaffolding must not be reported as a cleanup failure: {stderr}"
     );
+    assert!(
+        fixture.journals().is_empty(),
+        "no cleanup-critical entry remains, so nothing needs recovery evidence: {:?}",
+        fixture.journals()
+    );
+}
+
+/// A process killed right after a preserved directory becomes durable is finished by the next run.
+///
+/// `scaffolding-reconciled` is the one boundary this policy adds: the journal already says the
+/// directory is no longer an obligation while the directory itself is still there. A crash there must
+/// leave a state a later invocation can complete, not one that re-derives an obligation from the
+/// directory's presence.
+#[test]
+fn a_session_killed_after_reconciling_preserved_scaffolding_is_completed_by_the_next_run() {
+    let fixture = Fixture::new("scaffolding-reconciled");
+    fixture.skill("alpha");
+    fixture.run_stopping_at("codex", "journal-active", &[]);
+    let notes = fixture.project.join(".agents/skills/notes.md");
+    fs::write(&notes, "mine").expect("user content");
+
+    // The recovering session removes the Skill link, durably reconciles the store directory it must
+    // preserve, and is killed at exactly that boundary.
+    let killed = fixture.run_stopping_at("codex", "scaffolding-reconciled", &[]);
+    let killed_stderr = String::from_utf8_lossy(&killed.stderr);
+    assert!(
+        killed_stderr.contains("stopping at scaffolding-reconciled occurrence"),
+        "the boundary must be reachable: {killed_stderr}"
+    );
+    assert!(!exists(&fixture.project.join(".agents/skills/alpha")));
+    assert_eq!(
+        fixture.journals().len(),
+        1,
+        "the interrupted recovery leaves its adopted journal behind"
+    );
+
+    let finished = fixture.run("codex", &[]);
+    let stderr = String::from_utf8_lossy(&finished.stderr);
+
+    assert_eq!(
+        finished.status.code(),
+        Some(FIXTURE_CHILD_STATUS),
+        "a real second invocation must complete after the interruption: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&notes).expect("the operator's file survives every pass"),
+        "mine"
+    );
+    assert!(
+        fixture.journals().is_empty(),
+        "the completed pass retires every journal: {:?}",
+        fixture.journals()
+    );
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
 }
 
 #[test]
@@ -2401,10 +2497,11 @@ fn an_omp_session_creates_its_project_scope_marks_it_active_and_releases_all_of_
 
 /// Every automatically recoverable boundary an OMP session reaches survives a second invocation.
 ///
-/// The three remaining names in `Checkpoint::ALL` are deliberately outside this loop and are
-/// covered elsewhere: `journal-supervising` is quarantined rather than recovered,
-/// `journal-completed` describes an already-finished cleanup, and `journal-retired` is only
-/// reachable on the platform that needs a write-through rename.
+/// The four remaining names in `Checkpoint::ALL` are deliberately outside this loop and are covered
+/// elsewhere: `journal-supervising` is quarantined rather than recovered, `journal-completed`
+/// describes an already-finished cleanup, `journal-retired` is only reachable on the platform that
+/// needs a write-through rename, and `scaffolding-reconciled` needs residue this fixture never
+/// creates.
 #[test]
 fn a_second_omp_invocation_recovers_every_boundary_and_leaves_the_project_clean() {
     for boundary in BOUNDARIES {
@@ -2443,17 +2540,22 @@ fn a_second_omp_invocation_recovers_every_boundary_and_leaves_the_project_clean(
         let residue = fixture.project_tree();
         if boundary == "temporary-created" {
             // The one boundary that cannot be reconciled: the temporary entry exists and nothing
-            // proves which transaction made it, so both it and its journal stay, reported.
+            // proves which transaction made it. The interrupted action is a helper directory, so the
+            // preserved path is reported once and the journal is still retired.
             assert!(
                 residue.iter().any(|entry| entry.contains(".skillmount-")),
                 "the unprovable staged entry must still be present at {boundary}: {residue:?}"
             );
             assert!(
-                String::from_utf8_lossy(&recovered.stderr).contains("retained"),
-                "retained residue must be reported: {}",
+                String::from_utf8_lossy(&recovered.stderr).contains("preserved scaffolding"),
+                "preserved residue must be reported: {}",
                 String::from_utf8_lossy(&recovered.stderr)
             );
-            assert_eq!(fixture.journals().len(), 1);
+            assert!(
+                fixture.journals().is_empty(),
+                "scaffolding alone must not keep a journal: {:?}",
+                fixture.journals()
+            );
         } else {
             assert!(
                 residue.is_empty(),

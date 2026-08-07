@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::cli::CleanupInput;
 use crate::error::{AppError, ExitCategory};
 use crate::paths::resolve_operator_project_root;
-use crate::render::{os_value, path_value, text_value};
+use crate::render::{argument_vector, path_value, text_value};
 use crate::transaction::recover::{ExplicitCleanupReport, cleanup_explicit};
 
 use super::CommandOutcome;
@@ -90,7 +90,7 @@ fn render_report(project_root: Option<&Path>, report: &ExplicitCleanupReport) ->
     if attention {
         let _ = writeln!(
             output,
-            "No unproven entry was removed. After resolving the reported condition, retry these argv values:"
+            "No unproven entry was removed. After resolving the reported condition, retry with this argument vector rather than a shell command:"
         );
         render_retry_argv(&mut output, project_root);
     }
@@ -126,6 +126,14 @@ fn render_cleanup_outcomes(output: &mut String, report: &ExplicitCleanupReport) 
                     "  retained {}: {}",
                     path_value(&retained.path, true),
                     text_value(&retained.reason)
+                );
+            }
+            for preserved in &entry.report.preserved_scaffolding {
+                let _ = writeln!(
+                    output,
+                    "  preserved scaffolding {}: {}",
+                    path_value(&preserved.path, true),
+                    text_value(&preserved.reason)
                 );
             }
             for error in &entry.report.errors {
@@ -178,7 +186,7 @@ fn render_retry_argv(output: &mut String, project_root: Option<&Path>) {
         }
         None => arguments.push(OsString::from("--all")),
     }
-    for (index, argument) in arguments.iter().enumerate() {
-        let _ = writeln!(output, "  argv[{index}] = {}", os_value(argument, true));
+    for line in argument_vector("  ", &arguments) {
+        let _ = writeln!(output, "{line}");
     }
 }

@@ -40,7 +40,7 @@ enum CliCommand {
     Inspect(InspectArgs),
     /// Inspect agent, discovery, link, lock, and transaction health.
     Doctor(DoctorArgs),
-    /// Reconcile transaction-owned residue from durable evidence.
+    /// Reconcile residue from durable transaction evidence.
     Cleanup(CleanupArgs),
 }
 
@@ -91,7 +91,7 @@ struct SessionArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Retain later transaction-owned mounts for diagnostics.
+    /// Retain later session mounts for diagnostics.
     #[arg(long)]
     keep_mounts: bool,
 

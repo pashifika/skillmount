@@ -478,6 +478,17 @@ pub enum AppError {
     Filesystem(String),
     /// Temporary lock or recovery failure.
     Temporary(String),
+    /// A temporary failure whose operator diagnostic is already rendered as escaped lines.
+    ///
+    /// An ordinary message is escaped as one value, which is what stops a path inside it from
+    /// forging a line. A few recovery diagnostics are deliberately structured, so they carry their
+    /// own lines, each built from independently escaped values, and are written verbatim.
+    TemporaryReport {
+        /// One-line summary written as the primary error.
+        summary: String,
+        /// Already-escaped detail lines, written after the summary.
+        detail: Vec<String>,
+    },
     /// User interrupt.
     Interrupted,
 }
@@ -500,7 +511,7 @@ impl AppError {
             }
             Self::MissingInput { .. } => ExitCategory::MissingInput,
             Self::Internal(_) => ExitCategory::Internal,
-            Self::Temporary(_) => ExitCategory::Temporary,
+            Self::Temporary(_) | Self::TemporaryReport { .. } => ExitCategory::Temporary,
             Self::Interrupted => ExitCategory::Interrupted,
         }
     }
@@ -512,7 +523,10 @@ impl fmt::Display for AppError {
             Self::Usage(message)
             | Self::Internal(message)
             | Self::Filesystem(message)
-            | Self::Temporary(message) => formatter.write_str(message),
+            | Self::Temporary(message)
+            | Self::TemporaryReport {
+                summary: message, ..
+            } => formatter.write_str(message),
             Self::Catalog(error) => error.fmt(formatter),
             Self::Plan(error) => error.fmt(formatter),
             Self::Link(error) => error.fmt(formatter),

@@ -647,14 +647,29 @@ fn a_rollback_that_cannot_finish_reports_the_cause_and_the_residue_together() {
     let (mut transaction, _locks) = session.open();
     transaction.apply().expect("a clean fixture applies");
 
-    // A cleanup that cannot finish must surface both halves: what went wrong and what is left.
-    remove_directory_link(&project.join(".agents/skills/alpha"));
+    // A cleanup that cannot finish must surface both halves: what went wrong and what is left. Only
+    // the replaced Skill link is cleanup-critical here; the user's file under the helper directory
+    // is preserved scaffolding, which belongs on its own channel rather than in the failure.
+    let mounted = project.join(".agents/skills/alpha");
+    remove_directory_link(&mounted);
+    fs::create_dir_all(mounted.join("their-own-work")).expect("replacement");
     fs::write(project.join(".agents/skills/notes.md"), "mine").expect("user content");
     let report = transaction.cleanup().expect("cleanup completes");
     let journal = on_disk(&transaction);
 
     let rendered = report.describe().join("\n");
     assert!(rendered.contains("retained"), "{rendered}");
+    assert!(
+        !rendered.contains("preserved scaffolding"),
+        "scaffolding is not part of a cleanup failure: {rendered}"
+    );
+    assert!(
+        report
+            .describe_preserved()
+            .iter()
+            .any(|line| line.contains("preserved scaffolding")),
+        "the preserved directory stays visible on its own channel: {report:?}"
+    );
     assert!(
         journal
             .errors
@@ -968,11 +983,17 @@ fn a_link_retargeted_by_someone_else_is_left_alone() {
     );
 }
 
+/// Content another writer left in a helper directory survives and does not fail the session.
+///
+/// The directory is scaffolding: with the Skill link gone nothing selected is reachable through it,
+/// so the pass preserves it, reconciles its action, and retires the journal. Reporting it as
+/// unresolved mount ownership is what once turned an unrelated file into cleanup status `73`.
 #[test]
-fn a_helper_directory_that_gained_contents_keeps_them() {
+fn a_helper_directory_that_gained_contents_keeps_them_without_failing_cleanup() {
     let session = Session::codex("txn-nonempty", &["alpha"], &[]);
     let project = session.project();
     let (mut transaction, _locks) = session.open();
+    let journal_path = transaction.journal_path().to_path_buf();
     transaction.apply().expect("a clean fixture applies");
 
     // The mount is removed by hand but something else is left in the store.
@@ -987,20 +1008,31 @@ fn a_helper_directory_that_gained_contents_keeps_them() {
     );
     assert!(
         report
-            .retained
+            .preserved_scaffolding
             .iter()
             .any(|entry| entry.path == project.join(".agents/skills")
                 && entry.reason.contains("holds entries")),
-        "{:?}",
-        report.retained
+        "{report:?}"
+    );
+    assert!(report.retained.is_empty(), "{report:?}");
+    assert!(!report.needs_attention(), "{report:?}");
+    assert!(
+        !journal_path.exists(),
+        "helper-directory residue alone must not keep recovery evidence: {report:?}"
     );
 }
 
+/// A directory whose identity was never recorded is preserved rather than removed or journalled.
+///
+/// This is ADR 0015's create-to-first-observation window: the directory really is this
+/// transaction's, and nothing proves it, so it may not be removed. Because it is scaffolding, the
+/// residue is reported once and the journal is still retired instead of blocking every later pass.
 #[test]
 fn a_directory_recorded_without_an_identity_is_never_removed() {
     let session = Session::codex("txn-unprovable", &["alpha"], &[]);
     let project = session.project();
     let (mut transaction, _locks) = session.open();
+    let journal_path = transaction.journal_path().to_path_buf();
     transaction.apply().expect("a clean fixture applies");
 
     // Simulates a journal written by a host that reported no identity: the directory is genuinely
@@ -1017,13 +1049,140 @@ fn a_directory_recorded_without_an_identity_is_never_removed() {
 
     assert!(store_path.exists());
     assert!(
-        report.retained.iter().any(|entry| entry.path == store_path
-            && entry
-                .reason
-                .contains(OwnershipMismatch::IdentityUnavailable.label())),
-        "{:?}",
-        report.retained
+        report
+            .preserved_scaffolding
+            .iter()
+            .any(|entry| entry.path == store_path
+                && entry
+                    .reason
+                    .contains(OwnershipMismatch::IdentityUnavailable.label())),
+        "{report:?}"
     );
+    assert!(!report.needs_attention(), "{report:?}");
+    assert!(!journal_path.exists(), "{report:?}");
+}
+
+/// Rollback reports the failure that stopped the apply, not the scaffolding it preserved.
+#[test]
+fn rollback_preserves_a_helper_directory_that_gained_contents() {
+    let session = Session::codex("txn-rollback-scaffolding", &["alpha"], &[]);
+    let project = session.project();
+    let (mut transaction, _locks) = session.open();
+    transaction.apply().expect("a clean fixture applies");
+    fs::write(project.join(".agents/skills/notes.md"), "mine").expect("user content");
+
+    let failure = transaction.roll_back(AppError::Filesystem(
+        "injected placement failure".to_owned(),
+    ));
+    let journal = on_disk(&transaction);
+
+    assert!(
+        project.join(".agents/skills/notes.md").exists(),
+        "rollback must never take another writer's file with the scaffolding"
+    );
+    assert!(
+        failure.retained.is_empty(),
+        "preserved scaffolding is not user-facing residue: {failure:?}"
+    );
+    assert_eq!(
+        failure.into_error().to_string(),
+        AppError::Filesystem("injected placement failure".to_owned()).to_string(),
+        "the initiating filesystem failure is what an operator has to act on"
+    );
+    assert!(
+        journal
+            .errors
+            .iter()
+            .any(|error| error.contains("preserved scaffolding")),
+        "the durable record still names what was left behind: {:?}",
+        journal.errors
+    );
+}
+
+/// Automatic recovery retires a journal whose only remaining residue is scaffolding.
+///
+/// Under the previous rule this journal survived every later invocation: the directory could never
+/// become empty, so each pass retained it again and reported the same unresolved ownership.
+#[test]
+fn automatic_recovery_retires_a_journal_whose_only_residue_is_scaffolding() {
+    let session = Session::codex("txn-recovery-scaffolding", &["alpha"], &[]);
+    let project = session.project();
+    let (mut transaction, locks) = session.open();
+    transaction.apply().expect("a clean fixture applies");
+    let journal_path = transaction.journal_path().to_path_buf();
+    remove_directory_link(&project.join(".agents/skills/alpha"));
+    fs::write(project.join(".agents/skills/notes.md"), "mine").expect("user content");
+    drop(transaction);
+    drop(locks);
+
+    let mut recovery_locks = HeldLocks::default();
+    let recovery = recover::recover_stale(&mut recovery_locks).expect("recovery runs");
+    let report = &recovery
+        .reconciled
+        .first()
+        .expect("the abandoned transaction is reconciled")
+        .report;
+
+    assert!(!report.needs_attention(), "{report:?}");
+    assert!(!recovery.needs_attention(), "{recovery:?}");
+    assert!(
+        !report.preserved_scaffolding.is_empty(),
+        "the preserved directory is still reported: {report:?}"
+    );
+    assert!(project.join(".agents/skills/notes.md").exists());
+    assert!(
+        !journal_path.exists(),
+        "nothing cleanup-critical remains, so the journal is retired"
+    );
+}
+
+/// A directory action interrupted before its first observation leaves residue without a journal.
+///
+/// Its identity was never recorded, so ADR 0015 forbids removing either candidate. The staged
+/// sibling is therefore preserved exactly as it is; because scaffolding carries no cleanup
+/// obligation, the pass reports it once and still retires the journal.
+#[test]
+fn a_directory_staged_before_its_first_observation_is_preserved_and_released() {
+    let session = Session::codex("txn-preobservation-directory", &["alpha"], &[]);
+    let project = session.project();
+    let (mut transaction, _locks) = session.open();
+    let journal_path = transaction.journal_path().to_path_buf();
+    let store_path = project.join(".agents/skills");
+
+    // Exactly the state a process interrupted between `mkdir` and its first no-follow observation
+    // leaves: the staged sibling exists on disk and the journal knows no identity for it.
+    let staged = {
+        let action = transaction
+            .journal_mut()
+            .actions
+            .iter_mut()
+            .find(|action| action.final_path == store_path)
+            .expect("the store directory action is recorded");
+        action.status = ActionStatus::Staged;
+        action.identity = None;
+        action
+            .temporary_path
+            .clone()
+            .expect("a created directory has a staged sibling")
+    };
+    fs::create_dir_all(&staged).expect("staged directory fixture");
+
+    let report = transaction.cleanup().expect("cleanup completes");
+
+    assert!(
+        staged.is_dir(),
+        "an unproven staged directory is never removed"
+    );
+    assert!(
+        report
+            .preserved_scaffolding
+            .iter()
+            .any(|entry| entry.path == staged),
+        "{report:?}"
+    );
+    assert!(report.retained.is_empty(), "{report:?}");
+    assert!(!report.needs_attention(), "{report:?}");
+    assert!(!journal_path.exists(), "{report:?}");
 }
 
 #[test]

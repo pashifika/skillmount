@@ -571,8 +571,9 @@ fn an_unclassified_passthrough_option_is_forwarded_unchanged() {
     assert_eq!(tail[2], OsStr::new("prompt"));
 }
 
+/// Preserving scaffolding is silent; only an unprovable Skill link changes the outcome.
 #[test]
-fn child_and_cleanup_exit_precedence_preserves_unowned_session_content() {
+fn preserved_session_scaffolding_propagates_the_child_status_without_a_cleanup_block() {
     let clean = Fixture::new("child-nonzero");
     clean.skill(&clean.left, "alpha", "fixture");
     let output = clean
@@ -586,10 +587,8 @@ fn child_and_cleanup_exit_precedence_preserves_unowned_session_content() {
     assert_eq!(clean.sessions(), Vec::<PathBuf>::new());
     assert_eq!(clean.journal_count(), 0);
 
-    for (label, child_code, expected_code) in
-        [("cleanup-primary", "0", 73), ("child-primary", "2", 2)]
-    {
-        let fixture = Fixture::new(label);
+    for child_code in ["0", "2"] {
+        let fixture = Fixture::new(&format!("session-scaffolding-{child_code}"));
         fixture.skill(&fixture.left, "alpha", "fixture");
         let output = fixture
             .command()
@@ -601,23 +600,160 @@ fn child_and_cleanup_exit_precedence_preserves_unowned_session_content() {
             .expect("asm should retain unexpected session content");
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        assert_eq!(output.status.code(), Some(expected_code), "{stderr}");
+        assert_eq!(
+            output.status.code(),
+            Some(child_code.parse::<i32>().expect("fixture child code")),
+            "{stderr}"
+        );
         let record = fs::read_to_string(&fixture.record).expect("fake Claude record");
         let created = PathBuf::from(recorded_os_value(&record, "created"));
         assert_eq!(
             fs::read_to_string(&created).expect("unowned file survives cleanup"),
             "created by fake agent\n"
         );
-        assert_eq!(fixture.journal_count(), 1);
-        if child_code == "0" {
-            assert!(stderr.contains("error: session cleanup failed"), "{stderr}");
-        } else {
-            assert!(
-                stderr.contains("warning: session cleanup failed"),
-                "{stderr}"
-            );
-        }
+        assert_eq!(
+            fixture.journal_count(),
+            0,
+            "preserved scaffolding alone must not retain recovery evidence: {stderr}"
+        );
+        assert!(
+            !stderr.contains("session cleanup failed"),
+            "successful preservation emits neither block: {stderr}"
+        );
     }
+}
+
+/// A replaced staging Skill link is the residue that still decides the session outcome.
+#[test]
+fn child_and_cleanup_exit_precedence_follows_an_unprovable_staging_link() {
+    for (label, child_code, expected_code) in
+        [("cleanup-primary", "0", 73), ("child-primary", "9", 9)]
+    {
+        let fixture = Fixture::new(label);
+        fixture.skill(&fixture.left, "alpha", "fixture");
+        let output = fixture
+            .command()
+            .arg("--")
+            .arg("prompt")
+            .env("SKILLMOUNT_FAKE_REPLACE_IN_ADD_DIR", ".claude/skills/alpha")
+            .env("SKILLMOUNT_FAKE_EXIT", child_code)
+            .output()
+            .expect("asm should retain an unprovable staging link");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(output.status.code(), Some(expected_code), "{stderr}");
+        let record = fs::read_to_string(&fixture.record).expect("fake Claude record");
+        let replaced = PathBuf::from(recorded_os_value(&record, "replaced"));
+        assert_eq!(
+            fs::read_to_string(replaced.join("their-own-work.txt"))
+                .expect("the replacement survives cleanup"),
+            "replaced by fake agent\n"
+        );
+        assert_eq!(
+            fixture.journal_count(),
+            1,
+            "an unprovable Skill link keeps its recovery evidence: {stderr}"
+        );
+        let severity = if child_code == "0" {
+            "error"
+        } else {
+            "warning"
+        };
+        assert!(
+            stderr.contains(&format!("{severity}: session cleanup failed")),
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.matches("session cleanup failed").count(),
+            1,
+            "each fact is reported once: {stderr}"
+        );
+        assert!(stderr.contains("  retained path: "), "{stderr}");
+        assert!(stderr.contains("  retained journal: "), "{stderr}");
+        assert!(stderr.contains("    executable: asm"), "{stderr}");
+        assert!(stderr.contains("    argument 1: cleanup"), "{stderr}");
+        assert!(
+            !stderr.contains("argv["),
+            "raw argv fragments must be gone: {stderr}"
+        );
+        assert!(
+            !stderr.contains("asm cleanup --project-root"),
+            "recovery guidance must not look like a shell command: {stderr}"
+        );
+    }
+}
+
+/// Project mode removes its created Skill link and leaves the `.claude/skills` chain behind.
+///
+/// The scaffolding it establishes in the operator's own project is exactly the case where deleting
+/// content would be worst, so a helper directory another writer touched is preserved and the session
+/// still completes.
+#[test]
+fn project_mode_removes_its_link_and_preserves_unexpected_helper_content() {
+    let fixture = Fixture::new("project-mode-content");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+    let mounted = fixture.project.join(".claude/skills/alpha");
+    let user_file = fixture.project.join(".claude/skills/user-note.txt");
+
+    let output = fixture
+        .command()
+        .arg("--mount-mode=project")
+        .arg("--")
+        .arg("prompt")
+        .env("SKILLMOUNT_FAKE_CREATE_FILE", &user_file)
+        .output()
+        .expect("asm should run a project-mode Claude session");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&user_file).expect("project content survives cleanup"),
+        "created by fake agent\n"
+    );
+    assert!(
+        fs::symlink_metadata(&mounted).is_err(),
+        "the created project Skill link is cleanup-critical: {stderr}"
+    );
+    assert!(fixture.project.join(".claude/skills").is_dir());
+    assert_eq!(
+        fixture.journal_count(),
+        0,
+        "preserved project scaffolding must not retain recovery evidence: {stderr}"
+    );
+    assert_eq!(
+        fixture.sessions(),
+        Vec::<PathBuf>::new(),
+        "project mode establishes no staging root: {stderr}"
+    );
+    assert!(!stderr.contains("session cleanup failed"), "{stderr}");
+}
+
+/// A replaced project-mode Skill link keeps its journal and fails the otherwise successful session.
+#[test]
+fn project_mode_retains_an_unprovable_link_and_returns_filesystem_status() {
+    let fixture = Fixture::new("project-mode-replaced");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+    let mounted = fixture.project.join(".claude/skills/alpha");
+
+    let output = fixture
+        .command()
+        .arg("--mount-mode=project")
+        .arg("--")
+        .arg("prompt")
+        .env("SKILLMOUNT_FAKE_REPLACE_ENTRY", &mounted)
+        .output()
+        .expect("asm should retain an unprovable project link");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(73), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(mounted.join("their-own-work.txt"))
+            .expect("the replacement survives cleanup"),
+        "replaced by fake agent\n"
+    );
+    assert_eq!(fixture.journal_count(), 1, "{stderr}");
+    assert!(stderr.contains("error: session cleanup failed"), "{stderr}");
+    assert!(stderr.contains("    executable: asm"), "{stderr}");
 }
 
 #[test]

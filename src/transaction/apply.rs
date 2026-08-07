@@ -92,7 +92,7 @@ impl fmt::Display for ApplyFailure {
 impl Transaction {
     /// Applies every planned action, rolling back in reverse order if any of them fails.
     ///
-    /// On success the journal is durably `active` and every owned action is `applied`. On failure
+    /// On success the journal is durably `active` and every created action is `applied`. On failure
     /// the journal is durably `failed`, carries the original error and every rollback error, and
     /// the transaction owns nothing that could still be verified and removed.
     ///
@@ -171,7 +171,7 @@ impl Transaction {
             .temporary_path
             .clone()
             .ok_or_else(|| {
-                AppError::Internal("an owned action must record its staged sibling".to_owned())
+                AppError::Internal("a created action must record its staged sibling".to_owned())
             })?;
 
         self.check_precondition(index, &final_path)?;

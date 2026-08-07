@@ -427,7 +427,7 @@ fn an_omp_build_that_ignores_the_mount_still_releases_every_owned_entry() {
     assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
     assert!(
         !exists(&fixture.omp_scope()),
-        "an unused mount is still transaction-owned and released"
+        "an unused mount is still cleanup-critical and released"
     );
     assert_eq!(fixture.journals(), Vec::<PathBuf>::new());
     assert_eq!(
@@ -435,6 +435,107 @@ fn an_omp_build_that_ignores_the_mount_still_releases_every_owned_entry() {
         project_before,
         "an unused mount leaves the project exactly as it was found"
     );
+}
+
+/// Content another writer left under the OMP scope is not the session's to remove.
+///
+/// OMP itself, another same-user process, or the operating system can write into `.omp` while the
+/// session runs. Once every created Skill link is gone nothing `SkillMount` mounted is still visible,
+/// so the leftover chain is scaffolding rather than unresolved mount ownership: the content
+/// survives untouched, the journal is retired, and the child status is returned unchanged.
+#[test]
+fn unrelated_content_under_the_omp_scope_survives_without_failing_the_session() {
+    let fixture = Fixture::new("scope-residue");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+    let mounted = fixture.destination().join("alpha");
+    let residue = fixture.omp_scope().join("session-state.json");
+
+    let output = fixture
+        .command()
+        .arg("--")
+        .arg("prompt")
+        .env("SKILLMOUNT_FAKE_CREATE_FILE", &residue)
+        .output()
+        .expect("asm should launch fake OMP");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&residue).expect("content written under .omp must survive cleanup"),
+        "created by fake agent\n",
+        "cleanup must never take another writer's file with the scaffolding"
+    );
+    assert!(
+        !exists(&mounted),
+        "the created Skill link is the cleanup-critical entry and must be gone"
+    );
+    assert!(
+        !exists(&fixture.destination()),
+        "an empty helper directory is still pruned as best-effort housekeeping"
+    );
+    assert_eq!(
+        fixture.journals(),
+        Vec::<PathBuf>::new(),
+        "helper-directory residue alone must not retain recovery evidence"
+    );
+    assert!(!stderr.contains("session cleanup failed"), "{stderr}");
+    assert!(!stderr.contains("recovery:"), "{stderr}");
+}
+
+/// The same contract on native Windows, for both eligible mount-link implementations.
+///
+/// A Windows symbolic link needs Developer Mode or elevation while a junction does not, and the two
+/// are removed through different reparse data, so proving one proves nothing about the other. Both
+/// residue paths are named from fixture components rather than from a generated name, so nothing here
+/// depends on how a host spells a temporary directory.
+#[cfg(windows)]
+#[test]
+fn unrelated_windows_content_under_the_omp_scope_survives_for_both_link_modes() {
+    for (label, link_mode, residue_name) in [
+        ("symlink", "--link-mode=symlink", "session-state.json"),
+        ("junction", "--link-mode=junction", "provider-cache.bin"),
+    ] {
+        let fixture = Fixture::new(&format!("windows-scope-residue-{label}"));
+        fixture.skill(&fixture.left, "alpha", "fixture");
+        let mounted = fixture.destination().join("alpha");
+        let residue = fixture.omp_scope().join(residue_name);
+
+        let output = fixture
+            .command()
+            .arg(link_mode)
+            .arg("--")
+            .arg("prompt")
+            .env("SKILLMOUNT_FAKE_CREATE_FILE", &residue)
+            .output()
+            .expect("asm should launch fake OMP");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // An unavailable symbolic-link privilege is the documented Windows condition, not a defect;
+        // the guard turns it into a failure where a run must prove link coverage.
+        if link_mode == "--link-mode=symlink" && output.status.code() == Some(73) {
+            assert!(
+                std::env::var_os("SKILLMOUNT_REQUIRE_LINKS").is_none(),
+                "symbolic-link creation must be available under SKILLMOUNT_REQUIRE_LINKS: {stderr}"
+            );
+            continue;
+        }
+
+        assert_eq!(output.status.code(), Some(0), "{label}: {stderr}");
+        assert_eq!(
+            fs::read_to_string(&residue).expect("content written under .omp must survive cleanup"),
+            "created by fake agent\n",
+            "{label}: cleanup must never take another writer's file with the scaffolding"
+        );
+        assert!(!exists(&mounted), "{label}: {stderr}");
+        assert!(
+            fixture.journals().is_empty(),
+            "{label}: helper-directory residue alone must not retain recovery evidence"
+        );
+        assert!(
+            !stderr.contains("session cleanup failed"),
+            "{label}: {stderr}"
+        );
+    }
 }
 
 /// A child that returns with a live process domain must not have its links removed.

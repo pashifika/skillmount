@@ -2,16 +2,22 @@
 //!
 //! Both walk the same list in the same direction for the same reason, and both use the same
 //! removal code. The direction is reverse plan order: a helper directory is created before the
-//! links inside it, so undoing it first would leave a directory that is no longer empty and that
-//! cleanup then has to refuse.
+//! links inside it, so undoing it first would always find a directory that is not empty.
 //!
 //! Removal itself is deliberately timid. The removal observation must match every piece of evidence
 //! the journal recorded — kind, target, and platform identity for a link; identity and emptiness for
 //! a directory. Windows then retains that verified object handle through disposition; ADR 0016
 //! records why its identity, rather than mutable reparse metadata, remains the authority. Anything
-//! that already mismatches is retained and reported. That asymmetry is the point: a retained entry
-//! is a nuisance an operator or a later run can clear, while a removed one that belonged to somebody
-//! else is gone.
+//! that already mismatches is left exactly as it is and reported. That asymmetry is the point: a
+//! retained entry is a nuisance an operator or a later run can clear, while a removed one that
+//! belonged to somebody else is gone.
+//!
+//! What differs between the two dispositions is only how much a refusal costs. A created Skill link
+//! is the entry through which a selected external Skill is visible, so an unresolved one keeps its
+//! journal and can replace child success. A helper directory is scaffolding the links needed: once
+//! they are reconciled nothing selected is reachable through it, so a directory this pass cannot
+//! prune is preserved, reported, and released from transaction responsibility. ADR 0037 records why
+//! treating both as one obligation turned an unrelated file into a failed session.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -22,6 +28,7 @@ use crate::journal::{ActionStatus, JournalAction, RecordedKind, TransactionStatu
 use crate::link::{
     CreatedLink, CreatedLinkKind, EntryKind, OwnedDirectory, OwnershipMismatch, RemoveOutcome,
 };
+use crate::mount::CleanupDisposition;
 
 use super::Transaction;
 
@@ -34,9 +41,19 @@ pub struct RetainedEntry {
     pub reason: String,
 }
 
+/// Renders the pair as one already-escaped line.
+///
+/// Both halves are escaped here rather than at each use site: this value ends up in the durable
+/// journal, in a multiline operator diagnostic, and in a report, and a path that could contribute a
+/// newline would forge a line in the last two.
 impl fmt::Display for RetainedEntry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}: {}", self.path.display(), self.reason)
+        write!(
+            formatter,
+            "{}: {}",
+            crate::render::path_value(&self.path, true),
+            crate::render::text_value(&self.reason)
+        )
     }
 }
 
@@ -45,9 +62,18 @@ impl fmt::Display for RetainedEntry {
 pub struct CleanupReport {
     /// Paths whose entries were verified and removed.
     pub removed: Vec<PathBuf>,
-    /// Paths that were left alone, with the reason for each.
+    /// Cleanup-critical paths that were left alone, with the reason for each.
+    ///
+    /// Every entry here is a created Skill link this pass could not prove gone. That is what keeps
+    /// the journal on disk and lets cleanup replace a successful child status.
     pub retained: Vec<RetainedEntry>,
-    /// Failures the operating system reported while removing a verified entry.
+    /// Discovery scaffolding the pass deliberately left in place, with the reason for each.
+    ///
+    /// A helper directory that is non-empty, replaced, or unremovable is preserved rather than
+    /// emptied. Once every cleanup-critical link is reconciled nothing selected is reachable through
+    /// it, so these are observations for verbose and operator output, never a failure.
+    pub preserved_scaffolding: Vec<RetainedEntry>,
+    /// Failures the operating system reported while removing a verified cleanup-critical entry.
     pub errors: Vec<String>,
     /// Why the journal survives this pass.
     pub journal_retained: Option<JournalRetention>,
@@ -74,12 +100,16 @@ impl JournalRetention {
 
 impl CleanupReport {
     /// Returns whether anything needs an operator's attention.
+    ///
+    /// Preserved scaffolding is deliberately excluded. A directory this pass declined to remove
+    /// exposes no selected Skill once every cleanup-critical link is reconciled, so counting it here
+    /// would turn another writer's file into a failed session.
     #[must_use]
     pub fn needs_attention(&self) -> bool {
         !self.retained.is_empty() || !self.errors.is_empty()
     }
 
-    /// Renders every retained path and error, one per line.
+    /// Renders every unresolved cleanup-critical path and error, one per line.
     #[must_use]
     pub fn describe(&self) -> Vec<String> {
         let mut lines = Vec::new();
@@ -87,27 +117,42 @@ impl CleanupReport {
             lines.push(format!("retained {entry}"));
         }
         for error in &self.errors {
-            lines.push(format!("cleanup error: {error}"));
+            lines.push(format!(
+                "cleanup error: {}",
+                crate::render::text_value(error)
+            ));
         }
         if let Some(retention) = &self.journal_retained {
+            let path = crate::render::path_value(retention.path(), true);
             match retention {
-                JournalRetention::RequestedKeep(path) => lines.push(format!(
-                    "transaction journal {} and its mounts were retained because --keep-mounts \
-                     was requested; they require an explicit cleanup policy",
-                    path.display()
+                JournalRetention::RequestedKeep(_) => lines.push(format!(
+                    "transaction journal {path} and its mounts were retained because --keep-mounts \
+                     was requested; they require an explicit cleanup policy"
                 )),
-                JournalRetention::IncompleteCleanup(path) => lines.push(format!(
-                    "transaction journal {} is retained because cleanup could not finish",
-                    path.display()
+                JournalRetention::IncompleteCleanup(_) => lines.push(format!(
+                    "transaction journal {path} is retained because cleanup could not finish"
                 )),
             }
         }
         lines
     }
+
+    /// Renders every preserved-scaffolding observation, one per line.
+    ///
+    /// Kept out of [`CleanupReport::describe`] because none of these lines is a failure: a normal
+    /// session stays silent about them, while verbose session output and the explicit cleanup report
+    /// show what was left behind and why.
+    #[must_use]
+    pub fn describe_preserved(&self) -> Vec<String> {
+        self.preserved_scaffolding
+            .iter()
+            .map(|entry| format!("preserved scaffolding {entry}"))
+            .collect()
+    }
 }
 
 impl Transaction {
-    /// Removes transaction-owned entries even when the requested terminal policy was keep.
+    /// Reconciles every entry this transaction created, even when the terminal policy was keep.
     ///
     /// This is the pre-launch failure path: no child was allowed to use the mounts, so a failed
     /// compatibility or supervision-intent check must not turn `--keep-mounts` into retained state.
@@ -148,7 +193,7 @@ impl Transaction {
             });
         }
 
-        let mut report = self.remove_owned_entries()?;
+        let mut report = self.reconcile_pending_actions()?;
 
         if report.needs_attention() {
             // A failed cleanup keeps its journal. The retained entries are still described by it,
@@ -161,9 +206,11 @@ impl Transaction {
             return Ok(report);
         }
 
-        // Only now, with nothing left that anyone could need to reconcile, does the journal become
-        // removable. Marking it completed first means a crash between the two leaves a terminal
-        // journal that recovery correctly leaves alone.
+        // Only now, with nothing cleanup-critical left that anyone could need to reconcile, does the
+        // journal become removable. Preserved scaffolding is deliberately not a reason to keep it:
+        // no selected Skill is reachable through a directory once every link is gone. Marking the
+        // journal completed first means a crash between the two leaves a terminal journal that
+        // recovery correctly leaves alone.
         self.advance(TransactionStatus::Completed)?;
         reached(Checkpoint::JournalCompleted, 1);
         store::remove(&self.path)?;
@@ -173,11 +220,13 @@ impl Transaction {
     /// Undoes everything already created, then records the failure durably.
     pub(super) fn roll_back(&mut self, cause: AppError) -> Box<super::apply::ApplyFailure> {
         let mut retained = Vec::new();
+        let mut preserved = Vec::new();
         let mut rollback_errors = Vec::new();
 
-        match self.remove_owned_entries() {
+        match self.reconcile_pending_actions() {
             Ok(report) => {
                 retained = report.retained;
+                preserved = report.preserved_scaffolding;
                 rollback_errors = report.errors;
             }
             Err(error) => rollback_errors.push(error.to_string()),
@@ -186,6 +235,12 @@ impl Transaction {
         self.record_error(cause.to_string());
         for entry in &retained {
             self.record_error(format!("retained {entry}"));
+        }
+        // Scaffolding the pass preserved is durable evidence for an operator reading the journal of
+        // a failed apply, but it is not part of the user-facing residue: the failure to explain is
+        // the one that stopped the apply, not a directory nobody can reach a Skill through.
+        for entry in &preserved {
+            self.record_error(format!("preserved scaffolding {entry}"));
         }
         for error in &rollback_errors {
             self.record_error(format!("rollback error: {error}"));
@@ -201,15 +256,18 @@ impl Transaction {
         })
     }
 
-    /// Walks owned actions newest-first, removing only what can still be proved.
+    /// Walks pending create actions newest-first, reconciling only what it can still prove.
     ///
-    /// Each action is journalled as `rolled_back` immediately after its entry is gone, so a crash
-    /// mid-pass never leaves the journal claiming ownership of something that no longer exists.
-    fn remove_owned_entries(&mut self) -> Result<CleanupReport, AppError> {
+    /// Both dispositions travel the same pass in the same direction and use the same sealed removal
+    /// proofs; only the answer to "may this action stop being my responsibility?" differs. A
+    /// cleanup-critical link must be gone; a best-effort helper directory may also be preserved.
+    /// Either way the transition is journalled before the next action is touched, so a crash
+    /// mid-pass never leaves the journal claiming an obligation it already discharged.
+    fn reconcile_pending_actions(&mut self) -> Result<CleanupReport, AppError> {
         let mut report = CleanupReport::default();
         let order = self
             .journal
-            .reversible_actions()
+            .cleanup_candidates()
             .map(|action| action.id)
             .collect::<Vec<_>>();
 
@@ -218,11 +276,12 @@ impl Transaction {
             let Some(index) = self.journal.actions.iter().position(|a| a.id == id) else {
                 continue;
             };
-            let placement_residue = self.placement_residue.get(&id).cloned();
-            if let Some(retained) = &placement_residue {
-                report.retained.push(retained.clone());
-            }
             let action = self.journal.actions[index].clone();
+            let disposition = action.operation.cleanup_disposition();
+            let placement_residue = self.placement_residue.get(&id).cloned();
+            if let Some(residue) = &placement_residue {
+                record_left_alone(&mut report, disposition, residue.clone());
+            }
             let outcome = self.clear_action(
                 &action,
                 sequence,
@@ -230,12 +289,16 @@ impl Transaction {
                 placement_residue.as_ref().map(|entry| entry.path.as_path()),
             );
 
-            // The status is advanced only when nothing this transaction owns remains at either
-            // candidate path. Leaving it otherwise is what keeps a retained entry described by the
-            // journal, so a later run holding the same locks can try again.
-            if outcome == Outcome::Cleared {
+            // An unresolved cleanup-critical entry keeps its action pending, which is what keeps it
+            // described by the journal so a later run holding the same locks can try again. A
+            // preserved directory is reconciled instead: nothing selected is reachable through it,
+            // and revisiting it could only ever reach the same decision.
+            if outcome != Outcome::Unresolved {
                 self.journal.actions[index].status = ActionStatus::RolledBack;
                 self.persist()?;
+                if outcome == Outcome::Preserved {
+                    reached(Checkpoint::ScaffoldingReconciled, sequence);
+                }
             }
         }
         Ok(report)
@@ -243,26 +306,27 @@ impl Transaction {
 
     /// Tries every path an action's entry could occupy, temporary before final.
     ///
-    /// A candidate that cannot be proved is retained and reported, but it does not hide a later
-    /// candidate that may still hold the transaction-owned entry. This matters when handle-bound
+    /// A candidate that cannot be proved is left alone and reported, but it does not hide a later
+    /// candidate that may still hold the entry this action created. This matters when handle-bound
     /// placement moves the verified object while another actor installs a replacement at the old
-    /// staged pathname. A placement residue has already classified one path as retained, so only
-    /// that exact candidate is skipped; it cannot hide the action's other candidate. Once one owned
-    /// entry is removed the scan stops, because an action can own at most one object and a second
-    /// removal would exceed the journal's evidence.
+    /// staged pathname. A placement residue has already classified one path, so only that exact
+    /// candidate is skipped; it cannot hide the action's other candidate. Once one entry is removed
+    /// the scan stops, because an action can own at most one object and a second removal would
+    /// exceed the journal's evidence.
     fn clear_action(
         &self,
         action: &JournalAction,
         sequence: u32,
         report: &mut CleanupReport,
-        preserved_path: Option<&Path>,
+        residue_path: Option<&Path>,
     ) -> Outcome {
+        let disposition = action.operation.cleanup_disposition();
         if action.kind == RecordedKind::Undecided {
-            return self.inspect_undecided_candidates(action, report);
+            return self.inspect_undecided_candidates(action, disposition, report);
         }
-        let mut kept = preserved_path.is_some();
+        let mut left_alone = residue_path.is_some();
         for path in action.candidate_paths() {
-            if preserved_path == Some(path.as_path()) {
+            if residue_path == Some(path.as_path()) {
                 continue;
             }
             match self.remove_candidate(action, &path) {
@@ -270,42 +334,57 @@ impl Transaction {
                 Ok(RemoveOutcome::Removed) => {
                     report.removed.push(path);
                     reached(removal_checkpoint(action.kind), sequence);
-                    return if kept {
-                        Outcome::Kept
-                    } else {
-                        Outcome::Cleared
-                    };
+                    return outcome_for(disposition, left_alone);
                 }
                 Ok(RemoveOutcome::NotEmpty) => {
-                    report.retained.push(RetainedEntry {
-                        path,
-                        reason: "the directory holds entries this transaction did not create, so \
-                                 removing it would take them with it"
-                            .to_owned(),
-                    });
-                    kept = true;
+                    record_left_alone(
+                        report,
+                        disposition,
+                        RetainedEntry {
+                            path,
+                            reason: "the directory holds entries this transaction did not create, \
+                                     so removing it would take them with it"
+                                .to_owned(),
+                        },
+                    );
+                    left_alone = true;
                 }
                 Ok(RemoveOutcome::OwnershipMismatch(mismatch)) => {
-                    report.retained.push(RetainedEntry {
-                        path,
-                        reason: mismatch_reason(mismatch),
-                    });
-                    kept = true;
+                    record_left_alone(
+                        report,
+                        disposition,
+                        RetainedEntry {
+                            path,
+                            reason: mismatch_reason(mismatch),
+                        },
+                    );
+                    left_alone = true;
                 }
                 Err(error) => {
-                    report.errors.push(error.to_string());
-                    kept = true;
+                    // A failed prune of best-effort scaffolding is an observation rather than a
+                    // cleanup failure: the path is untouched, and once every cleanup-critical link
+                    // is reconciled no selected Skill is reachable through it.
+                    match disposition {
+                        CleanupDisposition::BestEffort => {
+                            report.preserved_scaffolding.push(RetainedEntry {
+                                path,
+                                reason: format!(
+                                    "pruning this scaffolding directory failed ({error}), so it \
+                                     was left exactly as it is"
+                                ),
+                            });
+                        }
+                        CleanupDisposition::Required | CleanupDisposition::None => {
+                            report.errors.push(error.to_string());
+                        }
+                    }
+                    left_alone = true;
                 }
             }
         }
-        if kept {
-            Outcome::Kept
-        } else {
-            // Nothing at either path. The process may have stopped before the entry was created,
-            // or a previous pass may already have removed it; either way there is nothing left to
-            // own.
-            Outcome::Cleared
-        }
+        // Nothing left alone and nothing at either path: the process may have stopped before the
+        // entry was created, or a previous pass may already have removed it.
+        outcome_for(disposition, left_alone)
     }
 
     /// Inspects both candidates for an intent whose concrete implementation was not durable.
@@ -317,34 +396,35 @@ impl Transaction {
     fn inspect_undecided_candidates(
         &self,
         action: &JournalAction,
+        disposition: CleanupDisposition,
         report: &mut CleanupReport,
     ) -> Outcome {
-        let mut kept = false;
+        let mut left_alone = false;
         for path in action.candidate_paths() {
             match self.backend.inspect_no_follow(&path) {
                 Ok(entry) if entry.kind == EntryKind::Missing => {}
                 Ok(entry) => {
-                    kept = true;
-                    report.retained.push(RetainedEntry {
-                        path,
-                        reason: format!(
-                            "the entry exists as {} but its concrete kind and identity were not \
-                             durably recorded, so ownership cannot be proved",
-                            entry.kind.label()
-                        ),
-                    });
+                    left_alone = true;
+                    record_left_alone(
+                        report,
+                        disposition,
+                        RetainedEntry {
+                            path,
+                            reason: format!(
+                                "the entry exists as {} but its concrete kind and identity were \
+                                 not durably recorded, so ownership cannot be proved",
+                                entry.kind.label()
+                            ),
+                        },
+                    );
                 }
                 Err(error) => {
-                    kept = true;
+                    left_alone = true;
                     report.errors.push(error.to_string());
                 }
             }
         }
-        if kept {
-            Outcome::Kept
-        } else {
-            Outcome::Cleared
-        }
+        outcome_for(disposition, left_alone)
     }
 
     /// Attempts one candidate path with the evidence recorded for the action.
@@ -391,13 +471,42 @@ impl Transaction {
     }
 }
 
-/// Whether an action still owns something after one pass.
+/// What responsibility an action still carries after one pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
-    /// Nothing this transaction owns remains at either candidate path.
-    Cleared,
-    /// Something remains and was deliberately left alone.
-    Kept,
+    /// Nothing this transaction created remains at either candidate path.
+    Reconciled,
+    /// A best-effort helper directory was deliberately left in place. Its responsibility is
+    /// discharged even though the directory is still there.
+    Preserved,
+    /// A cleanup-critical entry could not be proved gone, so the action stays pending.
+    Unresolved,
+}
+
+/// Maps "this pass left something alone" to the action's remaining responsibility.
+///
+/// A [`CleanupDisposition::None`] action never becomes a cleanup candidate; treating it as
+/// unresolved keeps the fail-closed direction if one ever did.
+const fn outcome_for(disposition: CleanupDisposition, left_alone: bool) -> Outcome {
+    if !left_alone {
+        return Outcome::Reconciled;
+    }
+    match disposition {
+        CleanupDisposition::BestEffort => Outcome::Preserved,
+        CleanupDisposition::Required | CleanupDisposition::None => Outcome::Unresolved,
+    }
+}
+
+/// Records one entry the pass left exactly as it is, in the channel its disposition belongs to.
+fn record_left_alone(
+    report: &mut CleanupReport,
+    disposition: CleanupDisposition,
+    entry: RetainedEntry,
+) {
+    match disposition {
+        CleanupDisposition::BestEffort => report.preserved_scaffolding.push(entry),
+        CleanupDisposition::Required | CleanupDisposition::None => report.retained.push(entry),
+    }
 }
 
 /// Returns the checkpoint that fires after a removal of this kind.

@@ -759,66 +759,124 @@ fn child_nonzero_status_is_preserved_after_successful_cleanup() {
     );
 }
 
+/// Content another writer left in the created `.agents/skills` chain is not the session's to remove.
+///
+/// Every created Skill link and the transaction journal disappear, the content survives, and the
+/// child status is what the wrapper returns.
 #[test]
-fn cleanup_failure_replaces_child_success_and_preserves_user_content() {
-    let fixture = Fixture::new("cleanup-failure");
-    fixture.skill("alpha");
-    let user_file = fixture.project.join(".agents/skills/user-note.txt");
+fn user_content_in_the_created_project_chain_survives_and_propagates_the_child_status() {
+    for child_code in ["0", "2"] {
+        let fixture = Fixture::new(&format!("project-chain-content-{child_code}"));
+        fixture.skill("alpha");
+        let user_file = fixture.project.join(".agents/skills/user-note.txt");
 
-    let output = fixture
-        .command()
-        .env("SKILLMOUNT_FAKE_CREATE_FILE", &user_file)
-        .output()
-        .expect("asm should report cleanup residue");
+        let output = fixture
+            .command()
+            .env("SKILLMOUNT_FAKE_CREATE_FILE", &user_file)
+            .env("SKILLMOUNT_FAKE_EXIT", child_code)
+            .output()
+            .expect("asm should preserve unrelated project content");
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(73));
-    assert_eq!(
-        fs::read_to_string(&user_file).expect("user file must survive cleanup"),
-        "created by fake agent\n"
-    );
-    assert!(!exists(&fixture.project.join(".agents/skills/alpha")));
-    assert!(fixture.project.join(".agents/skills").is_dir());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("session cleanup failed"), "{stderr}");
-    assert!(stderr.contains("journal retained at"), "{stderr}");
+        assert_eq!(
+            output.status.code(),
+            Some(child_code.parse::<i32>().expect("fixture child code")),
+            "{stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(&user_file).expect("user file must survive cleanup"),
+            "created by fake agent\n"
+        );
+        assert!(!exists(&fixture.project.join(".agents/skills/alpha")));
+        assert!(fixture.project.join(".agents/skills").is_dir());
+        assert!(
+            journals(&fixture).is_empty(),
+            "preserved scaffolding alone must not retain recovery evidence: {stderr}"
+        );
+        assert!(
+            !stderr.contains("session cleanup failed"),
+            "successful preservation emits neither block: {stderr}"
+        );
+    }
 }
 
+/// A replaced Skill link is the residue that still decides the session outcome.
 #[test]
-fn child_failure_remains_primary_when_cleanup_also_fails() {
-    let fixture = Fixture::new("child-and-cleanup-failure");
-    fixture.skill("alpha");
-    let user_file = fixture.project.join(".agents/skills/user-note.txt");
+fn an_unprovable_skill_link_replaces_child_success_and_keeps_child_failure_primary() {
+    for (child_code, expected_code, severity) in [("0", 73, "error"), ("9", 9, "warning")] {
+        let fixture = Fixture::new(&format!("unprovable-link-{child_code}"));
+        fixture.skill("alpha");
+        let mounted = fixture.project.join(".agents/skills/alpha");
 
-    let output = fixture
-        .command()
-        .env("SKILLMOUNT_FAKE_CREATE_FILE", &user_file)
-        .env("SKILLMOUNT_FAKE_EXIT", "2")
-        .output()
-        .expect("asm should preserve child precedence");
+        let output = fixture
+            .command()
+            .env("SKILLMOUNT_FAKE_REPLACE_ENTRY", &mounted)
+            .env("SKILLMOUNT_FAKE_EXIT", child_code)
+            .output()
+            .expect("asm should retain an unprovable Skill link");
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(2));
-    assert!(user_file.is_file());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("warning: session cleanup failed"),
-        "{stderr}"
+        assert_eq!(output.status.code(), Some(expected_code), "{stderr}");
+        assert_eq!(
+            fs::read_to_string(mounted.join("their-own-work.txt"))
+                .expect("the replacement survives cleanup"),
+            "replaced by fake agent\n"
+        );
+        assert_eq!(
+            journals(&fixture).len(),
+            1,
+            "an unprovable Skill link keeps its recovery evidence: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("{severity}: session cleanup failed")),
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.matches("session cleanup failed").count(),
+            1,
+            "each fact is reported once: {stderr}"
+        );
+        assert!(stderr.contains("  retained path: "), "{stderr}");
+        assert!(stderr.contains("  retained journal: "), "{stderr}");
+        assert!(
+            stderr
+                .contains("  recovery: first confirm that every related Agent process has exited"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("    executable: asm"), "{stderr}");
+        assert!(stderr.contains("    argument 1: cleanup"), "{stderr}");
+        assert!(
+            stderr.contains("    argument 2: --project-root"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("argv["),
+            "raw argv fragments must be gone: {stderr}"
+        );
+        assert!(
+            !stderr.contains("asm cleanup --project-root"),
+            "recovery guidance must not construct a shell command: {stderr}"
+        );
+    }
+}
+
+/// Returns every transaction journal in the fixture's private state root.
+fn journals(fixture: &Fixture) -> Vec<PathBuf> {
+    let mut found = fs::read_dir(fixture.state.join("transactions")).map_or_else(
+        |_| Vec::new(),
+        |entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "journal")
+                })
+                .collect()
+        },
     );
-    assert!(
-        !stderr.contains("error: session cleanup failed"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("retained path"), "{stderr}");
-    assert!(stderr.contains("journal retained at"), "{stderr}");
-    assert!(stderr.contains("recovery argv[0] = asm"), "{stderr}");
-    assert!(stderr.contains("recovery argv[1] = cleanup"), "{stderr}");
-    assert!(
-        stderr.contains("recovery argv[2] = --project-root"),
-        "{stderr}"
-    );
-    assert!(
-        !stderr.contains("asm cleanup --project-root"),
-        "recovery guidance must not construct a shell command: {stderr}"
-    );
+    found.sort();
+    found
 }
 
 #[cfg(unix)]
@@ -861,7 +919,13 @@ fn a_supervising_journal_is_quarantined_while_an_orphan_descendant_remains_alive
         stderr.contains("quarantined mounts were not changed and remain journal-backed"),
         "{stderr}"
     );
-    assert!(stderr.contains("recovery[0] argv[1] = cleanup"), "{stderr}");
+    assert!(stderr.contains("  quarantined journal: "), "{stderr}");
+    assert!(stderr.contains("    executable: asm"), "{stderr}");
+    assert!(stderr.contains("    argument 1: cleanup"), "{stderr}");
+    assert!(
+        !stderr.contains("recovery[0]") && !stderr.contains("argv["),
+        "nested raw recovery fragments must be gone: {stderr}"
+    );
     assert!(
         exists(&mounted),
         "automatic recovery must not remove the live mount"
