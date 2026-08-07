@@ -92,20 +92,24 @@ Agent publishes another banner.
 | `asm claude --mount-mode=project` | Uses the project's `.claude/skills` namespace instead of isolated staging; `--dry-run` keeps that plan read-only. |
 | `asm codex -- exec ...` or `-- review ...` without `--dry-run` | Resolves a shell-free executable, checks release-independent launch controls, locks, recovers, replans, journals, applies, repeats the hard controls, launches the bounded Codex command with the requested CWD and passthrough, then cleans up after the managed process domain is dead. No `--version` process runs on this path, so the installed release never warns or blocks; interactive TUI passthrough still fails before state access. |
 | `asm claude` without `--dry-run` | Runs the same release-independent, process-free preflight, stages under a unique state-owned root, locks, recovers, replans, journals, applies, injects that root through one `--add-dir` pair, supervises the shell-free child, and cleans up after proven process-domain death. Discovery-changing environment, detached/relocated execution, and known non-session commands remain hard failures; a passthrough token the adapter does not classify is forwarded unchanged. |
-| `asm omp` without `--dry-run` | Runs the same process-free preflight, plans `<launch-cwd>/.omp/skills` with missing `.omp` and `skills` directories as transaction-owned actions, locks, recovers, replans, journals, applies, repeats the hard controls plus a non-owned discovery-evidence recheck at the spawn boundary, launches the foreground OMP session with the operator's unchanged passthrough — injecting no argument or environment override — and cleans up after proven process-domain death. |
-| Session with `--keep-mounts` | After a child reaches the supervision boundary, records terminal kept state instead of removing owned entries. A pre-spawn hard launch-invariant or supervision-intent failure overrides the request and removes every verified owned entry. |
+| `asm omp` without `--dry-run` | Runs the same process-free preflight, plans `<launch-cwd>/.omp/skills` with missing `.omp` and `skills` directories as journalled non-critical scaffolding, locks, recovers, replans, journals, applies, repeats the hard controls plus a non-owned discovery-evidence recheck at the spawn boundary, launches the foreground OMP session with the operator's unchanged passthrough — injecting no argument or environment override — and cleans up after proven process-domain death. |
+| Session with `--keep-mounts` | After a child reaches the supervision boundary, records terminal kept state instead of reconciling anything it created. A pre-spawn hard launch-invariant or supervision-intent failure overrides the request and removes every verified created entry. |
 | Session with `--no-recover` | Refuses when incomplete state requires reconciliation; otherwise continues through the normal mutating path. |
 | Session encountering a free `supervising` journal | Refuses with category 75 and retains every recorded mount because wrapper-lock release does not prove child-domain death. |
 | `asm doctor` | Resolves every supported Agent executable — explicit paths via `--codex-bin`, `--claude-bin`, or `--omp-bin` — checks release-independent configuration, inspects discovery links, visible-name conflicts, lock liveness, and journals, and runs isolated link-capability probes without SkillMount-owned mutation of project, agent, lock, or journal state. Version capture executes each selected trusted Agent once with literal `--version`: the last-tested banner is `pass`, while a different or unavailable banner is `unverified` and does not fail the command by itself. Executable, configuration, discovery, or capability failures remain `failure` findings and produce category 65. |
-| `asm cleanup --project-root <path>` | Reconciles every structurally valid, non-completed journal for the canonical project after taking that journal's complete recorded lock set. A `supervising` or kept journal is eligible only because invoking this command is the operator's assertion that its process domain is dead or its retained mounts may be released. |
-| `asm cleanup --all` | Applies the same journal-by-journal engine across the bounded state store. Corrupt state blocks all mutation; live locks retain their journals and produce category 75; an ownership or filesystem failure takes category 73 precedence. |
+| `asm cleanup --project-root <path>` | Reconciles every structurally valid, non-completed journal for the canonical project after taking that journal's complete recorded lock set. A `supervising` or kept journal is eligible only because invoking this command is the operator's assertion that its process domain is dead or its retained mounts may be released. Its stdout report names every removed link, every unresolved cleanup-critical entry, and every helper directory it preserved. |
+| `asm cleanup --all` | Applies the same journal-by-journal engine across the bounded state store. Corrupt state blocks all mutation; live locks retain their journals and produce category 75; an unresolved cleanup-critical entry or filesystem failure takes category 73 precedence. Preserved scaffolding alone is reported and returns success. |
 
 A mutating agent invocation returns the child's ordinary status after successful cleanup. A spawn
 or supervision failure uses the shared typed exit mapping. Cleanup failure replaces child success
-with category 73 and remains secondary evidence behind a failed child. Ordinary cleanup attempts
-to release every owned entry, while `--keep-mounts` retains them intentionally after the child
-boundary. A hard launch-invariant or supervision-intent failure before spawn forces verified
-cleanup; anything cleanup cannot prove safe to remove remains reported and journal-backed.
+with category 73 and remains secondary evidence behind a failed child, and only an unresolved
+created Skill link, a failure removing one, or a journal failure is such a failure. Ordinary cleanup
+attempts to release every created entry, while `--keep-mounts` retains them intentionally after the
+child boundary. A hard launch-invariant or supervision-intent failure before spawn forces verified
+cleanup; a created Skill link cleanup cannot prove safe to remove remains reported and
+journal-backed, while a helper directory it cannot prune safely is preserved, reported once, and
+released from transaction responsibility. See
+[ADR 0037](adr/0037-limit-cleanup-ownership-to-created-skill-links.md).
 
 Version banners are ephemeral compatibility evidence, never authorization. They do not enter a
 journal, affect ownership, or change child/cleanup exit precedence, and no session observes one:
@@ -125,6 +129,14 @@ BrokenPipe as success and maps another output failure to category 70.
 [ADR 0026](adr/0026-reserve-session-stdout-for-child-data.md) records the session stream boundary;
 [ADR 0029](adr/0029-generate-static-completions-from-the-shared-cli-graph.md) records the static
 completion boundary.
+
+A genuine session-cleanup failure, a quarantined-journal refusal, and an explicit-cleanup retry are
+each rendered once as a structured block: a severity or summary line, then indented fields naming the
+reason, every retained path, the retained journal, the process-death precondition, and a labelled
+recovery vector whose executable and numbered arguments occupy one line each. Only those fixed labels
+and separators insert a line break; every external value is escaped independently through
+`src/render.rs`, so no path or reason can forge a line, and nothing is ever joined into a shell
+command string.
 
 ## Execution architecture
 
@@ -189,7 +201,7 @@ bounded journal scan -> reject the whole operation on corrupt state -> canonical
   -> per journal: claim missing keys into one shared complete lock set
   -> reload and verify immutable fields
   -> fail closed on disappearance or drift; otherwise classify the refreshed status
-  -> dependency-ordered adopt -> shared verified cleanup
+  -> deterministic scan-order adopt -> shared verified cleanup
 ```
 
 The command never trusts PID-looking holder text as liveness evidence and never treats a free lock
@@ -218,7 +230,7 @@ adapter passthrough validation -> hard launch-control preflight
   -> repeat hard launch controls in the adapter's spawn-boundary revalidation
      of the locked snapshot and plan
   -> persist supervising intent, then shell-free child supervision
-  -> after proven process-domain death: one reverse-order cleanup operation or terminal kept state
+  -> after proven process-domain death: one reverse-order reconciliation pass or terminal kept state
      after uncertain liveness: retain the supervising journal and every mount
 ```
 
@@ -242,11 +254,11 @@ conflict until recovery removes it. This ordering is the accepted decision in
 | `src/paths.rs` | Invocation CWD, launch CWD, project root, source occurrence, executable resolution, and construction of the one selected Agent's resolved configuration roots. |
 | `src/catalog/` | No-follow source discovery, ordered overlay selection, and selected-winner validation against declarative Agent catalog policy. |
 | `src/agent/` | The closed adapter registry, Codex, Claude, and OMP discovery inspection, declarative plan construction, the read-only adapter lifecycle contract, and the shared bounded version observer that only `doctor` calls. |
-| `src/mount/` | Destination conflict policy and deterministic, read-only mount actions. |
-| `src/render.rs` | Read-only plans, normal/verbose session diagnostics, warnings, and reversible native-value rendering. |
+| `src/mount/` | Destination conflict policy, deterministic read-only mount actions, and each action's creation and cleanup-disposition classification. |
+| `src/render.rs` | Read-only plans, normal/verbose session diagnostics, warnings, labelled native argument vectors, and reversible native-value rendering. |
 | `src/lock/` | Logical/physical resource identities and sorted operating-system advisory locks. |
 | `src/journal/` | Versioned, checksummed write-ahead ownership records and durable storage. |
-| `src/transaction/` | Apply, rollback, ordinary cleanup, kept state, and stale recovery. |
+| `src/transaction/` | Apply, rollback, ordinary cleanup of created Skill links, best-effort pruning of the scaffolding beneath them, kept state, and stale recovery. |
 | `src/process/` | Shell-free direct child launch, bounded captured-command containment, inherited session streams, reusable platform interruption, liveness-gated cleanup coordination, structured status, and exit-policy mapping. |
 | `src/link/` | Sealed platform boundary for no-follow inspection, link creation, no-replace placement, and verified entry removal. |
 | `src/state.rs` | Computes state locations and, only after the mutation boundary, creates their requested final directories with platform-specific access restrictions. |
@@ -359,8 +371,8 @@ unsound; [ADR 0010](adr/0010-discovery-entry-identity.md) records this decision.
 |---|---|---|---|
 | Current modeled discovery | Codex 0.146.0 recursive regular-file `SKILL.md` discovery under project and ancestor `.agents/skills` and `.codex/skills`, `$HOME/.agents/skills`, deprecated `$CODEX_HOME/skills`, bundled `$CODEX_HOME/skills/.system`, and the platform administrator root; file links are ignored, logical identity uses the supported frontmatter parser and directory-name fallback, and all same-name declarations are retained | Claude Code 2.1.220 direct-entry discovery in the platform managed Skill root, project `.claude/skills` from launch CWD through project root, the effective `CLAUDE_CONFIG_DIR/skills` user scope, the selected destination, and user-supplied `--add-dir` scopes; descendant collisions below launch CWD are namespace-qualified and custom standalone Skills override bundled names | OMP 17.2.9 priority-first, non-recursive `<root>/<entry>/SKILL.md` discovery across nine registered providers — `native` 100 (ancestor `.omp/skills` from the launch CWD up to the repository root or home, nearest first, plus the user `<agentDir>/skills`), `omp-plugins` 90 (each enabled extension package's `skills/` directory), `claude` 80, `claude-plugins` 70, `agents` 70, `codex` 70, `opencode` 55, `github` 30, and `omp-managed` 5 — plus a second-pass `skills.customDirectories` scan that overrides same-named provider Skills; an entry must be a directory or directory link, the first name wins, and `native`, `omp-plugins`, `github`, `omp-managed`, and custom directories require a non-empty description; the five-layer settings stack (schema defaults, `<agentDir>/config.yml`, project provider files folded so the lowest-priority provider wins a conflicting key, the `PI_CONFIG_FILES`/`--config` overlays SkillMount rejects as input, and in-memory runtime overrides) merges maps recursively, replaces arrays wholesale, and can disable or filter any name |
 | Compatibility | `.codex/skills` is a visible legacy conflict scope but never a placement candidate; an existing `.agents/skills -> .codex/skills` link is respected as operator configuration | No project compatibility store is created | Every cross-agent provider root — `.claude/skills` at user and ancestor scope, marketplace plugin caches, `.agent`/`.agents/skills`, `.codex/skills`, opencode's user and project scopes, `.github/skills`, and OMP's own user, plugin, and managed scopes — is a visible conflict scope but never a placement candidate; `<cwd>/.codex/config.toml` and the other agents' project settings files are parsed because they join the settings fold that can hide a selected Skill |
-| Planned destination | Always `<project>/.agents/skills`; a missing path is planned as a regular directory chain | Default: unique state-root staging tree at `<session>/root/.claude/skills`; project mode: `<project>/.claude/skills` | Always `<launch-cwd>/.omp/skills` under `--mount-mode=auto` or `--mount-mode=project`; `--mount-mode=staging` is a usage error, and missing `.omp` and `skills` directories are planned as ordinary transaction-owned directory actions |
-| Project mutation | Transaction-owned Skill links may be added only through `.agents/skills` | Project mode may add transaction-owned entries; default staging does not modify the project namespace | Transaction-owned Skill links may be added only through `.omp/skills`; every visible provider root contributes its logical lock resource and each canonical terminal directory a physical lock key |
+| Planned destination | Always `<project>/.agents/skills`; a missing path is planned as a non-critical regular directory chain | Default: unique state-root staging tree at `<session>/root/.claude/skills`; project mode: `<project>/.claude/skills`; a missing chain in either mode is non-critical scaffolding | Always `<launch-cwd>/.omp/skills` under `--mount-mode=auto` or `--mount-mode=project`; `--mount-mode=staging` is a usage error, and missing `.omp` and `skills` directories are planned as non-critical scaffolding |
+| Project mutation | Created Skill links may be added only through `.agents/skills` | Project mode may add created entries; default staging does not modify the project namespace | Created Skill links may be added only through `.omp/skills`; every visible provider root contributes its logical lock resource and each canonical terminal directory a physical lock key |
 | Launch integration | Implemented for bounded `exec` and `review` launches; no version process runs, and release-independent hard launch invariants repeat after lock stabilization and at the spawn boundary; interactive TUI is rejected because it can reload higher-precedence managed configuration after spawn; child `current_dir`, canonical explicit `CODEX_HOME`, injected native `-C` and session discovery overrides, validated passthrough, and no `--add-dir` | Implemented with the same repeated hard-invariant boundaries and no version process; default staging injects one `--add-dir <session>/root` pair and every mode injects a session-only selected-name `skillOverrides` object before unchanged validated passthrough | Implemented for one new supervised foreground session; no version process runs, the release-independent hard launch invariants repeat after lock stabilization and at the spawn boundary, and a pre-spawn recheck refuses to launch when non-owned discovery evidence moved; no argument or environment override is injected — child argv is exactly the validated operator passthrough and the child runs in the launch CWD; rejected before state access: root-relocating `--cwd`, `--profile`, `--alias`, and `--config`, selection-changing `--no-skills`, `--skills`, `-e`/`--extension`, `--hook`, `--no-extensions`, and `--plugin-dir`, lifecycle-reusing `-c`/`--continue`, `-r`/`--resume`/`--session`, `--fork`, `--from-claude`, `--from-codex`, and `--export`, `--mode` with `rpc`, `rpc-ui`, or `acp`, every recognized OMP subcommand, the `OMP_PROFILE`/`PI_PROFILE`/`PI_CONFIG_FILES` environment overlays, and a home launch CWD without the operator's own `--allow-home` |
 
 Scopes that resolve to one terminal directory and use the same traversal policy are folded for
@@ -564,7 +576,14 @@ including unpaired surrogates, rather than passing ownership evidence through UT
 Apply rechecks every planned precondition and uses evidence-bearing, atomic same-filesystem
 no-replace placement. Successful placement returns identity for the object established at the final
 path before the journal advances to `applied`; a visible mismatch remains journal-backed residue.
-Rollback and ordinary cleanup share the same reverse-order removal path. Windows derives
+Rollback and ordinary cleanup share the same reverse-order reconciliation pass, and both derive an
+action's cleanup disposition from the operation label already on disk rather than from a separate
+field: a created Skill link is cleanup-critical, a helper directory is best-effort scaffolding, and a
+reused entry is owned by nobody. A best-effort directory is pruned only while it remains
+identity-matching and empty; when it is non-empty, replaced, or unprunable it is left exactly as it
+is, reported once, and its action is durably reconciled. For a `mkdir` action the stable `rolled_back`
+label therefore records that cleanup responsibility ended, not that the directory is gone, while link
+semantics are unchanged. Windows derives
 attributes, strongest identity, and reparse data from one no-follow handle and retains that handle
 through rename or disposition. Kind and target are eligibility checks at the Windows handle
 boundary; retained identity is the authority for later object-bound mutation because attribute-only
@@ -690,16 +709,18 @@ The following are product rules rather than style preferences:
     arguments, and never replaces inherited standard streams with product-owned pipes. Session
     stdout is reserved for child data; every wrapper-owned session diagnostic uses stderr.
 13. Exactly one orderly cleanup operation runs when no child was spawned or the managed process
-    domain is proven dead. Uncertain liveness defers cleanup and preserves recovery evidence. A
-    cleanup failure replaces only child success; otherwise it remains structured secondary
-    evidence behind the primary child or process failure. Recovery never turns free wrapper locks
-    into process-domain death proof for a `supervising` journal.
+    domain is proven dead. Uncertain liveness defers cleanup and preserves recovery evidence. Only
+    an unresolved created Skill link, a failure removing one, or a journal failure is a cleanup
+    failure: it replaces only child success and otherwise remains structured secondary evidence
+    behind the primary child or process failure. A preserved helper directory is reported, never
+    counted as a failure, and never retains a journal by itself. Recovery never turns free wrapper
+    locks into process-domain death proof for a `supervising` journal.
 14. After release-independent adapter controls accept a launch, mount visibility for the session
     and removal after it are established by the write-ahead journal, the complete recorded lock
     set, proven managed-process-domain death, and ownership-verified removal. No part of that chain
     consults the Agent's version banner, and no session path observes one. An Agent release that
     ignores the mounted entries may leave the mount unused, but ordinary cleanup still removes only
-    matching transaction-owned entries. This guarantee does not extend process-domain proof beyond
+    matching created entries. This guarantee does not extend process-domain proof beyond
     ADR 0019's residual boundaries: known discovery-relocating and detaching controls remain hard
     launch failures, and forwarding an unknown token does not certify that future Agent semantics
     cannot escape those boundaries.
@@ -715,8 +736,9 @@ The following are product rules rather than style preferences:
 17. Explicit cleanup scans only the bounded journal store, rejects the whole operation before
     mutation when any journal is corrupt, acquires each eligible journal's complete lock set, and
     reloads and validates that journal under those locks before using the same ownership-checked
-    reverse-order cleanup as sessions and automatic recovery. Overlapping journals share one
-    claimed lock set and clean descendant owners before shared helper-directory owners. A journal
+    reverse-order reconciliation as sessions and automatic recovery. Overlapping journals share one
+    claimed lock set and are adopted in deterministic scan order, because a preserved helper
+    directory discharges its own action and can no longer strand another journal. A journal
     absent after its complete locks are held is unknown ownership and blocks mutation. A live lock
     always wins over holder text; an ownership mismatch is retained and reported.
 18. `completions` accepts only the owned Bash, Zsh, Fish, and PowerShell values, binds output only
@@ -837,14 +859,16 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
 - `inspect`, `--dry-run`, concise/verbose plan rendering, dated last-tested evidence rendering, and
   process-free read-only regression tests;
 - normal session summaries on stderr, child-data-only session stdout, verbose
-  scope/link/provenance and cleanup diagnostics, reversible recovery arguments, and retained-path
-  reporting;
+  scope/link/provenance and cleanup diagnostics including preserved scaffolding, and one structured
+  stderr block per cleanup failure or quarantined journal carrying the reason, retained paths,
+  retained journal, process-death precondition, and a labelled native recovery argument vector;
 - Unix/macOS symbolic-link and Windows symbolic-link/junction backends;
 - no-follow link-chain resolution, evidence-bearing atomic no-replace placement, Windows
   handle-bound mutation after initial observation, Unix ownership-checked pathname mutation under
   cooperative locks, and documented creation-to-observation residual scope;
-- logical and physical resource locks, versioned journals, write-ahead apply, rollback, cleanup,
-  terminal kept state, and stale recovery;
+- logical and physical resource locks, versioned journals, write-ahead apply, rollback, cleanup that
+  reconciles created Skill links and prunes their scaffolding best-effort, terminal kept state, and
+  stale recovery;
 - generic shell-free child supervision with inherited streams, typed child/interrupt/cleanup
   outcomes, stable exit precedence, reusable native event dispatch, liveness-gated cleanup, Unix
   signal-group handling, Windows console identity and Job Object containment, and feature-gated
@@ -857,7 +881,7 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
   exact passthrough injection, repeated hard controls, fake-child acceptance, concurrent roots, and
   the same liveness-gated cleanup and exit precedence;
 - complete OMP session composition through the same hard-control preflight, project `.omp/skills`
-  mounting with transaction-owned directory creation, complete-namespace conflict and
+  mounting with non-critical directory scaffolding, complete-namespace conflict and
   operator-visibility checks, a pre-spawn non-owned discovery-evidence recheck, unchanged validated
   passthrough with no injected argument or environment override, fake-child acceptance, and the
   shared liveness-gated cleanup and exit precedence;
@@ -868,7 +892,8 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
   discovery, lock, journal, conflict, and isolated link-capability findings, plus read-only mutation
   regression tests;
 - project-scoped and bounded all-state explicit cleanup through shared recovery and ownership
-  engines, including active, corrupt, supervising, kept, replaced, missing, and mixed outcomes;
+  engines, including active, corrupt, supervising, kept, replaced, missing, preserved-scaffolding,
+  and mixed outcomes;
 - operator quick-start, lifecycle, recovery, safety, compatibility, and manual smoke-test
   documentation, plus a dispatch-only native real-agent evidence workflow with integrity-locked
   agent packages, provider-scoped credentials, redacted artifacts, and process-tree timeouts;

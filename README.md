@@ -146,7 +146,7 @@ asm claude --skills-dir ~/agent-skills -- -p "Review the staged diff with the te
 ```
 
 Oh My Pi mounts into the project's own `.omp/skills`, the first place OMP searches, and removes
-the links — and any `.omp` directories it created — when the session ends:
+the links it created when the session ends:
 
 ```bash
 asm omp --skills-dir ~/agent-skills -- -p "Summarize this project's build steps"
@@ -164,7 +164,7 @@ them visible to an agent.
 `asm omp` and `skillmount omp` support exactly one scope: a new foreground Oh My Pi (OMP) session
 that SkillMount launches itself. The selected Skills are linked into `<launch CWD>/.omp/skills` —
 the first place OMP searches — and SkillMount creates the `.omp` and `.omp/skills` directories
-when they are missing, then removes everything it created after OMP exits:
+when they are missing, then removes every link it created after OMP exits:
 
 ```bash
 asm omp --skills-dir ~/agent-skills -- -p "Summarize this project's build steps"
@@ -209,8 +209,12 @@ no argument and no environment variable into an OMP launch, does not manage OMP 
 and never weakens OMP's permission or approval model: it forwards `--auto-approve`, `--yolo`, and
 `--approval-mode` only when you supplied them.
 
-Cleanup uses the same journaled, crash-recoverable path as the other agents: after the session,
-SkillMount removes the links it created and any `.omp` directories it had to create, and
+Cleanup uses the same journaled, crash-recoverable path as the other agents. Every Skill link
+SkillMount created is removed once the OMP process domain is dead, and the `.omp` and `.omp/skills`
+directories it had to create are pruned too — but only while they are still empty and still the
+directories it recorded. If OMP, the operating system, or another program left something in one,
+SkillMount preserves that directory and its contents untouched, reports it, and still completes: a
+leftover directory is not a failed cleanup, and nothing SkillMount mounted remains visible.
 `asm doctor` plus `asm cleanup` reconcile an interrupted session. Attaching to or hot-reloading
 Skills into an OMP process SkillMount did not launch is not supported — OMP loads Skills once at
 startup, so start a new session instead. The recorded OMP evidence, including the platforms it
@@ -225,7 +229,7 @@ omp           Run an Oh My Pi session with the selected Skills
 completions   Generate a shell completion script on standard output
 inspect       Inspect and validate a catalog without modifying the filesystem
 doctor        Inspect agent, discovery, link, lock, and transaction health
-cleanup       Reconcile transaction-owned residue from durable evidence
+cleanup       Reconcile residue from durable transaction evidence
 ```
 
 The session commands `codex`, `claude`, and `omp` share these options:
@@ -240,7 +244,7 @@ The session commands `codex`, `claude`, and `omp` share these options:
 --conflict <POLICY>    Existing-destination policy: error, skip [default: error]
 --validation <LEVEL>   Metadata validation policy: basic, strict, none [default: basic]
 --dry-run              Keep later planning read-only
---keep-mounts          Retain later transaction-owned mounts for diagnostics
+--keep-mounts          Retain later session mounts for diagnostics
 --no-recover           Disable later stale-transaction recovery
 -v, --verbose          Increase diagnostic verbosity
 ```
@@ -289,6 +293,25 @@ fails. `cleanup` releases mounts left behind by an interrupted session; run it o
 no Agent process still uses them, or sweep every recorded transaction with
 `asm cleanup --all`. The recovery rules and their guarantees are documented in
 [docs/architecture.md](docs/architecture.md).
+
+When a Skill link genuinely cannot be released, the session says so once, on stderr, and names what
+to run:
+
+```text
+error: session cleanup failed
+  reason: a regular directory replaced the entry, so it cannot be proved to belong to this session and was left untouched
+  retained path: /projects/webapp/.omp/skills/team-review
+  retained journal: ~/Library/Application Support/skillmount/transactions/<id>.journal
+  recovery: first confirm that every related Agent process has exited, then invoke this argument vector
+    executable: asm
+    argument 1: cleanup
+    argument 2: --project-root
+    argument 3: /projects/webapp
+```
+
+Those are argument values, not a command to paste into a shell. They stay separate on purpose: a
+path can hold spaces, quotes, or bytes no shell quoting round-trips, so SkillMount prints each value
+on its own labelled line instead of building a command string you would have to trust.
 
 ## Requirements
 
