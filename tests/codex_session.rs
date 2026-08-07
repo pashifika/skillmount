@@ -283,23 +283,22 @@ fn native_from_hex(value: &str) -> OsString {
     OsString::from_wide(&wide)
 }
 
-fn assert_single_silent_last_tested_observation(fixture: &Fixture, stderr: &str) {
-    let version_record =
-        fs::read_to_string(&fixture.version_record).expect("version observation record");
-    assert_eq!(
-        version_record.lines().count(),
-        1,
-        "the version banner is observed exactly once"
-    );
-    assert_eq!(
-        fs::canonicalize(PathBuf::from(recorded_os(&version_record, "cwd")))
-            .expect("canonical version observation CWD"),
-        fs::canonicalize(&fixture.root).expect("canonical invocation CWD"),
-        "the observation uses the wrapper invocation CWD, not the child launch CWD"
+/// A mutating session spawns exactly one Agent process: the supervised session child.
+///
+/// [ADR 0036](../docs/adr/0036-confine-agent-version-observation-to-doctor.md) removed the
+/// pre-state `--version` observation, so the absence of the record file is the observable proof.
+fn assert_no_version_process_and_no_compatibility_warning(fixture: &Fixture, stderr: &str) {
+    assert!(
+        !fixture.version_record.exists(),
+        "a mutating session must not run --version"
     );
     assert!(
         !stderr.contains("version compatibility is unverified"),
-        "the last-tested banner must not warn: {stderr}"
+        "a session must emit no compatibility warning: {stderr}"
+    );
+    assert!(
+        fixture.record.is_file(),
+        "the supervised session child must still start"
     );
 }
 
@@ -395,7 +394,7 @@ fn selected_skills_stay_mounted_while_fake_codex_runs_then_cleanup_succeeds() {
     assert!(fixture.sources.join("alpha/SKILL.md").is_file());
     assert!(!exists(&fixture.project.join(".agents")));
     assert!(!exists(&fixture.project.join(".codex")));
-    assert_single_silent_last_tested_observation(&fixture, &stderr);
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
 }
 
 #[test]
@@ -533,8 +532,8 @@ fn a_missing_explicit_codex_fails_with_66_before_mutation() {
 }
 
 #[test]
-fn an_untested_codex_version_warns_once_runs_the_child_and_preserves_child_status() {
-    let fixture = Fixture::new("untested-version");
+fn a_drifted_codex_banner_neither_warns_nor_starts_a_version_process() {
+    let fixture = Fixture::new("drifted-banner");
     fixture.skill("alpha");
 
     let output = fixture
@@ -542,154 +541,36 @@ fn an_untested_codex_version_warns_once_runs_the_child_and_preserves_child_statu
         .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", "codex-cli 0.147.0")
         .env("SKILLMOUNT_FAKE_EXIT", "23")
         .output()
-        .expect("asm should continue under untested version evidence");
+        .expect("asm should launch a drifted Codex build");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_eq!(output.status.code(), Some(23), "{stderr}");
-    assert_eq!(
-        stderr
-            .matches("version compatibility is unverified")
-            .count(),
-        1,
-        "{stderr}"
-    );
-    assert!(stderr.contains("codex-cli 0.147.0"), "{stderr}");
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
+    // Verbose output still names the dated constant, and now says the executable was never
+    // queried on any surface. The installed banner cannot appear because nothing read it.
     assert!(stderr.contains("codex-cli 0.146.0"), "{stderr}");
-    assert!(stderr.contains("docs/compatibility.md"), "{stderr}");
-    assert!(
-        stderr.contains("bounded --version observation attempted before state access"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("executable not queried"), "{stderr}");
-    assert!(fixture.record.is_file(), "the child must start");
-    assert_eq!(
-        fs::read_to_string(&fixture.version_record)
-            .expect("version observation record")
-            .lines()
-            .count(),
-        1
-    );
+    assert!(stderr.contains("executable not queried"), "{stderr}");
+    assert!(!stderr.contains("codex-cli 0.147.0"), "{stderr}");
     assert!(!exists(&fixture.project.join(".agents")));
     assert!(!exists(&fixture.project.join(".codex")));
 }
 
 #[test]
-fn unavailable_codex_version_warns_once_and_keep_mounts_preserves_the_session() {
-    let fixture = Fixture::new("unavailable-version-keep");
+fn a_codex_build_without_usable_version_evidence_still_keeps_mounts() {
+    let fixture = Fixture::new("unusable-version-keep");
     fixture.skill("alpha");
 
+    // The fake agent would fail `--version` if anything asked; nothing does.
     let output = fixture
         .command_with_options(&["--keep-mounts"])
         .env("SKILLMOUNT_FAKE_VERSION_EXIT", "9")
         .output()
-        .expect("asm should continue without usable version evidence");
+        .expect("asm should ignore an unusable --version");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_eq!(output.status.code(), Some(0), "{stderr}");
-    assert_eq!(
-        stderr
-            .matches("version compatibility is unverified")
-            .count(),
-        1,
-        "{stderr}"
-    );
-    assert!(stderr.contains("exit code 9"), "{stderr}");
-    assert!(stderr.contains("codex-cli 0.146.0"), "{stderr}");
-    assert!(fixture.record.is_file(), "the child must start");
-    assert_eq!(
-        fs::read_to_string(&fixture.version_record)
-            .expect("version observation record")
-            .lines()
-            .count(),
-        1
-    );
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
     assert!(exists(&fixture.project.join(".agents/skills/alpha")));
-}
-
-#[test]
-fn oversized_interleaved_version_output_is_bounded_and_the_session_continues() {
-    let fixture = Fixture::new("oversized-interleaved-version");
-    fixture.skill("alpha");
-
-    let output = fixture
-        .command()
-        .env("SKILLMOUNT_FAKE_VERSION_BEHAVIOR", "oversized-interleaved")
-        .output()
-        .expect("asm should bound both version output streams");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert_eq!(output.status.code(), Some(0), "{stderr}");
-    assert!(stderr.contains("1024-byte observation bound"), "{stderr}");
-    assert!(fixture.record.is_file(), "the real child must start");
-    assert_eq!(
-        fs::read_to_string(&fixture.version_record)
-            .expect("version observation record")
-            .lines()
-            .count(),
-        1
-    );
-    assert!(!exists(&fixture.project.join(".agents")));
-    assert!(!exists(&fixture.project.join(".codex")));
-}
-
-#[test]
-fn inherited_version_output_handles_are_terminated_at_the_lifetime_bound() {
-    let fixture = Fixture::new("inherited-version-descriptor");
-    fixture.skill("alpha");
-    let descendant_record = fixture.root.join("version-descendant.record");
-    let started = Instant::now();
-
-    let output = fixture
-        .command()
-        .env("SKILLMOUNT_FAKE_VERSION_BEHAVIOR", "inherited-descriptor")
-        .env(
-            "SKILLMOUNT_FAKE_VERSION_DESCENDANT_RECORD",
-            &descendant_record,
-        )
-        .output()
-        .expect("asm should stop a version descendant that retains the output handles");
-    let elapsed = started.elapsed();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert_eq!(output.status.code(), Some(0), "{stderr}");
-    assert!(elapsed < Duration::from_secs(8), "capture took {elapsed:?}");
-    assert!(
-        stderr.contains("3-second process/output lifetime bound"),
-        "{stderr}"
-    );
-    assert!(fixture.record.is_file(), "the real child must start");
-    assert_eq!(
-        fs::read_to_string(&fixture.version_record)
-            .expect("version observation record")
-            .lines()
-            .count(),
-        1
-    );
-    #[cfg(unix)]
-    {
-        let descendant = UnixProcessGuard::from_record(&descendant_record);
-        assert!(
-            !descendant.is_running(),
-            "the version descendant must be dead before launch continues"
-        );
-    }
-    #[cfg(windows)]
-    {
-        let descendant = fs::read_to_string(&descendant_record)
-            .expect("fake version descendant record")
-            .lines()
-            .find_map(|line| line.strip_prefix("pid="))
-            .expect("fake version descendant records its PID")
-            .parse::<u32>()
-            .expect("fake version descendant PID is numeric");
-        assert!(
-            !skillmount::process::test_support::process_is_running(descendant)
-                .expect("query version descendant liveness"),
-            "the version descendant must be dead before launch continues"
-        );
-    }
-    assert!(!exists(&fixture.project.join(".agents")));
-    assert!(!exists(&fixture.project.join(".codex")));
 }
 
 #[test]

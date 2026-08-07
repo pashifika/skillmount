@@ -27,6 +27,12 @@ ordered catalog, inspects the discovery scopes implemented by the selected adapt
 deterministic mount or preservation outcome for each selected Skill, and removes only entries that
 still match the transaction's recorded ownership evidence.
 
+Its responsibility stops at that lifetime. Mount visibility for the session and removal after it
+are established by the write-ahead journal, the complete recorded lock set, proven process-domain
+death, and ownership-verified removal. None of those depend on which Agent release is installed or
+on the Agent's option and command surface, so SkillMount reasons about its own state rather than
+about the Agent's interface.
+
 One package installs two behaviorally identical binaries:
 
 - `asm`, the primary command used by documentation;
@@ -66,6 +72,12 @@ SkillMount is not an operating-system sandbox. It does not elevate through UAC o
 agent's configuration to grant access, or edit the user's Git ignore rules or index as product
 behavior.
 
+SkillMount does not track, validate, or gate on an Agent's version, option surface, or command
+surface. A passthrough token the selected adapter does not classify is forwarded unchanged rather
+than guarded, because an unclassified token can only make a mount unused; it cannot defeat the
+guarantees above. Keeping an adapter aligned with an Agent release is compatibility evidence
+recorded in [docs/compatibility.md](compatibility.md), not a launch-time obligation.
+
 ## Current command behavior
 
 | Surface | Current behavior |
@@ -76,9 +88,9 @@ behavior.
 | `asm claude --dry-run` | Produces the isolated Claude staging plan under the same process-free read-only contract, with the same pre-plan launch-invariant gate. |
 | `asm omp --dry-run` | Produces the project `.omp/skills` plan under the same process-free read-only contract; the passthrough, environment, and home-CWD gates a real OMP launch enforces run before any plan is rendered. |
 | `asm claude --mount-mode=project` | Uses the project's `.claude/skills` namespace instead of isolated staging; `--dry-run` keeps that plan read-only. |
-| `asm codex -- exec ...` or `-- review ...` without `--dry-run` | Resolves a shell-free executable, checks release-independent launch controls, observes one bounded advisory `--version` banner before state access, locks, recovers, replans, journals, applies, repeats the hard controls, launches the bounded Codex command with the requested CWD and passthrough, then cleans up after the managed process domain is dead. An untested or unavailable banner warns once and continues; interactive TUI passthrough still fails before state access. |
-| `asm claude` without `--dry-run` | Applies the same one-observation advisory version policy, stages under a unique state-owned root, locks, recovers, replans, journals, applies, injects that root through one `--add-dir` pair, supervises the shell-free child, and cleans up after proven process-domain death. Discovery-changing environment, detached/relocated execution, and known non-session commands remain hard failures independent of the observed banner. |
-| `asm omp` without `--dry-run` | Applies the same one-observation advisory version policy, plans `<launch-cwd>/.omp/skills` with missing `.omp` and `skills` directories as transaction-owned actions, locks, recovers, replans, journals, applies, repeats the hard controls plus a non-owned discovery-evidence recheck at the spawn boundary, launches the foreground OMP session with the operator's unchanged passthrough — injecting no argument or environment override — and cleans up after proven process-domain death. |
+| `asm codex -- exec ...` or `-- review ...` without `--dry-run` | Resolves a shell-free executable, checks release-independent launch controls, locks, recovers, replans, journals, applies, repeats the hard controls, launches the bounded Codex command with the requested CWD and passthrough, then cleans up after the managed process domain is dead. No `--version` process runs on this path, so the installed release never warns or blocks; interactive TUI passthrough still fails before state access. |
+| `asm claude` without `--dry-run` | Runs the same release-independent, process-free preflight, stages under a unique state-owned root, locks, recovers, replans, journals, applies, injects that root through one `--add-dir` pair, supervises the shell-free child, and cleans up after proven process-domain death. Discovery-changing environment, detached/relocated execution, and known non-session commands remain hard failures; a passthrough token the adapter does not classify is forwarded unchanged. |
+| `asm omp` without `--dry-run` | Runs the same process-free preflight, plans `<launch-cwd>/.omp/skills` with missing `.omp` and `skills` directories as transaction-owned actions, locks, recovers, replans, journals, applies, repeats the hard controls plus a non-owned discovery-evidence recheck at the spawn boundary, launches the foreground OMP session with the operator's unchanged passthrough — injecting no argument or environment override — and cleans up after proven process-domain death. |
 | Session with `--keep-mounts` | After a child reaches the supervision boundary, records terminal kept state instead of removing owned entries. A pre-spawn hard launch-invariant or supervision-intent failure overrides the request and removes every verified owned entry. |
 | Session with `--no-recover` | Refuses when incomplete state requires reconciliation; otherwise continues through the normal mutating path. |
 | Session encountering a free `supervising` journal | Refuses with category 75 and retains every recorded mount because wrapper-lock release does not prove child-domain death. |
@@ -93,10 +105,15 @@ to release every owned entry, while `--keep-mounts` retains them intentionally a
 boundary. A hard launch-invariant or supervision-intent failure before spawn forces verified
 cleanup; anything cleanup cannot prove safe to remove remains reported and journal-backed.
 
-Version banners are ephemeral, advisory compatibility evidence. They never authorize a launch,
-enter a journal, affect ownership, or change child/cleanup exit precedence. The adapter's dated
-last-tested banner identifies the evidence baseline, not an exact-version allowlist.
-[ADR 0033](adr/0033-treat-agent-versions-as-advisory-evidence.md) records this boundary.
+Version banners are ephemeral compatibility evidence, never authorization. They do not enter a
+journal, affect ownership, or change child/cleanup exit precedence, and no session observes one:
+`doctor` is the single surface that executes an Agent with literal `--version`. Every other
+surface renders the adapter's dated last-tested banner as a compile-time constant that identifies
+the evidence baseline, not an exact-version allowlist.
+[ADR 0033](adr/0033-treat-agent-versions-as-advisory-evidence.md) established that the banner is
+evidence rather than launch authorization, and
+[ADR 0036](adr/0036-confine-agent-version-observation-to-doctor.md) removed the observation from
+the session path because a value that authorizes nothing does not belong there.
 
 Session stdout is exclusively the inherited child data stream. Wrapper-owned session summaries,
 warnings, informational lines, errors, and cleanup diagnostics use stderr, so Codex JSONL, Claude
@@ -184,7 +201,6 @@ The mutating path deliberately does not build a complete plan before locking:
 
 ```text
 adapter passthrough validation -> hard launch-control preflight
-  -> one bounded advisory version observation
   -> read-only journal preflight
   -> ensure the staging-state base when staging is required
   -> mint transaction / staging identity
@@ -223,7 +239,7 @@ conflict until recovery removes it. This ordering is the accepted decision in
 | `src/completion.rs` | Static Bash, Zsh, Fish, and PowerShell generation from the shared command graph, exact product-name binding, literal filesystem candidates, executable filtering, and cold-start opaque-passthrough guards. |
 | `src/paths.rs` | Invocation CWD, launch CWD, project root, source occurrence, executable resolution, and construction of the one selected Agent's resolved configuration roots. |
 | `src/catalog/` | No-follow source discovery, ordered overlay selection, and selected-winner validation against declarative Agent catalog policy. |
-| `src/agent/` | The closed adapter registry, Codex, Claude, and OMP discovery inspection, declarative plan construction, the read-only adapter lifecycle contract, and the shared bounded advisory version observer. |
+| `src/agent/` | The closed adapter registry, Codex, Claude, and OMP discovery inspection, declarative plan construction, the read-only adapter lifecycle contract, and the shared bounded version observer that only `doctor` calls. |
 | `src/mount/` | Destination conflict policy and deterministic, read-only mount actions. |
 | `src/render.rs` | Read-only plans, normal/verbose session diagnostics, warnings, and reversible native-value rendering. |
 | `src/lock/` | Logical/physical resource identities and sorted operating-system advisory locks. |
@@ -287,10 +303,10 @@ only the resolved executable with literal `--version`, null stdin, bounded captu
 the invocation CWD. Native process containment gives the observation a finite lifetime: crossing a
 stream or time bound closes capture, terminates the dedicated process domain before reaping its
 root, and requires bounded reader shutdown plus domain-death proof. A capture or containment
-failure becomes unavailable advisory evidence. The observer has no mount, lock, journal,
-transaction, or cleanup API and its result is never persisted as ownership evidence. `src/app.rs`
-owns the single pre-state session observation; `doctor` owns its independent diagnostic
-observation.
+failure becomes unavailable evidence. The observer has no mount, lock, journal, transaction, or
+cleanup API and its result is never persisted as ownership evidence. `doctor` is its only caller:
+no session path constructs one, so a mutating run spawns exactly one Agent process. See
+[ADR 0036](adr/0036-confine-agent-version-observation-to-doctor.md).
 
 The shared application layer owns ordering and policy. The transaction layer owns multi-step
 mutation and durable ownership. The sealed link backend provides both read-only inspection and
@@ -343,7 +359,7 @@ unsound; [ADR 0010](adr/0010-discovery-entry-identity.md) records this decision.
 | Compatibility | `.codex/skills` is a visible legacy conflict scope but never a placement candidate; an existing `.agents/skills -> .codex/skills` link is respected as operator configuration | No project compatibility store is created | Every cross-agent provider root — `.claude/skills` at user and ancestor scope, marketplace plugin caches, `.agent`/`.agents/skills`, `.codex/skills`, opencode's user and project scopes, `.github/skills`, and OMP's own user, plugin, and managed scopes — is a visible conflict scope but never a placement candidate; `<cwd>/.codex/config.toml` and the other agents' project settings files are parsed because they join the settings fold that can hide a selected Skill |
 | Planned destination | Always `<project>/.agents/skills`; a missing path is planned as a regular directory chain | Default: unique state-root staging tree at `<session>/root/.claude/skills`; project mode: `<project>/.claude/skills` | Always `<launch-cwd>/.omp/skills` under `--mount-mode=auto` or `--mount-mode=project`; `--mount-mode=staging` is a usage error, and missing `.omp` and `skills` directories are planned as ordinary transaction-owned directory actions |
 | Project mutation | Transaction-owned Skill links may be added only through `.agents/skills` | Project mode may add transaction-owned entries; default staging does not modify the project namespace | Transaction-owned Skill links may be added only through `.omp/skills`; every visible provider root contributes its logical lock resource and each canonical terminal directory a physical lock key |
-| Launch integration | Implemented for bounded `exec` and `review` launches; one bounded pre-state version observation compares against the dated last-tested banner `codex-cli 0.146.0`, while release-independent hard launch invariants repeat after lock stabilization and at the spawn boundary; interactive TUI is rejected because it can reload higher-precedence managed configuration after spawn; child `current_dir`, canonical explicit `CODEX_HOME`, injected native `-C` and session discovery overrides, validated passthrough, and no `--add-dir` | Implemented with one bounded pre-state version observation against the dated last-tested banner `2.1.220 (Claude Code)` and the same repeated hard-invariant boundaries; default staging injects one `--add-dir <session>/root` pair and every mode injects a session-only selected-name `skillOverrides` object before unchanged validated passthrough | Implemented for one new supervised foreground session; one bounded pre-state version observation compares against the dated last-tested banner `omp/17.2.9`, the release-independent hard launch invariants repeat after lock stabilization and at the spawn boundary, and a pre-spawn recheck refuses to launch when non-owned discovery evidence moved; no argument or environment override is injected — child argv is exactly the validated operator passthrough and the child runs in the launch CWD; rejected before state access: root-relocating `--cwd`, `--profile`, `--alias`, and `--config`, selection-changing `--no-skills`, `--skills`, `-e`/`--extension`, `--hook`, `--no-extensions`, and `--plugin-dir`, lifecycle-reusing `-c`/`--continue`, `-r`/`--resume`/`--session`, `--fork`, `--from-claude`, `--from-codex`, and `--export`, `--mode` with `rpc`, `rpc-ui`, or `acp`, every recognized OMP subcommand, the `OMP_PROFILE`/`PI_PROFILE`/`PI_CONFIG_FILES` environment overlays, and a home launch CWD without the operator's own `--allow-home` |
+| Launch integration | Implemented for bounded `exec` and `review` launches; no version process runs, and release-independent hard launch invariants repeat after lock stabilization and at the spawn boundary; interactive TUI is rejected because it can reload higher-precedence managed configuration after spawn; child `current_dir`, canonical explicit `CODEX_HOME`, injected native `-C` and session discovery overrides, validated passthrough, and no `--add-dir` | Implemented with the same repeated hard-invariant boundaries and no version process; default staging injects one `--add-dir <session>/root` pair and every mode injects a session-only selected-name `skillOverrides` object before unchanged validated passthrough | Implemented for one new supervised foreground session; no version process runs, the release-independent hard launch invariants repeat after lock stabilization and at the spawn boundary, and a pre-spawn recheck refuses to launch when non-owned discovery evidence moved; no argument or environment override is injected — child argv is exactly the validated operator passthrough and the child runs in the launch CWD; rejected before state access: root-relocating `--cwd`, `--profile`, `--alias`, and `--config`, selection-changing `--no-skills`, `--skills`, `-e`/`--extension`, `--hook`, `--no-extensions`, and `--plugin-dir`, lifecycle-reusing `-c`/`--continue`, `-r`/`--resume`/`--session`, `--fork`, `--from-claude`, `--from-codex`, and `--export`, `--mode` with `rpc`, `rpc-ui`, or `acp`, every recognized OMP subcommand, the `OMP_PROFILE`/`PI_PROFILE`/`PI_CONFIG_FILES` environment overlays, and a home launch CWD without the operator's own `--allow-home` |
 
 Scopes that resolve to one terminal directory and use the same traversal policy are folded for
 conflict evaluation while their visible aliases remain available for diagnostics. A bundled-system
@@ -356,9 +372,8 @@ namespaces without losing alias-level contention.
 
 The Codex model was revalidated on 2026-08-03 against `codex-cli 0.146.0`, current official Skill
 documentation, the pinned open-source loader, home resolver and bundled-Skill installer, and
-black-box prompt discovery. A mutating session treats that reported banner as dated last-tested
-evidence; a different or unavailable banner warns once and continues. Dry-run and inspection
-describe the same evidence boundary without launching an executable. This evidence replaced
+black-box prompt discovery. That banner is dated last-tested evidence carried as adapter
+metadata; no session, dry-run, or inspection launches the executable to compare against it. This evidence replaced
 the older direct-directory-name and two-entry backing models;
 [ADR 0021](adr/0021-merge-codex-visible-names-and-mount-through-agents.md) records the proof, merged
 index, placement rule, and deferred compatibility work. Repository, user, and administrator roots
@@ -677,23 +692,30 @@ The following are product rules rather than style preferences:
     cleanup failure replaces only child success; otherwise it remains structured secondary
     evidence behind the primary child or process failure. Recovery never turns free wrapper locks
     into process-domain death proof for a `supervising` journal.
-14. The process-lifetime event dispatcher preserves the first two handler occurrences for one
+14. Mount visibility for the session and removal after it are established only by the write-ahead
+    journal, the complete recorded lock set, proven process-domain death, and ownership-verified
+    removal. No part of that chain consults the Agent's version banner, option surface, or command
+    surface, and no session path observes them. An Agent release that ignores the mounted entries,
+    dispatches something other than a session, or exposes controls the adapter does not classify
+    may leave the mount unused; it can never leave it unremoved, remove a non-owned entry, or
+    remove one while the process domain is still alive.
+15. The process-lifetime event dispatcher preserves the first two handler occurrences for one
     active session, linearizes finalization against event recording, and returns inactive or
     finalizing events to platform default handling.
-15. SkillMount-owned `doctor` inspection never mutates project discovery, lock files, holder
+16. SkillMount-owned `doctor` inspection never mutates project discovery, lock files, holder
     sidecars, journals, or agent state. Capability probes are isolated under a unique
     owner-restricted temporary root. Link and directory removal requires matching recorded kind,
     target where applicable, and platform identity; sentinel removal requires its create-new
     regular-file kind and transaction-unique recorded bytes. The selected trusted agent executable
     is run with literal `--version`; its own behavior is outside this non-mutation guarantee.
-16. Explicit cleanup scans only the bounded journal store, rejects the whole operation before
+17. Explicit cleanup scans only the bounded journal store, rejects the whole operation before
     mutation when any journal is corrupt, acquires each eligible journal's complete lock set, and
     reloads and validates that journal under those locks before using the same ownership-checked
     reverse-order cleanup as sessions and automatic recovery. Overlapping journals share one
     claimed lock set and clean descendant owners before shared helper-directory owners. A journal
     absent after its complete locks are held is unknown ownership and blocks mutation. A live lock
     always wins over holder text; an ownership mismatch is retained and reported.
-17. `completions` accepts only the owned Bash, Zsh, Fish, and PowerShell values, binds output only
+18. `completions` accepts only the owned Bash, Zsh, Fish, and PowerShell values, binds output only
     to the recognized platform-native invoked product name, stops wrapper candidates after a `--`
     before the active cursor starting with the first completion, emits filesystem candidates as
     literal shell argument text, never falls back to unrelated files from constrained wrapper
@@ -823,20 +845,22 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
   outcomes, stable exit precedence, reusable native event dispatch, liveness-gated cleanup, Unix
   signal-group handling, Windows console identity and Job Object containment, and feature-gated
   native fake-agent coverage;
-- complete bounded Codex `exec`/`review` session composition through hard-control preflight, one
-  advisory version observation, locked reinspection, durable apply, pre-spawn invariant and
-  selected-plugin revalidation, supervising intent, fake-child acceptance, liveness-gated cleanup,
-  quarantined uncertain journals, and child/cleanup exit precedence;
+- complete bounded Codex `exec`/`review` session composition through hard-control preflight, locked
+  reinspection, durable apply, pre-spawn invariant and selected-plugin revalidation, supervising
+  intent, fake-child acceptance, liveness-gated cleanup, quarantined uncertain journals, and
+  child/cleanup exit precedence;
 - complete Claude session composition through isolated staging, ancestor/user/add-dir preflight,
-  one advisory version observation, exact passthrough injection, repeated hard controls,
-  fake-child acceptance, concurrent roots, and the same liveness-gated cleanup and exit precedence;
-- complete OMP session composition through the same hard-control preflight and one advisory
-  version observation, project `.omp/skills` mounting with transaction-owned directory creation,
-  complete-namespace conflict and operator-visibility checks, a pre-spawn non-owned
-  discovery-evidence recheck, unchanged validated passthrough with no injected argument or
-  environment override, fake-child acceptance, and the shared liveness-gated cleanup and exit
-  precedence;
-- `doctor` with typed last-tested/untested/unavailable version evidence, hard Agent configuration,
+  exact passthrough injection, repeated hard controls, fake-child acceptance, concurrent roots, and
+  the same liveness-gated cleanup and exit precedence;
+- complete OMP session composition through the same hard-control preflight, project `.omp/skills`
+  mounting with transaction-owned directory creation, complete-namespace conflict and
+  operator-visibility checks, a pre-spawn non-owned discovery-evidence recheck, unchanged validated
+  passthrough with no injected argument or environment override, fake-child acceptance, and the
+  shared liveness-gated cleanup and exit precedence;
+- session acceptance proving every mutating run spawns exactly one Agent process — the supervised
+  child — for a last-tested, drifted, or unobservable installed release;
+- `doctor` as the single surface that observes an Agent version, with typed
+  last-tested/untested/unavailable evidence over a real bounded child, hard Agent configuration,
   discovery, lock, journal, conflict, and isolated link-capability findings, plus read-only mutation
   regression tests;
 - project-scoped and bounded all-state explicit cleanup through shared recovery and ownership
@@ -866,12 +890,10 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
 
 ### Reserved work
 
-- compatibility evidence for releases beyond the dated last-tested Codex `codex-cli 0.146.0`,
-  Claude `2.1.220 (Claude Code)`, and OMP `omp/17.2.9` banners, any adapter changes that future
-  drift evidence requires, native Windows junction discovery — for OMP unrecorded on x64 and
-  permanently unavailable on x86, because 17.2.9 publishes no 32-bit Windows asset —
-  asynchronously delivered Claude managed-policy handling, and executed authenticated real-agent
-  certification;
+- executed authenticated real-agent certification for every supported Agent, platform, and link
+  combination, and native Windows junction discovery — for OMP unrecorded on x64 and permanently
+  unavailable on x86, because 17.2.9 publishes no 32-bit Windows asset;
+- asynchronously delivered Claude managed-policy handling;
 - lock-file reclamation;
 - binding a public transaction's lifetime to the lock guard validated when it is opened or adopted;
 - rejecting pre-existing links in application-state directory paths before creation or permission changes;

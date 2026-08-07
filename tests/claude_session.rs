@@ -186,23 +186,22 @@ fn three_source_overrides_count_once_normally_and_list_every_origin_verbose() {
     assert!(output.stdout.is_empty());
 }
 
-fn assert_single_silent_last_tested_observation(fixture: &Fixture, stderr: &str) {
-    let version_record =
-        fs::read_to_string(&fixture.version_record).expect("version observation record");
-    assert_eq!(
-        version_record.lines().count(),
-        1,
-        "the version banner is observed exactly once"
-    );
-    assert_eq!(
-        fs::canonicalize(PathBuf::from(recorded_os_value(&version_record, "cwd")))
-            .expect("canonical version observation CWD"),
-        fs::canonicalize(&fixture.root).expect("canonical invocation CWD"),
-        "the observation uses the wrapper invocation CWD, not the child launch CWD"
+/// A mutating session spawns exactly one Agent process: the supervised session child.
+///
+/// [ADR 0036](../docs/adr/0036-confine-agent-version-observation-to-doctor.md) removed the
+/// pre-state `--version` observation, so the absence of the record file is the observable proof.
+fn assert_no_version_process_and_no_compatibility_warning(fixture: &Fixture, stderr: &str) {
+    assert!(
+        !fixture.version_record.exists(),
+        "a mutating session must not run --version"
     );
     assert!(
         !stderr.contains("version compatibility is unverified"),
-        "the last-tested banner must not warn: {stderr}"
+        "a session must emit no compatibility warning: {stderr}"
+    );
+    assert!(
+        fixture.record.is_file(),
+        "the supervised session child must still start"
     );
 }
 
@@ -291,7 +290,7 @@ fn selected_winners_are_visible_only_in_the_injected_root_then_cleanup_succeeds(
     }));
     assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
     assert_eq!(fixture.journal_count(), 0);
-    assert_single_silent_last_tested_observation(&fixture, &stderr);
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
     for (root, before) in watched {
         assert_eq!(snapshot(&root), before, "{} changed", root.display());
     }
@@ -498,8 +497,8 @@ fn an_invalid_rightmost_claude_winner_never_falls_back_or_launches() {
 }
 
 #[test]
-fn an_untested_claude_version_warns_once_runs_the_child_and_preserves_child_status() {
-    let fixture = Fixture::new("untested-version");
+fn a_drifted_claude_banner_neither_warns_nor_starts_a_version_process() {
+    let fixture = Fixture::new("drifted-banner");
     fixture.skill(&fixture.left, "alpha", "fixture");
 
     let output = fixture
@@ -509,37 +508,22 @@ fn an_untested_claude_version_warns_once_runs_the_child_and_preserves_child_stat
         .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", "2.1.222 (Claude Code)")
         .env("SKILLMOUNT_FAKE_EXIT", "2")
         .output()
-        .expect("asm should continue under untested version evidence");
+        .expect("asm should launch a drifted Claude build");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_eq!(output.status.code(), Some(2), "{stderr}");
-    assert_eq!(
-        stderr
-            .matches("version compatibility is unverified")
-            .count(),
-        1,
-        "{stderr}"
-    );
-    assert!(stderr.contains("2.1.222 (Claude Code)"), "{stderr}");
-    assert!(stderr.contains("2.1.220 (Claude Code)"), "{stderr}");
-    assert!(stderr.contains("docs/compatibility.md"), "{stderr}");
-    assert!(fixture.record.is_file(), "the child must start");
-    assert_eq!(
-        fs::read_to_string(&fixture.version_record)
-            .expect("version observation record")
-            .lines()
-            .count(),
-        1
-    );
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
+    assert!(!stderr.contains("2.1.222 (Claude Code)"), "{stderr}");
     assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
     assert_eq!(fixture.journal_count(), 0);
 }
 
 #[test]
-fn unavailable_claude_version_warns_once_and_keep_mounts_preserves_the_session() {
-    let fixture = Fixture::new("unavailable-version-keep");
+fn a_claude_build_without_usable_version_evidence_still_keeps_mounts() {
+    let fixture = Fixture::new("unusable-version-keep");
     fixture.skill(&fixture.left, "alpha", "fixture");
 
+    // The fake agent would fail `--version` if anything asked; nothing does.
     let output = fixture
         .command()
         .arg("--keep-mounts")
@@ -547,29 +531,45 @@ fn unavailable_claude_version_warns_once_and_keep_mounts_preserves_the_session()
         .arg("prompt")
         .env("SKILLMOUNT_FAKE_VERSION_EXIT", "9")
         .output()
-        .expect("asm should continue without usable version evidence");
+        .expect("asm should ignore an unusable --version");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_eq!(output.status.code(), Some(0), "{stderr}");
-    assert_eq!(
-        stderr
-            .matches("version compatibility is unverified")
-            .count(),
-        1,
-        "{stderr}"
-    );
-    assert!(stderr.contains("exit code 9"), "{stderr}");
-    assert!(stderr.contains("2.1.220 (Claude Code)"), "{stderr}");
-    assert!(fixture.record.is_file(), "the child must start");
-    assert_eq!(
-        fs::read_to_string(&fixture.version_record)
-            .expect("version observation record")
-            .lines()
-            .count(),
-        1
-    );
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
     assert_eq!(fixture.sessions().len(), 1);
     assert_eq!(fixture.journal_count(), 1);
+}
+
+/// Upstream option growth is forwarded, not guarded.
+///
+/// The adapter classifies only the controls that can defeat its own contract. An option it has
+/// never seen can at worst make the mount unused, so blocking it would refuse a working launch to
+/// protect nothing. See ADR 0036 and the `docs/architecture.md` responsibility boundary.
+#[test]
+fn an_unclassified_passthrough_option_is_forwarded_unchanged() {
+    let fixture = Fixture::new("unclassified-option");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+
+    let output = fixture
+        .command()
+        .arg("--")
+        .arg("--future-control")
+        .arg("future-value")
+        .arg("prompt")
+        .output()
+        .expect("asm should forward an unclassified option");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
+    let record = fs::read_to_string(&fixture.record).expect("fake Claude record");
+    let arguments = recorded_os_values(&record, "arg");
+    let tail = arguments
+        .windows(3)
+        .find(|window| window[0] == OsStr::new("--future-control"))
+        .expect("the unclassified option reaches the child");
+    assert_eq!(tail[1], OsStr::new("future-value"));
+    assert_eq!(tail[2], OsStr::new("prompt"));
 }
 
 #[test]
