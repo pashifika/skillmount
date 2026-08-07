@@ -7,7 +7,6 @@ on:
       - "dev/**"
   push:
     branches:
-      - main
       - "dev/**"
   workflow_dispatch:
 
@@ -32,11 +31,22 @@ jobs:
     name: branch-policy
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    outputs:
+      package-acceptance: ${{ steps.scope.outputs.package-acceptance }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Classify the package-acceptance scope this run requires
+        id: scope
+        # Only a promotion into main consumes package-channel acceptance evidence before it can
+        # merge, and only a dispatch asks for it deliberately. github.base_ref is empty outside
+        # pull-request events, so this one expression also excludes every push. Both acceptance
+        # jobs and the gate read this single output, so the rule is written exactly once.
+        env:
+          PACKAGE_ACCEPTANCE: ${{ github.base_ref == 'main' || github.event_name == 'workflow_dispatch' }}
+        run: echo "package-acceptance=$PACKAGE_ACCEPTANCE" >> "$GITHUB_OUTPUT"
       - name: Test branch-policy rules
         run: python .github/scripts/test_branch_policy.py
       - name: Test live-smoke harness safeguards
@@ -260,6 +270,8 @@ jobs:
 
   package-homebrew-macos:
     name: package-homebrew-macos
+    needs: branch-policy
+    if: needs.branch-policy.outputs.package-acceptance == 'true'
     runs-on: macos-15
     timeout-minutes: 90
     env:
@@ -304,6 +316,8 @@ jobs:
 
   package-chocolatey-windows:
     name: package-chocolatey-windows
+    needs: branch-policy
+    if: needs.branch-policy.outputs.package-acceptance == 'true'
     runs-on: windows-2025
     timeout-minutes: 60
     env:
@@ -365,6 +379,7 @@ jobs:
     steps:
       - name: Require every CI predecessor to succeed
         env:
+          PACKAGE_ACCEPTANCE: ${{ needs.branch-policy.outputs.package-acceptance }}
           BRANCH_POLICY_RESULT: ${{ needs.branch-policy.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
           TEST_RESULT: ${{ needs.test.result }}
@@ -373,14 +388,35 @@ jobs:
           PACKAGE_HOMEBREW_MACOS_RESULT: ${{ needs.package-homebrew-macos.result }}
           PACKAGE_CHOCOLATEY_WINDOWS_RESULT: ${{ needs.package-chocolatey-windows.result }}
         run: |
-          if [[ "$BRANCH_POLICY_RESULT" != "success" || \
+          case "$PACKAGE_ACCEPTANCE" in
+            true | false) ;;
+            *)
+              echo "::error::Unrecognized package-acceptance classification '$PACKAGE_ACCEPTANCE'; refusing to assume the acceptance jobs were excluded."
+              exit 1
+              ;;
+          esac
+          # An excluded acceptance job reports 'skipped'. That is the only tolerated non-success
+          # result, and only while the classification excludes it, so a condition that stops
+          # acceptance from running on a promotion still fails this gate.
+          package_failed=""
+          for result in "$PACKAGE_HOMEBREW_MACOS_RESULT" "$PACKAGE_CHOCOLATEY_WINDOWS_RESULT"; do
+            case "$result" in
+              success) ;;
+              skipped)
+                if [[ "$PACKAGE_ACCEPTANCE" != "false" ]]; then
+                  package_failed=1
+                fi
+                ;;
+              *) package_failed=1 ;;
+            esac
+          done
+          if [[ -n "$package_failed" || \
+                "$BRANCH_POLICY_RESULT" != "success" || \
                 "$QUALITY_RESULT" != "success" || \
                 "$TEST_RESULT" != "success" || \
                 "$SHELL_COMPLETIONS_MACOS_RESULT" != "success" || \
-                "$SHELL_COMPLETIONS_WINDOWS_RESULT" != "success" || \
-                "$PACKAGE_HOMEBREW_MACOS_RESULT" != "success" || \
-                "$PACKAGE_CHOCOLATEY_WINDOWS_RESULT" != "success" ]]; then
-            echo "::error::Required job results: branch-policy=$BRANCH_POLICY_RESULT quality=$QUALITY_RESULT test=$TEST_RESULT shell-completions-macos=$SHELL_COMPLETIONS_MACOS_RESULT shell-completions-windows=$SHELL_COMPLETIONS_WINDOWS_RESULT package-homebrew-macos=$PACKAGE_HOMEBREW_MACOS_RESULT package-chocolatey-windows=$PACKAGE_CHOCOLATEY_WINDOWS_RESULT"
+                "$SHELL_COMPLETIONS_WINDOWS_RESULT" != "success" ]]; then
+            echo "::error::Required job results: branch-policy=$BRANCH_POLICY_RESULT quality=$QUALITY_RESULT test=$TEST_RESULT shell-completions-macos=$SHELL_COMPLETIONS_MACOS_RESULT shell-completions-windows=$SHELL_COMPLETIONS_WINDOWS_RESULT package-homebrew-macos=$PACKAGE_HOMEBREW_MACOS_RESULT package-chocolatey-windows=$PACKAGE_CHOCOLATEY_WINDOWS_RESULT package-acceptance=$PACKAGE_ACCEPTANCE"
             exit 1
           fi
           echo "All required CI jobs succeeded."
