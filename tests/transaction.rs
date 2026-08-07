@@ -854,6 +854,24 @@ fn cleanup_retains_a_replaced_mount_and_its_journal() {
     assert!(mounted.join("operator-owned").is_file());
     assert_eq!(fixture.journals().len(), 1);
     assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+    assert!(
+        rendered.contains("retry with this argument vector rather than a shell command"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("  executable: asm"), "{rendered}");
+    assert!(rendered.contains("  argument 1: cleanup"), "{rendered}");
+    assert!(
+        rendered.contains("  argument 2: --project-root"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("argv["),
+        "raw argv fragments must be gone: {rendered}"
+    );
+    assert!(
+        !rendered.contains("asm cleanup --project-root"),
+        "retry guidance must not construct a shell command: {rendered}"
+    );
 }
 
 #[test]
@@ -924,7 +942,7 @@ fn cleanup_preserves_a_non_empty_helper_after_removing_its_mount() {
     assert!(rendered.contains("preserved scaffolding"), "{rendered}");
     assert!(rendered.contains("holds entries"), "{rendered}");
     assert!(
-        !rendered.contains("retry these argv values"),
+        !rendered.contains("retry with this argument vector"),
         "preserved scaffolding is not a retryable condition: {rendered}"
     );
     assert!(operator_file.is_file());
