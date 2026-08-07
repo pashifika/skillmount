@@ -1,7 +1,9 @@
 # Compatibility evidence
 
-SkillMount records a dated last-tested banner for each launch adapter and observes the installed
-banner as advisory evidence. It is not an exact-version launch allowlist. This matrix records
+SkillMount records a dated last-tested banner for each launch adapter. The banner is compile-time
+adapter metadata, never an exact-version launch allowlist, and a mutating session neither observes
+it nor warns about it: `asm doctor` is the only surface that executes an Agent with `--version`
+([ADR 0036](adr/0036-confine-agent-version-observation-to-doctor.md)). This matrix records
 observations, not evergreen compatibility claims. A row is `observed` only when the named command
 or scenario ran on the stated platform and date. A banner observation alone does not certify
 mounted Skill discovery, lifecycle, link loading, or cleanup, and documentation review without a

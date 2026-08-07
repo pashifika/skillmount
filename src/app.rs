@@ -104,7 +104,6 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError
                 snapshot: &report.snapshot,
                 plan: &report.plan,
                 verbosity: context.options.verbosity,
-                version_observation_attempted: false,
             }))?;
             warn(&render::render_warnings(&report.catalog, &report.snapshot));
             Ok(0)
@@ -140,7 +139,6 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError
                     snapshot: &report.snapshot,
                     plan: &report.plan,
                     verbosity: 0,
-                    version_observation_attempted: false,
                 }));
                 warnings.extend(render::render_warnings(&report.catalog, &report.snapshot));
             }
@@ -199,19 +197,13 @@ pub(crate) struct ReadOnlyOutcome {
 /// through that same callback.
 fn run_session(context: &RunContext) -> Result<u8, AppError> {
     // Root-changing arguments and release-independent Agent controls are rejected before reading
-    // or creating SkillMount state. Version evidence is observed once and can warn, but never
-    // authorizes the launch or enters transaction ownership state.
+    // or creating SkillMount state. No Agent process runs here: mount visibility and removal are
+    // established by the journal, the locks, proven process-domain death, and ownership-verified
+    // removal, none of which depend on the installed release. `doctor` owns version evidence.
+    // See ADR 0036.
     let adapter = adapter(context.agent_id());
     adapter.validate_passthrough_args(&context.passthrough_args)?;
     adapter.validate_launch_invariants(context)?;
-    let version = crate::agent::version::observe(
-        context.executable(),
-        &context.invocation_cwd,
-        adapter.version_spec(),
-    );
-    if let Some(message) = version.session_warning(context.executable()) {
-        warn(&[message]);
-    }
 
     // Unknown ownership state is checked before creating even SkillMount's own staging or lock
     // directories. Recovery scans again after locks are held, so a journal appearing between this
@@ -281,8 +273,8 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     })?;
 
     // Lock acquisition may wait behind a long-running session while managed configuration or
-    // another hard launch control changes. Repeat those release-independent checks after the lock
-    // set stabilizes; version evidence remains the single advisory observation made before state.
+    // another hard launch control changes, so repeat those release-independent checks after the
+    // lock set stabilizes.
     adapter.validate_launch_invariants(&context)?;
 
     warn(&render::render_warnings(
@@ -352,7 +344,6 @@ fn render_session_output(context: &RunContext, outcome: &ReadOnlyOutcome) -> Str
         snapshot: &outcome.snapshot,
         plan: &outcome.plan,
         verbosity: context.options.verbosity,
-        version_observation_attempted: true,
     };
     let mut output = render::render_session_start(&report);
     if context.options.verbosity > 0 {

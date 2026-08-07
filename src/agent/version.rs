@@ -29,7 +29,6 @@ const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Agent-specific evidence needed by the shared observer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VersionSpec {
-    display_name: &'static str,
     last_tested_banner: &'static str,
     debug_override: &'static str,
 }
@@ -37,12 +36,10 @@ pub(crate) struct VersionSpec {
 impl VersionSpec {
     /// Creates one immutable Agent evidence description.
     pub(crate) const fn new(
-        display_name: &'static str,
         last_tested_banner: &'static str,
         debug_override: &'static str,
     ) -> Self {
         Self {
-            display_name,
             last_tested_banner,
             debug_override,
         }
@@ -77,32 +74,12 @@ pub(crate) enum VersionObservation {
 }
 
 impl VersionObservation {
-    /// Returns the stable evidence class used by sessions and doctor.
+    /// Returns the stable evidence class used by doctor.
     pub(crate) const fn kind(&self) -> VersionEvidenceKind {
         match self {
             Self::LastTested { .. } => VersionEvidenceKind::LastTested,
             Self::Untested { .. } => VersionEvidenceKind::Untested,
             Self::Unavailable { .. } => VersionEvidenceKind::Unavailable,
-        }
-    }
-
-    /// Renders the one advisory session warning, if this is not last-tested evidence.
-    pub(crate) fn session_warning(&self, executable: &Path) -> Option<String> {
-        let executable = path_value(executable, true);
-        match self {
-            Self::LastTested { .. } => None,
-            Self::Untested { spec, banner } => Some(format!(
-                "{} version compatibility is unverified: {executable} reported {:?}, while the last-tested banner is {:?}; continuing because version evidence is advisory. Review docs/compatibility.md and run the opt-in live-agent smoke before claiming compatibility",
-                spec.display_name,
-                text_value(banner),
-                spec.last_tested_banner,
-            )),
-            Self::Unavailable { spec, reason } => Some(format!(
-                "{} version compatibility is unverified: {executable} did not provide usable --version evidence ({}); the last-tested banner is {:?}; continuing because version evidence is advisory. Review docs/compatibility.md and run the opt-in live-agent smoke before claiming compatibility",
-                spec.display_name,
-                text_value(reason),
-                spec.last_tested_banner,
-            )),
         }
     }
 
@@ -516,11 +493,8 @@ mod tests {
     };
     use crate::test_support::{TestDir, assert_no_side_effects};
 
-    const SPEC: VersionSpec = VersionSpec::new(
-        "Fixture Agent",
-        "fixture-agent 1.0.0",
-        "SKILLMOUNT_UNUSED_VERSION_OVERRIDE",
-    );
+    const SPEC: VersionSpec =
+        VersionSpec::new("fixture-agent 1.0.0", "SKILLMOUNT_UNUSED_VERSION_OVERRIDE");
 
     fn captured(stdout: Vec<u8>) -> CapturedVersion {
         CapturedVersion {
@@ -543,14 +517,16 @@ mod tests {
         let different = classify_capture(SPEC, captured(b"fixture-agent 1.1.0\n".to_vec()));
 
         assert_eq!(exact.kind(), VersionEvidenceKind::LastTested);
-        assert!(exact.session_warning(Path::new("fixture-agent")).is_none());
+        assert!(
+            exact
+                .doctor_detail(Path::new("fixture-agent"))
+                .contains("matching the last-tested evidence")
+        );
         assert_eq!(different.kind(), VersionEvidenceKind::Untested);
-        let warning = different
-            .session_warning(Path::new("fixture-agent"))
-            .expect("untested evidence warns");
-        assert!(warning.contains("fixture-agent 1.1.0"));
-        assert!(warning.contains("fixture-agent 1.0.0"));
-        assert!(warning.contains("docs/compatibility.md"));
+        let detail = different.doctor_detail(Path::new("fixture-agent"));
+        assert!(detail.contains("fixture-agent 1.1.0"));
+        assert!(detail.contains("fixture-agent 1.0.0"));
+        assert!(detail.contains("docs/compatibility.md"));
     }
 
     #[test]
@@ -579,11 +555,9 @@ mod tests {
         });
 
         assert_eq!(observation.kind(), VersionEvidenceKind::Unavailable);
-        let warning = observation
-            .session_warning(&missing)
-            .expect("unavailable evidence warns");
-        assert!(warning.contains("cannot start --version"));
-        assert!(warning.contains("last-tested"));
+        let detail = observation.doctor_detail(&missing);
+        assert!(detail.contains("cannot start --version"));
+        assert!(detail.contains("last-tested"));
     }
 
     #[test]
@@ -622,25 +596,21 @@ mod tests {
         let observation = classify_capture(SPEC, captured(vec![b'f', 0xff, b'o']));
 
         assert_eq!(observation.kind(), VersionEvidenceKind::Unavailable);
-        let warning = observation
-            .session_warning(Path::new("fixture-agent"))
-            .expect("invalid evidence warns");
-        assert!(warning.contains("not valid UTF-8"));
-        assert!(!warning.contains(char::REPLACEMENT_CHARACTER));
+        let detail = observation.doctor_detail(Path::new("fixture-agent"));
+        assert!(detail.contains("not valid UTF-8"));
+        assert!(!detail.contains(char::REPLACEMENT_CHARACTER));
     }
 
     #[test]
-    fn warning_rendering_escapes_controls_and_is_bounded_by_captured_output() {
+    fn detail_rendering_escapes_controls_and_is_bounded_by_captured_output() {
         let banner = "\u{1b}\n".repeat(VERSION_OUTPUT_LIMIT / 2);
         let observation = VersionObservation::Untested { spec: SPEC, banner };
 
-        let warning = observation
-            .session_warning(Path::new("fixture-agent"))
-            .expect("untested evidence warns");
+        let detail = observation.doctor_detail(Path::new("fixture-agent"));
 
-        assert!(!warning.contains('\u{1b}'));
-        assert!(!warning.contains('\n'));
-        assert!(warning.len() < VERSION_OUTPUT_LIMIT * 8);
-        assert!(warning.contains("fixture-agent 1.0.0"));
+        assert!(!detail.contains('\u{1b}'));
+        assert!(!detail.contains('\n'));
+        assert!(detail.len() < VERSION_OUTPUT_LIMIT * 8);
+        assert!(detail.contains("fixture-agent 1.0.0"));
     }
 }

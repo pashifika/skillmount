@@ -12,9 +12,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
 const FAKE_OMP: &str = env!("CARGO_BIN_EXE_skillmount-fake-agent");
 
-/// Banner the OMP adapter carries as its last-tested compatibility evidence.
-const LAST_TESTED_BANNER: &str = "omp/17.2.9";
-
 struct Fixture {
     root: PathBuf,
     project: PathBuf,
@@ -175,16 +172,12 @@ impl Fixture {
             .env("SKILLMOUNT_STATE_DIR", &self.state)
             .env("SKILLMOUNT_FAKE_RECORD", &self.record)
             .env("SKILLMOUNT_FAKE_VERSION_RECORD", &self.version_record)
-            .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", LAST_TESTED_BANNER)
             .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
             // The fixture records one inherited variable it does not otherwise use, so a launch can
             // show that the child receives the wrapper's own environment rather than a rewritten
             // one. An OMP launch plan carries no environment override of its own.
             .env("SKILLMOUNT_FAKE_RECORD_CODEX_HOME", "1")
             .env("CODEX_HOME", &self.inherited_variable)
-            // The banner must come from the child process, so a deterministic override exported by
-            // a developer or another suite must never short-circuit the observation.
-            .env_remove("SKILLMOUNT_TEST_OMP_VERSION")
             // OMP resolves its roots from the environment, so the developer's real profile,
             // configuration overlay, and XDG bases must never reach a fixture.
             .env_remove("OMP_PROFILE")
@@ -193,8 +186,8 @@ impl Fixture {
             .env_remove("PI_CONFIG_DIR")
             .env_remove("PI_CODING_AGENT_DIR")
             .env_remove("XDG_DATA_HOME")
-            // The version observation runs in the invocation directory, which must differ from the
-            // launch CWD for that distinction to be observable at all.
+            // Keep the wrapper invocation directory distinct from the explicit launch CWD so the
+            // fixture still covers path resolution at that boundary.
             .current_dir(&self.root);
     }
 
@@ -276,7 +269,7 @@ fn the_selected_skill_is_visible_in_the_launch_cwd_then_the_omp_scope_is_release
         "cleanup releases the whole .omp scope"
     );
     assert_eq!(fixture.journals(), Vec::<PathBuf>::new());
-    assert_single_silent_last_tested_observation(&fixture, &stderr);
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
 }
 
 #[test]
@@ -358,7 +351,7 @@ fn every_accepted_omp_control_reaches_the_child_unchanged() {
 }
 
 #[test]
-fn a_drifted_omp_banner_warns_once_and_still_mounts_the_session() {
+fn a_drifted_omp_banner_neither_warns_nor_starts_a_version_process() {
     let fixture = Fixture::new("drifted-banner");
     let alpha = fixture.skill(&fixture.left, "alpha", "fixture");
     let mounted = fixture.destination().join("alpha");
@@ -371,38 +364,115 @@ fn a_drifted_omp_banner_warns_once_and_still_mounts_the_session() {
         .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", "omp/99.0.0")
         .env("SKILLMOUNT_FAKE_EXPECT_PATHS", expected_paths)
         .output()
-        .expect("asm should continue under drifted version evidence");
+        .expect("asm should launch a drifted OMP build");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "{stderr}");
-    assert_eq!(
-        stderr
-            .matches("version compatibility is unverified")
-            .count(),
-        1,
-        "{stderr}"
-    );
-    assert!(stderr.contains("omp/99.0.0"), "{stderr}");
-    assert!(stderr.contains(LAST_TESTED_BANNER), "{stderr}");
-    assert!(stderr.contains("docs/compatibility.md"), "{stderr}");
-    assert_eq!(
-        fs::read_to_string(&fixture.version_record)
-            .expect("version observation record")
-            .lines()
-            .count(),
-        1,
-        "advisory drift still costs exactly one observation"
-    );
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
+    assert!(!stderr.contains("omp/99.0.0"), "{stderr}");
     let record = fs::read_to_string(&fixture.record).expect("fake OMP launch record");
     assert_eq!(
         recorded_os_values(&record, "visible-target"),
         [fs::canonicalize(&alpha)
             .expect("canonical source Skill")
             .into_os_string()],
-        "an unverified banner still mounts the selected Skill"
+        "a drifted release still mounts the selected Skill"
     );
     assert!(!exists(&fixture.omp_scope()));
     assert_eq!(fixture.journals(), Vec::<PathBuf>::new());
+}
+
+#[test]
+fn an_omp_build_without_usable_version_evidence_still_runs_and_cleans_up() {
+    let fixture = Fixture::new("unusable-version");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+
+    // The fake Agent would fail `--version` if anything asked; the session must never ask.
+    let output = fixture
+        .command()
+        .arg("--")
+        .arg("prompt")
+        .env("SKILLMOUNT_FAKE_VERSION_EXIT", "9")
+        .output()
+        .expect("asm should ignore unusable OMP version evidence");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
+    assert!(!exists(&fixture.omp_scope()));
+    assert_eq!(fixture.journals(), Vec::<PathBuf>::new());
+}
+
+/// An OMP build that never reads the mount still gets ownership-verified removal.
+///
+/// This is the failure the removed banner check was imagined to prevent. It costs an unused
+/// mount, never an unremoved one, so the lifetime chain in `docs/architecture.md` holds without
+/// consulting the installed release. See ADR 0036.
+#[test]
+fn an_omp_build_that_ignores_the_mount_still_releases_every_owned_entry() {
+    let fixture = Fixture::new("ignored-mount");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+    let project_before = tree(&fixture.project);
+
+    // No `SKILLMOUNT_FAKE_EXPECT_PATHS`: the child never looks at the mounted scope.
+    let output = fixture
+        .command()
+        .arg("--")
+        .arg("prompt")
+        .output()
+        .expect("asm should launch an OMP build that ignores the mount");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
+    assert!(
+        !exists(&fixture.omp_scope()),
+        "an unused mount is still transaction-owned and released"
+    );
+    assert_eq!(fixture.journals(), Vec::<PathBuf>::new());
+    assert_eq!(
+        tree(&fixture.project),
+        project_before,
+        "an unused mount leaves the project exactly as it was found"
+    );
+}
+
+/// A child that returns with a live process domain must not have its links removed.
+///
+/// This covers a non-interactive child in the dedicated process group. Known detaching controls
+/// remain hard failures because ADR 0019 records residual interactive and domain-escape boundaries.
+#[cfg(unix)]
+#[test]
+fn an_omp_child_leaving_a_live_domain_defers_cleanup_and_retains_the_journal() {
+    let fixture = Fixture::new("live-domain");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+    let descendant_record = fixture.root.join("fake-descendant.record");
+    let mounted = fixture.destination().join("alpha");
+
+    let status = fixture
+        .command()
+        .arg("--")
+        .arg("prompt")
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "orphan-descendant-ignore-all")
+        .env("SKILLMOUNT_FAKE_DESCENDANT_RECORD", &descendant_record)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("the uncertain session should return within the supervision bound");
+    let descendant = UnixProcessGuard::from_record(&descendant_record);
+
+    assert_eq!(status.code(), Some(70));
+    assert!(descendant.is_running(), "the descendant must still be live");
+    assert!(
+        exists(&mounted),
+        "cleanup must be deferred while liveness is unknown"
+    );
+    assert_eq!(
+        fixture.journals().len(),
+        1,
+        "the ownership evidence must remain durable for recovery"
+    );
 }
 
 #[test]
@@ -1506,24 +1576,72 @@ fn accept_link(result: std::io::Result<()>, link: &Path) -> bool {
     true
 }
 
-fn assert_single_silent_last_tested_observation(fixture: &Fixture, stderr: &str) {
-    let version_record =
-        fs::read_to_string(&fixture.version_record).expect("version observation record");
-    assert_eq!(
-        version_record.lines().count(),
-        1,
-        "the version banner is observed exactly once"
-    );
-    assert_eq!(
-        fs::canonicalize(PathBuf::from(recorded_os(&version_record, "cwd")))
-            .expect("canonical version observation CWD"),
-        fixture.root,
-        "the observation uses the wrapper invocation CWD, not the child launch CWD"
+/// Every path under `root`, sorted, so a leftover mount or helper directory is visible.
+fn tree(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            // No-follow: a directory link is one entry, never a traversal.
+            if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                pending.push(path.clone());
+            }
+            found.push(path);
+        }
+    }
+    found.sort();
+    found
+}
+
+/// A mutating session spawns exactly one Agent process: the supervised session child.
+///
+/// [ADR 0036](../docs/adr/0036-confine-agent-version-observation-to-doctor.md) removed the
+/// pre-state `--version` observation, so the absence of the record file is the observable proof.
+fn assert_no_version_process_and_no_compatibility_warning(fixture: &Fixture, stderr: &str) {
+    assert!(
+        !fixture.version_record.exists(),
+        "a mutating session must not run --version"
     );
     assert!(
         !stderr.contains("version compatibility is unverified"),
-        "the last-tested banner must not warn: {stderr}"
+        "a session must emit no compatibility warning: {stderr}"
     );
+    assert!(
+        fixture.record.is_file(),
+        "the supervised session child must still start"
+    );
+}
+
+#[cfg(unix)]
+struct UnixProcessGuard(nix::unistd::Pid);
+
+#[cfg(unix)]
+impl UnixProcessGuard {
+    fn from_record(path: &Path) -> Self {
+        let record = fs::read_to_string(path).expect("fake descendant record");
+        let pid = record
+            .lines()
+            .find_map(|line| line.strip_prefix("pid="))
+            .expect("fake descendant records its PID")
+            .parse::<i32>()
+            .expect("fake descendant PID is numeric");
+        Self(nix::unistd::Pid::from_raw(pid))
+    }
+
+    fn is_running(&self) -> bool {
+        nix::sys::signal::kill(self.0, None).is_ok()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixProcessGuard {
+    fn drop(&mut self) {
+        let _ = nix::sys::signal::kill(self.0, nix::sys::signal::Signal::SIGKILL);
+    }
 }
 
 fn assert_rejected_before_any_mutation(fixture: &Fixture, output: &Output, fragment: &str) {

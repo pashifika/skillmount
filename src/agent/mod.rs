@@ -333,8 +333,8 @@ pub(crate) trait AgentAdapter {
     /// Revalidates the launch contract after apply and immediately before the child is spawned.
     ///
     /// The snapshot and plan are the locked pre-apply values, so an adapter can ignore exactly the
-    /// transaction-owned actions it just asked for. Version evidence is deliberately not observed
-    /// again here: an Agent update during apply is not launch authorization.
+    /// transaction-owned actions it just asked for. No version evidence is observed on any session
+    /// path, here or earlier: an Agent update is not launch authorization. See ADR 0036.
     ///
     /// # Errors
     ///

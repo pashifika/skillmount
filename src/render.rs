@@ -27,8 +27,6 @@ pub(crate) struct ReadOnlyReport<'a> {
     pub(crate) plan: &'a MountPlan,
     /// Requested diagnostic verbosity.
     pub(crate) verbosity: u8,
-    /// Whether the mutating path already attempted its one advisory version observation.
-    pub(crate) version_observation_attempted: bool,
 }
 
 impl ReadOnlyReport<'_> {
@@ -109,14 +107,11 @@ fn header(out: &mut String, report: &ReadOnlyReport<'_>) {
         let _ = writeln!(out, "{label:<15} {}", path_value(value, report.verbose()));
     };
     let _ = writeln!(out, "{:<15} {}", "Agent:", context.descriptor().label());
-    let evidence_note = if report.version_observation_attempted {
-        "advisory evidence; bounded --version observation attempted before state access"
-    } else {
-        "advisory evidence; executable not queried"
-    };
+    // Read-only rendering uses dated adapter metadata without querying the executable; `doctor`
+    // owns banner observation. See ADR 0036.
     let _ = writeln!(
         out,
-        "{:<15} {:?} ({evidence_note})",
+        "{:<15} {:?} (advisory evidence; executable not queried)",
         "Last tested:",
         crate::agent::adapter(context.agent_id())
             .version_spec()
