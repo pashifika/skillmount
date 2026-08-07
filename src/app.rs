@@ -273,8 +273,8 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     })?;
 
     // Lock acquisition may wait behind a long-running session while managed configuration or
-    // another hard launch control changes. Repeat those release-independent checks after the lock
-    // set stabilizes; version evidence remains the single advisory observation made before state.
+    // another hard launch control changes, so repeat those release-independent checks after the
+    // lock set stabilizes.
     adapter.validate_launch_invariants(&context)?;
 
     warn(&render::render_warnings(

@@ -29,7 +29,6 @@ const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Agent-specific evidence needed by the shared observer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VersionSpec {
-    display_name: &'static str,
     last_tested_banner: &'static str,
     debug_override: &'static str,
 }
@@ -37,12 +36,10 @@ pub(crate) struct VersionSpec {
 impl VersionSpec {
     /// Creates one immutable Agent evidence description.
     pub(crate) const fn new(
-        display_name: &'static str,
         last_tested_banner: &'static str,
         debug_override: &'static str,
     ) -> Self {
         Self {
-            display_name,
             last_tested_banner,
             debug_override,
         }
@@ -77,7 +74,7 @@ pub(crate) enum VersionObservation {
 }
 
 impl VersionObservation {
-    /// Returns the stable evidence class used by sessions and doctor.
+    /// Returns the stable evidence class used by doctor.
     pub(crate) const fn kind(&self) -> VersionEvidenceKind {
         match self {
             Self::LastTested { .. } => VersionEvidenceKind::LastTested,
@@ -496,11 +493,8 @@ mod tests {
     };
     use crate::test_support::{TestDir, assert_no_side_effects};
 
-    const SPEC: VersionSpec = VersionSpec::new(
-        "Fixture Agent",
-        "fixture-agent 1.0.0",
-        "SKILLMOUNT_UNUSED_VERSION_OVERRIDE",
-    );
+    const SPEC: VersionSpec =
+        VersionSpec::new("fixture-agent 1.0.0", "SKILLMOUNT_UNUSED_VERSION_OVERRIDE");
 
     fn captured(stdout: Vec<u8>) -> CapturedVersion {
         CapturedVersion {

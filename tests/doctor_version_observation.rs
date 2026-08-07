@@ -9,6 +9,7 @@
 
 #![cfg(feature = "test-fixtures")]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -16,6 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
 const FAKE_AGENT: &str = env!("CARGO_BIN_EXE_skillmount-fake-agent");
+
+type StateSnapshot = Vec<(PathBuf, BTreeMap<PathBuf, String>)>;
 
 struct Fixture {
     root: PathBuf,
@@ -107,6 +110,22 @@ impl Fixture {
     fn observations(&self) -> usize {
         fs::read_to_string(&self.version_record).map_or(0, |record| record.lines().count())
     }
+
+    fn state_snapshot(&self) -> StateSnapshot {
+        [
+            self.project.clone(),
+            self.home.clone(),
+            self.root.join("codex-home"),
+            self.root.join("claude-managed"),
+            self.root.join("admin-skills"),
+        ]
+        .into_iter()
+        .map(|root| {
+            let contents = snapshot(&root);
+            (root, contents)
+        })
+        .collect()
+    }
 }
 
 impl Drop for Fixture {
@@ -115,8 +134,43 @@ impl Drop for Fixture {
     }
 }
 
-/// Every observation is diagnostic: it never fails doctor and never writes `SkillMount` state.
-fn assert_diagnostic_only(fixture: &Fixture, output: &Output) -> String {
+fn snapshot(root: &Path) -> BTreeMap<PathBuf, String> {
+    let mut entries = BTreeMap::new();
+    collect_snapshot(root, root, &mut entries);
+    entries
+}
+
+fn collect_snapshot(root: &Path, current: &Path, entries: &mut BTreeMap<PathBuf, String>) {
+    let Ok(metadata) = fs::symlink_metadata(current) else {
+        return;
+    };
+    let file_type = metadata.file_type();
+    let descriptor = if file_type.is_symlink() {
+        format!(
+            "link -> {}",
+            fs::read_link(current)
+                .map_or_else(|_| "?".into(), |target| target.display().to_string())
+        )
+    } else if file_type.is_dir() {
+        "dir".to_owned()
+    } else {
+        format!("file {:?}", fs::read(current).unwrap_or_default())
+    };
+    if let Ok(relative) = current.strip_prefix(root) {
+        entries.insert(relative.to_path_buf(), descriptor);
+    }
+    if file_type.is_dir() && !file_type.is_symlink() {
+        let Ok(children) = fs::read_dir(current) else {
+            return;
+        };
+        for child in children.flatten() {
+            collect_snapshot(root, &child.path(), entries);
+        }
+    }
+}
+
+/// Every observation is diagnostic: it never fails doctor or mutates redirected user state.
+fn assert_diagnostic_only(fixture: &Fixture, before: &StateSnapshot, output: &Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
         output.status.success(),
@@ -132,18 +186,24 @@ fn assert_diagnostic_only(fixture: &Fixture, output: &Output) -> String {
         !fixture.state.exists(),
         "observing a version must not create SkillMount state"
     );
+    assert_eq!(
+        &fixture.state_snapshot(),
+        before,
+        "observing a version must not mutate project or Agent state"
+    );
     stdout
 }
 
 #[test]
 fn an_exact_banner_passes_after_exactly_one_real_observation() {
     let fixture = Fixture::new("exact-banner");
+    let before = fixture.state_snapshot();
 
     let output = fixture
         .doctor_command()
         .output()
         .expect("doctor should observe the fake agent");
-    let rendered = assert_diagnostic_only(&fixture, &output);
+    let rendered = assert_diagnostic_only(&fixture, &before, &output);
 
     assert!(rendered.contains("[PASS] codex executable"), "{rendered}");
     assert!(rendered.contains("codex-cli 0.146.0"), "{rendered}");
@@ -157,13 +217,14 @@ fn an_exact_banner_passes_after_exactly_one_real_observation() {
 #[test]
 fn a_drifted_banner_is_unverified_and_names_both_releases() {
     let fixture = Fixture::new("drifted-banner");
+    let before = fixture.state_snapshot();
 
     let output = fixture
         .doctor_command()
         .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", "codex-cli 999.0.0")
         .output()
         .expect("doctor should observe a drifted fake agent");
-    let rendered = assert_diagnostic_only(&fixture, &output);
+    let rendered = assert_diagnostic_only(&fixture, &before, &output);
 
     assert!(
         rendered.contains("[UNVERIFIED] codex executable"),
@@ -179,13 +240,14 @@ fn a_drifted_banner_is_unverified_and_names_both_releases() {
 #[test]
 fn a_nonzero_version_exit_is_unverified_without_suppressing_other_checks() {
     let fixture = Fixture::new("nonzero-exit");
+    let before = fixture.state_snapshot();
 
     let output = fixture
         .doctor_command()
         .env("SKILLMOUNT_FAKE_VERSION_EXIT", "9")
         .output()
         .expect("doctor should classify a failed version probe");
-    let rendered = assert_diagnostic_only(&fixture, &output);
+    let rendered = assert_diagnostic_only(&fixture, &before, &output);
 
     assert!(
         rendered.contains("[UNVERIFIED] codex executable"),
@@ -199,13 +261,20 @@ fn a_nonzero_version_exit_is_unverified_without_suppressing_other_checks() {
 #[test]
 fn oversized_interleaved_version_output_is_bounded() {
     let fixture = Fixture::new("oversized-interleaved");
+    let before = fixture.state_snapshot();
+    let started = Instant::now();
 
     let output = fixture
         .doctor_command()
         .env("SKILLMOUNT_FAKE_VERSION_BEHAVIOR", "oversized-interleaved")
         .output()
         .expect("doctor should bound both version output streams");
-    let rendered = assert_diagnostic_only(&fixture, &output);
+    let elapsed = started.elapsed();
+    let rendered = assert_diagnostic_only(&fixture, &before, &output);
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "bounded output handling took {elapsed:?}"
+    );
 
     assert!(
         rendered.contains("[UNVERIFIED] codex executable"),
@@ -222,6 +291,7 @@ fn oversized_interleaved_version_output_is_bounded() {
 #[test]
 fn inherited_version_output_handles_are_terminated_at_the_lifetime_bound() {
     let fixture = Fixture::new("inherited-descriptor");
+    let before = fixture.state_snapshot();
     let descendant_record = fixture.root.join("version-descendant.record");
     let started = Instant::now();
 
@@ -235,7 +305,7 @@ fn inherited_version_output_handles_are_terminated_at_the_lifetime_bound() {
         .output()
         .expect("doctor should stop a version descendant that retains the output handles");
     let elapsed = started.elapsed();
-    let rendered = assert_diagnostic_only(&fixture, &output);
+    let rendered = assert_diagnostic_only(&fixture, &before, &output);
 
     assert!(
         elapsed < Duration::from_secs(20),

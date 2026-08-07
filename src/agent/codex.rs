@@ -40,11 +40,8 @@ const MAX_DISCOVERY_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const DISCOVERY_RESPONSE_ITEM_OVERHEAD_BYTES: usize = 64;
 /// Codex banner attached to the adapter's last-tested discovery evidence.
 const LAST_TESTED_CODEX_BANNER: &str = "codex-cli 0.146.0";
-const CODEX_VERSION_SPEC: VersionSpec = VersionSpec::new(
-    "Codex CLI",
-    LAST_TESTED_CODEX_BANNER,
-    "SKILLMOUNT_TEST_CODEX_VERSION",
-);
+const CODEX_VERSION_SPEC: VersionSpec =
+    VersionSpec::new(LAST_TESTED_CODEX_BANNER, "SKILLMOUNT_TEST_CODEX_VERSION");
 /// Local fail-closed bound for a plugin manifest used only to determine namespace behavior.
 const MAX_PLUGIN_MANIFEST_BYTES: u64 = 64 * 1024;
 const SYSTEM_SKILL_NAMES: [&str; 6] = [

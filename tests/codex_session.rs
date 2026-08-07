@@ -546,8 +546,8 @@ fn a_drifted_codex_banner_neither_warns_nor_starts_a_version_process() {
 
     assert_eq!(output.status.code(), Some(23), "{stderr}");
     assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
-    // Verbose output still names the dated constant, and now says the executable was never
-    // queried on any surface. The installed banner cannot appear because nothing read it.
+    // Verbose session output still names the dated constant and makes clear that this executable
+    // was not queried. The installed banner cannot appear because this session never read it.
     assert!(stderr.contains("codex-cli 0.146.0"), "{stderr}");
     assert!(stderr.contains("executable not queried"), "{stderr}");
     assert!(!stderr.contains("codex-cli 0.147.0"), "{stderr}");

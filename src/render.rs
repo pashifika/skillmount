@@ -107,8 +107,8 @@ fn header(out: &mut String, report: &ReadOnlyReport<'_>) {
         let _ = writeln!(out, "{label:<15} {}", path_value(value, report.verbose()));
     };
     let _ = writeln!(out, "{:<15} {}", "Agent:", context.descriptor().label());
-    // No SkillMount surface queries the Agent for a banner any more: the constant is dated
-    // adapter metadata, and `doctor` owns observation. See ADR 0036.
+    // Read-only rendering uses dated adapter metadata without querying the executable; `doctor`
+    // owns banner observation. See ADR 0036.
     let _ = writeln!(
         out,
         "{:<15} {:?} (advisory evidence; executable not queried)",

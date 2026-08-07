@@ -9,13 +9,13 @@
 
 ## Context
 
-Every mutating Codex, Claude, and OMP session spawns one bounded `--version` child before SkillMount
-state access and compares the banner with a single embedded string by exact equality
-(`src/agent/version.rs:500-506`). Any other value emits an advisory warning
-(`src/app.rs:206-214`). The operator's installed Claude Code reports `2.1.224 (Claude Code)` against
-a last-tested `2.1.220 (Claude Code)`, and `docs/compatibility.md:20` already records `2.1.222` as
-an `observed` banner, so the warning fires on every session for a release this project has itself
-recorded as observed.
+Before this change, every mutating Codex, Claude, and OMP session at base revision `6738a8ef`
+spawned one bounded `--version` child through `app::run_session`.
+`agent::version::classify_banner` compared the result with one embedded string by exact equality,
+and `VersionObservation::session_warning` rendered every other value as an advisory warning. The
+operator's installed Claude Code reports `2.1.224 (Claude Code)` against a last-tested
+`2.1.220 (Claude Code)`, and `docs/compatibility.md:22` already records `2.1.222` as an `observed`
+banner, so the warning fired on every session for a release this project had itself recorded.
 
 ADR 0033 established that a version is evidence, not authorization, and removed the banner as a
 launch allowlist. It kept the observation in the session path so an operator would retain local
@@ -29,19 +29,21 @@ implementation stopped honoring it. ADR 0034's decision 6 then restated the advi
 observation for OMP. Both are superseded here, so the recorded decisions and the implementation
 agree again rather than diverging by one unnamed clause.
 
-Mount-lifetime correctness does not consult the banner. `src/process/mod.rs:779-798` reaps the root
-child and then requires `domain_is_empty` before cleanup runs; a non-empty domain yields
-`ChildOutcome::Uncertain`, defers cleanup, and retains the journal
-(`src/process/mod.rs:720-733`). An Agent that detaches therefore cannot have its links removed from
-underneath it, with or without a version check. Ownership-verified removal and the write-ahead
-journal supply the remaining two guarantees. All three are argument- and version-independent.
+Mount-lifetime correctness does not consult the banner. For a managed process domain,
+`crate::process::ProcessSupervisor` requires a terminal domain probe before cleanup; a non-empty or
+uncertain domain defers cleanup and retains the journal. The write-ahead journal and
+ownership-verified removal supply the remaining mutation guarantees.
 
-Auditing the adapters' passthrough guards against that boundary gives one result: every bypass lands
-on a mount that is useless, not one that is unsafe. A disabled Skill surface, an undone visibility
-override, a non-session subcommand, and an unclassified new option all end in the same place — the
-Agent runs, exits, and cleanup proceeds correctly. `src/agent/claude.rs:265-274` already forwards
-unknown options unchanged, which is the correct behavior for a wrapper whose contract is link
-lifetime rather than Agent semantics.
+That proof is deliberately scoped. ADR 0019 leaves interactive Unix descendants outside the
+containment proof and records a Windows pre-Job attachment escape window. The adapters therefore
+continue to reject known controls that relocate discovery or detach the logical session. Unknown
+tokens remain forwarded for compatibility, but forwarding does not certify that a future Agent
+cannot attach detaching semantics to one.
+
+Removing the banner comparison weakens none of those controls: its result never authorized or
+blocked a launch, and a matching banner could not prove that the child would remain inside the
+managed domain. The safety boundary is the release-independent launch validation plus the journal,
+managed-domain proof, and ownership-verified cleanup, not the observed version string.
 
 A banner difference is uncorrelated with any of this. The operator cannot act on the warning, and
 its absence certifies nothing. It is inert output on the one path where SkillMount otherwise spawns
@@ -55,8 +57,8 @@ contained `--version` observation and classifies the result `pass` or `unverifie
 
 `VersionSpec`, the last-tested banner constant in each adapter, the shared bounded observer,
 `VersionEvidenceKind`, and `doctor_detail` are retained. The constant continues to be rendered
-without a process by `inspect` (`src/render.rs:122-123`) and by the automatic-junction compatibility
-warning (`src/app.rs:386-392`). `VersionObservation::session_warning` is removed.
+without a process by `render::header` and by `app::automatic_junction_warning`.
+`VersionObservation::session_warning` is removed.
 
 ADR 0033's governing principle is preserved and applied more strictly: a value that authorizes
 nothing is removed from the authorization path rather than retained as advice the operator cannot
@@ -97,12 +99,13 @@ act on.
 - A session in which the Agent starts, exits successfully, and never sees the mounted Skills stays
   undetected. This is not a regression; the banner check never detected it either. Detecting it
   requires an authenticated live run, which remains opt-in evidence.
-- Removing the session call site must not remove ADR 0033's process-containment coverage. The
-  oversized-stream, invalid-UTF-8, spawn-failure, timeout, descendant-handle, and domain-death cases
-  are properties of the shared bounded observer and move to its unit tests and to `doctor` coverage.
+- Removing the session call site must not remove ADR 0033's process-containment coverage. The real
+  `doctor` suite covers successful, nonzero, bounded-output, timeout, descendant-handle, and
+  domain-death paths. Observer unit tests retain deterministic invalid-UTF-8 and pre-spawn-failure
+  classification, which cannot be induced through a resolved executable without a race.
 - Restoring a session-time Agent probe later would need a new ADR and would have to state which
-  safety property it establishes that the process domain, journal, and ownership-verified removal do
-  not.
+  safety property it establishes beyond the existing launch controls, journal, managed-domain
+  proof, and ownership-verified removal.
 - `docs/architecture.md` and `docs/compatibility.md` are updated in the same product change so the
   recorded mutating-session flow matches the implementation.
 

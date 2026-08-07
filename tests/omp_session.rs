@@ -12,9 +12,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
 const FAKE_OMP: &str = env!("CARGO_BIN_EXE_skillmount-fake-agent");
 
-/// Banner the OMP adapter carries as its last-tested compatibility evidence.
-const LAST_TESTED_BANNER: &str = "omp/17.2.9";
-
 struct Fixture {
     root: PathBuf,
     project: PathBuf,
@@ -175,16 +172,12 @@ impl Fixture {
             .env("SKILLMOUNT_STATE_DIR", &self.state)
             .env("SKILLMOUNT_FAKE_RECORD", &self.record)
             .env("SKILLMOUNT_FAKE_VERSION_RECORD", &self.version_record)
-            .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", LAST_TESTED_BANNER)
             .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
             // The fixture records one inherited variable it does not otherwise use, so a launch can
             // show that the child receives the wrapper's own environment rather than a rewritten
             // one. An OMP launch plan carries no environment override of its own.
             .env("SKILLMOUNT_FAKE_RECORD_CODEX_HOME", "1")
             .env("CODEX_HOME", &self.inherited_variable)
-            // The banner must come from the child process, so a deterministic override exported by
-            // a developer or another suite must never short-circuit the observation.
-            .env_remove("SKILLMOUNT_TEST_OMP_VERSION")
             // OMP resolves its roots from the environment, so the developer's real profile,
             // configuration overlay, and XDG bases must never reach a fixture.
             .env_remove("OMP_PROFILE")
@@ -193,8 +186,8 @@ impl Fixture {
             .env_remove("PI_CONFIG_DIR")
             .env_remove("PI_CODING_AGENT_DIR")
             .env_remove("XDG_DATA_HOME")
-            // The version observation runs in the invocation directory, which must differ from the
-            // launch CWD for that distinction to be observable at all.
+            // Keep the wrapper invocation directory distinct from the explicit launch CWD so the
+            // fixture still covers path resolution at that boundary.
             .current_dir(&self.root);
     }
 
@@ -389,6 +382,27 @@ fn a_drifted_omp_banner_neither_warns_nor_starts_a_version_process() {
     assert_eq!(fixture.journals(), Vec::<PathBuf>::new());
 }
 
+#[test]
+fn an_omp_build_without_usable_version_evidence_still_runs_and_cleans_up() {
+    let fixture = Fixture::new("unusable-version");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+
+    // The fake Agent would fail `--version` if anything asked; the session must never ask.
+    let output = fixture
+        .command()
+        .arg("--")
+        .arg("prompt")
+        .env("SKILLMOUNT_FAKE_VERSION_EXIT", "9")
+        .output()
+        .expect("asm should ignore unusable OMP version evidence");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
+    assert!(!exists(&fixture.omp_scope()));
+    assert_eq!(fixture.journals(), Vec::<PathBuf>::new());
+}
+
 /// An OMP build that never reads the mount still gets ownership-verified removal.
 ///
 /// This is the failure the removed banner check was imagined to prevent. It costs an unused
@@ -425,8 +439,8 @@ fn an_omp_build_that_ignores_the_mount_still_releases_every_owned_entry() {
 
 /// A child that returns with a live process domain must not have its links removed.
 ///
-/// Detachment is the only passthrough outcome that touches mount lifetime, and the supervisor —
-/// not an argument table and not a banner — is what makes it safe.
+/// This covers a non-interactive child in the dedicated process group. Known detaching controls
+/// remain hard failures because ADR 0019 records residual interactive and domain-escape boundaries.
 #[cfg(unix)]
 #[test]
 fn an_omp_child_leaving_a_live_domain_defers_cleanup_and_retains_the_journal() {
@@ -441,6 +455,7 @@ fn an_omp_child_leaving_a_live_domain_defers_cleanup_and_retains_the_journal() {
         .arg("prompt")
         .env("SKILLMOUNT_FAKE_BEHAVIOR", "orphan-descendant-ignore-all")
         .env("SKILLMOUNT_FAKE_DESCENDANT_RECORD", &descendant_record)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()

@@ -25,11 +25,8 @@ const SKILLS_SUFFIX: &str = ".claude/skills";
 
 /// Claude Code banner attached to the adapter's last-tested discovery evidence.
 const LAST_TESTED_CLAUDE_BANNER: &str = "2.1.220 (Claude Code)";
-const CLAUDE_VERSION_SPEC: VersionSpec = VersionSpec::new(
-    "Claude Code",
-    LAST_TESTED_CLAUDE_BANNER,
-    "SKILLMOUNT_TEST_CLAUDE_VERSION",
-);
+const CLAUDE_VERSION_SPEC: VersionSpec =
+    VersionSpec::new(LAST_TESTED_CLAUDE_BANNER, "SKILLMOUNT_TEST_CLAUDE_VERSION");
 
 /// Passthrough arguments that change the normal Skill discovery model.
 ///

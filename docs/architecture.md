@@ -27,11 +27,11 @@ ordered catalog, inspects the discovery scopes implemented by the selected adapt
 deterministic mount or preservation outcome for each selected Skill, and removes only entries that
 still match the transaction's recorded ownership evidence.
 
-Its responsibility stops at that lifetime. Mount visibility for the session and removal after it
-are established by the write-ahead journal, the complete recorded lock set, proven process-domain
-death, and ownership-verified removal. None of those depend on which Agent release is installed or
-on the Agent's option and command surface, so SkillMount reasons about its own state rather than
-about the Agent's interface.
+Its responsibility stops at that lifetime. After an adapter's release-independent discovery and
+lifecycle controls accept a foreground launch, mount visibility and removal are established by the
+write-ahead journal, the complete recorded lock set, proven managed-process-domain death, and
+ownership-verified removal. The Agent's version banner is not part of that chain. Native
+process-domain proof retains the residual boundaries documented in ADR 0019.
 
 One package installs two behaviorally identical binaries:
 
@@ -72,11 +72,13 @@ SkillMount is not an operating-system sandbox. It does not elevate through UAC o
 agent's configuration to grant access, or edit the user's Git ignore rules or index as product
 behavior.
 
-SkillMount does not track, validate, or gate on an Agent's version, option surface, or command
-surface. A passthrough token the selected adapter does not classify is forwarded unchanged rather
-than guarded, because an unclassified token can only make a mount unused; it cannot defeat the
-guarantees above. Keeping an adapter aligned with an Agent release is compatibility evidence
-recorded in [docs/compatibility.md](compatibility.md), not a launch-time obligation.
+SkillMount records dated last-tested evidence but never treats the installed Agent version as a
+session launch gate. It does reject known options and commands that relocate inspected discovery
+roots, disable required visibility, or detach
+the logical session from the supervised process boundary. Tokens the selected adapter does not
+classify are forwarded unchanged; that compatibility choice does not certify their future
+semantics. An adapter changes when concrete contract evidence requires it, not merely because an
+Agent publishes another banner.
 
 ## Current command behavior
 
@@ -692,13 +694,15 @@ The following are product rules rather than style preferences:
     cleanup failure replaces only child success; otherwise it remains structured secondary
     evidence behind the primary child or process failure. Recovery never turns free wrapper locks
     into process-domain death proof for a `supervising` journal.
-14. Mount visibility for the session and removal after it are established only by the write-ahead
-    journal, the complete recorded lock set, proven process-domain death, and ownership-verified
-    removal. No part of that chain consults the Agent's version banner, option surface, or command
-    surface, and no session path observes them. An Agent release that ignores the mounted entries,
-    dispatches something other than a session, or exposes controls the adapter does not classify
-    may leave the mount unused; it can never leave it unremoved, remove a non-owned entry, or
-    remove one while the process domain is still alive.
+14. After release-independent adapter controls accept a launch, mount visibility for the session
+    and removal after it are established by the write-ahead journal, the complete recorded lock
+    set, proven managed-process-domain death, and ownership-verified removal. No part of that chain
+    consults the Agent's version banner, and no session path observes one. An Agent release that
+    ignores the mounted entries may leave the mount unused, but ordinary cleanup still removes only
+    matching transaction-owned entries. This guarantee does not extend process-domain proof beyond
+    ADR 0019's residual boundaries: known discovery-relocating and detaching controls remain hard
+    launch failures, and forwarding an unknown token does not certify that future Agent semantics
+    cannot escape those boundaries.
 15. The process-lifetime event dispatcher preserves the first two handler occurrences for one
     active session, linearizes finalization against event recording, and returns inactive or
     finalizing events to platform default handling.

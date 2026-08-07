@@ -29,7 +29,7 @@ use crate::mount::{
 /// OMP banner attached to the adapter's last-tested discovery evidence.
 const LAST_TESTED_OMP_BANNER: &str = "omp/17.2.9";
 const OMP_VERSION_SPEC: VersionSpec =
-    VersionSpec::new("OMP", LAST_TESTED_OMP_BANNER, "SKILLMOUNT_TEST_OMP_VERSION");
+    VersionSpec::new(LAST_TESTED_OMP_BANNER, "SKILLMOUNT_TEST_OMP_VERSION");
 
 /// Environment variables that relocate every OMP root or inject a settings overlay.
 const REJECTED_ENVIRONMENT: [(&str, &str); 3] = [

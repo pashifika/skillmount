@@ -130,9 +130,9 @@ asm codex --skills-dir ~/agent-skills --dry-run -- exec "Summarize this project'
 
 The preview prints the adapter's dated last-tested banner but does not query the installed Agent.
 
-Run the session for real. SkillMount observes the Agent version once, mounts the Skills, launches
-Codex, and cleans up after the Agent exits. A banner that differs from the last-tested evidence, or
-cannot be read, produces one compatibility warning but does not block an otherwise valid session:
+Run the session for real. SkillMount mounts the Skills, launches Codex, and cleans up after the
+Agent exits. Normal sessions neither query the installed Agent banner nor emit a version
+compatibility warning; use `asm doctor` when you need local version evidence:
 
 ```bash
 asm codex --skills-dir ~/agent-skills -- exec "Summarize this project's build steps"
@@ -294,11 +294,12 @@ no Agent process still uses them, or sweep every recorded transaction with
 
 - Supported hosts: Windows 10 version 1709 or later (x64 and x86) and macOS on Apple Silicon.
 - The adapters' dated last-tested banners are `codex-cli 0.146.0`, `2.1.220 (Claude Code)`, and
-  `omp/17.2.9`. These are evidence baselines, not an exact-version allowlist. A different
-  or unavailable banner warns and continues; it remains unverified compatibility evidence until
-  the live-agent workflow is recorded in [docs/compatibility.md](docs/compatibility.md).
+  `omp/17.2.9`. These are evidence baselines, not an exact-version allowlist. Normal sessions do
+  not query or warn about the installed banner; `asm doctor` classifies a different or unavailable
+  banner as `unverified` until the live-agent workflow is recorded in
+  [docs/compatibility.md](docs/compatibility.md).
 - Release-independent discovery, configuration, and foreground-lifecycle controls still fail
-  closed for every observed version.
+  closed independently of banner evidence.
 - Building from source requires Rust 1.85.0 or newer.
 
 ## Documentation

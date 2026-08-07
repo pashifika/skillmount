@@ -106,7 +106,6 @@ impl Fixture {
             .env("SKILLMOUNT_STATE_DIR", &self.state)
             .env("SKILLMOUNT_FAKE_RECORD", &self.record)
             .env("SKILLMOUNT_FAKE_VERSION_RECORD", &self.version_record)
-            .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", "2.1.220 (Claude Code)")
             .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
             .current_dir(&self.project);
         command
@@ -540,11 +539,11 @@ fn a_claude_build_without_usable_version_evidence_still_keeps_mounts() {
     assert_eq!(fixture.journal_count(), 1);
 }
 
-/// Upstream option growth is forwarded, not guarded.
+/// Unknown options are forwarded for compatibility, not certified as harmless.
 ///
-/// The adapter classifies only the controls that can defeat its own contract. An option it has
-/// never seen can at worst make the mount unused, so blocking it would refuse a working launch to
-/// protect nothing. See ADR 0036 and the `docs/architecture.md` responsibility boundary.
+/// Known discovery and lifecycle controls remain hard failures. Forwarding a token absent from the
+/// pinned tables neither predicts its future Agent semantics nor expands ADR 0019's process-domain
+/// proof.
 #[test]
 fn an_unclassified_passthrough_option_is_forwarded_unchanged() {
     let fixture = Fixture::new("unclassified-option");
