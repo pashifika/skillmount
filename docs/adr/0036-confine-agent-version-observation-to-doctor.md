@@ -1,6 +1,6 @@
 # ADR 0036: Confine Agent Version Observation to Doctor
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-07
 - **Supersedes:** ADR 0033's mandatory normal-session `--version` observation and its
   banner-mismatch session warning; ADR 0034's decision 6 session version-evidence rule; and ADR
