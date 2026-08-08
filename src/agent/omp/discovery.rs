@@ -885,32 +885,28 @@ fn lock_resources(
         } else {
             crate::lock::LockAccess::Observe
         };
-        resources.push(if scope.state.entry.starts_with(&context.project_root) {
-            LockResource::describe_entry(
-                LockResourceKind::DiscoveryEntry,
-                access,
-                &context.project_root,
-                &scope.state,
-            )?
-        } else {
-            LockResource::describe_shared(
-                LockResourceKind::DiscoveryEntry,
-                access,
-                &scope.state.entry,
-            )?
-        });
+        let legacy_anchor = scope
+            .state
+            .entry
+            .starts_with(&context.project_root)
+            .then_some(context.project_root.as_path());
+        resources.extend(LockResource::describe_shared_and_legacy_entry(
+            access,
+            legacy_anchor,
+            &scope.state,
+        )?);
     }
     // Declarative settings, plugin registries, and traversed roots only decide the observed
     // namespace. SkillMount never rewrites them.
     for input in settings.inputs.iter().chain(plugin_roots.inputs.iter()) {
-        resources.push(LockResource::describe_shared(
+        resources.extend(LockResource::describe_shared_and_legacy_unanchored(
             LockResourceKind::DiscoveryEntry,
             crate::lock::LockAccess::Observe,
             input,
         )?);
     }
     for terminal in physical {
-        resources.push(LockResource::describe_shared(
+        resources.extend(LockResource::describe_shared_and_legacy_unanchored(
             LockResourceKind::DiscoveryEntry,
             crate::lock::LockAccess::Observe,
             terminal,
@@ -918,6 +914,11 @@ fn lock_resources(
     }
     // The project scope is locked as well, because a plan may create it.
     let scope_directory = context.launch_cwd.join(OMP_CONFIG_DIR_NAME);
+    resources.push(LockResource::describe_shared(
+        LockResourceKind::DiscoveryEntry,
+        crate::lock::LockAccess::Mutate,
+        &scope_directory,
+    )?);
     resources.push(LockResource::describe(
         LockResourceKind::DiscoveryEntry,
         crate::lock::LockAccess::Mutate,

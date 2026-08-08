@@ -427,6 +427,11 @@ fn claude_lock_resources(
         ]
     } else {
         vec![
+            LockResource::describe_shared(
+                LockResourceKind::DiscoveryEntry,
+                crate::lock::LockAccess::Mutate,
+                discovery_entry,
+            )?,
             LockResource::describe(
                 LockResourceKind::DiscoveryEntry,
                 crate::lock::LockAccess::Mutate,
@@ -447,26 +452,16 @@ fn claude_lock_resources(
         } else {
             crate::lock::LockAccess::Observe
         };
-        resources.push(if scope.state.entry.starts_with(&context.project_root) {
-            LockResource::describe_entry(
-                LockResourceKind::DiscoveryEntry,
-                access,
-                &context.project_root,
-                &scope.state,
-            )?
-        } else if access == crate::lock::LockAccess::Mutate {
-            LockResource::describe_unanchored(
-                LockResourceKind::DiscoveryEntry,
-                access,
-                &scope.state.entry,
-            )
-        } else {
-            LockResource::describe_shared(
-                LockResourceKind::DiscoveryEntry,
-                access,
-                &scope.state.entry,
-            )?
-        });
+        let legacy_anchor = scope
+            .state
+            .entry
+            .starts_with(&context.project_root)
+            .then_some(context.project_root.as_path());
+        resources.extend(LockResource::describe_shared_and_legacy_entry(
+            access,
+            legacy_anchor,
+            &scope.state,
+        )?);
     }
     resources.sort_by_key(LockResource::ordering_key);
     resources.dedup();

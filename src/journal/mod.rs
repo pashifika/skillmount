@@ -19,7 +19,7 @@ mod codec;
 mod tests;
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::domain::AgentId;
 use crate::link::PlatformIdentity;
@@ -40,6 +40,9 @@ const LEGACY_SCHEMA_VERSION: u32 = 1;
 
 /// Filename extension every journal uses.
 pub const JOURNAL_EXTENSION: &str = "journal";
+
+/// Filename prefix every staged entry uses.
+const STAGING_PREFIX: &str = ".skillmount-";
 
 /// The identity of one transaction, used for its journal name and its staged entries.
 ///
@@ -96,6 +99,17 @@ impl fmt::Display for TransactionId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
+}
+
+/// Returns the transaction-unique sibling an entry is staged at before atomic placement.
+#[must_use]
+pub(crate) fn staged_sibling(
+    transaction_id: &TransactionId,
+    action_id: u32,
+    final_path: &Path,
+) -> PathBuf {
+    let parent = final_path.parent().unwrap_or_else(|| Path::new(""));
+    parent.join(format!("{STAGING_PREFIX}{transaction_id}-{action_id}.tmp"))
 }
 
 /// How far a transaction has durably progressed.
@@ -718,14 +732,24 @@ impl TransactionJournal {
             }
         }
 
-        journal.validate()?;
+        journal.validate(schema_version)?;
         Ok(journal)
     }
 
     /// Rejects a structurally decodable journal whose contents cannot be acted on safely.
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, schema_version: u32) -> Result<(), String> {
         if self.locks.is_empty() {
             return Err("a mutating transaction must record at least one resource lock".to_owned());
+        }
+        let resources = self.lock_resources();
+        if !resources
+            .iter()
+            .any(|resource| resource.access.satisfies(LockAccess::Mutate))
+        {
+            return Err(
+                "a mutating transaction must record at least one resource lock with mutate access"
+                    .to_owned(),
+            );
         }
 
         let mut previous = 0;
@@ -766,9 +790,102 @@ impl TransactionJournal {
             {
                 return Err("a link action must record its canonical source".to_owned());
             }
+            if action.operation.creates_entry() {
+                let expected = staged_sibling(&self.transaction_id, action.id, &action.final_path);
+                if action.temporary_path.as_ref() != Some(&expected) {
+                    return Err(format!(
+                        "action {} temporary path must be its transaction-unique staged sibling {}",
+                        action.id,
+                        expected.display()
+                    ));
+                }
+            } else if action.temporary_path.is_some() {
+                return Err("a reuse action cannot record a temporary path".to_owned());
+            }
+        }
+
+        require_mutation_authority(
+            &resources,
+            &self.discovery_entry,
+            Some(LockResourceKind::DiscoveryEntry),
+            "discovery entry",
+        )?;
+        require_mutation_authority(
+            &resources,
+            &self.backing_store,
+            Some(LockResourceKind::BackingStore),
+            "backing store",
+        )?;
+        for action in self
+            .actions
+            .iter()
+            .filter(|action| action.operation.creates_entry())
+        {
+            if schema_version == SCHEMA_VERSION {
+                let temporary = action
+                    .temporary_path
+                    .as_deref()
+                    .expect("creating-action shape was validated above");
+                require_exact_mutation_authority(
+                    &resources,
+                    temporary,
+                    LockResourceKind::DiscoveryEntry,
+                    &format!("action {} temporary path", action.id),
+                )?;
+            }
+            require_mutation_authority(
+                &resources,
+                &action.final_path,
+                None,
+                &format!("action {} final path", action.id),
+            )?;
         }
         Ok(())
     }
+}
+
+/// Requires a mutation resource whose durable logical identity encloses `path`.
+///
+/// Returning the recorded resource rather than rebuilding one is essential: recovery later acquires
+/// its complete logical and optional physical key set. Its diagnostic path spelling is not authority.
+fn require_mutation_authority(
+    resources: &[LockResource],
+    path: &Path,
+    kind: Option<LockResourceKind>,
+    description: &str,
+) -> Result<(), String> {
+    if resources.iter().any(|resource| {
+        kind.is_none_or(|required| resource.kind == required)
+            && resource.authorizes_mutation_of(path)
+    }) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "the journal has no mutation lock resource whose logical identity covers its \
+         {description} {}",
+        path.display()
+    ))
+}
+
+/// Requires mutation access under the exact logical key another path observer derives.
+fn require_exact_mutation_authority(
+    resources: &[LockResource],
+    path: &Path,
+    kind: LockResourceKind,
+    description: &str,
+) -> Result<(), String> {
+    if resources
+        .iter()
+        .any(|resource| resource.kind == kind && resource.authorizes_exact_mutation_of(path))
+    {
+        return Ok(());
+    }
+
+    Err(format!(
+        "the journal has no exact mutation lock resource covering its {description} {}",
+        path.display()
+    ))
 }
 
 fn require_one<'a>(lines: &'a [Line], record: &str) -> Result<&'a Line, String> {

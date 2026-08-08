@@ -249,12 +249,15 @@ adapter passthrough validation -> hard launch-control preflight
   -> ensure the staging-state base when staging is required
   -> mint transaction / staging identity
   -> discovery-only inspection
-  -> acquire access-aware logical and physical resource locks
+  -> acquire the adapter's snapshot-known access-aware logical and physical resource locks
   -> recover eligible incomplete transactions
   -> catalog + discovery + full plan under the locks, through the same gated read-only pipeline
-  -> expand or reacquire the lock set until it stabilizes
+  -> derive one exact volume-root DiscoveryEntry mutation resource for every transaction-id-specific
+     staged sibling
+  -> expand or reacquire the strongest complete lock set until it stabilizes, rerunning recovery,
+     discovery, planning, and staged-resource derivation after every unlocked gap
   -> repeat hard launch controls
-  -> persist planned journal
+  -> persist the schema-version-2 planned journal with the stabilized complete lock set
   -> write-ahead apply
   -> journal active
   -> repeat hard launch controls in the adapter's spawn-boundary revalidation
@@ -270,10 +273,13 @@ selected-plugin namespace checks, and OMP additionally rechecks the non-owned se
 provider discovery evidence its locked plan depends on. A failed invariant spawns no child and
 releases the active transaction through the normal evidence-checked cleanup path.
 
-Discovery can run before the lock because it independently identifies the resources that may be
-mutated. The conflict-producing plan cannot: crash residue may look like an ordinary destination
-conflict until recovery removes it. This ordering is the accepted decision in
-[ADR 0012](adr/0012-acquire-locks-before-building-the-plan.md).
+Adapter discovery can run before the first lock because it independently identifies every
+snapshot-known resource. The conflict-producing plan cannot: crash residue may look like an
+ordinary destination conflict until recovery removes it, and its creating actions are what reveal
+the transaction-specific staged siblings. Shared code derives those exact resources after planning
+and returns them to stabilization rather than asking the adapter to predict them. This ordering is
+the accepted decision in [ADR 0012](adr/0012-acquire-locks-before-building-the-plan.md), extended by
+[ADR 0039](adr/0039-distinguish-observation-from-mutation-lock-access.md).
 
 ## Module responsibilities
 
@@ -288,7 +294,7 @@ conflict until recovery removes it. This ordering is the accepted decision in
 | `src/render.rs` | Access-aware read-only plans, normal/verbose session diagnostics, warnings, stable-deduplicated recovery footers, proved PowerShell and Command Prompt encoders, labelled native-vector fallback, and reversible native-value rendering. |
 | `src/lock/` | Logical/physical resource identities, strongest-access folding, and sorted shared-observation or exclusive-mutation operating-system advisory locks. |
 | `src/journal/` | Versioned, checksummed write-ahead ownership and lock-access records with conservative legacy decoding and durable storage. |
-| `src/transaction/` | Mutation-authority validation, apply, rollback, ordinary cleanup of created Skill links, best-effort scaffolding pruning, kept state, and access-aware stale recovery. |
+| `src/transaction/` | Exact transaction-specific staged-sibling resource derivation, mutation-authority validation, apply, rollback, ordinary cleanup of created Skill links, best-effort scaffolding pruning, kept state, and access-aware stale recovery. |
 | `src/process/` | Shell-free direct child launch, bounded captured-command containment, inherited session streams, reusable platform interruption, liveness-gated cleanup coordination, presentation-only invocation-shell ancestry classification, structured status, and exit-policy mapping. |
 | `src/link/` | Sealed platform boundary for no-follow inspection, link creation, no-replace placement, and verified entry removal. |
 | `src/state.rs` | Computes state locations and, only after the mutation boundary, creates their requested final directories with platform-specific access restrictions. |
@@ -601,28 +607,45 @@ copying an environment-specific path from diagnostics.
 ## Locks, journals, and recovery
 
 Every resource description carries `Observe` or `Mutate` access over a logical identity and an
-optional physical identity. The logical key uses an existing canonical anchor plus a normalized
-suffix, so the first process creating a missing directory and a later process observing it contend
-on the same key. A physical identity makes aliases and worktrees that reach one existing directory
-contend as well. Access does not alter either key.
+optional physical identity. Shared discovery entries use the volume root plus a normalized suffix,
+so an external observer and a project writer address the same logical key before the entry exists
+and after it is created. Because the unchanged key hash treats anchor and suffix as separate
+inputs, an entry replacing an `origin/dev/0.3.x` project-anchor or deepest-existing identity
+retains that exact identity with the same access. Newly classified observations carry the
+corresponding legacy anchor convention. New processes therefore acquire the shared key and every
+retained or compatibility key: the volume-root key coordinates new cross-project roles, while a
+common legacy key preserves the mixed-version intersections the older producer made available.
+Explicit backing-store and Claude session-only staging identities remain unchanged. A physical
+identity makes aliases and worktrees that reach one existing directory contend as well. Access
+does not alter any key.
 
 Requests that collapse to one key retain all diagnostic paths and fold to the strongest access.
 Observation takes a shared operating-system lock; mutation takes an exclusive lock that excludes
-both readers and writers. Locks are acquired in sorted key order. If reinspection adds an earlier
-key or strengthens held access, the application drops the complete set, reacquires the strongest
-accumulated union in global order, and repeats recovery and discovery across that unlocked gap.
+both readers and writers. Adapters supply every snapshot-known discovery, destination, helper, and
+retained legacy resource. Once the shared sequencer has the transaction id and full plan,
+transaction code derives each creating action's canonical staged sibling and adds only its exact
+volume-root `DiscoveryEntry::Mutate` request; the older release never emitted transaction-specific
+staged names. Locks are acquired in sorted key order. If reinspection, plan-specific derivation, or
+recovery adds an earlier key or strengthens held access, the application drops the complete set,
+reacquires the strongest accumulated union in global order, and repeats recovery, discovery,
+planning, and staged-resource derivation across that unlocked gap.
 A lock file is not liveness evidence because it survives process death; only the operating-system
 lock is. Human-readable holder information lives in a transaction-specific sidecar so concurrent
 readers do not overwrite or remove one another's diagnostic text.
 
 A transaction persists a schema-version-2 journal before each planned destination mutation can
-become externally visible. Every recorded lock carries its access; schema version 1 remains
-readable by conservatively mapping each legacy record to `Mutate`. Opening, adoption, and recovery
-require held mutation access for every identity the transaction may own. Observation access is
-compatible discovery evidence, never cleanup authority. The journal distinguishes intent, staged
-identity, final placement, active use, child supervision, cleanup, kept state, and failure. Its path
-codec round-trips arbitrary Unix bytes and Windows UTF-16, including unpaired surrogates, rather
-than passing ownership evidence through UTF-8.
+become externally visible. Every recorded lock carries its access. For each creating action, schema
+version 2 requires mutation authority under the exact volume-root logical key of its canonical
+transaction-unique staged sibling; a broader ancestor or a different anchor/suffix split that joins
+to the same pathname is not equivalent. This makes an external `Observe` request for the staged
+path contend with both the live writer and later recovery. Schema version 1 remains readable by
+conservatively mapping each legacy record to `Mutate`; because legacy journals did not record exact
+staged-sibling keys, they retain the conservative legacy authority check. Opening, adoption, and
+recovery require held mutation access for every identity the transaction may own. Observation
+access is compatible discovery evidence, never cleanup authority. The journal distinguishes
+intent, staged identity, final placement, active use, child supervision, cleanup, kept state, and
+failure. Its path codec round-trips arbitrary Unix bytes and Windows UTF-16, including unpaired
+surrogates, rather than passing ownership evidence through UTF-8.
 
 Apply rechecks every planned precondition and uses evidence-bearing, atomic same-filesystem
 no-replace placement. Successful placement returns identity for the object established at the final
@@ -757,10 +780,14 @@ The following are product rules rather than style preferences:
 3. Source precedence never overrides a pre-existing Skill in an inspected discovery scope.
 4. `inspect` and `--dry-run` create no directories, links, locks, journals, recovery mutations, or
    child processes.
-5. Discovery supplies the first access-aware lock set; requests for one key fold to the strongest
-   access, observation is shared, and mutation excludes both readers and writers. Recovery runs
-   under the complete locks before the first mutating plan is accepted. Any unlocked reacquisition
-   gap invalidates the old snapshot and requires recovery and discovery to run again.
+5. Discovery supplies the first access-aware lock set; each changed snapshot-known discovery
+   identity carries its shared volume-root key and every exact retained or legacy-convention key
+   with identical access. Requests for one key fold to the strongest access, observation is shared,
+   and mutation excludes both readers and writers. After plan construction, shared transaction
+   code adds only the exact volume-root mutation key for every transaction-id-specific staged
+   sibling. Recovery and this expanded set stabilize before the first mutating journal is
+   accepted. Any unlocked reacquisition gap invalidates the old snapshot and plan and requires
+   recovery, discovery, planning, and staged-resource derivation to run again.
 6. No planned destination mutation occurs before its durable intent, and apply rechecks persisted
    preconditions.
 7. Windows placement verifies and mutates the same no-follow object handle. Windows removal checks

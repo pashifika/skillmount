@@ -23,7 +23,7 @@ use crate::process::{
 };
 use crate::render;
 use crate::transaction::cleanup::CleanupReport;
-use crate::transaction::{Transaction, recover};
+use crate::transaction::{Transaction, recover, staged_mutation_resources};
 
 /// Maximum discovery/recovery passes allowed while a mutating lock set expands.
 const MAX_LOCK_SET_PASSES: usize = 8;
@@ -344,15 +344,20 @@ fn stabilize_resource_locks(
     owner: &LockOwner,
     mut required_resources: Vec<crate::lock::LockResource>,
 ) -> Result<(ReadOnlyOutcome, HeldLocks), AppError> {
+    let transaction_id = context.session_id.as_ref().ok_or_else(|| {
+        AppError::Internal(
+            "a mutating lock stabilization pass requires a transaction identifier".to_owned(),
+        )
+    })?;
     let mut locks = HeldLocks::acquire(&required_resources, policy, owner)?;
     let mut stable = None;
     let mut recovery_candidates = Vec::new();
 
-    // Recovery or an external filesystem change can make the rebuilt snapshot add a physical key.
-    // A new key that sorts after the held set can be appended safely. A key that sorts before it
-    // requires dropping the set and taking the complete union in one order. That unlocked gap is
-    // never hidden from the rest of the pipeline: recovery and filesystem inspection run again
-    // after every restart and after every monotonic expansion.
+    // Recovery, transaction-specific staged actions, or an external filesystem change can make the
+    // rebuilt snapshot add a key. A new key that sorts after the held set can be appended safely.
+    // A key that sorts before the held set requires dropping and reacquiring the complete union in
+    // one order. That unlocked gap is never hidden from the rest of the pipeline: recovery and
+    // filesystem inspection run again after every restart and monotonic expansion.
     for _ in 0..MAX_LOCK_SET_PASSES {
         let recovery_resources = reconcile_incomplete_transactions(
             context,
@@ -370,7 +375,13 @@ fn stabilize_resource_locks(
         // Built under the lock and after recovery, because recovery may have removed mounts
         // discovery saw a moment ago. A plan that disagrees with the filesystem it is about to
         // change is exactly what every precondition check exists to catch.
-        let rebuilt = plan_read_only(context)?;
+        let mut rebuilt = plan_read_only(context)?;
+        let staged_resources = staged_mutation_resources(transaction_id, &rebuilt.plan)?;
+        extend_resources(&mut rebuilt.snapshot.lock_resources, &staged_resources);
+        rebuilt
+            .snapshot
+            .lock_resources
+            .sort_by_key(crate::lock::LockResource::ordering_key);
         if locks.holds_all(&rebuilt.snapshot.lock_resources) {
             stable = Some(rebuilt);
             break;

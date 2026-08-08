@@ -60,28 +60,129 @@ fn a_logical_key_survives_the_resource_being_created() {
 }
 
 #[test]
-fn a_shared_missing_root_keeps_its_logical_key_after_external_creation() {
-    let fixture = TestDir::new("lock-shared-stable-key");
+fn an_external_observer_contends_with_a_project_writer_for_a_missing_entry() {
+    let fixture = TestDir::new("lock-external-observer-project-writer");
+    let _guard = StateRootGuard::set(fixture.path());
     let root = std::fs::canonicalize(fixture.path()).unwrap();
-    let shared = root.join("home/.agents/skills");
+    let destination = root.join("projects/b/.agents/skills");
 
     let observed = LockResource::describe_shared(
         LockResourceKind::DiscoveryEntry,
         LockAccess::Observe,
-        &shared,
+        &destination,
     )
-    .expect("absolute shared root");
-    std::fs::create_dir_all(&shared).expect("external shared-root creation");
-    let mutated = LockResource::describe_shared(
+    .expect("absolute external discovery entry");
+    let missing_writer = LockResource::describe_shared_entry(
+        LockAccess::Mutate,
+        &classify(&destination).expect("missing project destination"),
+    )
+    .expect("absolute project discovery entry");
+
+    assert_eq!(observed.lock_keys(), missing_writer.lock_keys());
+    assert!(observed.identity.physical.is_none());
+    assert!(missing_writer.identity.physical.is_none());
+
+    let held = HeldLocks::acquire(
+        std::slice::from_ref(&observed),
+        LockPolicy::immediate(),
+        &LockOwner::preliminary(),
+    )
+    .expect("external observer acquires the shared lock");
+    let contention = HeldLocks::try_acquire_all(
+        std::slice::from_ref(&missing_writer),
+        &LockOwner::preliminary(),
+    )
+    .expect("the project writer can probe the lock")
+    .expect_err("mutation must contend with the external observation");
+    assert_eq!(contention.key, observed.lock_keys()[0]);
+    drop(held);
+
+    std::fs::create_dir_all(&destination).expect("project destination creation");
+    let existing_observer = LockResource::describe_shared(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &destination,
+    )
+    .expect("existing external discovery entry");
+    let existing_writer = LockResource::describe_shared_entry(
+        LockAccess::Mutate,
+        &classify(&destination).expect("existing project destination"),
+    )
+    .expect("absolute existing project discovery entry");
+
+    assert_eq!(observed.lock_keys()[0], existing_observer.lock_keys()[0]);
+    assert_eq!(
+        existing_observer.lock_keys()[0],
+        existing_writer.lock_keys()[0]
+    );
+    assert!(existing_observer.identity.physical.is_some());
+    assert!(existing_writer.identity.physical.is_some());
+}
+
+#[test]
+fn dual_identity_helpers_preserve_exact_legacy_and_shared_logical_keys() {
+    let fixture = TestDir::new("lock-dual-identity");
+    let _guard = StateRootGuard::set(fixture.path());
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let project = root.join("project");
+    std::fs::create_dir(&project).expect("project fixture");
+    let destination = project.join(".agents/skills");
+    let resolved = classify(&destination).expect("missing destination");
+
+    let [shared, project_legacy] = LockResource::describe_shared_and_legacy_entry(
+        LockAccess::Mutate,
+        Some(&project),
+        &resolved,
+    )
+    .expect("dual project identity");
+    let expected_shared = LockResource::describe_shared_entry(LockAccess::Mutate, &resolved)
+        .expect("shared identity");
+    let expected_project_legacy = LockResource::describe_entry(
         LockResourceKind::DiscoveryEntry,
         LockAccess::Mutate,
-        &shared,
+        &project,
+        &resolved,
     )
-    .expect("same absolute shared root");
+    .expect("legacy project identity");
 
-    assert_eq!(observed.lock_keys()[0], mutated.lock_keys()[0]);
-    assert!(observed.identity.physical.is_none());
-    assert!(mutated.identity.physical.is_some());
+    assert_eq!(shared.lock_keys()[0], expected_shared.lock_keys()[0]);
+    assert_eq!(
+        project_legacy.lock_keys()[0],
+        expected_project_legacy.lock_keys()[0]
+    );
+    assert_ne!(shared.lock_keys()[0], project_legacy.lock_keys()[0]);
+
+    let [external_shared, external_legacy] = LockResource::describe_shared_and_legacy_unanchored(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &destination,
+    )
+    .expect("dual external identity");
+    let expected_external_legacy = LockResource::describe_unanchored(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &destination,
+    );
+
+    assert_eq!(external_shared.lock_keys()[0], shared.lock_keys()[0]);
+    assert_eq!(
+        external_legacy.lock_keys()[0],
+        expected_external_legacy.lock_keys()[0]
+    );
+
+    let _new_observer = HeldLocks::acquire(
+        &[external_shared, external_legacy],
+        LockPolicy::immediate(),
+        &LockOwner::preliminary(),
+    )
+    .expect("new observer acquires both logical identities");
+    let contention = HeldLocks::try_acquire_all(
+        std::slice::from_ref(&expected_project_legacy),
+        &LockOwner::preliminary(),
+    )
+    .expect("legacy writer can probe")
+    .expect_err("origin/dev/0.3.x writer key must contend with the new observer");
+    assert_eq!(contention.key, expected_project_legacy.lock_keys()[0]);
 }
 
 #[test]
@@ -153,6 +254,39 @@ fn two_routes_to_one_store_report_the_same_physical_identity() {
         direct.lock_keys()[1],
         through_link.lock_keys()[1],
         "the shared physical key is what actually serializes them"
+    );
+}
+
+#[test]
+fn mutation_authority_canonicalizes_parents_without_following_the_final_entry() {
+    let fixture = TestDir::new("lock-authority-parent-alias");
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let canonical_parent = root.join("canonical-parent");
+    std::fs::create_dir_all(&canonical_parent).expect("canonical parent fixture");
+    let alias_parent = root.join("alias-parent");
+    if !symlink_dir_or_skip(&canonical_parent, &alias_parent) {
+        return;
+    }
+
+    let final_path = canonical_parent.join("owned-entry");
+    let resource = LockResource::describe_unanchored(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Mutate,
+        &final_path,
+    );
+    let unrelated_target = root.join("unrelated-target");
+    std::fs::create_dir_all(&unrelated_target).expect("unrelated target fixture");
+    if !symlink_dir_or_skip(&unrelated_target, &final_path) {
+        return;
+    }
+
+    assert!(
+        resource.authorizes_mutation_of(&alias_parent.join("owned-entry")),
+        "canonicalizing the aliased parent must recover the held logical identity"
+    );
+    assert!(
+        !resource.authorizes_mutation_of(&unrelated_target),
+        "authority belongs to the final directory entry, not the target it now reaches"
     );
 }
 

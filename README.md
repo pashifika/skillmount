@@ -234,8 +234,8 @@ does and does not cover, lives in [docs/compatibility.md](docs/compatibility.md)
 Independent project sessions can overlap, even when they inspect the same user, administrator,
 settings, plugin, compatibility, or custom Skill roots. Each invocation stabilizes its own current
 namespace before planning, so a later session applies `--conflict=error` or `--conflict=skip` to
-what exists at its launch. An already-running Agent receives no live update; start a new session
-when it must see newly added Skills.
+what exists at its launch. An already-running Agent is not guaranteed to receive a live update;
+start a new session when it must see newly added Skills.
 
 Logical or physical destination overlap is still exclusive. A contender waits for the active
 session to release the destination and, if contention remains, exits with status 75 before applying

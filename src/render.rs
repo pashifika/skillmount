@@ -309,7 +309,13 @@ fn locks(out: &mut String, report: &ReadOnlyReport<'_>) {
         return;
     }
     let _ = writeln!(out, "\nLock resources:");
+    let mut previous = None;
     for resource in &report.snapshot.lock_resources {
+        let diagnostic = (resource.access, resource.kind, resource.path.as_path());
+        if !report.verbose() && previous == Some(diagnostic) {
+            continue;
+        }
+        previous = Some(diagnostic);
         let _ = writeln!(
             out,
             "  {:<7} {:<16} {}",

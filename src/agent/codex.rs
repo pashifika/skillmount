@@ -1105,23 +1105,18 @@ fn os_starts_with(value: &OsStr, prefix: &str) -> bool {
     value.starts_with(&prefix)
 }
 
-/// Describes project scopes beneath their fixed project anchor and shared scopes beneath a fixed
-/// volume-root anchor.
-fn scope_root_lock(
+/// Describes every discovery scope under both its shared and `origin/dev/0.3.x` identities.
+fn scope_root_locks(
     context: &RunContext,
     scope: &DiscoveryScope,
     access: crate::lock::LockAccess,
-) -> Result<LockResource, AppError> {
-    if scope.state.entry.starts_with(&context.project_root) {
-        LockResource::describe_entry(
-            LockResourceKind::DiscoveryEntry,
-            access,
-            &context.project_root,
-            &scope.state,
-        )
-    } else {
-        LockResource::describe_shared(LockResourceKind::DiscoveryEntry, access, &scope.state.entry)
-    }
+) -> Result<[LockResource; 2], AppError> {
+    let legacy_anchor = scope
+        .state
+        .entry
+        .starts_with(&context.project_root)
+        .then_some(context.project_root.as_path());
+    LockResource::describe_shared_and_legacy_entry(access, legacy_anchor, &scope.state)
 }
 
 impl AgentAdapter for CodexAdapter {
@@ -1257,10 +1252,10 @@ impl AgentAdapter for CodexAdapter {
             } else {
                 crate::lock::LockAccess::Observe
             };
-            lock_resources.push(scope_root_lock(context, scope, access)?);
+            lock_resources.extend(scope_root_locks(context, scope, access)?);
             for terminal in &scope.observed_directories {
                 if scope.state.terminal.as_deref() != Some(terminal.as_path()) {
-                    lock_resources.push(LockResource::describe_shared(
+                    lock_resources.extend(LockResource::describe_shared_and_legacy_unanchored(
                         LockResourceKind::DiscoveryEntry,
                         crate::lock::LockAccess::Observe,
                         terminal,
@@ -1269,12 +1264,21 @@ impl AgentAdapter for CodexAdapter {
             }
         }
         let agents_parent = classify(&context.project_root.join(".agents"))?;
-        lock_resources.push(LockResource::describe_entry(
-            LockResourceKind::DiscoveryEntry,
+        lock_resources.push(LockResource::describe_shared_entry(
             crate::lock::LockAccess::Mutate,
-            &context.project_root,
             &agents_parent,
         )?);
+        if matches!(
+            agents_parent.kind,
+            PathKind::Directory | PathKind::DirectoryLink
+        ) {
+            lock_resources.push(LockResource::describe_entry(
+                LockResourceKind::DiscoveryEntry,
+                crate::lock::LockAccess::Mutate,
+                &context.project_root,
+                &agents_parent,
+            )?);
+        }
         lock_resources.push(LockResource::describe(
             LockResourceKind::BackingStore,
             crate::lock::LockAccess::Mutate,

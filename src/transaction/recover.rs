@@ -645,6 +645,20 @@ mod tests {
         id: &str,
         resources: &[LockResource],
     ) -> TransactionJournal {
+        let discovery = resources
+            .iter()
+            .find(|resource| {
+                resource.kind == LockResourceKind::DiscoveryEntry
+                    && resource.access.satisfies(LockAccess::Mutate)
+            })
+            .expect("a recovery fixture records discovery mutation authority");
+        let backing_store = resources
+            .iter()
+            .find(|resource| {
+                resource.kind == LockResourceKind::BackingStore
+                    && resource.access.satisfies(LockAccess::Mutate)
+            })
+            .expect("a recovery fixture records backing-store mutation authority");
         TransactionJournal {
             transaction_id: TransactionId::parse(id).unwrap(),
             agent: AgentId::Codex,
@@ -652,8 +666,8 @@ mod tests {
             status: TransactionStatus::Planned,
             project_root: root.to_path_buf(),
             launch_cwd: root.to_path_buf(),
-            discovery_entry: root.join("discovery"),
-            backing_store: root.join("store"),
+            discovery_entry: discovery.path.clone(),
+            backing_store: backing_store.path.clone(),
             keep_mounts: false,
             sources: Vec::new(),
             locks: resources.iter().map(JournalLock::from).collect(),
@@ -671,6 +685,16 @@ mod tests {
         let path = store::journal_path(&journal.transaction_id).unwrap();
         store::persist(&journal, &path).unwrap();
         path
+    }
+
+    fn complete_mutation_pair(resource: &LockResource) -> [LockResource; 2] {
+        let mut discovery = resource.clone();
+        discovery.kind = LockResourceKind::DiscoveryEntry;
+        discovery.access = LockAccess::Mutate;
+        let mut backing_store = resource.clone();
+        backing_store.kind = LockResourceKind::BackingStore;
+        backing_store.access = LockAccess::Mutate;
+        [discovery, backing_store]
     }
 
     #[test]
@@ -753,6 +777,13 @@ mod tests {
             &root.join("shared"),
         )
         .unwrap();
+        let backing_store = LockResource::describe(
+            LockResourceKind::BackingStore,
+            LockAccess::Mutate,
+            &root,
+            &root.join("store"),
+        )
+        .unwrap();
         let mut journal = TransactionJournal {
             transaction_id: TransactionId::parse("a11ce").unwrap(),
             agent: AgentId::Codex,
@@ -761,10 +792,13 @@ mod tests {
             project_root: root.clone(),
             launch_cwd: root.clone(),
             discovery_entry: root.join("shared"),
-            backing_store: root.join("store"),
+            backing_store: backing_store.path.clone(),
             keep_mounts: false,
             sources: Vec::new(),
-            locks: vec![JournalLock::from(&observed)],
+            locks: vec![
+                JournalLock::from(&observed),
+                JournalLock::from(&backing_store),
+            ],
             actions: Vec::new(),
             errors: Vec::new(),
         };
@@ -775,7 +809,7 @@ mod tests {
             journal: journal.clone(),
         };
         let locks = HeldLocks::acquire(
-            std::slice::from_ref(&observed),
+            &[observed.clone(), backing_store],
             LockPolicy::immediate(),
             &LockOwner::preliminary(),
         )
@@ -809,6 +843,7 @@ mod tests {
             &root.join("live"),
         )
         .unwrap();
+        let live_authority = complete_mutation_pair(&live_mutation);
         let independent_mutation = LockResource::describe(
             LockResourceKind::BackingStore,
             LockAccess::Mutate,
@@ -816,9 +851,21 @@ mod tests {
             &root.join("independent"),
         )
         .unwrap();
-        let path = persist_minimal(&root, "11", &[shared.clone(), live_mutation.clone()]);
+        let path = persist_minimal(
+            &root,
+            "11",
+            &[
+                shared.clone(),
+                live_authority[0].clone(),
+                live_authority[1].clone(),
+            ],
+        );
         let _live = HeldLocks::acquire(
-            &[shared.clone(), live_mutation],
+            &[
+                shared.clone(),
+                live_authority[0].clone(),
+                live_authority[1].clone(),
+            ],
             LockPolicy::immediate(),
             &LockOwner {
                 transaction: "live".to_owned(),
@@ -863,7 +910,16 @@ mod tests {
             &root.join("stale"),
         )
         .unwrap();
-        let path = persist_minimal(&root, "22", &[shared.clone(), stale_mutation]);
+        let stale_authority = complete_mutation_pair(&stale_mutation);
+        let path = persist_minimal(
+            &root,
+            "22",
+            &[
+                shared.clone(),
+                stale_authority[0].clone(),
+                stale_authority[1].clone(),
+            ],
+        );
         let reader = HeldLocks::acquire(
             std::slice::from_ref(&shared),
             LockPolicy::immediate(),
@@ -897,7 +953,8 @@ mod tests {
         .unwrap();
         let mut mutated = observed.clone();
         mutated.access = LockAccess::Mutate;
-        let path = persist_minimal(&root, "33", std::slice::from_ref(&mutated));
+        let authority = complete_mutation_pair(&mutated);
+        let path = persist_minimal(&root, "33", &authority);
         let current = HeldLocks::acquire(
             std::slice::from_ref(&observed),
             LockPolicy::immediate(),
@@ -907,7 +964,7 @@ mod tests {
         let mut current = current;
 
         let first = recover_stale(&mut current).expect("promotion is surfaced");
-        assert_eq!(first.reacquire, vec![mutated.clone()]);
+        assert_eq!(first.reacquire, authority.to_vec());
         assert!(first.reconciled.is_empty());
         assert!(path.exists());
 
@@ -939,7 +996,8 @@ mod tests {
         .unwrap();
         let mut mutated = observed.clone();
         mutated.access = LockAccess::Mutate;
-        let journal = minimal_journal(&root, "44", std::slice::from_ref(&mutated));
+        let authority = complete_mutation_pair(&mutated);
+        let journal = minimal_journal(&root, "44", &authority);
         let path = store::journal_path(&journal.transaction_id).unwrap();
         store::persist_legacy_for_test(&journal, &path).unwrap();
         let mut current = HeldLocks::acquire(

@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use super::claude::ClaudeAdapter;
 use super::codex::{CodexAdapter, resolve_destination};
-use super::{AgentAdapter, ScopeKind, inspect_scope};
+use super::omp::OmpAdapter;
+use super::{AgentAdapter, DiscoverySnapshot, ScopeKind, inspect_scope};
 use crate::catalog::{CatalogRequest, resolve_catalog};
 use crate::diagnostic::DiagnosticKind;
 use crate::domain::{
@@ -133,6 +134,46 @@ fn plan_claude(
     let catalog = project.catalog(AgentId::Claude);
     let snapshot = ClaudeAdapter.inspect_discovery(context)?;
     ClaudeAdapter.build_mount_plan(context, &catalog, &snapshot)
+}
+
+fn assert_dual_discovery_keys(
+    snapshot: &DiscoverySnapshot,
+    path: &Path,
+    access: crate::lock::LockAccess,
+    legacy: &crate::lock::LockResource,
+) {
+    let emitted = snapshot
+        .lock_resources
+        .iter()
+        .filter(|resource| {
+            resource.kind == crate::lock::LockResourceKind::DiscoveryEntry
+                && resource.access == access
+                && resource.path == path
+        })
+        .map(|resource| resource.lock_keys()[0].clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let shared = crate::lock::LockResource::describe_shared(
+        crate::lock::LockResourceKind::DiscoveryEntry,
+        access,
+        path,
+    )
+    .expect("shared discovery identity");
+
+    assert!(
+        emitted.contains(&shared.lock_keys()[0]),
+        "the shared volume-root key is emitted for {}",
+        path.display()
+    );
+    assert!(
+        emitted.contains(&legacy.lock_keys()[0]),
+        "the origin/dev/0.3.x key is emitted for {}",
+        path.display()
+    );
+    assert_ne!(
+        shared.lock_keys()[0],
+        legacy.lock_keys()[0],
+        "the fixture must exercise two distinct logical identities"
+    );
 }
 
 #[test]
@@ -1204,6 +1245,37 @@ fn every_codex_discovery_root_and_backing_store_is_locked() {
         .inspect_discovery(&context)
         .expect("discovery snapshot");
 
+    let preferred = project.preferred();
+    let preferred_state = classify(&preferred).expect("missing Codex destination");
+    let legacy_writer = crate::lock::LockResource::describe_entry(
+        crate::lock::LockResourceKind::DiscoveryEntry,
+        crate::lock::LockAccess::Mutate,
+        &project.root,
+        &preferred_state,
+    )
+    .expect("origin/dev/0.3.x Codex writer identity");
+    assert_dual_discovery_keys(
+        &snapshot,
+        &preferred,
+        crate::lock::LockAccess::Mutate,
+        &legacy_writer,
+    );
+
+    let nested_legacy = nested.join(LEGACY);
+    let legacy_observer = crate::lock::LockResource::describe_entry(
+        crate::lock::LockResourceKind::DiscoveryEntry,
+        crate::lock::LockAccess::Observe,
+        &project.root,
+        &classify(&nested_legacy).expect("existing Codex ancestor scope"),
+    )
+    .expect("origin/dev/0.3.x Codex observer identity");
+    assert_dual_discovery_keys(
+        &snapshot,
+        &nested_legacy,
+        crate::lock::LockAccess::Observe,
+        &legacy_observer,
+    );
+
     let resources = snapshot
         .lock_resources
         .iter()
@@ -1265,6 +1337,83 @@ fn every_codex_discovery_root_and_backing_store_is_locked() {
     .collect::<std::collections::BTreeSet<_>>();
 
     assert_eq!(resources, expected);
+}
+
+#[test]
+fn omp_emits_shared_and_legacy_keys_for_observation_and_mutation() {
+    let project = Project::new("omp-dual-lock-identities");
+    let context = project.context(AgentId::Omp, MountMode::Project, ConflictPolicy::Error);
+    let snapshot = OmpAdapter
+        .inspect_discovery(&context)
+        .expect("OMP discovery snapshot");
+
+    let destination = project.root.join(".omp/skills");
+    let legacy_writer = crate::lock::LockResource::describe_entry(
+        crate::lock::LockResourceKind::DiscoveryEntry,
+        crate::lock::LockAccess::Mutate,
+        &project.root,
+        &classify(&destination).expect("missing OMP destination"),
+    )
+    .expect("origin/dev/0.3.x OMP writer identity");
+    assert_dual_discovery_keys(
+        &snapshot,
+        &destination,
+        crate::lock::LockAccess::Mutate,
+        &legacy_writer,
+    );
+
+    let observed = project.root.join("home/.omp/agent/skills");
+    let legacy_observer = crate::lock::LockResource::describe_entry(
+        crate::lock::LockResourceKind::DiscoveryEntry,
+        crate::lock::LockAccess::Observe,
+        &project.root,
+        &classify(&observed).expect("missing OMP user scope"),
+    )
+    .expect("origin/dev/0.3.x OMP observer identity");
+    assert_dual_discovery_keys(
+        &snapshot,
+        &observed,
+        crate::lock::LockAccess::Observe,
+        &legacy_observer,
+    );
+}
+
+#[test]
+fn claude_emits_shared_and_legacy_keys_for_observation_and_project_mutation() {
+    let project = Project::new("claude-dual-lock-identities");
+    let context = project.context(AgentId::Claude, MountMode::Project, ConflictPolicy::Error);
+    let snapshot = ClaudeAdapter
+        .inspect_discovery(&context)
+        .expect("Claude discovery snapshot");
+
+    let legacy_writer = crate::lock::LockResource::describe(
+        crate::lock::LockResourceKind::DiscoveryEntry,
+        crate::lock::LockAccess::Mutate,
+        &project.root,
+        &project.root,
+    )
+    .expect("origin/dev/0.3.x Claude project writer identity");
+    assert_dual_discovery_keys(
+        &snapshot,
+        &project.root,
+        crate::lock::LockAccess::Mutate,
+        &legacy_writer,
+    );
+
+    let observed = project.root.join("home/.claude/skills");
+    let legacy_observer = crate::lock::LockResource::describe_entry(
+        crate::lock::LockResourceKind::DiscoveryEntry,
+        crate::lock::LockAccess::Observe,
+        &project.root,
+        &classify(&observed).expect("missing Claude user scope"),
+    )
+    .expect("legacy project-scope observer identity");
+    assert_dual_discovery_keys(
+        &snapshot,
+        &observed,
+        crate::lock::LockAccess::Observe,
+        &legacy_observer,
+    );
 }
 
 #[test]
