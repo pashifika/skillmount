@@ -92,7 +92,7 @@ impl fmt::Display for ApplyFailure {
 impl Transaction {
     /// Applies every planned action, rolling back in reverse order if any of them fails.
     ///
-    /// On success the journal is durably `active` and every owned action is `applied`. On failure
+    /// On success the journal is durably `active` and every created action is `applied`. On failure
     /// the journal is durably `failed`, carries the original error and every rollback error, and
     /// the transaction owns nothing that could still be verified and removed.
     ///
@@ -103,18 +103,18 @@ impl Transaction {
     /// than the success value and would otherwise widen every frame on the happy path.
     pub fn apply(&mut self) -> Result<(), Box<ApplyFailure>> {
         if let Err(error) = self.advance(TransactionStatus::Applying) {
-            return Err(Self::fail_without_rollback(error));
+            return Err(Box::new(Self::fail_without_rollback(error)));
         }
         reached(Checkpoint::JournalApplying, 1);
 
         for index in 0..self.journal.actions.len() {
             if let Err(error) = self.apply_one(index) {
-                return Err(self.roll_back(error));
+                return Err(Box::new(self.roll_back(error)));
             }
         }
 
         if let Err(error) = self.advance(TransactionStatus::Active) {
-            return Err(self.roll_back(error));
+            return Err(Box::new(self.roll_back(error)));
         }
         reached(Checkpoint::JournalActive, 1);
         Ok(())
@@ -171,7 +171,7 @@ impl Transaction {
             .temporary_path
             .clone()
             .ok_or_else(|| {
-                AppError::Internal("an owned action must record its staged sibling".to_owned())
+                AppError::Internal("a created action must record its staged sibling".to_owned())
             })?;
 
         self.check_precondition(index, &final_path)?;
@@ -309,10 +309,10 @@ impl Transaction {
 
     /// Builds the error for a destination whose observed state contradicts the plan.
     fn drift(path: &Path, reason: &str) -> AppError {
-        AppError::Plan(PlanError::UnsupportedLayout {
+        AppError::Plan(Box::new(PlanError::UnsupportedLayout {
             path: path.to_path_buf(),
             reason: reason.to_owned(),
-        })
+        }))
     }
 
     /// Records a placement result that must be reported but not repaired by this apply attempt.
@@ -333,12 +333,12 @@ impl Transaction {
     }
 
     /// Records a failure that happened before anything could have been created.
-    fn fail_without_rollback(cause: AppError) -> Box<ApplyFailure> {
-        Box::new(ApplyFailure {
+    fn fail_without_rollback(cause: AppError) -> ApplyFailure {
+        ApplyFailure {
             cause,
             retained: Vec::new(),
             rollback_errors: Vec::new(),
-        })
+        }
     }
 }
 

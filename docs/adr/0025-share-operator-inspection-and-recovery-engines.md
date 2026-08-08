@@ -1,6 +1,6 @@
 # ADR 0025: Share Operator Inspection and Recovery Engines
 
-- **Status:** Accepted
+- **Status:** Accepted; vector-only recovery presentation superseded by ADR 0038
 - **Date:** 2026-08-03
 - **Supersedes:** _none_
 
@@ -46,8 +46,8 @@ rather than treating the empty set as proof that all locks are held.
 Unreadable journals remain a global fail-closed condition and prevent every cleanup mutation.
 Active or unreadable state returns temporary status 75, ownership-retained or filesystem cleanup
 failure returns 73, and a complete/no-op pass returns zero. When conditions overlap, 73 takes
-precedence. Retry arguments are rendered as indexed native values, never as an executable shell
-command string.
+precedence. Retry operations remain executable-plus-argument native values. ADR 0038 supersedes
+only this record's requirement to display them exclusively as indexed native values.
 
 ## Alternatives
 
@@ -59,8 +59,10 @@ command string.
   may own the same resources; scope cannot be proved from a journal that cannot be decoded.
 - Probe link capability inside `.agents`, `.codex`, or `.claude`. Rejected because diagnosis would
   then mutate the project namespace it is meant to inspect.
-- Print copy-paste shell commands. Rejected because platform-native and non-Unicode arguments
-  cannot be represented portably without introducing shell interpretation.
+- Print one portable or unconditional copy-paste shell command. Rejected because platform-native
+  and non-Unicode arguments cannot share one portable representation. ADR 0038 later permits a
+  narrower detected-shell convenience line only after an exact encoder succeeds, with this native
+  representation retained as the fallback.
 
 ## Consequences
 

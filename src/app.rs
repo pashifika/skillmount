@@ -9,7 +9,7 @@ use clap::error::ErrorKind;
 
 use crate::agent::{AgentAdapter, DiscoverySnapshot, adapter};
 use crate::catalog::{CatalogRequest, resolve_catalog};
-use crate::cli::{CompletionInput, InspectAgent, ParsedCommand, parse_command_from};
+use crate::cli::{CompletionInput, InspectAgent, ParsedCommand, ProductBinary, parse_command_from};
 use crate::domain::{AgentId, LinkMode, MountMode, RunContext, SkillCatalog};
 use crate::error::{AppError, CatalogError, ExitCategory, LinkError, PlanError};
 use crate::journal::store::RejectedJournal;
@@ -18,7 +18,8 @@ use crate::lock::acquire::{HeldLocks, LockOwner, LockPolicy};
 use crate::mount::MountPlan;
 use crate::paths::{resolve_inspection, resolve_session};
 use crate::process::{
-    CleanupFailure, ProcessSupervisor, SupervisionDiagnostic, SupervisionRequest, map_exit,
+    CleanupFailure, InvocationShell, ProcessSupervisor, SupervisionDiagnostic, SupervisionRequest,
+    invocation_shell, map_exit,
 };
 use crate::render;
 use crate::transaction::cleanup::CleanupReport;
@@ -26,6 +27,11 @@ use crate::transaction::{Transaction, recover};
 
 /// Maximum discovery/recovery passes allowed while a mutating lock set expands.
 const MAX_LOCK_SET_PASSES: usize = 8;
+#[derive(Debug, Clone, Copy)]
+struct InvocationContext {
+    product: ProductBinary,
+    shell: InvocationShell,
+}
 
 pub(crate) fn run_from<I, T>(args: I) -> ExitCode
 where
@@ -33,6 +39,13 @@ where
     T: Into<OsString> + Clone,
 {
     let mut args = args.into_iter().map(Into::into).collect::<Vec<OsString>>();
+    let invocation = InvocationContext {
+        product: args
+            .first()
+            .and_then(|argv0| ProductBinary::from_argv0(argv0))
+            .unwrap_or(ProductBinary::Asm),
+        shell: invocation_shell(),
+    };
     if args.len() == 1 {
         args.push(OsString::from("--help"));
     }
@@ -56,7 +69,7 @@ where
             let mut stdout = io::stdout().lock();
             return match execute_completion(input, &mut stdout) {
                 Ok(code) => ExitCode::from(code),
-                Err(error) => report_error(&error),
+                Err(error) => report_error(&error, invocation),
             };
         }
         command => command,
@@ -65,14 +78,15 @@ where
     let invocation_cwd = match std::env::current_dir() {
         Ok(path) => path,
         Err(error) => {
-            return report_error(&AppError::Internal(format!(
-                "cannot capture invocation CWD: {error}"
-            )));
+            return report_error(
+                &AppError::Internal(format!("cannot capture invocation CWD: {error}")),
+                invocation,
+            );
         }
     };
-    match execute(command, &invocation_cwd) {
+    match execute(command, &invocation_cwd, invocation) {
         Ok(code) => ExitCode::from(code),
-        Err(error) => report_error(&error),
+        Err(error) => report_error(&error, invocation),
     }
 }
 
@@ -86,7 +100,11 @@ fn execute_completion(input: CompletionInput, writer: &mut dyn Write) -> Result<
     }
 }
 
-fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError> {
+fn execute(
+    command: ParsedCommand,
+    invocation_cwd: &Path,
+    invocation: InvocationContext,
+) -> Result<u8, AppError> {
     match command {
         ParsedCommand::Completions(_) => Err(AppError::Internal(
             "completion request reached path-dependent command dispatch".to_owned(),
@@ -95,7 +113,7 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError
             let dry_run = input.options.dry_run;
             let context = resolve_session(input, invocation_cwd)?;
             if !dry_run {
-                return run_session(&context);
+                return run_session(&context, invocation);
             }
             let report = plan_read_only(&context)?;
             emit(&render::render(&render::ReadOnlyReport {
@@ -169,7 +187,12 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError
             Ok(outcome.code)
         }
         ParsedCommand::Cleanup(input) => {
-            let outcome = crate::operator::cleanup::run(&input, invocation_cwd)?;
+            let outcome = crate::operator::cleanup::run(
+                &input,
+                invocation_cwd,
+                invocation.product,
+                invocation.shell,
+            )?;
             emit(&outcome.output)?;
             Ok(outcome.code)
         }
@@ -195,7 +218,7 @@ pub(crate) struct ReadOnlyOutcome {
 /// child was spawned or the managed process domain is empty; uncertain liveness leaves the active
 /// journal untouched for recovery. `--keep-mounts` reaches the transaction's terminal kept state
 /// through that same callback.
-fn run_session(context: &RunContext) -> Result<u8, AppError> {
+fn run_session(context: &RunContext, invocation: InvocationContext) -> Result<u8, AppError> {
     // Root-changing arguments and release-independent Agent controls are rejected before reading
     // or creating SkillMount state. No Agent process runs here: mount visibility and removal are
     // established by the journal, the locks, proven process-domain death, and ownership-verified
@@ -245,7 +268,7 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     // after every restart and after every monotonic expansion.
     let mut stable = None;
     for _ in 0..MAX_LOCK_SET_PASSES {
-        reconcile_incomplete_transactions(&context, &mut locks)?;
+        reconcile_incomplete_transactions(&context, &mut locks, invocation)?;
 
         // Built under the lock and after recovery, because recovery may have removed mounts
         // discovery saw a moment ago. A plan that disagrees with the filesystem it is about to
@@ -326,14 +349,19 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     let request = SupervisionRequest::new(rebuilt.plan.launch.clone());
     let verbose_cleanup = context.options.verbosity > 0;
     let outcome = ProcessSupervisor::new().supervise(request, move || {
-        cleanup_for_supervisor(&mut transaction, &journal_path, verbose_cleanup)
+        cleanup_for_supervisor(
+            &mut transaction,
+            &journal_path,
+            verbose_cleanup,
+            invocation.product,
+        )
     });
     // Lock ownership covers the whole child lifetime and the cleanup callback. Keeping this
     // explicit prevents a future refactor from shortening the guard to the last planning use.
     drop(locks);
 
     let decision = map_exit(&outcome);
-    report_supervision_diagnostics(&decision);
+    report_supervision_diagnostics(&decision, invocation.shell);
     Ok(decision.code)
 }
 
@@ -419,13 +447,14 @@ fn cleanup_for_supervisor(
     transaction: &mut Transaction,
     journal_path: &Path,
     verbose: bool,
+    product: ProductBinary,
 ) -> Result<(), CleanupFailure> {
-    let recovery_command = cleanup_recovery_arguments(&transaction.journal().project_root);
+    let recovery_command = cleanup_recovery_arguments(product, &transaction.journal().project_root);
     match transaction.cleanup() {
         Ok(report) => {
             if verbose {
                 if report.removed.is_empty() {
-                    inform(&["cleanup removed 0 transaction-owned entries".to_owned()]);
+                    inform(&["cleanup removed 0 created entries".to_owned()]);
                 } else {
                     inform(
                         &report
@@ -437,42 +466,65 @@ fn cleanup_for_supervisor(
                             .collect::<Vec<_>>(),
                     );
                 }
+                // Scaffolding a pass preserved is normal housekeeping, not a finding. It appears
+                // only where an operator asked for detail.
+                inform(&report.describe_preserved());
             }
-            let messages = report.describe();
-            warn(&messages);
             if report.needs_attention() {
-                Err(cleanup_failure_from_report(
+                // Deliberately no warning first: the same facts are about to be reported once, as
+                // one structured block, by the supervision diagnostic.
+                return Err(cleanup_failure_from_report(
                     &report,
-                    &messages,
                     journal_path,
                     recovery_command,
-                ))
-            } else {
-                Ok(())
+                ));
             }
+            warn(&report.describe());
+            Ok(())
         }
         Err(error) => Err(CleanupFailure {
             reason: error.to_string(),
-            failed_paths: Vec::new(),
+            failed_paths: transaction.cleanup_critical_paths(),
             retained_journal: Some(journal_path.to_path_buf()),
             recovery_command,
         }),
     }
 }
 
+/// Summarizes why cleanup could not finish, without repeating the paths the block already lists.
+///
+/// Identical reasons collapse: two links refused for the same cause are one fact, and each of their
+/// paths still gets its own `retained path` line.
 fn cleanup_failure_from_report(
     report: &CleanupReport,
-    messages: &[String],
     fallback_journal: &Path,
     recovery_command: Vec<OsString>,
 ) -> CleanupFailure {
+    let mut reasons: Vec<String> = Vec::new();
+    for reason in report
+        .retained
+        .iter()
+        .chain(&report.failed)
+        .map(|entry| entry.reason.clone())
+    {
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+    let mut failed_paths = Vec::with_capacity(report.retained.len() + report.failed.len());
+    for path in report
+        .retained
+        .iter()
+        .chain(&report.failed)
+        .map(|entry| &entry.path)
+    {
+        if !failed_paths.contains(path) {
+            failed_paths.push(path.clone());
+        }
+    }
     CleanupFailure {
-        reason: messages.join("; "),
-        failed_paths: report
-            .retained
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect(),
+        reason: reasons.join("; "),
+        failed_paths,
         retained_journal: report
             .journal_retained
             .as_ref()
@@ -482,34 +534,84 @@ fn cleanup_failure_from_report(
     }
 }
 
-fn cleanup_recovery_arguments(project_root: &Path) -> Vec<OsString> {
+fn cleanup_recovery_arguments(product: ProductBinary, project_root: &Path) -> Vec<OsString> {
     vec![
-        OsString::from("asm"),
+        OsString::from(product.registration_name()),
         OsString::from("cleanup"),
         OsString::from("--project-root"),
         project_root.as_os_str().to_os_string(),
     ]
 }
 
-fn report_supervision_diagnostics(decision: &crate::process::ExitDecision) {
-    if let Some(primary) = &decision.primary {
-        let _ = writeln!(
-            io::stderr().lock(),
-            "error: {}",
-            render_supervision_diagnostic(primary)
-        );
-    }
-    for secondary in &decision.secondary {
-        let _ = writeln!(
-            io::stderr().lock(),
-            "warning: {}",
-            render_supervision_diagnostic(secondary)
-        );
+fn report_supervision_diagnostics(decision: &crate::process::ExitDecision, shell: InvocationShell) {
+    let mut stderr = io::stderr().lock();
+    for line in supervision_diagnostic_report(decision, shell) {
+        let _ = writeln!(stderr, "{line}");
     }
 }
 
-fn render_supervision_diagnostic(diagnostic: &SupervisionDiagnostic) -> String {
-    render::text_value(&describe_supervision_diagnostic(diagnostic))
+fn supervision_diagnostic_report(
+    decision: &crate::process::ExitDecision,
+    shell: InvocationShell,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(primary) = &decision.primary {
+        lines.extend(supervision_diagnostic_lines("error", primary));
+    }
+    for secondary in &decision.secondary {
+        lines.extend(supervision_diagnostic_lines("warning", secondary));
+    }
+    let recovery_operations = decision
+        .primary
+        .iter()
+        .chain(decision.secondary.iter())
+        .filter_map(|diagnostic| match diagnostic {
+            SupervisionDiagnostic::Cleanup(failure) if !failure.recovery_command.is_empty() => {
+                Some(failure.recovery_command.as_slice())
+            }
+            _ => None,
+        });
+    lines.extend(render::recovery_footer(shell, recovery_operations));
+    lines
+}
+
+/// Renders one diagnostic as already-escaped lines, severity headline first.
+fn supervision_diagnostic_lines(severity: &str, diagnostic: &SupervisionDiagnostic) -> Vec<String> {
+    match diagnostic {
+        SupervisionDiagnostic::Cleanup(failure) => cleanup_failure_lines(severity, failure),
+        other => vec![format!(
+            "{severity}: {}",
+            render::text_value(&describe_supervision_diagnostic(other))
+        )],
+    }
+}
+
+/// Renders a cleanup failure as one deliberately multiline block.
+///
+/// Only the fixed labels and separators here introduce a newline; every external value is escaped on
+/// its own, so a reason or path carrying `\n[PASS] forged` cannot manufacture a line that looks like
+/// one of ours. The severity is the whole difference between replacing child success and annotating a
+/// child failure, and each fact appears exactly once.
+fn cleanup_failure_lines(severity: &str, failure: &CleanupFailure) -> Vec<String> {
+    let mut lines = vec![format!("{severity}: session cleanup failed")];
+    if !failure.reason.is_empty() {
+        lines.push(format!("  reason: {}", render::text_value(&failure.reason)));
+    }
+    for path in &failure.failed_paths {
+        lines.push(format!(
+            "  retained path: {}",
+            render::path_value(path, true)
+        ));
+    }
+    match &failure.retained_journal {
+        Some(path) => lines.push(format!(
+            "  retained journal: {}",
+            render::path_value(path, true)
+        )),
+        None => lines.push("  retained journal: none was available".to_owned()),
+    }
+    // Recovery is rendered once, after every complete primary and secondary diagnostic block.
+    lines
 }
 
 fn describe_supervision_diagnostic(diagnostic: &SupervisionDiagnostic) -> String {
@@ -541,40 +643,9 @@ fn describe_supervision_diagnostic(diagnostic: &SupervisionDiagnostic) -> String
         SupervisionDiagnostic::ExceptionalUnixStatus { raw_status } => {
             format!("agent returned unrepresentable Unix wait status {raw_status}")
         }
-        SupervisionDiagnostic::Cleanup(failure) => {
-            let journal = failure.retained_journal.as_ref().map_or_else(
-                || "no journal path was available".to_owned(),
-                |path| format!("journal retained at {}", path.display()),
-            );
-            let retained = failure
-                .failed_paths
-                .iter()
-                .map(|path| format!("retained path {}", render::path_value(path, true)))
-                .collect::<Vec<_>>()
-                .join("; ");
-            let recovery = failure
-                .recovery_command
-                .iter()
-                .enumerate()
-                .map(|(index, argument)| {
-                    format!(
-                        "recovery argv[{index}] = {}",
-                        render::os_value(argument, true)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            [
-                format!("session cleanup failed: {}", failure.reason),
-                retained,
-                journal,
-                recovery,
-            ]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("; ")
-        }
+        // Rendered as a structured block by `cleanup_failure_lines`; recovery is appended once
+        // after every complete primary and secondary diagnostic.
+        SupervisionDiagnostic::Cleanup(_) => "session cleanup failed".to_owned(),
     }
 }
 
@@ -586,17 +657,20 @@ fn describe_supervision_diagnostic(diagnostic: &SupervisionDiagnostic) -> String
 fn reconcile_incomplete_transactions(
     context: &RunContext,
     locks: &mut HeldLocks,
+    invocation: InvocationContext,
 ) -> Result<(), AppError> {
     if context.options.no_recover {
         let blocking = recover::blocking_state(locks)?;
         if blocking.is_empty() {
             return Ok(());
         }
-        return Err(AppError::Temporary(format!(
-            "--no-recover forbids reconciling incomplete transaction state, and nothing was \
-             changed:\n{}",
-            blocking.join("\n")
-        )));
+        return Err(AppError::TemporaryReport {
+            summary: "--no-recover forbids reconciling incomplete transaction state, and nothing \
+                      was changed"
+                .to_owned(),
+            detail: blocking,
+            recovery: Vec::new().into_boxed_slice(),
+        });
     }
 
     let report = recover::recover_stale(locks)?;
@@ -604,39 +678,66 @@ fn reconcile_incomplete_transactions(
         return Err(unreadable_journals_error(&report.unreadable));
     }
     if !report.quarantined.is_empty() {
+        // `report.describe` names each quarantined journal once. Native operations stay separate
+        // until the application boundary appends one deduplicated recovery footer.
+        let mut detail = report.describe();
+        detail.push(
+            "state: recovered entries listed above were changed by ownership-checked recovery; the \
+             quarantined mounts were not changed and remain journal-backed"
+                .to_owned(),
+        );
+        detail.push(
+            "safe next action: use the recovery operation below for each quarantined project, or \
+             account for every recorded path manually"
+                .to_owned(),
+        );
         let recovery = report
             .quarantined
             .iter()
-            .enumerate()
-            .flat_map(|(recovery_index, quarantined)| {
-                let mut lines = vec![format!(
-                    "recovery[{recovery_index}] journal = {}",
-                    render::path_value(&quarantined.journal, true)
-                )];
-                lines.extend(
-                    cleanup_recovery_arguments(&quarantined.project_root)
-                        .into_iter()
-                        .enumerate()
-                        .map(move |(argument_index, argument)| {
-                            format!(
-                                "recovery[{recovery_index}] argv[{argument_index}] = {}",
-                                render::os_value(&argument, true)
-                            )
-                        }),
-                );
-                lines
+            .map(|quarantined| {
+                cleanup_recovery_arguments(invocation.product, &quarantined.project_root)
             })
             .collect::<Vec<_>>()
-            .join("\n");
-        return Err(AppError::Temporary(format!(
-            "cannot start a mutating session because process-domain death was never proved:\n{}\n\
-             state: recovered entries listed above were changed by ownership-checked recovery; \
-             the quarantined mounts were not changed and remain journal-backed\n\
-             safe next action: verify that every related process has exited, then invoke the \
-             explicit recovery arguments below or account for every recorded path manually:\n{}",
-            report.describe().join("\n"),
-            recovery
-        )));
+            .into_boxed_slice();
+        return Err(AppError::TemporaryReport {
+            summary:
+                "cannot start a mutating session because process-domain death was never proved"
+                    .to_owned(),
+            detail,
+            recovery,
+        });
+    }
+    let unresolved = report
+        .reconciled
+        .iter()
+        .filter(|entry| entry.report.needs_attention())
+        .collect::<Vec<_>>();
+    if !unresolved.is_empty() {
+        let mut detail = report.describe();
+        detail.push(
+            "state: every unproven entry and its ownership journal were retained; no new mount was \
+             planned or applied"
+                .to_owned(),
+        );
+        detail.push(
+            "safe next action: inspect every retained path and any location to which the created \
+             link may have moved; correct a reported mismatch before retrying, or invoke the listed \
+             cleanup command to accept an all-absent set of recorded paths"
+                .to_owned(),
+        );
+        let recovery = unresolved
+            .iter()
+            .map(|entry| cleanup_recovery_arguments(invocation.product, &entry.project_root))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        return Err(AppError::FilesystemReport {
+            summary:
+                "cannot start a mutating session because recovered Skill-link ownership remains \
+                 unresolved"
+                    .to_owned(),
+            detail,
+            recovery,
+        });
     }
     warn(&report.describe());
     Ok(())
@@ -644,23 +745,29 @@ fn reconcile_incomplete_transactions(
 
 /// Builds the fail-closed operator diagnostic for journals this build cannot account for.
 fn unreadable_journals_error(rejected: &[RejectedJournal]) -> AppError {
-    AppError::Temporary(format!(
-        "cannot start a mutating session while transaction state is unreadable or uses an \
-         unsupported schema; no cleanup was attempted and no new plan was applied:\n{}\n\
-         account for every recorded path that may belong to each reported journal before moving \
-         or removing any remaining state, then retry",
-        rejected
-            .iter()
-            .map(|rejected| {
-                format!(
-                    "transaction journal {} cannot be interpreted: {}",
-                    rejected.path.display(),
-                    rejected.reason
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    ))
+    let mut detail = rejected
+        .iter()
+        .map(|rejected| {
+            format!(
+                "transaction journal {} cannot be interpreted: {}",
+                render::path_value(&rejected.path, true),
+                render::text_value(&rejected.reason)
+            )
+        })
+        .collect::<Vec<_>>();
+    detail.push(
+        "account for every recorded path that may belong to each reported journal before moving or \
+         removing any remaining state, then retry"
+            .to_owned(),
+    );
+    AppError::TemporaryReport {
+        summary:
+            "cannot start a mutating session while transaction state is unreadable or uses an \
+                  unsupported schema; no cleanup was attempted and no new plan was applied"
+                .to_owned(),
+        recovery: Vec::new().into_boxed_slice(),
+        detail,
+    }
 }
 
 /// Extends an accumulated lock-resource description without duplicating identical observations.
@@ -820,11 +927,27 @@ fn report_clap_fallback(original_kind: ErrorKind) -> ExitCode {
     }
 }
 
-fn report_error(error: &AppError) -> ExitCode {
+fn report_error(error: &AppError, invocation: InvocationContext) -> ExitCode {
     let mut stderr = io::stderr().lock();
     let _ = writeln!(stderr, "error: {}", render::text_value(&error.to_string()));
+    if let AppError::TemporaryReport { detail, .. } | AppError::FilesystemReport { detail, .. } =
+        error
+    {
+        // Written verbatim: each line was built here from independently escaped values, so escaping
+        // the block again would only hide the structure it exists to provide.
+        for line in detail {
+            let _ = writeln!(stderr, "{line}");
+        }
+    }
     for line in error_guidance(error) {
         let _ = writeln!(stderr, "{line}");
+    }
+    if let AppError::TemporaryReport { recovery, .. }
+    | AppError::FilesystemReport { recovery, .. } = error
+    {
+        for line in render::recovery_footer(invocation.shell, recovery.iter().map(Vec::as_slice)) {
+            let _ = writeln!(stderr, "{line}");
+        }
     }
     ExitCode::from(error.category().code())
 }
@@ -840,10 +963,14 @@ fn error_guidance(error: &AppError) -> Vec<&'static str> {
             "state: no selected Skill was mounted and no existing destination was replaced; any earlier stale recovery was reported separately",
             "safe next action: correct the named catalog entry or source ordering, then retry",
         ],
-        AppError::Plan(PlanError::DestinationConflict { .. }) => vec![
-            "state: the conflicting destination was not replaced; any earlier stale recovery was reported separately",
-            "safe next action: --conflict=skip may preserve an ordinary project directory or different-source directory link while omitting this selected Skill; otherwise account for and repair the existing entry before retrying",
-        ],
+        AppError::Plan(error)
+            if matches!(error.as_ref(), PlanError::DestinationConflict { .. }) =>
+        {
+            vec![
+                "state: the conflicting destination was not replaced; any earlier stale recovery was reported separately",
+                "safe next action: --conflict=skip may preserve an ordinary project directory or different-source directory link while omitting this selected Skill; otherwise account for and repair the existing entry before retrying",
+            ]
+        }
         AppError::Plan(_) => vec![
             "state: the reported destination was not replaced; an ownership-checked rollback completed if mutation had already begun",
             "safe next action: inspect and account for the reported discovery entry before repairing it and retrying",
@@ -869,10 +996,13 @@ fn error_guidance(error: &AppError) -> Vec<&'static str> {
         AppError::Filesystem(_) => vec![
             "safe next action: inspect every retained path and journal named above with asm doctor; use asm cleanup only after proving no related process is active",
         ],
-        AppError::Temporary(_) => vec![
+        AppError::FilesystemReport { .. }
+        | AppError::Usage(_)
+        | AppError::Internal(_)
+        | AppError::Interrupted => Vec::new(),
+        AppError::Temporary(_) | AppError::TemporaryReport { .. } => vec![
             "safe next action: run asm doctor and wait for any active session to exit; never delete a lock file or trust holder text as liveness proof, and use asm cleanup only after proving process-domain death",
         ],
-        AppError::Usage(_) | AppError::Internal(_) | AppError::Interrupted => Vec::new(),
     }
 }
 
@@ -883,12 +1013,14 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        error_guidance, execute_completion, junction_policy_warning, render_supervision_diagnostic,
+        cleanup_failure_from_report, error_guidance, execute_completion, junction_policy_warning,
+        supervision_diagnostic_lines, supervision_diagnostic_report,
     };
     use crate::cli::{CompletionInput, CompletionShell, ProductBinary};
     use crate::domain::{AgentId, LinkMode};
     use crate::error::{AppError, ExitCategory, LinkError};
-    use crate::process::{CleanupFailure, SupervisionDiagnostic};
+    use crate::process::{CleanupFailure, ExitDecision, InvocationShell, SupervisionDiagnostic};
+    use crate::transaction::cleanup::CleanupReport;
 
     struct ErrorWriter {
         kind: io::ErrorKind,
@@ -909,6 +1041,17 @@ mod tests {
             shell: CompletionShell::Bash,
             product: ProductBinary::Asm,
         }
+    }
+
+    fn diagnostic_report(diagnostic: SupervisionDiagnostic, shell: InvocationShell) -> Vec<String> {
+        supervision_diagnostic_report(
+            &ExitDecision {
+                code: ExitCategory::Filesystem.code(),
+                primary: Some(diagnostic),
+                secondary: Vec::new(),
+            },
+            shell,
+        )
     }
 
     #[test]
@@ -985,22 +1128,262 @@ mod tests {
     }
 
     #[test]
+    fn a_cleanup_removal_error_keeps_its_path_in_the_structured_failure() {
+        let failed_path = PathBuf::from("/project/.agents/skills/alpha");
+        let fallback_journal = PathBuf::from("/state/transactions/one.journal");
+        let report = CleanupReport {
+            failed: vec![crate::transaction::cleanup::RetainedEntry {
+                path: failed_path.clone(),
+                reason: "access was denied".to_owned(),
+            }],
+            ..CleanupReport::default()
+        };
+
+        let failure = cleanup_failure_from_report(&report, &fallback_journal, Vec::new());
+
+        assert_eq!(failure.reason, "access was denied");
+        assert_eq!(failure.failed_paths, vec![failed_path]);
+        assert_eq!(failure.retained_journal, Some(fallback_journal));
+    }
+
+    /// One structured block per condition, followed by one native fallback footer.
+    #[test]
+    fn a_cleanup_failure_renders_one_labelled_block_per_condition() {
+        let diagnostic = SupervisionDiagnostic::Cleanup(CleanupFailure {
+            reason: "the entry could not be proved to belong to this session".to_owned(),
+            failed_paths: vec![
+                PathBuf::from("/project/.agents/skills/alpha"),
+                PathBuf::from("/project/.agents/skills/beta"),
+            ],
+            retained_journal: Some(PathBuf::from("/state/transactions/one.journal")),
+            recovery_command: vec![
+                OsString::from("asm"),
+                OsString::from("cleanup"),
+                OsString::from("--project-root"),
+                OsString::from("/project"),
+            ],
+        });
+
+        let lines = diagnostic_report(diagnostic, InvocationShell::Unknown);
+        let rendered = lines.join("\n");
+
+        assert_eq!(lines[0], "error: session cleanup failed", "{rendered}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("  retained path: "))
+                .count(),
+            2,
+            "each retained path gets its own line: {rendered}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("  reason: "))
+                .count(),
+            1,
+            "the reason is stated once: {rendered}"
+        );
+        assert!(
+            lines.contains(&"  retained journal: /state/transactions/one.journal".to_owned()),
+            "{rendered}"
+        );
+        assert!(
+            lines.contains(&"    executable: asm".to_owned())
+                && lines.contains(&"    argument 1: cleanup".to_owned())
+                && lines.contains(&"    argument 2: --project-root".to_owned())
+                && lines.contains(&"    argument 3: /project".to_owned()),
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("Recovery —").count(), 1, "{rendered}");
+        assert!(!rendered.contains("argv["), "{rendered}");
+        assert!(
+            !rendered.contains("asm cleanup --project-root"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn every_diagnostic_precedes_one_stably_deduplicated_recovery_footer() {
+        let cleanup = |reason: &str, recovery_command: Vec<OsString>| {
+            SupervisionDiagnostic::Cleanup(CleanupFailure {
+                reason: reason.to_owned(),
+                failed_paths: vec![PathBuf::from(format!("/retained/{reason}"))],
+                retained_journal: Some(PathBuf::from(format!("/journal/{reason}"))),
+                recovery_command,
+            })
+        };
+        let first = vec![
+            OsString::from("asm"),
+            OsString::from("cleanup"),
+            OsString::from("--project-root"),
+            OsString::from(r"D:\recovery one"),
+        ];
+        let second = vec![
+            OsString::from("skillmount"),
+            OsString::from("cleanup"),
+            OsString::from("--project-root"),
+            OsString::from(r"D:\recovery two"),
+        ];
+        let decision = ExitDecision {
+            code: ExitCategory::Filesystem.code(),
+            primary: Some(cleanup("first", first.clone())),
+            secondary: vec![cleanup("duplicate", first), cleanup("second", second)],
+        };
+
+        let rendered =
+            supervision_diagnostic_report(&decision, InvocationShell::PowerShell).join("\n");
+
+        let last_diagnostic = rendered
+            .rfind("  retained journal: /journal/second")
+            .expect("last diagnostic fact");
+        let footer = rendered.find("Recovery —").expect("one recovery footer");
+        assert!(last_diagnostic < footer, "{rendered}");
+        assert_eq!(rendered.matches("Recovery —").count(), 1, "{rendered}");
+        assert_eq!(
+            rendered.matches("command 1 (PowerShell):").count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("command 2 (PowerShell):").count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered
+                .matches(r"asm cleanup --project-root 'D:\recovery one'")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered
+                .matches(r"skillmount cleanup --project-root 'D:\recovery two'")
+                .count(),
+            1,
+            "{rendered}"
+        );
+    }
+
+    /// A child failure keeps its own code; only the severity word changes.
+    #[test]
+    fn a_secondary_cleanup_failure_differs_only_in_its_severity_word() {
+        let failure = CleanupFailure {
+            reason: "removal was refused".to_owned(),
+            failed_paths: vec![PathBuf::from("/project/.agents/skills/alpha")],
+            retained_journal: Some(PathBuf::from("/state/transactions/one.journal")),
+            recovery_command: vec![OsString::from("asm"), OsString::from("cleanup")],
+        };
+        let diagnostic = SupervisionDiagnostic::Cleanup(failure);
+
+        let primary = supervision_diagnostic_lines("error", &diagnostic);
+        let secondary = supervision_diagnostic_lines("warning", &diagnostic);
+
+        assert_eq!(primary[0], "error: session cleanup failed");
+        assert_eq!(secondary[0], "warning: session cleanup failed");
+        assert_eq!(primary[1..], secondary[1..]);
+    }
+
+    #[test]
+    fn a_cleanup_failure_without_a_journal_path_says_so_once() {
+        let diagnostic = SupervisionDiagnostic::Cleanup(CleanupFailure {
+            reason: "the journal transition could not be persisted".to_owned(),
+            failed_paths: Vec::new(),
+            retained_journal: None,
+            recovery_command: Vec::new(),
+        });
+
+        let lines = supervision_diagnostic_lines("error", &diagnostic);
+
+        assert_eq!(
+            lines,
+            [
+                "error: session cleanup failed".to_owned(),
+                "  reason: the journal transition could not be persisted".to_owned(),
+                "  retained journal: none was available".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
     fn supervision_diagnostics_escape_line_and_terminal_controls() {
         let diagnostic = SupervisionDiagnostic::Cleanup(CleanupFailure {
             reason: "cleanup failed\n[PASS] forged\u{1B}]52;clipboard\u{7}".to_owned(),
             failed_paths: vec![PathBuf::from("mount\n[PASS] path")],
             retained_journal: Some(PathBuf::from("journal\u{202E}txt")),
-            recovery_command: vec![OsString::from("cleanup\n[PASS] argv")],
+            recovery_command: vec![
+                OsString::from("asm"),
+                OsString::from("cleanup\n[PASS] argv"),
+            ],
         });
 
-        let rendered = render_supervision_diagnostic(&diagnostic);
+        let lines = diagnostic_report(diagnostic, InvocationShell::Unknown);
+        let rendered = lines.join("\n");
 
         assert!(rendered.contains("\\u{A}"), "{rendered}");
         assert!(rendered.contains("\\u{1B}"), "{rendered}");
         assert!(rendered.contains("\\u{7}"), "{rendered}");
         assert!(rendered.contains("\\u{202E}"), "{rendered}");
-        assert!(!rendered.contains("\n[PASS]"), "{rendered}");
         assert!(!rendered.contains('\u{1B}'), "{rendered}");
         assert!(!rendered.contains('\u{202E}'), "{rendered}");
+        assert_eq!(
+            lines.len(),
+            9,
+            "only fixed separators may create lines: {rendered}"
+        );
+        for line in &lines {
+            assert!(!line.contains('\n'), "{line}");
+        }
+        assert!(
+            !lines.iter().any(|line| line.starts_with("[PASS]")),
+            "{rendered}"
+        );
+    }
+
+    /// A non-Unicode recovery argument stays reversible instead of lossy.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_recovery_argument_is_escaped_reversibly() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let diagnostic = SupervisionDiagnostic::Cleanup(CleanupFailure {
+            reason: "removal was refused".to_owned(),
+            failed_paths: Vec::new(),
+            retained_journal: None,
+            recovery_command: vec![
+                OsString::from("asm"),
+                OsString::from_vec(b"/pro\xffject".to_vec()),
+            ],
+        });
+
+        let rendered = diagnostic_report(diagnostic, InvocationShell::Unknown).join("\n");
+
+        assert!(
+            rendered.contains("argument 1: escaped:/pro\\xFFject"),
+            "{rendered}"
+        );
+    }
+
+    /// A Windows argument holding an unpaired surrogate stays reversible instead of lossy.
+    #[cfg(windows)]
+    #[test]
+    fn an_unpaired_utf16_recovery_argument_is_escaped_reversibly() {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let diagnostic = SupervisionDiagnostic::Cleanup(CleanupFailure {
+            reason: "removal was refused".to_owned(),
+            failed_paths: Vec::new(),
+            retained_journal: None,
+            recovery_command: vec![
+                OsString::from("asm"),
+                OsString::from_wide(&[0x0043, 0x003A, 0x005C, 0xD800, 0x0070]),
+            ],
+        });
+
+        let rendered = diagnostic_report(diagnostic, InvocationShell::PowerShell).join("\n");
+
+        assert!(rendered.contains("argument 1: escaped:"), "{rendered}");
+        assert!(rendered.contains("\\uD800"), "{rendered}");
     }
 }

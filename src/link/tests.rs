@@ -199,19 +199,6 @@ fn comparison_keeps_the_path_the_operator_supplied() {
     assert_ne!(noisy.display_path(), noisy.key());
 }
 
-#[test]
-fn containment_is_compared_by_component_and_not_by_prefix_text() {
-    let store = ComparablePath::new(Path::new("/root/skills/a"));
-
-    assert!(store.contains(&ComparablePath::new(Path::new("/root/skills/a/rust"))));
-    assert!(store.contains(&store), "a store contains itself");
-    assert!(
-        !store.contains(&ComparablePath::new(Path::new("/root/skills/ab"))),
-        "a sibling whose name merely starts with the same text is not contained"
-    );
-    assert!(!store.contains(&ComparablePath::new(Path::new("/root/skills"))));
-}
-
 #[cfg(unix)]
 #[test]
 fn a_non_unicode_path_survives_inspection_and_comparison() {

@@ -551,12 +551,13 @@ fn a_link_to_the_selected_source_is_reused_and_never_owned() {
         "an entry that already points at the selected source is not recreated"
     );
     assert!(
-        plan.owned_actions().all(|action| match &action.operation {
-            MountAction::CreateDirectory { path } => path != &store.join("alpha"),
-            MountAction::CreateDirectoryLink { destination, .. } =>
-                destination != &store.join("alpha"),
-            MountAction::ReuseExistingLink { .. } => false,
-        }),
+        plan.created_actions()
+            .all(|action| match &action.operation {
+                MountAction::CreateDirectory { path } => path != &store.join("alpha"),
+                MountAction::CreateDirectoryLink { destination, .. } =>
+                    destination != &store.join("alpha"),
+                MountAction::ReuseExistingLink { .. } => false,
+            }),
         "a reused entry must never be owned, so cleanup can never remove it"
     );
 }
@@ -1468,7 +1469,7 @@ fn a_same_source_claude_user_skill_is_reused_without_cleanup_ownership() {
     assert_eq!(reuse_destinations(&plan), [user_store.join("alpha")]);
     assert!(link_destinations(&plan).is_empty());
     assert!(
-        plan.owned_actions()
+        plan.created_actions()
             .all(|action| !matches!(&action.operation, MountAction::ReuseExistingLink { .. }))
     );
 }

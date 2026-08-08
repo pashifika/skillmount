@@ -206,6 +206,26 @@ impl Transaction {
         &self.path
     }
 
+    /// Returns every still-pending created Skill link path for a cleanup failure diagnostic.
+    ///
+    /// This is evidence, not removal authority. The caller uses it only when journal persistence
+    /// fails before cleanup can return a structured report, so the operator still learns which
+    /// mounted entries remain.
+    pub(crate) fn cleanup_critical_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for action in self
+            .journal
+            .cleanup_candidates()
+            .filter(|action| action.operation == ActionOperation::CreateDirectoryLink)
+        {
+            let path = action.current_path();
+            if !paths.contains(path) {
+                paths.push(path.clone());
+            }
+        }
+        paths
+    }
+
     /// Durably records that a child may begin using the mounted entries.
     ///
     /// This transition precedes every spawn attempt. If the wrapper disappears afterwards, free
@@ -302,8 +322,11 @@ fn journal_action(
         id: planned.id,
         operation,
         expected_precondition: planned.expected_precondition,
+        // Both create operations receive a transaction-unique staged sibling. Cleanup authority
+        // differs between a Skill link and a helper directory, but the write-ahead sequence that
+        // brings either into existence does not.
         temporary_path: operation
-            .is_transaction_owned()
+            .creates_entry()
             .then(|| staged_sibling(transaction_id, planned.id, &final_path)),
         final_path,
         source_canonical,

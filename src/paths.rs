@@ -761,9 +761,10 @@ mod tests {
         match std::os::windows::fs::symlink_dir(target, link) {
             Ok(()) => true,
             Err(error) => {
-                if std::env::var_os("SKILLMOUNT_REQUIRE_LINKS").is_some() {
-                    panic!("directory-link fixture is required: {error}");
-                }
+                assert!(
+                    std::env::var_os("SKILLMOUNT_REQUIRE_LINKS").is_none(),
+                    "directory-link fixture is required: {error}"
+                );
                 false
             }
         }
@@ -1046,9 +1047,10 @@ mod tests {
         let alias = fixture.0.join("codex.exe");
         fs::write(&batch, "@exit /b 0\r\n").expect("batch fixture");
         if let Err(error) = std::os::windows::fs::symlink_file(&batch, &alias) {
-            if std::env::var_os("SKILLMOUNT_REQUIRE_LINKS").is_some() {
-                panic!("file-link fixture is required: {error}");
-            }
+            assert!(
+                std::env::var_os("SKILLMOUNT_REQUIRE_LINKS").is_none(),
+                "file-link fixture is required: {error}"
+            );
             return;
         }
 

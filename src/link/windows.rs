@@ -522,7 +522,7 @@ impl WindowsBackend {
     /// directory is opened and identified, the same handle writes, reads back, and if necessary
     /// rolls back the entry. A failure before that evidence exists leaves the pathname untouched.
     /// ADR 0015 records that a replacement crossing the status-only create boundary can therefore
-    /// be adopted and receive the mount-point data before SkillMount can distinguish it.
+    /// be adopted and receive the mount-point data before `SkillMount` can distinguish it.
     fn create_junction(
         request: &LinkRequest,
         source_canonical: &Path,

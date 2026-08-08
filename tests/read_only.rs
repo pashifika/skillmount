@@ -708,6 +708,53 @@ fn a_codex_dry_run_plans_the_whole_layout_without_creating_it() {
     assert!(rendered.contains("advisory evidence; executable not queried"));
 }
 
+/// A verbose read-only plan says which entries a later cleanup is obliged to reconcile.
+///
+/// The disposition is part of the plan an operator reads before anything is mutated: a created Skill
+/// link is cleanup-critical, the discovery chain beneath it is scaffolding a later pass may leave
+/// behind. Rendering it must still create nothing.
+#[test]
+fn a_verbose_dry_run_marks_only_created_skill_links_as_cleanup_critical() {
+    let fixture = Fixture::new("dry-run-disposition");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let output = fixture.assert_unchanged(&[
+        "codex",
+        "--skills-dir",
+        &sources,
+        "--dry-run",
+        "--verbose",
+        "--",
+        "exec",
+        "fixture",
+    ]);
+
+    assert!(output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    // Every action carries a disposition, and the counts pin which kind gets which: the observed
+    // plan is `MKDIR .agents`, `MKDIR .agents/skills`, then the mounted Skill link, so exactly one
+    // action is cleanup-critical and the two directories beneath it are scaffolding.
+    assert_eq!(
+        rendered.matches("cleanup=cleanup-critical").count(),
+        1,
+        "{rendered}"
+    );
+    assert_eq!(
+        rendered.matches("cleanup=scaffolding").count(),
+        2,
+        "{rendered}"
+    );
+    // The directories are established before the link that needs them, so the first disposition the
+    // plan reports is scaffolding.
+    assert!(
+        rendered.find("cleanup=scaffolding") < rendered.find("cleanup=cleanup-critical"),
+        "{rendered}"
+    );
+    assert!(!fixture.project.join(".agents").exists());
+    assert!(!fixture.project.join(".codex").exists());
+}
+
 #[test]
 fn codex_rejects_every_plugin_namespace_spelling_above_a_selected_source() {
     for manifest_directory in [".codex-plugin", ".claude-plugin", ".cursor-plugin"] {

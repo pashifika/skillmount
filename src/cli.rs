@@ -40,7 +40,7 @@ enum CliCommand {
     Inspect(InspectArgs),
     /// Inspect agent, discovery, link, lock, and transaction health.
     Doctor(DoctorArgs),
-    /// Reconcile transaction-owned residue from durable evidence.
+    /// Reconcile residue from durable transaction evidence.
     Cleanup(CleanupArgs),
 }
 
@@ -91,7 +91,7 @@ struct SessionArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Retain later transaction-owned mounts for diagnostics.
+    /// Retain later session mounts for diagnostics.
     #[arg(long)]
     keep_mounts: bool,
 
@@ -191,7 +191,7 @@ pub(crate) enum CompletionShell {
     PowerShell,
 }
 
-/// Installed product name to which one generated script is bound.
+/// Recognized installed product identity used by completions and recovery presentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProductBinary {
     /// Primary `asm` executable.
@@ -208,7 +208,7 @@ impl ProductBinary {
         }
     }
 
-    fn from_argv0(argv0: &OsStr) -> Option<Self> {
+    pub(crate) fn from_argv0(argv0: &OsStr) -> Option<Self> {
         let name = Path::new(argv0).file_name()?;
         #[cfg(windows)]
         {

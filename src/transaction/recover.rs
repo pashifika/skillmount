@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::AgentId;
 use crate::error::AppError;
+use crate::journal::TransactionStatus;
 use crate::journal::store::{self, JournalScan, RejectedJournal, ScannedJournal};
-use crate::journal::{ActionOperation, TransactionJournal, TransactionStatus};
 use crate::link::resolve::ComparablePath;
 use crate::lock::LockResource;
 use crate::lock::acquire::LockContention;
@@ -55,14 +55,18 @@ impl RecoveryReport {
     }
 
     /// Renders one line per outcome, for the diagnostics stream.
+    ///
+    /// Preserved scaffolding is included here even though a session's own cleanup stays silent about
+    /// it. Recovery adopted somebody else's journal and is about to retire it, so this is the last
+    /// moment anything records that a directory was deliberately left behind.
     #[must_use]
     pub fn describe(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for entry in &self.reconciled {
             lines.push(format!(
                 "recovered transaction {} from {}: {} entr{} removed",
-                entry.transaction,
-                entry.journal.display(),
+                crate::render::text_value(&entry.transaction),
+                crate::render::path_value(&entry.journal, true),
                 entry.report.removed.len(),
                 if entry.report.removed.len() == 1 {
                     "y"
@@ -71,24 +75,25 @@ impl RecoveryReport {
                 }
             ));
             lines.extend(entry.report.describe());
+            lines.extend(entry.report.describe_preserved());
         }
         for path in &self.active {
             lines.push(format!(
                 "transaction journal {} belongs to a session that still holds its locks and was left alone",
-                path.display()
+                crate::render::path_value(path, true)
             ));
         }
         for entry in &self.quarantined {
             lines.push(format!(
                 "transaction journal {} may still belong to a live child process domain and was quarantined without cleanup",
-                entry.journal.display()
+                crate::render::path_value(&entry.journal, true)
             ));
         }
         for rejected in &self.unreadable {
             lines.push(format!(
                 "transaction journal {} cannot be interpreted ({}), so it is retained and nothing beneath it was removed",
-                rejected.path.display(),
-                rejected.reason
+                crate::render::path_value(&rejected.path, true),
+                crate::render::text_value(&rejected.reason)
             ));
         }
         lines
@@ -113,6 +118,8 @@ pub struct ReconciledTransaction {
     pub agent: AgentId,
     /// Journal that described it.
     pub journal: PathBuf,
+    /// Canonical project recorded by that transaction.
+    pub project_root: PathBuf,
     /// What the removal pass did.
     pub report: CleanupReport,
 }
@@ -235,19 +242,21 @@ pub(crate) fn cleanup_explicit(
     Ok(report)
 }
 
+/// Reconciles every claimed journal under the shared lock set, in deterministic scan order.
+///
+/// Overlapping journals used to need an ownership-derived order: cleaning a directory owner before
+/// the transaction owning a link inside it stranded the directory owner's journal on a non-empty
+/// directory. A helper directory is now best-effort scaffolding whose retention discharges its own
+/// action, so no order can strand a journal and scan order carries no policy.
 fn reconcile_explicit_claims(
     claimed: Vec<ScannedJournal>,
     locks: &HeldLocks,
     report: &mut ExplicitCleanupReport,
 ) {
-    let cleanup_order = explicit_cleanup_order(&claimed);
-    let mut remaining = claimed.into_iter().map(Some).collect::<Vec<_>>();
-    for index in cleanup_order {
-        let scanned = remaining[index]
-            .take()
-            .expect("every claimed journal is cleaned exactly once");
+    for scanned in claimed {
         let transaction = scanned.journal.transaction_id.to_string();
         let agent = scanned.journal.agent;
+        let project_root = scanned.journal.project_root.clone();
         let mut adopted = match Transaction::adopt(scanned.journal, scanned.path.clone(), locks) {
             Ok(transaction) => transaction,
             Err(error) => {
@@ -260,11 +269,12 @@ fn reconcile_explicit_claims(
                 continue;
             }
         };
-        match adopted.cleanup_required() {
+        match adopted.cleanup_explicit() {
             Ok(outcome) => report.reconciled.push(ReconciledTransaction {
                 transaction,
                 agent,
                 journal: scanned.path,
+                project_root,
                 report: outcome,
             }),
             Err(error) => report.failures.push(ExplicitCleanupFailure {
@@ -275,69 +285,6 @@ fn reconcile_explicit_claims(
             }),
         }
     }
-}
-
-/// Orders a claimed batch so a transaction that owns an entry below another transaction's owned
-/// helper directory is cleaned first.
-///
-/// Kept transactions can overlap legitimately: the first session owns the shared helper
-/// directories, while later sessions reuse those directories and own only their mount links.
-/// Cleaning the directory owner first would retain it as non-empty and strand its journal. The
-/// journal actions provide the dependency evidence directly, without relying on transaction-id or
-/// scan order as a proxy for which session created the helper.
-fn explicit_cleanup_order(journals: &[ScannedJournal]) -> Vec<usize> {
-    let mut prerequisites = vec![Vec::new(); journals.len()];
-    for before in 0..journals.len() {
-        for after in 0..journals.len() {
-            if before != after
-                && transaction_must_precede(&journals[before].journal, &journals[after].journal)
-            {
-                prerequisites[after].push(before);
-            }
-        }
-    }
-
-    let mut emitted = vec![false; journals.len()];
-    let mut order = Vec::with_capacity(journals.len());
-    while order.len() < journals.len() {
-        let next = (0..journals.len()).find(|&index| {
-            !emitted[index]
-                && prerequisites[index]
-                    .iter()
-                    .all(|&required| emitted[required])
-        });
-        let Some(next) = next else {
-            // Valid plans cannot form an ownership-containment cycle. Preserve deterministic
-            // scan order if a future or externally edited journal set nevertheless does; the
-            // ordinary ownership checks still retain rather than remove an uncertain entry.
-            order.extend((0..journals.len()).filter(|&index| !emitted[index]));
-            break;
-        };
-        emitted[next] = true;
-        order.push(next);
-    }
-    order
-}
-
-fn transaction_must_precede(first: &TransactionJournal, second: &TransactionJournal) -> bool {
-    first
-        .actions
-        .iter()
-        .filter(|action| {
-            action.operation.is_transaction_owned() && action.status.may_have_created_something()
-        })
-        .any(|first_action| {
-            let first_path = ComparablePath::new(&first_action.final_path);
-            second.actions.iter().any(|second_action| {
-                if second_action.operation != ActionOperation::CreateDirectory
-                    || !second_action.status.may_have_created_something()
-                {
-                    return false;
-                }
-                let directory = ComparablePath::new(&second_action.final_path);
-                directory.contains(&first_path) && !directory.names_same_path(&first_path)
-            })
-        })
 }
 
 /// Reconciles automatically recoverable transactions whose locks are free and quarantines
@@ -407,6 +354,7 @@ pub fn recover_stale(already_held: &mut HeldLocks) -> Result<RecoveryReport, App
         // leave a mismatched file behind to be recovered again on every later run.
         let transaction_id = scanned.journal.transaction_id.to_string();
         let agent = scanned.journal.agent;
+        let project_root = scanned.journal.project_root.clone();
         let journal_path = scanned.path.clone();
         let mut transaction =
             Transaction::adopt(scanned.journal, journal_path.clone(), already_held)?;
@@ -415,6 +363,7 @@ pub fn recover_stale(already_held: &mut HeldLocks) -> Result<RecoveryReport, App
             transaction: transaction_id,
             agent,
             journal: journal_path,
+            project_root,
             report: outcome,
         });
     }
@@ -505,8 +454,8 @@ pub fn blocking_state(already_held: &HeldLocks) -> Result<Vec<String>, AppError>
         .map(|rejected| {
             format!(
                 "transaction journal {} cannot be interpreted: {}",
-                rejected.path.display(),
-                rejected.reason
+                crate::render::path_value(&rejected.path, true),
+                crate::render::text_value(&rejected.reason)
             )
         })
         .collect::<Vec<_>>();
@@ -519,7 +468,7 @@ pub fn blocking_state(already_held: &HeldLocks) -> Result<Vec<String>, AppError>
         if claim(&resources, already_held)?.is_some() {
             blocking.push(format!(
                 "transaction {} is incomplete ({}) and --no-recover forbids handling it",
-                scanned.journal.transaction_id,
+                crate::render::text_value(scanned.journal.transaction_id.as_str()),
                 scanned.journal.status.label()
             ));
         }

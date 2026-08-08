@@ -18,6 +18,8 @@ const EXPECT_PATHS_ENV: &str = "SKILLMOUNT_FAKE_EXPECT_PATHS";
 const EXPECT_ADD_DIR_SKILLS_ENV: &str = "SKILLMOUNT_FAKE_EXPECT_ADD_DIR_SKILLS";
 const CREATE_FILE_ENV: &str = "SKILLMOUNT_FAKE_CREATE_FILE";
 const CREATE_IN_ADD_DIR_ENV: &str = "SKILLMOUNT_FAKE_CREATE_IN_ADD_DIR";
+const REPLACE_ENTRY_ENV: &str = "SKILLMOUNT_FAKE_REPLACE_ENTRY";
+const REPLACE_IN_ADD_DIR_ENV: &str = "SKILLMOUNT_FAKE_REPLACE_IN_ADD_DIR";
 const RELEASE_FILE_ENV: &str = "SKILLMOUNT_FAKE_RELEASE_FILE";
 const RECORD_CODEX_HOME_ENV: &str = "SKILLMOUNT_FAKE_RECORD_CODEX_HOME";
 const VERSION_RECORD_ENV: &str = "SKILLMOUNT_FAKE_VERSION_RECORD";
@@ -62,6 +64,7 @@ fn run() -> io::Result<ExitCode> {
     verify_add_dir_skills(&recorder, &arguments)?;
     create_requested_file(&recorder)?;
     create_in_add_dir(&recorder, &arguments)?;
+    replace_requested_entry(&recorder, &arguments)?;
 
     let behavior = env::var(BEHAVIOR_ENV).unwrap_or_else(|_| "exit".to_owned());
     match behavior.as_str() {
@@ -220,6 +223,16 @@ fn create_in_add_dir(recorder: &Recorder, arguments: &[OsString]) -> io::Result<
     let Some(relative) = env::var_os(CREATE_IN_ADD_DIR_ENV).map(PathBuf::from) else {
         return Ok(());
     };
+    let path = injected_add_dir(arguments)?.join(checked_relative(&relative)?);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, b"created by fake agent\n")?;
+    recorder.os("created", path.as_os_str())
+}
+
+/// Rejects a fixture path that could reach outside the scope it is joined to.
+fn checked_relative(relative: &Path) -> io::Result<&Path> {
     if relative.as_os_str().is_empty()
         || relative
             .components()
@@ -227,15 +240,47 @@ fn create_in_add_dir(recorder: &Recorder, arguments: &[OsString]) -> io::Result<
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "the add-dir fixture path must be a non-empty relative path without traversal",
+            "a scoped fixture path must be a non-empty relative path without traversal",
         ));
     }
-    let path = injected_add_dir(arguments)?.join(relative);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    Ok(relative)
+}
+
+/// Replaces a mounted Skill link with a directory of the caller's own.
+///
+/// This is the residue a session must still fail on: the entry at a recorded destination is no longer
+/// the link `SkillMount` created, so cleanup can prove nothing about it and must leave it. Only a real
+/// process can do that while the mounts are live, which is why it lives here rather than in a test
+/// that edits the tree before or after the session. The path is named absolutely, or relative to the
+/// injected `--add-dir` scope for an Agent whose destination is a per-session directory.
+fn replace_requested_entry(recorder: &Recorder, arguments: &[OsString]) -> io::Result<()> {
+    let path = if let Some(absolute) = env::var_os(REPLACE_ENTRY_ENV) {
+        PathBuf::from(absolute)
+    } else if let Some(relative) = env::var_os(REPLACE_IN_ADD_DIR_ENV).map(PathBuf::from) {
+        injected_add_dir(arguments)?.join(checked_relative(&relative)?)
+    } else {
+        return Ok(());
+    };
+    if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+        remove_symlinked_directory(&path)?;
+    } else {
+        fs::remove_dir(&path)?;
     }
-    fs::write(&path, b"created by fake agent\n")?;
-    recorder.os("created", path.as_os_str())
+    fs::create_dir(&path)?;
+    fs::write(path.join("their-own-work.txt"), b"replaced by fake agent\n")?;
+    recorder.os("replaced", path.as_os_str())
+}
+
+/// Unlinks a directory symbolic link without following it.
+#[cfg(unix)]
+fn remove_symlinked_directory(path: &Path) -> io::Result<()> {
+    fs::remove_file(path)
+}
+
+/// Removes a Windows directory symbolic link or junction without following it.
+#[cfg(windows)]
+fn remove_symlinked_directory(path: &Path) -> io::Result<()> {
+    fs::remove_dir(path)
 }
 
 fn injected_add_dir(arguments: &[OsString]) -> io::Result<PathBuf> {

@@ -647,14 +647,29 @@ fn a_rollback_that_cannot_finish_reports_the_cause_and_the_residue_together() {
     let (mut transaction, _locks) = session.open();
     transaction.apply().expect("a clean fixture applies");
 
-    // A cleanup that cannot finish must surface both halves: what went wrong and what is left.
-    remove_directory_link(&project.join(".agents/skills/alpha"));
+    // A cleanup that cannot finish must surface both halves: what went wrong and what is left. Only
+    // the replaced Skill link is cleanup-critical here; the user's file under the helper directory
+    // is preserved scaffolding, which belongs on its own channel rather than in the failure.
+    let mounted = project.join(".agents/skills/alpha");
+    remove_directory_link(&mounted);
+    fs::create_dir_all(mounted.join("their-own-work")).expect("replacement");
     fs::write(project.join(".agents/skills/notes.md"), "mine").expect("user content");
     let report = transaction.cleanup().expect("cleanup completes");
     let journal = on_disk(&transaction);
 
     let rendered = report.describe().join("\n");
     assert!(rendered.contains("retained"), "{rendered}");
+    assert!(
+        !rendered.contains("preserved scaffolding"),
+        "scaffolding is not part of a cleanup failure: {rendered}"
+    );
+    assert!(
+        report
+            .describe_preserved()
+            .iter()
+            .any(|line| line.contains("preserved scaffolding")),
+        "the preserved directory stays visible on its own channel: {report:?}"
+    );
     assert!(
         journal
             .errors
@@ -724,12 +739,12 @@ fn disposition_failure_retains_the_mount_and_its_journal_evidence() {
         "the verified mount is retained"
     );
     assert!(
-        report
-            .errors
-            .iter()
-            .any(|error| error.contains(&format!("os error {access_denied}"))),
+        report.failed.iter().any(|failure| failure
+            .reason
+            .contains(&format!("os error {access_denied}"))),
         "the operating-system cause remains visible: {report:?}"
     );
+    assert_eq!(report.failed[0].path, mounted);
     assert_eq!(
         report.journal_retained,
         Some(JournalRetention::IncompleteCleanup(journal_path.clone()))
@@ -968,18 +983,23 @@ fn a_link_retargeted_by_someone_else_is_left_alone() {
     );
 }
 
+/// Content another writer left in a helper survives when the missing link remains unproven.
+///
+/// Pathname absence cannot distinguish a manually removed link from a link moved elsewhere. The
+/// required action and its helper evidence therefore stay journal-backed for manual recovery.
 #[test]
-fn a_helper_directory_that_gained_contents_keeps_them() {
+fn a_helper_with_content_and_an_absent_link_remains_journal_backed() {
     let session = Session::codex("txn-nonempty", &["alpha"], &[]);
     let project = session.project();
     let (mut transaction, _locks) = session.open();
+    let journal_path = transaction.journal_path().to_path_buf();
     transaction.apply().expect("a clean fixture applies");
 
     // The mount is removed by hand but something else is left in the store.
     remove_directory_link(&project.join(".agents/skills/alpha"));
     fs::write(project.join(".agents/skills/notes.md"), "mine").expect("user content");
 
-    let report = transaction.cleanup().expect("cleanup completes");
+    let report = transaction.cleanup().expect("cleanup reports uncertainty");
 
     assert!(
         project.join(".agents/skills/notes.md").exists(),
@@ -987,57 +1007,369 @@ fn a_helper_directory_that_gained_contents_keeps_them() {
     );
     assert!(
         report
-            .retained
+            .preserved_scaffolding
             .iter()
             .any(|entry| entry.path == project.join(".agents/skills")
-                && entry.reason.contains("holds entries")),
-        "{:?}",
-        report.retained
+                && entry.reason.contains("cleanup-critical descendant")),
+        "{report:?}"
+    );
+    assert!(
+        report
+            .retained
+            .iter()
+            .any(|entry| entry.path.ends_with("alpha")
+                && entry.reason.contains("pathname absence cannot prove")),
+        "{report:?}"
+    );
+    assert!(report.needs_attention(), "{report:?}");
+    assert!(
+        journal_path.exists(),
+        "unproven required-link absence must keep recovery evidence: {report:?}"
     );
 }
 
 #[test]
-fn a_directory_recorded_without_an_identity_is_never_removed() {
-    let session = Session::codex("txn-unprovable", &["alpha"], &[]);
+fn a_helper_directory_removal_error_is_preserved_without_failing_cleanup() {
+    let session = Session::codex("txn-unremovable-scaffolding", &["alpha"], &[]);
+    let project = session.project();
+    let store_path = project.join(".agents/skills");
+    let mounted = store_path.join("alpha");
+    let (mut transaction, _locks) = session.open();
+    let journal_path = transaction.journal_path().to_path_buf();
+    transaction.apply().expect("a clean fixture applies");
+    let hook_path = store_path.clone();
+
+    let report = with_hook(
+        move |event| {
+            if event.point == HookPoint::BeforeRemovalMutation && event.path == hook_path {
+                return Err(LinkError::Remove {
+                    path: hook_path.clone(),
+                    reason: "injected scaffolding removal failure".to_owned(),
+                });
+            }
+            Ok(())
+        },
+        || transaction.cleanup(),
+    )
+    .expect("a scaffolding removal refusal is non-critical");
+
+    assert!(
+        platform_backend()
+            .inspect_no_follow(&mounted)
+            .expect("the Skill destination remains inspectable")
+            .kind
+            == crate::link::EntryKind::Missing,
+        "every cleanup-critical Skill link is still removed"
+    );
+    assert!(
+        store_path.exists(),
+        "the refused directory remains untouched"
+    );
+    assert!(
+        report
+            .preserved_scaffolding
+            .iter()
+            .any(|entry| entry.path == store_path
+                && entry
+                    .reason
+                    .contains("injected scaffolding removal failure")),
+        "{report:?}"
+    );
+    assert!(report.retained.is_empty(), "{report:?}");
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert!(!report.needs_attention(), "{report:?}");
+    assert!(!journal_path.exists(), "{report:?}");
+}
+
+/// A pre-existing store that moves with a created link remains journal-backed across retries.
+///
+/// The store has no `CreateDirectory` action. Its planning-time lock identity cannot prove which
+/// directory object received a later mutation, so pathname absence remains unresolved rather than
+/// allowing cleanup to forget a moved link.
+#[test]
+fn a_link_moved_with_a_preexisting_store_stays_journal_backed_across_retries() {
+    let session = Session::codex("txn-moved-preexisting-store", &["alpha"], &[]);
+    let project = session.project();
+    let store_path = project.join(".agents/skills");
+    fs::create_dir_all(&store_path).expect("pre-existing Skill store");
+    let (mut transaction, _locks) = session.open();
+    let journal_path = transaction.journal_path().to_path_buf();
+    transaction.apply().expect("a clean fixture applies");
+
+    let moved_store = project.join("operator-moved-skills");
+    fs::rename(&store_path, &moved_store).expect("move the store with its created link");
+    fs::create_dir_all(&store_path).expect("replacement Skill store");
+    fs::write(store_path.join("operator-owned.txt"), "mine").expect("replacement content");
+
+    for attempt in 1..=2 {
+        let report = transaction.cleanup().expect("cleanup reports uncertainty");
+        assert!(report.needs_attention(), "attempt {attempt}: {report:?}");
+        assert!(
+            report.retained.iter().any(|entry| {
+                entry.path.ends_with("alpha")
+                    && entry.reason.contains("pathname absence cannot prove")
+            }),
+            "attempt {attempt}: {report:?}"
+        );
+        assert!(
+            journal_path.exists(),
+            "attempt {attempt} must keep evidence durable: {report:?}"
+        );
+        assert!(
+            moved_store.join("alpha").is_dir(),
+            "attempt {attempt} must preserve the moved created link"
+        );
+        assert!(
+            store_path.join("operator-owned.txt").is_file(),
+            "attempt {attempt} must preserve the replacement store"
+        );
+    }
+}
+
+/// A planning-time store identity never authorizes absence after the parent changed before apply.
+#[test]
+fn a_preexisting_store_replaced_before_apply_cannot_hide_the_mutated_store_from_cleanup() {
+    let session = Session::codex("txn-parent-replaced-before-apply", &["alpha"], &[]);
+    let project = session.project();
+    let store_path = project.join(".agents/skills");
+    fs::create_dir_all(&store_path).expect("original pre-existing Skill store");
+    let (mut transaction, _locks) = session.open();
+    let journal_path = transaction.journal_path().to_path_buf();
+
+    let original_store = project.join("original-skills");
+    fs::rename(&store_path, &original_store).expect("move the planned store away");
+    fs::create_dir_all(&store_path).expect("replacement store receives the mutation");
+    transaction
+        .apply()
+        .expect("the replacement occurs outside the child precondition");
+
+    let mutated_store = project.join("mutated-skills");
+    fs::rename(&store_path, &mutated_store).expect("move the store containing the created link");
+    fs::rename(&original_store, &store_path).expect("restore the planning-time store identity");
+
+    let report = transaction.cleanup().expect("cleanup reports uncertainty");
+
+    assert!(report.needs_attention(), "{report:?}");
+    assert!(
+        report.retained.iter().any(|entry| {
+            entry.path.ends_with("alpha") && entry.reason.contains("pathname absence cannot prove")
+        }),
+        "{report:?}"
+    );
+    assert!(
+        mutated_store.join("alpha").is_dir(),
+        "the created link remains visible and journal-backed"
+    );
+    assert!(journal_path.exists(), "{report:?}");
+}
+
+/// Renaming a created link inside its recorded helper cannot turn it into apparent absence.
+#[test]
+fn a_created_link_renamed_within_its_helper_remains_journal_backed() {
+    let session = Session::codex("txn-link-renamed-in-helper", &["alpha"], &[]);
+    let project = session.project();
+    let store_path = project.join(".agents/skills");
+    let (mut transaction, _locks) = session.open();
+    let journal_path = transaction.journal_path().to_path_buf();
+    transaction.apply().expect("a clean fixture applies");
+
+    let renamed = store_path.join("renamed");
+    fs::rename(store_path.join("alpha"), &renamed).expect("rename the created link");
+    let report = transaction
+        .cleanup()
+        .expect("cleanup reports the renamed link");
+
+    assert!(report.needs_attention(), "{report:?}");
+    assert!(
+        report.retained.iter().any(|entry| {
+            entry.path.ends_with("alpha") && entry.reason.contains("pathname absence cannot prove")
+        }),
+        "{report:?}"
+    );
+    assert!(renamed.is_dir(), "the renamed created link remains visible");
+    assert!(journal_path.exists(), "{report:?}");
+}
+
+/// Moving a created link beyond every recorded parent cannot turn it into apparent absence.
+#[test]
+fn a_created_link_moved_outside_its_helper_remains_journal_backed() {
+    let session = Session::codex("txn-link-moved-outside-helper", &["alpha"], &[]);
+    let project = session.project();
+    let store_path = project.join(".agents/skills");
+    let (mut transaction, _locks) = session.open();
+    let journal_path = transaction.journal_path().to_path_buf();
+    transaction.apply().expect("a clean fixture applies");
+
+    let relocated_store = project.join("operator-relocated-skills");
+    fs::create_dir(&relocated_store).expect("create an unrelated destination directory");
+    let relocated = relocated_store.join("alpha");
+    fs::rename(store_path.join("alpha"), &relocated)
+        .expect("move the created link beyond its recorded helper");
+
+    for attempt in 1..=2 {
+        let report = transaction.cleanup().expect("cleanup reports uncertainty");
+        assert!(report.needs_attention(), "attempt {attempt}: {report:?}");
+        assert!(
+            report.retained.iter().any(|entry| {
+                entry.path.ends_with("alpha")
+                    && entry.reason.contains("pathname absence cannot prove")
+            }),
+            "attempt {attempt}: {report:?}"
+        );
+        assert!(
+            relocated.is_dir(),
+            "attempt {attempt} must preserve the relocated created link"
+        );
+        assert!(
+            journal_path.exists(),
+            "attempt {attempt} must keep ownership evidence durable"
+        );
+    }
+}
+
+/// Rollback reports the failure that stopped the apply, not the scaffolding it preserved.
+#[test]
+fn rollback_preserves_a_helper_directory_that_gained_contents() {
+    let session = Session::codex("txn-rollback-scaffolding", &["alpha"], &[]);
     let project = session.project();
     let (mut transaction, _locks) = session.open();
     transaction.apply().expect("a clean fixture applies");
+    fs::write(project.join(".agents/skills/notes.md"), "mine").expect("user content");
 
-    // Simulates a journal written by a host that reported no identity: the directory is genuinely
-    // this transaction's, and it still must not be removed, because nothing proves that.
-    remove_directory_link(&project.join(".agents/skills/alpha"));
-    let store_path = project.join(".agents/skills");
-    for action in &mut transaction.journal_mut().actions {
-        if action.final_path == store_path {
-            action.identity = None;
-        }
-    }
+    let failure = transaction.roll_back(AppError::Filesystem(
+        "injected placement failure".to_owned(),
+    ));
+    let journal = on_disk(&transaction);
 
-    let report = transaction.cleanup().expect("cleanup completes");
-
-    assert!(store_path.exists());
     assert!(
-        report.retained.iter().any(|entry| entry.path == store_path
-            && entry
-                .reason
-                .contains(OwnershipMismatch::IdentityUnavailable.label())),
-        "{:?}",
-        report.retained
+        project.join(".agents/skills/notes.md").exists(),
+        "rollback must never take another writer's file with the scaffolding"
+    );
+    assert!(
+        failure.retained.is_empty(),
+        "preserved scaffolding is not user-facing residue: {failure:?}"
+    );
+    assert_eq!(
+        failure.into_error().to_string(),
+        AppError::Filesystem("injected placement failure".to_owned()).to_string(),
+        "the initiating filesystem failure is what an operator has to act on"
+    );
+    assert!(
+        journal
+            .errors
+            .iter()
+            .any(|error| error.contains("preserved scaffolding")),
+        "the durable record still names what was left behind: {:?}",
+        journal.errors
     );
 }
 
+/// Automatic recovery retains a journal when its required link is already absent.
+///
+/// The surviving helper content is safe, but pathname absence cannot prove whether the created link
+/// was removed or relocated, so recovery must preserve the ownership record.
 #[test]
-fn an_entry_that_is_already_gone_is_a_harmless_cleanup() {
+fn automatic_recovery_retains_a_journal_for_an_unproven_absent_link() {
+    let session = Session::codex("txn-recovery-scaffolding", &["alpha"], &[]);
+    let project = session.project();
+    let (mut transaction, locks) = session.open();
+    transaction.apply().expect("a clean fixture applies");
+    let journal_path = transaction.journal_path().to_path_buf();
+    remove_directory_link(&project.join(".agents/skills/alpha"));
+    fs::write(project.join(".agents/skills/notes.md"), "mine").expect("user content");
+    drop(transaction);
+    drop(locks);
+
+    let mut recovery_locks = HeldLocks::default();
+    let recovery = recover::recover_stale(&mut recovery_locks).expect("recovery runs");
+    let report = &recovery
+        .reconciled
+        .first()
+        .expect("the abandoned transaction is reconciled")
+        .report;
+
+    assert!(report.needs_attention(), "{report:?}");
+    assert!(recovery.needs_attention(), "{recovery:?}");
+    assert!(
+        !report.preserved_scaffolding.is_empty(),
+        "the preserved directory is still reported: {report:?}"
+    );
+    assert!(project.join(".agents/skills/notes.md").exists());
+    assert!(
+        journal_path.exists(),
+        "unproven required-link absence keeps the journal"
+    );
+}
+
+/// A directory action interrupted before its first observation leaves residue without a journal.
+///
+/// Its identity was never recorded, so ADR 0015 forbids removing either candidate. The staged
+/// sibling is therefore preserved exactly as it is; because scaffolding carries no cleanup
+/// obligation, the pass reports it once and still retires the journal.
+#[test]
+fn a_directory_staged_before_its_first_observation_is_preserved_and_released() {
+    let session = Session::codex("txn-preobservation-directory", &["alpha"], &[]);
+    let project = session.project();
+    let (mut transaction, _locks) = session.open();
+    let journal_path = transaction.journal_path().to_path_buf();
+    let store_path = project.join(".agents/skills");
+
+    // Exactly the state a process interrupted between `mkdir` and its first no-follow observation
+    // leaves: the staged sibling exists on disk and the journal knows no identity for it.
+    let staged = {
+        let action = transaction
+            .journal_mut()
+            .actions
+            .iter_mut()
+            .find(|action| action.final_path == store_path)
+            .expect("the store directory action is recorded");
+        action.status = ActionStatus::Staged;
+        action.identity = None;
+        action
+            .temporary_path
+            .clone()
+            .expect("a created directory has a staged sibling")
+    };
+    fs::create_dir_all(&staged).expect("staged directory fixture");
+
+    let report = transaction.cleanup().expect("cleanup completes");
+
+    assert!(
+        staged.is_dir(),
+        "an unproven staged directory is never removed"
+    );
+    assert!(
+        report
+            .preserved_scaffolding
+            .iter()
+            .any(|entry| entry.path == staged),
+        "{report:?}"
+    );
+    assert!(report.retained.is_empty(), "{report:?}");
+    assert!(!report.needs_attention(), "{report:?}");
+    assert!(!journal_path.exists(), "{report:?}");
+}
+
+#[test]
+fn an_entry_that_is_already_gone_remains_journal_backed() {
     let session = Session::codex("txn-absent", &["alpha"], &[]);
     let project = session.project();
     let (mut transaction, _locks) = session.open();
     transaction.apply().expect("a clean fixture applies");
     remove_directory_link(&project.join(".agents/skills/alpha"));
 
-    let report = transaction.cleanup().expect("cleanup completes");
+    let report = transaction.cleanup().expect("cleanup reports uncertainty");
 
-    assert!(!report.needs_attention(), "{report:?}");
-    assert!(!transaction.journal_path().exists());
+    assert!(report.needs_attention(), "{report:?}");
+    assert!(
+        report
+            .retained
+            .iter()
+            .any(|entry| entry.path.ends_with("alpha")
+                && entry.reason.contains("pathname absence cannot prove")),
+        "{report:?}"
+    );
+    assert!(transaction.journal_path().exists());
 }
 
 #[test]

@@ -199,7 +199,7 @@ pub struct RunOptions {
     pub validation: ValidationLevel,
     /// Whether planning should remain read-only.
     pub dry_run: bool,
-    /// Whether cleanup should retain transaction-owned mounts.
+    /// Whether cleanup should retain the mounts this session creates.
     pub keep_mounts: bool,
     /// Whether transaction recovery is disabled.
     pub no_recover: bool,

@@ -1,10 +1,10 @@
-//! Rendering for the read-only commands.
+//! Rendering for read-only output and operator diagnostics.
 //!
-//! Every value that could come from the operating system is written as its own indexed line. A
-//! joined command string is never produced: quoting inside one would be reinterpretable, and the
-//! whole point of these commands is that the reader can trust what they see.
+//! Every operating-system value is independently checked before it enters display syntax.
+//! Recovery may use a shell-specific convenience line only when its encoder proves a display-safe
+//! native round trip; every other value remains a labelled native argument vector.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -14,6 +14,7 @@ use crate::domain::{RunContext, ShadowReason, SkillCatalog};
 use crate::journal::TransactionStatus;
 use crate::lock::LockResource;
 use crate::mount::{MountAction, MountPlan};
+use crate::process::InvocationShell;
 
 /// Everything a read-only command has observed, ready to render.
 pub(crate) struct ReadOnlyReport<'a> {
@@ -280,11 +281,15 @@ fn plan(out: &mut String, report: &ReadOnlyReport<'_>) {
             }
         }
         if report.verbose() {
+            // The disposition is part of the plan, not a cleanup detail: it tells an operator which
+            // entries a later pass is obliged to reconcile and which ones are scaffolding it may
+            // leave behind. Reading it changes nothing on disk.
             let _ = writeln!(
                 out,
-                "         #{} precondition={}",
+                "         #{} precondition={} cleanup={}",
                 action.id,
-                action.expected_precondition.label()
+                action.expected_precondition.label(),
+                action.operation.cleanup_disposition().label()
             );
         }
     }
@@ -364,10 +369,10 @@ fn recovery(out: &mut String) {
         };
         let _ = writeln!(
             out,
-            "  {verb}  {}  ({}, {} owned action(s))",
+            "  {verb}  {}  ({}, {} pending action(s))",
             path_value(&scanned.path, false),
             scanned.journal.status.label(),
-            scanned.journal.reversible_actions().count()
+            scanned.journal.cleanup_candidates().count()
         );
     }
     for rejected in &scan.rejected {
@@ -433,6 +438,176 @@ pub(crate) fn render_warnings(catalog: &SkillCatalog, snapshot: &DiscoverySnapsh
 
 pub(crate) fn path_value(path: &Path, verbose: bool) -> String {
     os_value(path.as_os_str(), verbose)
+}
+
+/// Renders one recovery footer after stable-deduplicating exact native operations.
+///
+/// A shell command is presentation only. The operation remains the executable and arguments passed
+/// to this function, and a value outside the selected encoder's contract falls back to the labelled
+/// native vector.
+pub(crate) fn recovery_footer<'a>(
+    shell: InvocationShell,
+    operations: impl IntoIterator<Item = &'a [OsString]>,
+) -> Vec<String> {
+    let mut distinct: Vec<&[OsString]> = Vec::new();
+    for operation in operations {
+        if operation.is_empty() || distinct.contains(&operation) {
+            continue;
+        }
+        distinct.push(operation);
+    }
+    if distinct.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = vec![
+        String::new(),
+        "Recovery — run only after confirming that every related Agent process has exited:"
+            .to_owned(),
+    ];
+    for (index, operation) in distinct.into_iter().enumerate() {
+        if let Some((shell_name, command)) = shell_command(shell, operation) {
+            lines.push(format!("  command {} ({shell_name}):", index + 1));
+            lines.push(format!("    {command}"));
+        } else {
+            lines.push(format!("  command {} (native argument vector):", index + 1));
+            lines.extend(argument_vector("    ", operation));
+        }
+    }
+    lines
+}
+
+pub(crate) fn shell_command(
+    shell: InvocationShell,
+    operation: &[OsString],
+) -> Option<(&'static str, String)> {
+    match shell {
+        InvocationShell::PowerShell => {
+            powershell_command(operation).map(|command| ("PowerShell", command))
+        }
+        InvocationShell::CommandPrompt => {
+            command_prompt_command(operation).map(|command| ("Command Prompt", command))
+        }
+        InvocationShell::Unknown => None,
+    }
+}
+
+fn powershell_command(operation: &[OsString]) -> Option<String> {
+    let mut values = operation.iter();
+    let executable = display_safe_text(values.next()?)?;
+    if executable.is_empty() {
+        return None;
+    }
+
+    let mut command = String::new();
+    if powershell_bare_word(executable) {
+        command.push_str(executable);
+    } else {
+        command.push_str("& ");
+        push_powershell_literal(&mut command, executable);
+    }
+    for value in values {
+        let value = display_safe_text(value)?;
+        // Windows PowerShell 5.1 drops an empty quoted native argument, while PowerShell 7 can
+        // preserve it. One renderer serves both observed images, so the common contract rejects it.
+        if value.is_empty() {
+            return None;
+        }
+        command.push(' ');
+        if powershell_bare_word(value) {
+            command.push_str(value);
+        } else {
+            push_powershell_literal(&mut command, value);
+        }
+    }
+    Some(command)
+}
+
+fn powershell_bare_word(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn push_powershell_literal(command: &mut String, value: &str) {
+    command.push('\'');
+    for character in value.chars() {
+        if character == '\'' {
+            command.push('\'');
+        }
+        command.push(character);
+    }
+    command.push('\'');
+}
+
+fn command_prompt_command(operation: &[OsString]) -> Option<String> {
+    let mut command = String::new();
+    for (index, value) in operation.iter().enumerate() {
+        let value = display_safe_text(value)?;
+        if value.contains(['%', '!', '^', '"']) {
+            return None;
+        }
+        if index > 0 {
+            command.push(' ');
+        }
+        push_command_prompt_value(&mut command, value);
+    }
+    (!operation.is_empty()).then_some(command)
+}
+
+fn push_command_prompt_value(command: &mut String, value: &str) {
+    let needs_quotes = value.is_empty()
+        || value.chars().any(|character| {
+            character.is_whitespace() || matches!(character, '&' | '|' | '<' | '>' | '(' | ')')
+        });
+    if !needs_quotes {
+        command.push_str(value);
+        return;
+    }
+
+    command.push('"');
+    let trailing_separators = value
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count();
+    command.push_str(value);
+    for _ in 0..trailing_separators {
+        command.push('\\');
+    }
+    command.push('"');
+}
+
+fn display_safe_text(value: &OsStr) -> Option<&str> {
+    let text = value.to_str()?;
+    (!text.chars().any(is_display_control)).then_some(text)
+}
+
+/// Renders the universal recovery fallback as one labelled line per native value.
+///
+/// The first value is the executable and the rest are numbered from 1, each escaped on its own
+/// through [`os_value`]. This representation joins nothing: no single quoting contract covers POSIX
+/// shells, PowerShell, and values that are not valid text, so a universal joined string would be
+/// lossy or reinterpretable. The labels identify an argument vector to invoke, not a shell command.
+pub(crate) fn argument_vector(indent: &str, argv: &[OsString]) -> Vec<String> {
+    let mut values = argv.iter();
+    let Some(executable) = values.next() else {
+        return Vec::new();
+    };
+    let mut lines = Vec::with_capacity(argv.len());
+    lines.push(format!(
+        "{indent}executable: {}",
+        os_value(executable, true)
+    ));
+    for (index, argument) in values.enumerate() {
+        lines.push(format!(
+            "{indent}argument {}: {}",
+            index + 1,
+            os_value(argument, true)
+        ));
+    }
+    lines
 }
 
 /// Marks a value that had to be escaped because it is not representable as text.
@@ -537,7 +712,8 @@ fn is_display_control(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ESCAPED_PREFIX, escaped, os_value, text_value};
+    use super::{ESCAPED_PREFIX, escaped, os_value, recovery_footer, text_value};
+    use crate::process::InvocationShell;
     use std::ffi::OsString;
 
     #[test]
@@ -633,6 +809,180 @@ mod tests {
             os_value(&value, false),
             os_value(&value, true),
             "the lossy form is only used when verbose output was not requested"
+        );
+    }
+
+    fn recovery_argv(root: &str) -> Vec<OsString> {
+        vec![
+            OsString::from("asm"),
+            OsString::from("cleanup"),
+            OsString::from("--project-root"),
+            OsString::from(root),
+        ]
+    }
+
+    fn footer(shell: InvocationShell, operations: &[Vec<OsString>]) -> String {
+        recovery_footer(shell, operations.iter().map(Vec::as_slice)).join("\n")
+    }
+
+    #[test]
+    fn powershell_recovery_quotes_spaces_and_doubles_apostrophes() {
+        let operations = vec![recovery_argv(r"D:\Work\O'Brien project")];
+
+        let rendered = footer(InvocationShell::PowerShell, &operations);
+
+        assert!(rendered.contains("command 1 (PowerShell):"), "{rendered}");
+        assert!(
+            rendered.contains(r"asm cleanup --project-root 'D:\Work\O''Brien project'"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("executable:"), "{rendered}");
+    }
+
+    #[test]
+    fn powershell_empty_argument_uses_the_native_vector() {
+        let operations = vec![vec![
+            OsString::from("asm"),
+            OsString::from("cleanup"),
+            OsString::new(),
+        ]];
+
+        let rendered = footer(InvocationShell::PowerShell, &operations);
+
+        assert!(
+            rendered.contains("command 1 (native argument vector):"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| line == "    argument 2: "),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn command_prompt_recovery_doubles_a_quoted_trailing_separator() {
+        let operations = vec![recovery_argv("D:\\Work\\project\\My test\\")];
+
+        let rendered = footer(InvocationShell::CommandPrompt, &operations);
+
+        assert!(
+            rendered.contains("command 1 (Command Prompt):"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("asm cleanup --project-root \"D:\\Work\\project\\My test\\\\\""),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("executable:"), "{rendered}");
+    }
+
+    #[test]
+    fn recovery_footer_uses_the_native_product_and_stable_deduplicates_operations() {
+        let first = recovery_argv(r"D:\one");
+        let duplicate = first.clone();
+        let mut second = recovery_argv(r"D:\two");
+        second[0] = OsString::from("skillmount");
+        let operations = vec![first, duplicate, second];
+
+        let rendered = footer(InvocationShell::PowerShell, &operations);
+
+        assert_eq!(rendered.matches("command 1 (PowerShell):").count(), 1);
+        assert_eq!(rendered.matches("command 2 (PowerShell):").count(), 1);
+        assert_eq!(
+            rendered
+                .matches(r"asm cleanup --project-root 'D:\one'")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered
+                .matches(r"skillmount cleanup --project-root 'D:\two'")
+                .count(),
+            1
+        );
+        assert!(
+            rendered.find(r"D:\one") < rendered.find(r"D:\two"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn unknown_shell_and_unsafe_shell_values_use_the_labelled_native_vector() {
+        let unknown = vec![recovery_argv(r"D:\plain")];
+        let percent = vec![recovery_argv(r"D:\%NAME%\project")];
+        let exclamation = vec![recovery_argv(r"D:\project!draft")];
+        let control = vec![recovery_argv("D:\\project\n[PASS] forged")];
+
+        for (shell, operations) in [
+            (InvocationShell::Unknown, &unknown),
+            (InvocationShell::CommandPrompt, &percent),
+            (InvocationShell::CommandPrompt, &exclamation),
+            (InvocationShell::PowerShell, &control),
+        ] {
+            let rendered = footer(shell, operations);
+            assert!(
+                rendered.contains("command 1 (native argument vector):"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("executable: asm"), "{rendered}");
+            assert!(
+                rendered.contains("argument 1: cleanup")
+                    && rendered.contains("argument 2: --project-root"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("[PASS] forged\n"), "{rendered}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unpaired_utf16_uses_the_labelled_native_vector_for_a_known_shell() {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let mut operation = recovery_argv(r"D:\placeholder");
+        operation[3] = OsString::from_wide(&[0x0044, 0x003A, 0x005C, 0xD800]);
+        let operations = vec![operation];
+
+        let rendered = footer(InvocationShell::PowerShell, &operations);
+
+        assert!(
+            rendered.contains("command 1 (native argument vector):"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\\uD800"), "{rendered}");
+    }
+
+    #[test]
+    fn powershell_literal_encoding_is_injective_for_embedded_apostrophes() {
+        let operations = vec![vec![
+            OsString::from("asm"),
+            OsString::from("cleanup"),
+            OsString::from("a'b"),
+            OsString::from("a''b"),
+        ]];
+
+        let rendered = footer(InvocationShell::PowerShell, &operations);
+
+        assert!(rendered.contains("'a''b' 'a''''b'"), "{rendered}");
+    }
+
+    #[test]
+    fn native_vector_fallback_preserves_each_os_value_separately() {
+        let operations = vec![vec![
+            OsString::from("asm"),
+            OsString::from("cleanup"),
+            OsString::from("value with spaces"),
+        ]];
+        let rendered = footer(InvocationShell::Unknown, &operations);
+
+        assert!(rendered.contains("executable: asm"), "{rendered}");
+        assert!(
+            rendered.contains("argument 2: value with spaces"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("asm cleanup value with spaces"),
+            "{rendered}"
         );
     }
 

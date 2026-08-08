@@ -146,7 +146,7 @@ asm claude --skills-dir ~/agent-skills -- -p "Review the staged diff with the te
 ```
 
 Oh My Pi mounts into the project's own `.omp/skills`, the first place OMP searches, and removes
-the links — and any `.omp` directories it created — when the session ends:
+the links it created when the session ends:
 
 ```bash
 asm omp --skills-dir ~/agent-skills -- -p "Summarize this project's build steps"
@@ -164,7 +164,7 @@ them visible to an agent.
 `asm omp` and `skillmount omp` support exactly one scope: a new foreground Oh My Pi (OMP) session
 that SkillMount launches itself. The selected Skills are linked into `<launch CWD>/.omp/skills` —
 the first place OMP searches — and SkillMount creates the `.omp` and `.omp/skills` directories
-when they are missing, then removes everything it created after OMP exits:
+when they are missing, then removes every link it created after OMP exits:
 
 ```bash
 asm omp --skills-dir ~/agent-skills -- -p "Summarize this project's build steps"
@@ -209,10 +209,22 @@ no argument and no environment variable into an OMP launch, does not manage OMP 
 and never weakens OMP's permission or approval model: it forwards `--auto-approve`, `--yolo`, and
 `--approval-mode` only when you supplied them.
 
-Cleanup uses the same journaled, crash-recoverable path as the other agents: after the session,
-SkillMount removes the links it created and any `.omp` directories it had to create, and
-`asm doctor` plus `asm cleanup` reconcile an interrupted session. Attaching to or hot-reloading
-Skills into an OMP process SkillMount did not launch is not supported — OMP loads Skills once at
+Cleanup uses the same journaled, crash-recoverable path as the other agents. Every Skill link
+SkillMount created remains cleanup-critical once the OMP process domain is dead. The `.omp` and
+`.omp/skills` directories it had to create are pruned too — but only while they are still empty and
+directories it recorded. If OMP, the operating system, or another program left something in one,
+SkillMount preserves that directory and its contents untouched, reports it, and still completes
+when no created link remains. Automatic and session cleanup reconcile a created link only after an
+identity-verified unlink; pathname absence cannot prove that the same object was not moved
+elsewhere, so an unverified link and its created enclosing helpers remain journal-backed. After
+checking the reported paths and establishing that the process domain is dead, run `asm cleanup`.
+That explicit command treats an all-absent set of recorded link paths as the operator's decision to
+release the stale ownership record, reports that no filesystem entry was removed, and completes the
+journal. It still leaves every existing mismatch untouched. This repairs a crash after unlink
+without adding a second recovery option; if the link was instead moved elsewhere, the command
+deliberately stops tracking that moved link. `asm doctor` helps inspect the interrupted session.
+Attaching to or hot-reloading Skills into an OMP process SkillMount did not launch is not supported
+— OMP loads Skills once at
 startup, so start a new session instead. The recorded OMP evidence, including the platforms it
 does and does not cover, lives in [docs/compatibility.md](docs/compatibility.md).
 
@@ -225,7 +237,7 @@ omp           Run an Oh My Pi session with the selected Skills
 completions   Generate a shell completion script on standard output
 inspect       Inspect and validate a catalog without modifying the filesystem
 doctor        Inspect agent, discovery, link, lock, and transaction health
-cleanup       Reconcile transaction-owned residue from durable evidence
+cleanup       Reconcile residue from durable transaction evidence
 ```
 
 The session commands `codex`, `claude`, and `omp` share these options:
@@ -240,7 +252,7 @@ The session commands `codex`, `claude`, and `omp` share these options:
 --conflict <POLICY>    Existing-destination policy: error, skip [default: error]
 --validation <LEVEL>   Metadata validation policy: basic, strict, none [default: basic]
 --dry-run              Keep later planning read-only
---keep-mounts          Retain later transaction-owned mounts for diagnostics
+--keep-mounts          Retain later session mounts for diagnostics
 --no-recover           Disable later stale-transaction recovery
 -v, --verbose          Increase diagnostic verbosity
 ```
@@ -289,6 +301,47 @@ fails. `cleanup` releases mounts left behind by an interrupted session; run it o
 no Agent process still uses them, or sweep every recorded transaction with
 `asm cleanup --all`. The recovery rules and their guarantees are documented in
 [docs/architecture.md](docs/architecture.md).
+
+When one or more Skill links genuinely cannot be released, the session first reports every
+condition once on stderr, then emits one recovery footer. A direct Windows invocation whose
+ancestry identifies PowerShell receives a command whose path is a single-quoted literal:
+
+```text
+error: session cleanup failed
+  reason: a regular directory replaced the entry, so it cannot be proved to belong to this session and was left untouched
+  retained path: C:\projects\O'Brien webapp\.omp\skills\team-review
+  retained journal: C:\Users\me\AppData\Local\skillmount\transactions\<id>.journal
+
+Recovery — run only after confirming that every related Agent process has exited:
+  command 1 (PowerShell):
+    asm cleanup --project-root 'C:\projects\O''Brien webapp'
+```
+
+PowerShell emits only the narrow ASCII safe-word set `[A-Za-z0-9_.-]+` unquoted and uses `'...'`
+for every other accepted value; an apostrophe inside the value becomes `''`. A direct Command Prompt
+invocation uses its independently verified double-quoted form instead:
+
+```text
+  command 1 (Command Prompt):
+    asm cleanup --project-root "C:\projects\web app"
+```
+
+The executable is `skillmount` when that is the recognized invoked product name and `asm`
+otherwise. If startup ancestry is absent or ambiguous, or a native value cannot be represented
+losslessly in the selected shell, SkillMount prints the authoritative native values instead of
+guessing:
+
+```text
+  command 1 (native argument vector):
+    executable: asm
+    argument 1: cleanup
+    argument 2: --project-root
+    argument 3: /projects/webapp
+```
+
+SkillMount never stores or executes the displayed shell line. Recovery authority still comes from
+the separate native values and the operator's confirmation that every related Agent process has
+exited.
 
 ## Requirements
 

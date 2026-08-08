@@ -10,10 +10,11 @@ use super::{
     TransactionId, TransactionJournal, TransactionStatus,
 };
 use crate::domain::AgentId;
+use crate::domain::LinkMode;
 use crate::error::{AppError, ExitCategory, JournalError};
 use crate::link::PlatformIdentity;
 use crate::lock::LockResourceKind;
-use crate::mount::PathPrecondition;
+use crate::mount::{CleanupDisposition, MountAction, PathPrecondition};
 use crate::state::testing::StateRootGuard;
 use crate::test_support::TestDir;
 use sha2::Digest as _;
@@ -241,6 +242,37 @@ fn validation_rejects_states_no_apply_sequence_can_produce() {
             .expect_err("a link with no source can never be verified")
             .contains("canonical source")
     );
+
+    for (label, operation, kind) in [
+        (
+            "directory creation recorded as a link",
+            ActionOperation::CreateDirectory,
+            RecordedKind::Symlink,
+        ),
+        (
+            "link creation recorded as a directory",
+            ActionOperation::CreateDirectoryLink,
+            RecordedKind::Directory,
+        ),
+        (
+            "reused link recorded as transaction-created",
+            ActionOperation::ReuseExistingLink,
+            RecordedKind::Junction,
+        ),
+    ] {
+        let mut inconsistent = sample(TransactionStatus::Planned);
+        inconsistent.actions[1].operation = operation;
+        inconsistent.actions[1].kind = kind;
+        if operation == ActionOperation::ReuseExistingLink {
+            inconsistent.actions[1].status = ActionStatus::Reused;
+        }
+        assert!(
+            round_trip(&inconsistent)
+                .expect_err(label)
+                .contains("cannot record"),
+            "{label}"
+        );
+    }
 }
 
 #[test]
@@ -449,19 +481,134 @@ fn incomplete_and_terminal_statuses_are_partitioned_exhaustively() {
     }
 }
 
+/// The plan and the journal must classify one operation the same way.
+///
+/// Both impls match exhaustively, so the compiler already refuses a new operation that is left
+/// unclassified. What it cannot catch is the two modules disagreeing: one side would then stage an
+/// entry the other refuses to reconcile, or reconcile one the other never created.
 #[test]
-fn recovery_walks_owned_actions_newest_first_and_skips_reuse() {
+fn the_plan_and_the_journal_classify_every_operation_identically() {
+    let destination = PathBuf::from("/projects/app/.agents/skills/alpha");
+    let source = PathBuf::from("/skills/alpha");
+    for (planned, recorded, label, disposition) in [
+        (
+            MountAction::CreateDirectory {
+                path: PathBuf::from("/projects/app/.agents/skills"),
+            },
+            ActionOperation::CreateDirectory,
+            "mkdir",
+            CleanupDisposition::BestEffort,
+        ),
+        (
+            MountAction::CreateDirectoryLink {
+                source: source.clone(),
+                destination: destination.clone(),
+                mode: LinkMode::Auto,
+            },
+            ActionOperation::CreateDirectoryLink,
+            "link",
+            CleanupDisposition::Required,
+        ),
+        (
+            MountAction::ReuseExistingLink {
+                source: source.clone(),
+                destination: destination.clone(),
+            },
+            ActionOperation::ReuseExistingLink,
+            "reuse",
+            CleanupDisposition::None,
+        ),
+    ] {
+        assert_eq!(
+            recorded.label(),
+            label,
+            "the on-disk label must stay stable"
+        );
+        assert_eq!(ActionOperation::parse(label), Some(recorded), "{label}");
+        assert_eq!(recorded.cleanup_disposition(), disposition, "{label}");
+        assert_eq!(
+            planned.cleanup_disposition(),
+            recorded.cleanup_disposition(),
+            "{label}"
+        );
+        assert_eq!(planned.creates_entry(), recorded.creates_entry(), "{label}");
+        assert_eq!(
+            recorded.creates_entry(),
+            disposition != CleanupDisposition::None,
+            "only a created entry can have a cleanup disposition: {label}"
+        );
+    }
+}
+
+/// A journal written before dispositions existed receives the new policy without a schema change.
+///
+/// The evidence is at the byte level. Nothing is serialized beside the operation label, so a
+/// pre-change file and one this build writes are the same document, and both derive the policy from
+/// the `op` value they already record.
+#[test]
+fn a_pre_change_journal_receives_the_cleanup_policy_without_a_schema_change() {
+    let journal = sample(TransactionStatus::Cleaning);
+    let document = codec::render_document(&journal.to_lines());
+    let text = String::from_utf8(document).expect("the rendered journal is ASCII");
+
+    assert!(
+        !text.contains("cleanup=") && !text.contains("disposition="),
+        "the disposition must stay derived rather than recorded: {text}"
+    );
+    let decoded = round_trip(&journal).expect("a pre-change document must still decode");
+    assert_eq!(
+        decoded
+            .actions
+            .iter()
+            .map(|action| (
+                action.operation.label(),
+                action.operation.cleanup_disposition()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("mkdir", CleanupDisposition::BestEffort),
+            ("link", CleanupDisposition::Required),
+            ("reuse", CleanupDisposition::None),
+        ]
+    );
+}
+
+#[test]
+fn cleanup_walks_created_actions_newest_first_and_skips_reuse() {
     let journal = sample(TransactionStatus::Applying);
 
     let ids = journal
-        .reversible_actions()
+        .cleanup_candidates()
         .map(|action| action.id)
         .collect::<Vec<_>>();
 
     assert_eq!(
         ids,
         [2, 1],
-        "a helper directory must be undone after the links inside it, and a reused entry never"
+        "a helper directory must be visited after the links inside it, and a reused entry never"
+    );
+}
+
+/// A reconciled action leaves the candidate set whatever its disposition was.
+///
+/// For a preserved helper directory that is the whole point of the best-effort rule: the action
+/// records that cleanup has no remaining responsibility, so a later pass must not revisit a
+/// directory it already decided to leave alone.
+#[test]
+fn a_reconciled_action_is_no_longer_a_cleanup_candidate() {
+    let mut journal = sample(TransactionStatus::Cleaning);
+    for action in &mut journal.actions {
+        if action.operation == ActionOperation::CreateDirectory {
+            action.status = ActionStatus::RolledBack;
+        }
+    }
+
+    assert_eq!(
+        journal
+            .cleanup_candidates()
+            .map(|action| action.id)
+            .collect::<Vec<_>>(),
+        [2]
     );
 }
 

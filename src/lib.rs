@@ -44,8 +44,8 @@ use std::process::ExitCode;
 
 /// Runs the shared `SkillMount` command-line entry point.
 ///
-/// Both installed executable names delegate directly to this function. Arguments and paths are
-/// retained as platform-native values until diagnostics are rendered.
+/// Both installed executable names delegate directly to this function. Arguments and paths remain
+/// platform-native authority values; only final diagnostics may render a proved shell convenience.
 #[must_use]
 pub fn run_from<I, T>(args: I) -> ExitCode
 where
