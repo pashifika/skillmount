@@ -97,18 +97,21 @@ Agent publishes another banner.
 | Session with `--no-recover` | Refuses when incomplete state requires reconciliation; otherwise continues through the normal mutating path. |
 | Session encountering a free `supervising` journal | Refuses with category 75 and retains every recorded mount because wrapper-lock release does not prove child-domain death. |
 | `asm doctor` | Resolves every supported Agent executable — explicit paths via `--codex-bin`, `--claude-bin`, or `--omp-bin` — checks release-independent configuration, inspects discovery links, visible-name conflicts, lock liveness, and journals, and runs isolated link-capability probes without SkillMount-owned mutation of project, agent, lock, or journal state. Version capture executes each selected trusted Agent once with literal `--version`: the last-tested banner is `pass`, while a different or unavailable banner is `unverified` and does not fail the command by itself. Executable, configuration, discovery, or capability failures remain `failure` findings and produce category 65. |
-| `asm cleanup --project-root <path>` | Reconciles every structurally valid, non-completed journal for the canonical project after taking that journal's complete recorded lock set. A `supervising` or kept journal is eligible only because invoking this command is the operator's assertion that its process domain is dead or its retained mounts may be released. Its stdout report names every removed link, every unresolved cleanup-critical entry, and every helper directory it preserved; unresolved entries are followed by the same detected-shell recovery footer as a session diagnostic. |
-| `asm cleanup --all` | Applies the same journal-by-journal engine across the bounded state store. Corrupt state blocks all mutation; live locks retain their journals and produce category 75; an unresolved cleanup-critical entry or filesystem failure takes category 73 precedence. Preserved scaffolding alone is reported and returns success. Distinct retry operations are stable-deduplicated before the one final footer. |
+| `asm cleanup --project-root <path>` | Reconciles every structurally valid, non-completed journal for the canonical project after taking that journal's complete recorded lock set. A `supervising` or kept journal is eligible because invoking this command is the operator's assertion that its process domain is dead and its retained ownership may be released. Existing entries still require ownership verification before removal. When every recorded candidate for a required link is absent, explicit cleanup accepts that action without claiming global absence, reports that no filesystem entry was removed, and completes it. Stdout names every removal, accepted missing-link action, unresolved cleanup-critical entry, and preserved helper; unresolved entries receive the detected-shell recovery footer. |
+| `asm cleanup --all` | Applies the same explicit policy journal by journal across the bounded state store. Corrupt state blocks all mutation; live locks retain their journals and produce category 75; an unresolved existing cleanup-critical entry or filesystem failure takes category 73 precedence. Accepted missing-link actions and preserved scaffolding are reported and return success when no failure remains. Distinct retry operations are stable-deduplicated before the one final footer. |
 
 A mutating agent invocation returns the child's ordinary status after successful cleanup. A spawn
-or supervision failure uses the shared typed exit mapping. Cleanup failure replaces child success
-with category 73 and remains secondary evidence behind a failed child, and only an unresolved
-created Skill link, a failure removing one, or a journal failure is such a failure. Ordinary cleanup
-attempts to release every created entry, while `--keep-mounts` retains them intentionally after the
-child boundary. A hard launch-invariant or supervision-intent failure before spawn forces verified
-cleanup; a created Skill link cleanup cannot prove safe to remove remains reported and
-journal-backed, while a helper directory it cannot prune safely is preserved, reported once, and
-released from transaction responsibility. See
+or supervision failure uses the shared typed exit mapping. Automatic or session cleanup failure
+replaces child success with category 73 and remains secondary evidence behind a failed child. An
+unresolved created Skill link, a failed identity-verified removal, an everywhere-absent required
+action, or a journal failure is such a failure. Automatic and ordinary session cleanup attempt to
+release every created entry without inferring global absence; `--keep-mounts` retains them
+intentionally after the child boundary. Explicit `asm cleanup` is the operator recovery boundary:
+it still refuses to mutate an existing mismatch, but it may release an all-absent required action
+and reports that no entry was removed. A hard launch-invariant or supervision-intent failure before
+spawn forces verified cleanup. A helper directory that cannot be pruned is preserved, reported
+once, and released from transaction responsibility only after every enclosed created link is
+reconciled; otherwise its action stays journal-backed with the unresolved descendant. See
 [ADR 0037](adr/0037-limit-cleanup-ownership-to-created-skill-links.md).
 
 Version banners are ephemeral compatibility evidence, never authorization. They do not enter a
@@ -134,12 +137,14 @@ A genuine session-cleanup failure, a quarantined-journal refusal, and an explici
 render every complete structured diagnostic before one recovery footer. The native recovery
 operation remains an executable plus separate platform-native arguments and exact operations are
 stable-deduplicated in first-seen order. Near startup, Windows performs one bounded, best-effort
-process-ancestry observation up to a recognized terminal or session-bootstrap prompt boundary;
-boundaries and other wrappers do not choose a shell, while a missing link before the boundary is
-inconsistent evidence. Exactly one observed `powershell.exe`/`pwsh.exe` family selects a PowerShell
-command, exactly one `cmd.exe` family selects a Command Prompt command, and absent, failed,
-prematurely incomplete, or mixed evidence selects the labelled native vector. Unsupported
-platforms use the vector.
+process-ancestry observation up to a recognized terminal or session-bootstrap prompt boundary.
+Every alleged parent is opened for limited query and its creation time must predate its child;
+inaccessible or inconsistent process-instance evidence, PID zero before the boundary, or a missing
+link before the boundary rejects the observation. Boundaries and other wrappers do not choose a
+shell. Exactly one observed `powershell.exe`/`pwsh.exe` family selects a PowerShell command, exactly
+one `cmd.exe` family selects a Command Prompt command, and absent, failed, prematurely incomplete,
+reused-PID, or mixed evidence selects the labelled native vector. Unsupported platforms use the
+vector.
 
 Each detected-shell encoder accepts a value only when the corresponding native shell can reproduce
 it exactly. PowerShell emits only `[A-Za-z0-9_.-]+` values as bare words and uses single-quoted
@@ -597,15 +602,29 @@ including unpaired surrogates, rather than passing ownership evidence through UT
 Apply rechecks every planned precondition and uses evidence-bearing, atomic same-filesystem
 no-replace placement. Successful placement returns identity for the object established at the final
 path before the journal advances to `applied`; a visible mismatch remains journal-backed residue.
-Rollback and ordinary cleanup share the same reverse-order reconciliation pass, and both derive an
-action's cleanup disposition from the operation label already on disk rather than from a separate
-field: a created Skill link is cleanup-critical, a helper directory is best-effort scaffolding, and a
-reused entry is owned by nobody. A best-effort directory is pruned only while it remains
-identity-matching and empty; when it is non-empty, replaced, or unprunable it is left exactly as it
-is, reported once, and its action is durably reconciled. For a `mkdir` action the stable `rolled_back`
-label therefore records that cleanup responsibility ended, not that the directory is gone, while link
-semantics are unchanged. Windows derives
-attributes, strongest identity, and reparse data from one no-follow handle and retains that handle
+Rollback and ordinary cleanup share the same reverse-order reconciliation pass. The journal decoder
+first rejects any operation/entry-kind combination that no apply sequence can produce; only then
+does cleanup derive disposition from the operation label already on disk. A created Skill link is
+cleanup-critical, a helper directory is best-effort scaffolding, and a reused entry is owned by
+nobody. A best-effort directory is pruned only while it remains identity-matching and empty; when it
+is non-empty, replaced, or unprunable it is left exactly as it is and reported once. Its action is
+durably reconciled only after every enclosed created link is reconciled; an unresolved descendant
+keeps created enclosing helpers pending so a later pass retains their identity evidence. For a
+`mkdir` action the stable `rolled_back` label therefore records that cleanup responsibility ended,
+not that the directory is gone. Automatic, rollback, and session cleanup reconcile a required
+created-link action only after an identity-verified unlink. Pathname absence never proves that link
+gone: another same-user process can move the link beyond every recorded parent, so no bounded
+pathname or enclosing-directory scan can rule it out. If neither recorded candidate still contains
+the verified object, automatic and session cleanup retain the link action and every created
+enclosing helper for manual accounting. An explicit `asm cleanup` invocation is the operator's
+recovery decision: after observing every recorded candidate absent, it may reconcile the action
+without removing an entry,
+release the journal, and report that acceptance. It never removes an existing mismatch. A
+planning-time `BackingStore` lock likewise does not prove which directory later received a
+path-based mutation. Moved, replaced, unreadable, mismatched, and everywhere-absent links remain
+journal-backed until identity-verified removal or that explicit all-absent release.
+Windows derives attributes, strongest identity, and reparse data from one no-follow handle and
+retains that handle
 through rename or disposition. Kind and target are eligibility checks at the Windows handle
 boundary; retained identity is the authority for later object-bound mutation because attribute-only
 access is exempt from Windows share-mode enforcement. Disposition never traverses a reparse target.
@@ -733,12 +752,17 @@ The following are product rules rather than style preferences:
     arguments, and never replaces inherited standard streams with product-owned pipes. Session
     stdout is reserved for child data; every wrapper-owned session diagnostic uses stderr.
 13. Exactly one orderly cleanup operation runs when no child was spawned or the managed process
-    domain is proven dead. Uncertain liveness defers cleanup and preserves recovery evidence. Only
-    an unresolved created Skill link, a failure removing one, or a journal failure is a cleanup
-    failure: it replaces only child success and otherwise remains structured secondary evidence
-    behind the primary child or process failure. A preserved helper directory is reported, never
-    counted as a failure, and never retains a journal by itself. Recovery never turns free wrapper
-    locks into process-domain death proof for a `supervising` journal.
+    domain is proven dead. Uncertain liveness defers cleanup and preserves recovery evidence.
+    Automatic and session cleanup count an unresolved created Skill link, a failed
+    identity-verified removal, an everywhere-absent required action, or a journal failure as a
+    cleanup failure: it replaces only child success and otherwise remains structured secondary
+    evidence behind the primary child or process failure. Explicit `asm cleanup` may instead accept
+    an all-absent required action as the operator's decision to release responsibility; it reports
+    that no filesystem entry was removed and still refuses existing mismatches. A preserved helper
+    directory is reported and never counted as a failure; it never retains a journal by itself, but
+    its action remains pending while an enclosed link independently requires that journal.
+    Recovery never turns free wrapper locks into process-domain death proof for a `supervising`
+    journal.
 14. After release-independent adapter controls accept a launch, mount visibility for the session
     and removal after it are established by the write-ahead journal, the complete recorded lock
     set, proven managed-process-domain death, and ownership-verified removal. No part of that chain
@@ -885,14 +909,17 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
 - normal session summaries on stderr, child-data-only session stdout, verbose
   scope/link/provenance and cleanup diagnostics including preserved scaffolding, and one structured
   stderr block per cleanup failure or quarantined journal carrying the reason, retained paths,
-  retained journal, process-death precondition, and a labelled native recovery argument vector;
-- Unix/macOS symbolic-link and Windows symbolic-link/junction backends;
+  retained journal, process-death precondition, and either one proved detected-shell recovery
+  command or the labelled native argument-vector fallback;
+- Unix/macOS symbolic-link and Windows symbolic-link/junction backends with identity-verified link
+  and empty-directory removal;
 - no-follow link-chain resolution, evidence-bearing atomic no-replace placement, Windows
   handle-bound mutation after initial observation, Unix ownership-checked pathname mutation under
   cooperative locks, and documented creation-to-observation residual scope;
-- logical and physical resource locks, versioned journals, write-ahead apply, rollback, cleanup that
-  reconciles created Skill links and prunes their scaffolding best-effort, terminal kept state, and
-  stale recovery;
+- logical and physical resource locks, versioned journals, write-ahead apply, rollback, automatic and
+  session cleanup that reconcile created Skill links only after identity-verified unlink, explicit
+  operator cleanup that can accept all-absent recorded link paths, best-effort scaffolding pruning,
+  terminal kept state, and stale recovery;
 - generic shell-free child supervision with inherited streams, typed child/interrupt/cleanup
   outcomes, stable exit precedence, reusable native event dispatch, liveness-gated cleanup, Unix
   signal-group handling, Windows console identity and Job Object containment, and feature-gated

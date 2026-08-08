@@ -210,13 +210,21 @@ and never weakens OMP's permission or approval model: it forwards `--auto-approv
 `--approval-mode` only when you supplied them.
 
 Cleanup uses the same journaled, crash-recoverable path as the other agents. Every Skill link
-SkillMount created is removed once the OMP process domain is dead, and the `.omp` and `.omp/skills`
-directories it had to create are pruned too — but only while they are still empty and still the
+SkillMount created remains cleanup-critical once the OMP process domain is dead. The `.omp` and
+`.omp/skills` directories it had to create are pruned too — but only while they are still empty and
 directories it recorded. If OMP, the operating system, or another program left something in one,
-SkillMount preserves that directory and its contents untouched, reports it, and still completes: a
-leftover directory is not a failed cleanup, and nothing SkillMount mounted remains visible.
-`asm doctor` plus `asm cleanup` reconcile an interrupted session. Attaching to or hot-reloading
-Skills into an OMP process SkillMount did not launch is not supported — OMP loads Skills once at
+SkillMount preserves that directory and its contents untouched, reports it, and still completes
+when no created link remains. Automatic and session cleanup reconcile a created link only after an
+identity-verified unlink; pathname absence cannot prove that the same object was not moved
+elsewhere, so an unverified link and its created enclosing helpers remain journal-backed. After
+checking the reported paths and establishing that the process domain is dead, run `asm cleanup`.
+That explicit command treats an all-absent set of recorded link paths as the operator's decision to
+release the stale ownership record, reports that no filesystem entry was removed, and completes the
+journal. It still leaves every existing mismatch untouched. This repairs a crash after unlink
+without adding a second recovery option; if the link was instead moved elsewhere, the command
+deliberately stops tracking that moved link. `asm doctor` helps inspect the interrupted session.
+Attaching to or hot-reloading Skills into an OMP process SkillMount did not launch is not supported
+— OMP loads Skills once at
 startup, so start a new session instead. The recorded OMP evidence, including the platforms it
 does and does not cover, lives in [docs/compatibility.md](docs/compatibility.md).
 

@@ -492,6 +492,15 @@ pub enum AppError {
         /// Executable-plus-argument sequences rendered only after all detail and guidance.
         recovery: Box<[Vec<OsString>]>,
     },
+    /// A filesystem failure with independently escaped details and native recovery operations.
+    FilesystemReport {
+        /// One-line summary written as the primary error.
+        summary: String,
+        /// Already-escaped detail lines, written after the summary.
+        detail: Vec<String>,
+        /// Executable-plus-argument sequences rendered only after all detail and guidance.
+        recovery: Box<[Vec<OsString>]>,
+    },
     /// User interrupt.
     Interrupted,
 }
@@ -504,7 +513,9 @@ impl AppError {
             Self::Usage(_) => ExitCategory::Usage,
             Self::Catalog(_) => ExitCategory::Data,
             // A destination conflict is a filesystem-state failure, not a catalog failure.
-            Self::Plan(_) | Self::Link(_) | Self::Filesystem(_) => ExitCategory::Filesystem,
+            Self::Plan(_) | Self::Link(_) | Self::Filesystem(_) | Self::FilesystemReport { .. } => {
+                ExitCategory::Filesystem
+            }
             Self::Journal(error) => {
                 if error.blocks_recovery() {
                     ExitCategory::Temporary
@@ -527,6 +538,9 @@ impl fmt::Display for AppError {
             | Self::Internal(message)
             | Self::Filesystem(message)
             | Self::Temporary(message)
+            | Self::FilesystemReport {
+                summary: message, ..
+            }
             | Self::TemporaryReport {
                 summary: message, ..
             } => formatter.write_str(message),

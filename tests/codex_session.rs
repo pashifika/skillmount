@@ -642,6 +642,38 @@ fn supervision_journal_failure_overrides_keep_and_cleans_mounts_before_returning
 }
 
 #[test]
+fn cleanup_journal_failure_names_every_retained_mount() {
+    let fixture = Fixture::new("cleanup-journal-failure-paths");
+    fixture.skill("alpha");
+    fixture.skill("beta");
+
+    let output = fixture
+        .command_with_options(&[])
+        .env("SKILLMOUNT_TEST_FAIL_BEGIN_CLEANUP", "1")
+        .output()
+        .expect("asm should report the durable cleanup failure");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(73), "{stderr}");
+    assert!(
+        stderr.contains("injected cleanup transition persistence failure"),
+        "{stderr}"
+    );
+    let normalized = stderr.replace('\\', "/");
+    for skill in ["alpha", "beta"] {
+        let mounted = fixture.project.join(".agents/skills").join(skill);
+        assert!(exists(&mounted), "the failed cleanup retains {mounted:?}");
+        let suffix = format!("/.agents/skills/{skill}");
+        assert!(
+            normalized
+                .lines()
+                .any(|line| line.contains("retained path:") && line.ends_with(&suffix)),
+            "{mounted:?} was omitted from:\n{stderr}"
+        );
+    }
+}
+
+#[test]
 fn codex_is_resolved_from_path_before_mounting() {
     let fixture = Fixture::new("path-agent");
     fixture.skill("alpha");

@@ -718,6 +718,22 @@ impl TransactionJournal {
             }
             previous = action.id;
 
+            let valid_kind = match action.operation {
+                ActionOperation::CreateDirectory => action.kind == RecordedKind::Directory,
+                ActionOperation::CreateDirectoryLink => matches!(
+                    action.kind,
+                    RecordedKind::Undecided | RecordedKind::Symlink | RecordedKind::Junction
+                ),
+                ActionOperation::ReuseExistingLink => action.kind == RecordedKind::Undecided,
+            };
+            if !valid_kind {
+                return Err(format!(
+                    "a {} action cannot record the {} entry kind",
+                    action.operation.label(),
+                    action.kind.label()
+                ));
+            }
+
             if action.operation == ActionOperation::ReuseExistingLink
                 && action.status != ActionStatus::Reused
             {

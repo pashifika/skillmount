@@ -242,6 +242,37 @@ fn validation_rejects_states_no_apply_sequence_can_produce() {
             .expect_err("a link with no source can never be verified")
             .contains("canonical source")
     );
+
+    for (label, operation, kind) in [
+        (
+            "directory creation recorded as a link",
+            ActionOperation::CreateDirectory,
+            RecordedKind::Symlink,
+        ),
+        (
+            "link creation recorded as a directory",
+            ActionOperation::CreateDirectoryLink,
+            RecordedKind::Directory,
+        ),
+        (
+            "reused link recorded as transaction-created",
+            ActionOperation::ReuseExistingLink,
+            RecordedKind::Junction,
+        ),
+    ] {
+        let mut inconsistent = sample(TransactionStatus::Planned);
+        inconsistent.actions[1].operation = operation;
+        inconsistent.actions[1].kind = kind;
+        if operation == ActionOperation::ReuseExistingLink {
+            inconsistent.actions[1].status = ActionStatus::Reused;
+        }
+        assert!(
+            round_trip(&inconsistent)
+                .expect_err(label)
+                .contains("cannot record"),
+            "{label}"
+        );
+    }
 }
 
 #[test]

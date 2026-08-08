@@ -484,7 +484,7 @@ fn cleanup_for_supervisor(
         }
         Err(error) => Err(CleanupFailure {
             reason: error.to_string(),
-            failed_paths: Vec::new(),
+            failed_paths: transaction.cleanup_critical_paths(),
             retained_journal: Some(journal_path.to_path_buf()),
             recovery_command,
         }),
@@ -504,20 +504,27 @@ fn cleanup_failure_from_report(
     for reason in report
         .retained
         .iter()
+        .chain(&report.failed)
         .map(|entry| entry.reason.clone())
-        .chain(report.errors.iter().cloned())
     {
         if !reasons.contains(&reason) {
             reasons.push(reason);
         }
     }
+    let mut failed_paths = Vec::with_capacity(report.retained.len() + report.failed.len());
+    for path in report
+        .retained
+        .iter()
+        .chain(&report.failed)
+        .map(|entry| &entry.path)
+    {
+        if !failed_paths.contains(path) {
+            failed_paths.push(path.clone());
+        }
+    }
     CleanupFailure {
         reason: reasons.join("; "),
-        failed_paths: report
-            .retained
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect(),
+        failed_paths,
         retained_journal: report
             .journal_retained
             .as_ref()
@@ -695,6 +702,38 @@ fn reconcile_incomplete_transactions(
         return Err(AppError::TemporaryReport {
             summary:
                 "cannot start a mutating session because process-domain death was never proved"
+                    .to_owned(),
+            detail,
+            recovery,
+        });
+    }
+    let unresolved = report
+        .reconciled
+        .iter()
+        .filter(|entry| entry.report.needs_attention())
+        .collect::<Vec<_>>();
+    if !unresolved.is_empty() {
+        let mut detail = report.describe();
+        detail.push(
+            "state: every unproven entry and its ownership journal were retained; no new mount was \
+             planned or applied"
+                .to_owned(),
+        );
+        detail.push(
+            "safe next action: inspect every retained path and any location to which the created \
+             link may have moved; correct a reported mismatch before retrying, or invoke the listed \
+             cleanup command to accept an all-absent set of recorded paths"
+                .to_owned(),
+        );
+        let recovery = unresolved
+            .iter()
+            .map(|entry| cleanup_recovery_arguments(invocation.product, &entry.project_root))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        return Err(AppError::FilesystemReport {
+            summary:
+                "cannot start a mutating session because recovered Skill-link ownership remains \
+                 unresolved"
                     .to_owned(),
             detail,
             recovery,
@@ -891,7 +930,9 @@ fn report_clap_fallback(original_kind: ErrorKind) -> ExitCode {
 fn report_error(error: &AppError, invocation: InvocationContext) -> ExitCode {
     let mut stderr = io::stderr().lock();
     let _ = writeln!(stderr, "error: {}", render::text_value(&error.to_string()));
-    if let AppError::TemporaryReport { detail, .. } = error {
+    if let AppError::TemporaryReport { detail, .. } | AppError::FilesystemReport { detail, .. } =
+        error
+    {
         // Written verbatim: each line was built here from independently escaped values, so escaping
         // the block again would only hide the structure it exists to provide.
         for line in detail {
@@ -901,7 +942,9 @@ fn report_error(error: &AppError, invocation: InvocationContext) -> ExitCode {
     for line in error_guidance(error) {
         let _ = writeln!(stderr, "{line}");
     }
-    if let AppError::TemporaryReport { recovery, .. } = error {
+    if let AppError::TemporaryReport { recovery, .. }
+    | AppError::FilesystemReport { recovery, .. } = error
+    {
         for line in render::recovery_footer(invocation.shell, recovery.iter().map(Vec::as_slice)) {
             let _ = writeln!(stderr, "{line}");
         }
@@ -953,10 +996,13 @@ fn error_guidance(error: &AppError) -> Vec<&'static str> {
         AppError::Filesystem(_) => vec![
             "safe next action: inspect every retained path and journal named above with asm doctor; use asm cleanup only after proving no related process is active",
         ],
+        AppError::FilesystemReport { .. }
+        | AppError::Usage(_)
+        | AppError::Internal(_)
+        | AppError::Interrupted => Vec::new(),
         AppError::Temporary(_) | AppError::TemporaryReport { .. } => vec![
             "safe next action: run asm doctor and wait for any active session to exit; never delete a lock file or trust holder text as liveness proof, and use asm cleanup only after proving process-domain death",
         ],
-        AppError::Usage(_) | AppError::Internal(_) | AppError::Interrupted => Vec::new(),
     }
 }
 
@@ -967,13 +1013,14 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        error_guidance, execute_completion, junction_policy_warning, supervision_diagnostic_lines,
-        supervision_diagnostic_report,
+        cleanup_failure_from_report, error_guidance, execute_completion, junction_policy_warning,
+        supervision_diagnostic_lines, supervision_diagnostic_report,
     };
     use crate::cli::{CompletionInput, CompletionShell, ProductBinary};
     use crate::domain::{AgentId, LinkMode};
     use crate::error::{AppError, ExitCategory, LinkError};
     use crate::process::{CleanupFailure, ExitDecision, InvocationShell, SupervisionDiagnostic};
+    use crate::transaction::cleanup::CleanupReport;
 
     struct ErrorWriter {
         kind: io::ErrorKind,
@@ -1078,6 +1125,25 @@ mod tests {
         assert!(guidance.contains("the agent was not launched"));
         assert!(guidance.contains("retained path or journal"));
         assert!(!guidance.contains("no selected Skill was mounted"));
+    }
+
+    #[test]
+    fn a_cleanup_removal_error_keeps_its_path_in_the_structured_failure() {
+        let failed_path = PathBuf::from("/project/.agents/skills/alpha");
+        let fallback_journal = PathBuf::from("/state/transactions/one.journal");
+        let report = CleanupReport {
+            failed: vec![crate::transaction::cleanup::RetainedEntry {
+                path: failed_path.clone(),
+                reason: "access was denied".to_owned(),
+            }],
+            ..CleanupReport::default()
+        };
+
+        let failure = cleanup_failure_from_report(&report, &fallback_journal, Vec::new());
+
+        assert_eq!(failure.reason, "access was denied");
+        assert_eq!(failure.failed_paths, vec![failed_path]);
+        assert_eq!(failure.retained_journal, Some(fallback_journal));
     }
 
     /// One structured block per condition, followed by one native fallback footer.

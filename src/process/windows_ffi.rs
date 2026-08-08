@@ -13,7 +13,7 @@ use std::ptr;
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_NO_MORE_FILES, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
 };
 #[cfg(feature = "test-fixtures")]
 use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -31,9 +31,11 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 #[cfg(feature = "test-fixtures")]
-use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcessId, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 use super::{InterruptKind, InvocationShell};
 
@@ -111,27 +113,43 @@ fn decode_process_entry(raw: &PROCESSENTRY32W) -> ProcessEntry {
 }
 
 fn ancestor_images(entries: &[ProcessEntry], current_process_id: u32) -> Option<Vec<OsString>> {
+    ancestor_images_with(entries, current_process_id, |process_id| {
+        process_creation_time(process_id).ok()
+    })
+}
+
+fn ancestor_images_with(
+    entries: &[ProcessEntry],
+    current_process_id: u32,
+    mut creation_time: impl FnMut(u32) -> Option<u64>,
+) -> Option<Vec<OsString>> {
     let current = unique_process(entries, current_process_id)?;
+    let mut child_creation_time = creation_time(current_process_id)?;
     let mut parent_process_id = current.parent_process_id;
     let mut visited = vec![current_process_id];
     let mut images = Vec::new();
 
     for _ in 0..MAX_ANCESTOR_DEPTH {
-        if parent_process_id == 0 {
-            return Some(images);
-        }
-        if visited.contains(&parent_process_id) {
+        if parent_process_id == 0 || visited.contains(&parent_process_id) {
             return None;
         }
         let parent = unique_process(entries, parent_process_id)?;
+        let parent_creation_time = creation_time(parent_process_id)?;
+        // A process can only create a child after it exists. A newer alleged parent means the
+        // numeric PID was reused after the real parent exited, so the snapshot does not prove this
+        // process instance belongs in the chain.
+        if parent_creation_time >= child_creation_time {
+            return None;
+        }
         visited.push(parent_process_id);
         if is_invocation_boundary(&parent.image) {
             return Some(images);
         }
         images.push(parent.image.clone());
         parent_process_id = parent.parent_process_id;
+        child_creation_time = parent_creation_time;
     }
-    (parent_process_id == 0).then_some(images)
+    None
 }
 
 fn unique_process(entries: &[ProcessEntry], process_id: u32) -> Option<&ProcessEntry> {
@@ -140,6 +158,38 @@ fn unique_process(entries: &[ProcessEntry], process_id: u32) -> Option<&ProcessE
         .filter(|entry| entry.process_id == process_id);
     let entry = matching.next()?;
     matching.next().is_none().then_some(entry)
+}
+
+fn process_creation_time(process_id: u32) -> io::Result<u64> {
+    // SAFETY: the PID is data from the bounded Tool Help snapshot. The call retains no borrowed
+    // memory, and a successful non-null handle is owned by `ProcessHandle`.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let process = ProcessHandle(process);
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    // SAFETY: every pointer names distinct writable `FILETIME` storage for the duration of the
+    // call, the API retains none of them, and `process` keeps the queried process object alive.
+    let observed = unsafe {
+        GetProcessTimes(
+            process.0,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    if observed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
 }
 
 /// Returns whether ancestors above this process cannot be the prompt that regains control.
@@ -172,6 +222,18 @@ impl Drop for SnapshotHandle {
     fn drop(&mut self) {
         // SAFETY: this is the owned non-invalid handle returned by `CreateToolhelp32Snapshot`, and
         // `Drop` runs exactly once.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+struct ProcessHandle(HANDLE);
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the owned non-null handle returned by `OpenProcess`, and this guard is
+        // neither `Clone` nor `Copy`, so it closes exactly once.
         unsafe {
             CloseHandle(self.0);
         }
@@ -395,21 +457,21 @@ mod tests {
         }
     }
 
+    fn ancestors(entries: &[ProcessEntry], current_process_id: u32) -> Option<Vec<OsString>> {
+        ancestor_images_with(entries, current_process_id, |process_id| {
+            Some(u64::MAX - u64::from(process_id))
+        })
+    }
+
     #[test]
-    fn ancestor_walk_returns_ordered_parent_images() {
+    fn ancestor_walk_requires_a_supported_prompt_boundary() {
         let entries = [
             process(10, 20, "asm.exe"),
             process(20, 30, "wrapper.exe"),
             process(30, 0, "pwsh.exe"),
         ];
 
-        assert_eq!(
-            ancestor_images(&entries, 10),
-            Some(vec![
-                OsString::from("wrapper.exe"),
-                OsString::from("pwsh.exe")
-            ])
-        );
+        assert_eq!(ancestors(&entries, 10), None);
     }
 
     #[test]
@@ -421,7 +483,7 @@ mod tests {
         ];
 
         assert_eq!(
-            ancestor_images(&entries, 10),
+            ancestors(&entries, 10),
             Some(vec![OsString::from("pwsh.exe")])
         );
     }
@@ -429,14 +491,14 @@ mod tests {
     #[test]
     fn ancestor_walk_rejects_missing_duplicate_and_cyclic_process_evidence() {
         assert_eq!(
-            ancestor_images(
+            ancestors(
                 &[process(10, 20, "asm.exe"), process(20, 30, "pwsh.exe")],
                 10
             ),
             None
         );
         assert_eq!(
-            ancestor_images(
+            ancestors(
                 &[
                     process(10, 20, "asm.exe"),
                     process(20, 0, "pwsh.exe"),
@@ -447,10 +509,47 @@ mod tests {
             None
         );
         assert_eq!(
-            ancestor_images(
+            ancestors(
                 &[process(10, 20, "asm.exe"), process(20, 10, "pwsh.exe")],
                 10
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn ancestor_walk_rejects_a_reused_parent_process_id() {
+        let entries = [
+            process(10, 20, "asm.exe"),
+            process(20, 30, "pwsh.exe"),
+            process(30, 40, "WindowsTerminal.exe"),
+        ];
+
+        assert_eq!(
+            ancestor_images_with(&entries, 10, |process_id| match process_id {
+                10 => Some(100),
+                // The alleged parent was created after its child, which can only describe a reused
+                // numeric PID rather than the process instance that launched SkillMount.
+                20 => Some(200),
+                30 => Some(50),
+                _ => None,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn ancestor_walk_rejects_unavailable_process_time_evidence() {
+        let entries = [
+            process(10, 20, "asm.exe"),
+            process(20, 30, "pwsh.exe"),
+            process(30, 40, "WindowsTerminal.exe"),
+        ];
+
+        assert_eq!(
+            ancestor_images_with(&entries, 10, |process_id| {
+                (process_id == 10).then_some(100)
+            }),
             None
         );
     }
@@ -469,6 +568,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(ancestor_images(&entries, 1), None);
+        assert_eq!(ancestors(&entries, 1), None);
     }
 }

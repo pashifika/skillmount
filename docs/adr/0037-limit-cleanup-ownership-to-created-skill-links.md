@@ -41,17 +41,29 @@ observed no-follow, but their removal is best-effort housekeeping:
 1. Cleanup, rollback, automatic recovery, and `asm cleanup` prune a recorded helper directory only
    while its recorded identity still matches and it is empty, and never recursively.
 2. A helper directory that is non-empty, replaced, ownership-uncertain, or whose prune fails is left
-   exactly as it is, is reported as preserved scaffolding with its reason, and its action is
-   durably reconciled. Preserved scaffolding alone MUST NOT retain a journal, replace a child
-   status, or produce recovery guidance.
+   exactly as it is and reported as preserved scaffolding with its reason. Once every enclosed
+   created Skill link is reconciled, its helper action is durably reconciled too; preserved
+   scaffolding alone MUST NOT retain a journal, replace a child status, or produce recovery
+   guidance. While a cleanup-critical descendant remains unresolved, however, its enclosing helper
+   action stays pending so the next pass does not lose the identity evidence needed to retry.
 3. For a `mkdir` action the stable on-disk `rolled_back` label means that cleanup responsibility was
    reconciled; unlike a link action it does not assert physical absence. The journal schema, the
    `mkdir`/`link`/`reuse` operation labels, and the action-status labels are unchanged, so a
    pre-change journal receives this policy without migration.
 4. An unremoved or ownership-uncertain created Skill link, and any journal-persistence failure,
-   remain fail-closed exactly as before: the journal is retained, child-versus-cleanup exit
-   precedence is unchanged, and release still requires proven managed-process-domain death or an
-   explicit operator assertion.
+   remain fail-closed during rollback, automatic recovery, and ordinary session cleanup: the
+   journal is retained, child-versus-cleanup exit precedence is unchanged, and mutation still
+   requires proven managed-process-domain death.
+5. Pathname absence never proves a created link is gone because the link can be moved beyond every
+   recorded parent. No bounded pathname or enclosing-directory scan can establish global absence.
+   Automatic, rollback, and session cleanup therefore reconcile a required created-link action only
+   after an identity-verified unlink and retain every all-absent action plus its created enclosing
+   helpers for manual accounting. `asm cleanup` is the explicit operator recovery boundary. Once it
+   observes every recorded candidate absent, it may accept the action and release the journal while
+   reporting that no filesystem entry was removed. It still refuses every existing mismatch. This
+   rule applies equally to transaction-created helpers and pre-existing stores; a planning-time
+   `BackingStore` lock does not add mutation-bound authority. The conservative automatic path and
+   explicit-release path use the existing journal schema.
 
 Because a preserved directory can no longer block another transaction, batch cleanup order carries
 no policy. Explicit cleanup keeps its single shared-lock claim, its reload under those locks, and
@@ -99,15 +111,16 @@ native round trip, with the labelled vector as fallback.
   `.agents/skills`, project-mode `.claude/skills`, or `.omp/skills` disappeared. Only the links it
   created are guaranteed absent. Normal best-effort pruning still produces the previous empty-layout
   result when nothing interferes.
-- A directory the pass could not prune is preserved without a journal. This is intentional: it
-  exposes no selected external Skill, and the alternative is deleting content SkillMount did not
-  create.
+- A directory the pass could not prune is preserved without a journal only after every enclosed
+  created link is reconciled. Until then, the link and any created enclosing helper remain pending
+  so a failed proof can be retried without losing its directory identity evidence.
 - Directory creation failures and journal-persistence failures still fail normally. Only
   post-link-removal housekeeping is non-critical, and verbose session output and the `asm cleanup`
   report still name the preserved path and its reason.
-- The `rolled_back` label now carries a kind-dependent meaning. Link semantics are unchanged, so the
-  weaker directory meaning cannot leak into link recovery, but a reader of the journal format must
-  consult the operation to interpret it.
+- The `rolled_back` label now carries a kind-dependent meaning. For automatic, rollback, and session
+  cleanup, required-link reconciliation still means identity-verified unlink. Explicit `asm cleanup`
+  can additionally record the operator's acceptance of all-absent candidates. A reader of the
+  journal format must consult both the operation and the cleanup entry point to interpret it.
 - Reverting this decision needs no data conversion. An older binary reading a journal written by
   this one sees ordinary scaffolding plus already terminal actions; its recovered behavior is more
   conservative, never more destructive.
@@ -120,6 +133,10 @@ native round trip, with the labelled vector as fallback.
   force. ADR 0038 alone replaces the vector-only presentation rule. No claim here is stronger than
   those records support: the guarantee for a preserved directory is that SkillMount did not touch
   it, not that no other actor will.
+- Explicit cleanup cannot distinguish a successfully unlinked link from one moved beyond every
+  recorded parent. Invoking `asm cleanup` after reviewing an all-absent report deliberately releases
+  SkillMount's responsibility for either outcome; a moved link remains where the operator moved it.
+  Existing mismatches are never removed by this authority.
 - No recursive remover, junk-file allowlist, shell invocation, dependency, CLI flag, exit category,
   journal schema version, pinned Agent version, unsafe allowlist entry, or supported target changes.
 - `docs/architecture.md`, `README.md`, the six modified capability specifications, and the
@@ -135,10 +152,15 @@ native round trip, with the labelled vector as fallback.
   a genuine link mismatch to keep status `73`, its journal, and one structured recovery block.
 - `tests/transaction.rs` covers apply rollback, ordinary cleanup, automatic recovery, and explicit
   cleanup for directory-only residue, a pre-change `mkdir` journal, the shared-lock claim for
-  overlapping kept journals, and termination at the debug-only `scaffolding-reconciled` checkpoint
-  followed by a real second invocation that completes.
-- `src/transaction/tests.rs` and `src/journal/tests.rs` pin the exhaustive creation/disposition
-  classification, the stable label round trips, and the preserved-scaffolding report channel.
+  overlapping kept journals, automatic retention of a moved Claude staging root, explicit release
+  of its all-absent recorded link paths without deleting the moved link, and interruption after an
+  identity-verified unlink followed by successful `asm cleanup` and a real resumed invocation.
+- `src/transaction/tests.rs` exercises a link moved with a pre-existing `BackingStore`, replacement
+  of that store between planning and apply, links renamed within and moved beyond their created
+  helper, repeated all-absent automatic cleanup, the exhaustive creation/disposition
+  classification, and the preserved-scaffolding report channel. `src/journal/tests.rs` pins stable
+  label round trips and rejects operation/kind combinations that would reinterpret required link
+  cleanup as best effort.
 - `src/app.rs` unit tests pin one block per condition, multiple retained paths, multiple quarantined
   journals, macOS control bytes, Windows unpaired UTF-16, forged-line input, and one final,
   stable-deduplicated detected-shell command or native-vector fallback; raw `recovery[n] argv[n]`

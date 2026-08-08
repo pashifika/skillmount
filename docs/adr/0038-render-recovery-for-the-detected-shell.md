@@ -39,11 +39,14 @@ or execute a rendered shell command.
 Near application startup, SkillMount SHALL capture a best-effort invocation-shell hint. On Windows,
 a bounded Tool Help ancestry walk ends at a recognized terminal or Windows session-bootstrap
 process; ancestors beyond that prompt boundary cannot regain control, and Windows commonly records
-the PID of an already-exited launcher there. Before that boundary, a missing link, cycle, duplicate
-PID, or overlong chain is inconsistent evidence. `powershell.exe` and `pwsh.exe` form one
-PowerShell family and `cmd.exe` forms the Command Prompt family; boundaries and other wrappers do
-not choose a family. Exactly one family selects it. Zero or mixed families, observation failure,
-premature disappearance, PID uncertainty, or an unsupported platform yields `Unknown`. The hint is
+the PID of an already-exited launcher there. Every numeric parent PID before the boundary SHALL be
+bound to the observed process instance by querying its creation time and proving that it predates
+the child; an unavailable timestamp, a parent that is not older than its child, or PID zero before a
+recognized boundary is inconsistent evidence. A missing link, cycle, duplicate PID, or overlong
+chain is likewise inconsistent. `powershell.exe` and `pwsh.exe` form one PowerShell family and
+`cmd.exe` forms the Command Prompt family; boundaries and other wrappers do not choose a family.
+Exactly one family selects it. Zero or mixed families, observation failure, premature
+disappearance, PID uncertainty, or an unsupported platform yields `Unknown`. The hint is
 presentation-only and MUST NOT affect cleanup authority, process-death proof, scope, mutation, or
 exit status.
 
@@ -97,9 +100,10 @@ so no flag is added.
   non-Unicode cases remain correct but less convenient through the labelled vector.
 - Process ancestry becomes one new best-effort observation at startup. Failure is silent and cannot
   stop `inspect`, a dry run, a session, `doctor`, or `cleanup`.
-- Windows implementation adds the Tool Help feature to the existing `windows-sys` dependency and
-  keeps all raw calls in the already allowed `src/process/windows_ffi.rs` boundary. No dependency,
-  unsafe allowlist entry, deployment target, permission, elevation, or shell process is added.
+- Windows implementation adds Tool Help plus limited process-query and process-time calls to the
+  existing `windows-sys` feature set and keeps all raw calls in the already allowed
+  `src/process/windows_ffi.rs` boundary. No dependency, unsafe allowlist entry, deployment target,
+  permission, elevation, or shell process is added.
 - Public recovery text changes, so README examples, the architecture baseline, operator-recovery
   specifications, and executable-seam assertions change in the same product change.
 - Reverting the renderer requires no journal or state migration because native recovery operations
@@ -111,8 +115,8 @@ so no flag is added.
   Command Prompt spaces and trailing separators, recognized `asm`/`skillmount` identity, exact
   deduplication, and vector fallback for controls, expansion-sensitive input, and unpaired UTF-16.
 - Ancestry-classifier tests pin direct PowerShell, direct Command Prompt, ignored wrappers,
-  recognized prompt boundaries, mixed families, premature missing parents, bounded walks, and
-  observation failures as non-authoritative data.
+  recognized prompt boundaries, mixed families, premature missing parents, PID reuse, missing
+  process-time evidence, bounded walks, and observation failures as non-authoritative data.
 - Native Windows executable-seam tests parse accepted commands through real Windows PowerShell and
   `cmd.exe` into the fake agent and compare its recorded `args_os()` values with the source native
   operation.

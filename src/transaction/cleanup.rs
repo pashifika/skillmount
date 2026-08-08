@@ -23,8 +23,11 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::checkpoint::{Checkpoint, reached};
-use crate::error::AppError;
-use crate::journal::{ActionStatus, JournalAction, RecordedKind, TransactionStatus, store};
+use crate::error::{AppError, LinkError};
+use crate::journal::{
+    ActionOperation, ActionStatus, JournalAction, RecordedKind, TransactionStatus, store,
+};
+use crate::link::resolve::ComparablePath;
 use crate::link::{
     CreatedLink, CreatedLinkKind, EntryKind, OwnedDirectory, OwnershipMismatch, RemoveOutcome,
 };
@@ -62,10 +65,14 @@ impl fmt::Display for RetainedEntry {
 pub struct CleanupReport {
     /// Paths whose entries were verified and removed.
     pub removed: Vec<PathBuf>,
-    /// Cleanup-critical paths that were left alone, with the reason for each.
+    /// Required link actions explicitly accepted after every recorded path was observed absent.
     ///
-    /// Every entry here is a created Skill link this pass could not prove gone. That is what keeps
-    /// the journal on disk and lets cleanup replace a successful child status.
+    /// Only `asm cleanup` can populate this channel. It records an operator-authorized release of
+    /// responsibility, not a filesystem removal.
+    pub accepted_missing_links: Vec<PathBuf>,
+    /// Cleanup-critical paths that were left alone, with the reason for each.
+    /// Every entry here is a created Skill link this pass could not identity-verify and unlink. That
+    /// is what keeps the journal on disk and lets cleanup replace a successful child status.
     pub retained: Vec<RetainedEntry>,
     /// Discovery scaffolding the pass deliberately left in place, with the reason for each.
     ///
@@ -73,8 +80,9 @@ pub struct CleanupReport {
     /// emptied. Once every cleanup-critical link is reconciled nothing selected is reachable through
     /// it, so these are observations for verbose and operator output, never a failure.
     pub preserved_scaffolding: Vec<RetainedEntry>,
-    /// Failures the operating system reported while removing a verified cleanup-critical entry.
-    pub errors: Vec<String>,
+    /// Cleanup-critical entries whose inspection or removal failed at the operating-system
+    /// boundary.
+    pub failed: Vec<RetainedEntry>,
     /// Why the journal survives this pass.
     pub journal_retained: Option<JournalRetention>,
 }
@@ -106,7 +114,7 @@ impl CleanupReport {
     /// would turn another writer's file into a failed session.
     #[must_use]
     pub fn needs_attention(&self) -> bool {
-        !self.retained.is_empty() || !self.errors.is_empty()
+        !self.retained.is_empty() || !self.failed.is_empty()
     }
 
     /// Renders every unresolved cleanup-critical path and error, one per line.
@@ -116,11 +124,8 @@ impl CleanupReport {
         for entry in &self.retained {
             lines.push(format!("retained {entry}"));
         }
-        for error in &self.errors {
-            lines.push(format!(
-                "cleanup error: {}",
-                crate::render::text_value(error)
-            ));
+        for failure in &self.failed {
+            lines.push(format!("cleanup error: {failure}"));
         }
         if let Some(retention) = &self.journal_retained {
             let path = crate::render::path_value(retention.path(), true);
@@ -164,7 +169,17 @@ impl Transaction {
     /// Returns the same errors and evidence-rich partial report as [`Self::cleanup`].
     pub fn cleanup_required(&mut self) -> Result<CleanupReport, AppError> {
         self.journal.keep_mounts = false;
-        self.cleanup()
+        self.cleanup_with_missing_link_policy(MissingLinkPolicy::Retain)
+    }
+
+    /// Reconciles an explicitly selected stale transaction with operator authority.
+    ///
+    /// Unlike automatic and session cleanup, `asm cleanup` accepts responsibility for a required
+    /// link action when every recorded candidate is absent. It still refuses every existing entry
+    /// whose ownership cannot be verified.
+    pub(super) fn cleanup_explicit(&mut self) -> Result<CleanupReport, AppError> {
+        self.journal.keep_mounts = false;
+        self.cleanup_with_missing_link_policy(MissingLinkPolicy::Accept)
     }
 
     /// Removes everything this transaction owns when an orderly session releases it.
@@ -179,6 +194,21 @@ impl Transaction {
     /// that fails or is refused is reported in the [`CleanupReport`] rather than as an error,
     /// because the remaining entries still have to be attempted.
     pub fn cleanup(&mut self) -> Result<CleanupReport, AppError> {
+        self.cleanup_with_missing_link_policy(MissingLinkPolicy::Retain)
+    }
+
+    fn cleanup_with_missing_link_policy(
+        &mut self,
+        missing_link_policy: MissingLinkPolicy,
+    ) -> Result<CleanupReport, AppError> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SKILLMOUNT_TEST_FAIL_BEGIN_CLEANUP").is_some() {
+            return Err(crate::error::JournalError::Write {
+                path: self.path.clone(),
+                reason: "injected cleanup transition persistence failure".to_owned(),
+            }
+            .into());
+        }
         // Enter cleanup durably before deciding whether this orderly session may terminalize a
         // keep request. A crash in planned, applying, active, supervising, failed, or even at this
         // cleaning boundary remains incomplete. Once `cleaning` is durable it is automatically
@@ -193,7 +223,7 @@ impl Transaction {
             });
         }
 
-        let mut report = self.reconcile_pending_actions()?;
+        let mut report = self.reconcile_pending_actions(missing_link_policy)?;
 
         if report.needs_attention() {
             // A failed cleanup keeps its journal. The retained entries are still described by it,
@@ -223,11 +253,15 @@ impl Transaction {
         let mut preserved = Vec::new();
         let mut rollback_errors = Vec::new();
 
-        match self.reconcile_pending_actions() {
+        match self.reconcile_pending_actions(MissingLinkPolicy::Retain) {
             Ok(report) => {
                 retained = report.retained;
                 preserved = report.preserved_scaffolding;
-                rollback_errors = report.errors;
+                rollback_errors = report
+                    .failed
+                    .into_iter()
+                    .map(|failure| failure.to_string())
+                    .collect();
             }
             Err(error) => rollback_errors.push(error.to_string()),
         }
@@ -260,16 +294,22 @@ impl Transaction {
     ///
     /// Both dispositions travel the same pass in the same direction and use the same sealed removal
     /// proofs; only the answer to "may this action stop being my responsibility?" differs. A
-    /// cleanup-critical link must be gone; a best-effort helper directory may also be preserved.
+    /// cleanup-critical link normally requires an identity-verified unlink, while explicit cleanup
+    /// may also accept an action whose two recorded paths are absent. A best-effort helper directory
+    /// may be preserved.
     /// Either way the transition is journalled before the next action is touched, so a crash
     /// mid-pass never leaves the journal claiming an obligation it already discharged.
-    fn reconcile_pending_actions(&mut self) -> Result<CleanupReport, AppError> {
+    fn reconcile_pending_actions(
+        &mut self,
+        missing_link_policy: MissingLinkPolicy,
+    ) -> Result<CleanupReport, AppError> {
         let mut report = CleanupReport::default();
         let order = self
             .journal
             .cleanup_candidates()
             .map(|action| action.id)
             .collect::<Vec<_>>();
+        let mut unresolved_required = Vec::new();
 
         for (position, id) in order.into_iter().enumerate() {
             let sequence = u32::try_from(position + 1).unwrap_or(u32::MAX);
@@ -282,12 +322,29 @@ impl Transaction {
             if let Some(residue) = &placement_residue {
                 record_left_alone(&mut report, disposition, residue.clone());
             }
-            let outcome = self.clear_action(
-                &action,
-                sequence,
-                &mut report,
-                placement_residue.as_ref().map(|entry| entry.path.as_path()),
-            );
+            let outcome = if disposition == CleanupDisposition::BestEffort
+                && action.operation == ActionOperation::CreateDirectory
+                && action_encloses_any(&action, &unresolved_required)
+            {
+                report.preserved_scaffolding.push(RetainedEntry {
+                    path: action.current_path().clone(),
+                    reason: "the helper directory remains recorded while a cleanup-critical \
+                             descendant cannot be proved gone"
+                        .to_owned(),
+                });
+                Outcome::Unresolved
+            } else {
+                self.clear_action(
+                    &action,
+                    sequence,
+                    &mut report,
+                    placement_residue.as_ref().map(|entry| entry.path.as_path()),
+                    missing_link_policy,
+                )
+            };
+            if outcome == Outcome::Unresolved && disposition == CleanupDisposition::Required {
+                unresolved_required.extend(action.candidate_paths());
+            }
 
             // An unresolved cleanup-critical entry keeps its action pending, which is what keeps it
             // described by the journal so a later run holding the same locks can try again. A
@@ -319,15 +376,41 @@ impl Transaction {
         sequence: u32,
         report: &mut CleanupReport,
         residue_path: Option<&Path>,
+        missing_link_policy: MissingLinkPolicy,
     ) -> Outcome {
         let disposition = action.operation.cleanup_disposition();
         if action.kind == RecordedKind::Undecided {
-            return self.inspect_undecided_candidates(action, disposition, report);
+            return self.inspect_undecided_candidates(
+                action,
+                disposition,
+                report,
+                missing_link_policy,
+            );
         }
         let mut left_alone = residue_path.is_some();
+        let incomplete_link_evidence = disposition == CleanupDisposition::Required
+            && matches!(action.kind, RecordedKind::Symlink | RecordedKind::Junction)
+            && (action.source_canonical.is_none()
+                || action.link_target.is_none()
+                || action.identity.is_none());
         for path in action.candidate_paths() {
             if residue_path == Some(path.as_path()) {
                 continue;
+            }
+            // A fixed link mode is durable at `action-intent`, before the target and identity are.
+            // Automatic cleanup must retain that uncertainty. Explicit cleanup still needs to
+            // distinguish an absent candidate from an existing object it has no authority to
+            // remove, so inspect only; any present entry falls through to the normal refusal.
+            if missing_link_policy == MissingLinkPolicy::Accept && incomplete_link_evidence {
+                match self.backend.inspect_no_follow(&path) {
+                    Ok(entry) if entry.kind == EntryKind::Missing => continue,
+                    Ok(_) => {}
+                    Err(error) => {
+                        report.failed.push(cleanup_failure(path, error));
+                        left_alone = true;
+                        continue;
+                    }
+                }
             }
             match self.remove_candidate(action, &path) {
                 Ok(RemoveOutcome::AlreadyAbsent) => {}
@@ -364,26 +447,35 @@ impl Transaction {
                     // A failed prune of best-effort scaffolding is an observation rather than a
                     // cleanup failure: the path is untouched, and once every cleanup-critical link
                     // is reconciled no selected Skill is reachable through it.
+                    let mut failure = cleanup_failure(path, error);
                     match disposition {
                         CleanupDisposition::BestEffort => {
-                            report.preserved_scaffolding.push(RetainedEntry {
-                                path,
-                                reason: format!(
-                                    "pruning this scaffolding directory failed ({error}), so it \
-                                     was left exactly as it is"
-                                ),
-                            });
+                            failure.reason = format!(
+                                "pruning this scaffolding directory failed ({}), so it was left \
+                                 exactly as it is",
+                                failure.reason
+                            );
+                            report.preserved_scaffolding.push(failure);
                         }
                         CleanupDisposition::Required | CleanupDisposition::None => {
-                            report.errors.push(error.to_string());
+                            report.failed.push(failure);
                         }
                     }
                     left_alone = true;
                 }
             }
         }
-        // Nothing left alone and nothing at either path: the process may have stopped before the
-        // entry was created, or a previous pass may already have removed it.
+        // A created link can move outside its recorded parent as well as between its two recorded
+        // paths. No bounded pathname or directory scan proves that object gone. Automatic cleanup
+        // therefore requires a successful identity-verified unlink. Explicit cleanup may instead
+        // accept responsibility when every recorded candidate is absent.
+        left_alone = Self::retain_if_no_verified_removal(
+            action,
+            disposition,
+            report,
+            left_alone,
+            missing_link_policy,
+        );
         outcome_for(disposition, left_alone)
     }
 
@@ -398,6 +490,7 @@ impl Transaction {
         action: &JournalAction,
         disposition: CleanupDisposition,
         report: &mut CleanupReport,
+        missing_link_policy: MissingLinkPolicy,
     ) -> Outcome {
         let mut left_alone = false;
         for path in action.candidate_paths() {
@@ -420,10 +513,17 @@ impl Transaction {
                 }
                 Err(error) => {
                     left_alone = true;
-                    report.errors.push(error.to_string());
+                    report.failed.push(cleanup_failure(path, error));
                 }
             }
         }
+        left_alone = Self::retain_if_no_verified_removal(
+            action,
+            disposition,
+            report,
+            left_alone,
+            missing_link_policy,
+        );
         outcome_for(disposition, left_alone)
     }
 
@@ -432,14 +532,12 @@ impl Transaction {
         &self,
         action: &JournalAction,
         path: &Path,
-    ) -> Result<RemoveOutcome, AppError> {
+    ) -> Result<RemoveOutcome, LinkError> {
         match action.kind {
-            RecordedKind::Directory => {
-                Ok(self.backend.remove_empty_directory(&OwnedDirectory {
-                    path: path.to_path_buf(),
-                    identity: action.identity.clone(),
-                })?)
-            }
+            RecordedKind::Directory => self.backend.remove_empty_directory(&OwnedDirectory {
+                path: path.to_path_buf(),
+                identity: action.identity.clone(),
+            }),
             RecordedKind::Symlink | RecordedKind::Junction => {
                 let Some(source_canonical) = action.source_canonical.clone() else {
                     return Ok(RemoveOutcome::OwnershipMismatch(
@@ -453,7 +551,7 @@ impl Transaction {
                         OwnershipMismatch::IdentityUnavailable,
                     ));
                 };
-                Ok(self.backend.remove_link_entry(&CreatedLink {
+                self.backend.remove_link_entry(&CreatedLink {
                     path: path.to_path_buf(),
                     kind: if action.kind == RecordedKind::Junction {
                         CreatedLinkKind::Junction
@@ -463,18 +561,68 @@ impl Transaction {
                     target,
                     source_canonical,
                     identity: action.identity.clone(),
-                })?)
+                })
             }
             // Handled by `inspect_undecided_candidates`, which must inspect both paths together.
             RecordedKind::Undecided => Ok(RemoveOutcome::AlreadyAbsent),
         }
     }
+
+    /// Reconciles a required created-link action when no recorded path was verified and unlinked.
+    fn retain_if_no_verified_removal(
+        action: &JournalAction,
+        disposition: CleanupDisposition,
+        report: &mut CleanupReport,
+        already_left_alone: bool,
+        missing_link_policy: MissingLinkPolicy,
+    ) -> bool {
+        if already_left_alone || disposition != CleanupDisposition::Required {
+            return already_left_alone;
+        }
+        if missing_link_policy == MissingLinkPolicy::Accept {
+            report
+                .accepted_missing_links
+                .push(action.current_path().clone());
+            return false;
+        }
+        record_left_alone(
+            report,
+            disposition,
+            RetainedEntry {
+                path: action.current_path().clone(),
+                reason: "no recorded path contained the created Skill link, and pathname absence \
+                         cannot prove that the link identity was not moved elsewhere"
+                    .to_owned(),
+            },
+        );
+        true
+    }
+}
+
+/// Returns whether a helper action encloses any still-unresolved cleanup-critical path.
+fn action_encloses_any(action: &JournalAction, descendants: &[PathBuf]) -> bool {
+    action.candidate_paths().iter().any(|container| {
+        let container = ComparablePath::new(container);
+        descendants.iter().any(|descendant| {
+            let descendant = ComparablePath::new(descendant);
+            descendant.key() != container.key() && descendant.key().starts_with(container.key())
+        })
+    })
+}
+
+/// Whether an all-absent required link action remains transaction responsibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingLinkPolicy {
+    /// Automatic, rollback, and normal session cleanup retain ownership evidence.
+    Retain,
+    /// Explicit operator cleanup accepts responsibility and releases the journal.
+    Accept,
 }
 
 /// What responsibility an action still carries after one pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
-    /// Nothing this transaction created remains at either candidate path.
+    /// This transaction's responsibility for the action was discharged.
     Reconciled,
     /// A best-effort helper directory was deliberately left in place. Its responsibility is
     /// discharged even though the directory is still there.
@@ -507,6 +655,17 @@ fn record_left_alone(
         CleanupDisposition::BestEffort => report.preserved_scaffolding.push(entry),
         CleanupDisposition::Required | CleanupDisposition::None => report.retained.push(entry),
     }
+}
+
+/// Keeps one failed cleanup fact structured so diagnostics render its path and cause exactly once.
+fn cleanup_failure(path: PathBuf, error: LinkError) -> RetainedEntry {
+    let reason = match error {
+        LinkError::Inspect { reason, .. }
+        | LinkError::Remove { reason, .. }
+        | LinkError::Unsupported { reason, .. } => reason,
+        other => other.to_string(),
+    };
+    RetainedEntry { path, reason }
 }
 
 /// Returns the checkpoint that fires after a removal of this kind.

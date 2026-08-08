@@ -56,11 +56,7 @@ impl LinkBackend for UnixBackend {
             path: path.to_path_buf(),
             kind,
             target,
-            identity: Some(PlatformIdentity::from_pair(
-                "unix",
-                metadata.dev(),
-                metadata.ino(),
-            )),
+            identity: Some(identity(&metadata)),
         })
     }
 
@@ -313,6 +309,9 @@ impl LinkBackend for UnixBackend {
             }
         }
     }
+}
+fn identity(metadata: &fs::Metadata) -> PlatformIdentity {
+    PlatformIdentity::from_pair("unix", metadata.dev(), metadata.ino())
 }
 
 /// Runs the backend-private atomic pathname rename, returning `false` for destination contention.

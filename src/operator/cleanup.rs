@@ -134,6 +134,14 @@ fn render_cleanup_outcomes(output: &mut String, report: &ExplicitCleanupReport) 
             for removed in &entry.report.removed {
                 let _ = writeln!(output, "  removed {}", path_value(removed, true));
             }
+            for accepted in &entry.report.accepted_missing_links {
+                let _ = writeln!(
+                    output,
+                    "  accepted missing link {}: every recorded path was absent; no filesystem \
+                     entry was removed",
+                    path_value(accepted, true)
+                );
+            }
             for retained in &entry.report.retained {
                 let _ = writeln!(
                     output,
@@ -150,8 +158,8 @@ fn render_cleanup_outcomes(output: &mut String, report: &ExplicitCleanupReport) 
                     text_value(&preserved.reason)
                 );
             }
-            for error in &entry.report.errors {
-                let _ = writeln!(output, "  cleanup error: {}", text_value(error));
+            for failure in &entry.report.failed {
+                let _ = writeln!(output, "  cleanup error: {failure}");
             }
             if let Some(retention) = &entry.report.journal_retained {
                 let _ = writeln!(

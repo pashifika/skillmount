@@ -28,6 +28,8 @@ const SKILLMOUNT: &str = env!("CARGO_BIN_EXE_skillmount");
 const FAKE_AGENT: &str = env!("CARGO_BIN_EXE_skillmount-fake-agent");
 /// The reused `asm` child rejects Codex-native injected arguments with this usage status.
 const FIXTURE_CHILD_STATUS: i32 = 64;
+/// `SkillMount`'s filesystem/ownership failure status.
+const FILESYSTEM_STATUS: i32 = 73;
 /// Real-process startup includes durable filesystem I/O on the selected native volume.
 const HOLD_START_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -912,7 +914,7 @@ fn cleanup_retains_a_replaced_mount_and_its_journal() {
 }
 
 #[test]
-fn cleanup_accepts_an_already_missing_mount_but_never_touches_the_source() {
+fn cleanup_accepts_an_already_missing_mount_and_releases_its_journal() {
     let fixture = Fixture::new("explicit-cleanup-missing");
     fixture.skill("alpha");
     fixture.run_stopping_at("codex", "journal-active", &[]);
@@ -920,15 +922,28 @@ fn cleanup_accepts_an_already_missing_mount_but_never_touches_the_source() {
     remove_directory_link(&mounted);
 
     let cleaned = fixture.cleanup(false);
+    let rendered = String::from_utf8_lossy(&cleaned.stdout);
 
+    assert!(cleaned.status.success(), "{rendered}");
     assert!(
-        cleaned.status.success(),
-        "{}",
-        String::from_utf8_lossy(&cleaned.stdout)
+        !exists(&mounted),
+        "cleanup does not recreate the missing link"
     );
-    assert!(fixture.project_tree().is_empty());
+    assert!(
+        fixture.project_tree().is_empty(),
+        "explicit acceptance lets empty transaction-created helpers be pruned"
+    );
     assert!(fixture.journals().is_empty());
     assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+    assert!(rendered.contains("accepted missing link"), "{rendered}");
+    assert!(
+        rendered.contains("no filesystem entry was removed"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("Resolve every reported condition before recovery"),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -1130,8 +1145,12 @@ fn a_second_invocation_recovers_every_boundary_and_leaves_the_project_clean() {
 
         assert_eq!(
             recovered.status.code(),
-            Some(FIXTURE_CHILD_STATUS),
-            "the recovering session must launch and clean up after its fixture child at {boundary}: {}",
+            Some(if boundary == "entry-removed" {
+                FILESYSTEM_STATUS
+            } else {
+                FIXTURE_CHILD_STATUS
+            }),
+            "the recovering session returned the wrong status at {boundary}: {}",
             String::from_utf8_lossy(&recovered.stderr)
         );
         assert!(
@@ -1161,6 +1180,18 @@ fn a_second_invocation_recovers_every_boundary_and_leaves_the_project_clean() {
                 "scaffolding alone must not keep a journal: {:?}",
                 fixture.journals()
             );
+        } else if boundary == "entry-removed" {
+            assert!(
+                !residue.is_empty(),
+                "created helpers retain evidence after an unjournalled unlink"
+            );
+            assert_eq!(fixture.journals().len(), 1);
+            assert!(
+                String::from_utf8_lossy(&recovered.stderr)
+                    .contains("recovered Skill-link ownership remains unresolved"),
+                "{}",
+                String::from_utf8_lossy(&recovered.stderr)
+            );
         } else {
             assert!(
                 residue.is_empty(),
@@ -1173,6 +1204,98 @@ fn a_second_invocation_recovers_every_boundary_and_leaves_the_project_clean() {
                 fixture.journals()
             );
         }
+    }
+}
+
+#[test]
+fn explicit_cleanup_repairs_an_interruption_after_the_created_link_was_unlinked() {
+    let fixture = Fixture::new("recover-entry-removed-explicitly");
+    fixture.skill("alpha");
+
+    let stopped = fixture.run_stopping_at("codex", "entry-removed", &[]);
+    assert!(!stopped.status.success());
+    assert!(!exists(&fixture.project.join(".agents/skills/alpha")));
+    assert_eq!(fixture.journals().len(), 1);
+
+    let automatic = fixture.run("codex", &[]);
+    assert_eq!(automatic.status.code(), Some(FILESYSTEM_STATUS));
+    assert_eq!(fixture.journals().len(), 1);
+
+    let repaired = fixture.cleanup(false);
+    let repaired_output = String::from_utf8_lossy(&repaired.stdout);
+    assert!(repaired.status.success(), "{repaired_output}");
+    assert!(
+        repaired_output.contains("accepted missing link"),
+        "{repaired_output}"
+    );
+    assert!(fixture.journals().is_empty());
+    assert!(fixture.project_tree().is_empty());
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+
+    let resumed = fixture.run("codex", &[]);
+    assert_eq!(
+        resumed.status.code(),
+        Some(FIXTURE_CHILD_STATUS),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(fixture.journals().is_empty());
+    assert!(fixture.project_tree().is_empty());
+}
+
+#[test]
+fn explicit_cleanup_accepts_absent_fixed_kind_intents_without_removal_evidence() {
+    let modes: &[(&str, &str)] = if cfg!(windows) {
+        &[
+            ("symlink", "--link-mode=symlink"),
+            ("junction", "--link-mode=junction"),
+        ]
+    } else {
+        &[("symlink", "--link-mode=symlink")]
+    };
+
+    for &(label, link_mode) in modes {
+        let fixture = Fixture::new(&format!("recover-{label}-intent-explicitly"));
+        fixture.skill("alpha");
+
+        let stopped = fixture.run_stopping_at("codex", "action-intent@3", &[link_mode]);
+        assert!(!stopped.status.success());
+        assert!(!exists(&fixture.project.join(".agents/skills/alpha")));
+        assert_eq!(fixture.journals().len(), 1);
+
+        let automatic = fixture.run("codex", &[]);
+        let automatic_error = String::from_utf8_lossy(&automatic.stderr);
+        assert_eq!(
+            automatic.status.code(),
+            Some(FILESYSTEM_STATUS),
+            "{label}: {automatic_error}"
+        );
+        assert_eq!(fixture.journals().len(), 1);
+
+        let repaired = fixture.cleanup(false);
+        let repaired_output = String::from_utf8_lossy(&repaired.stdout);
+        assert!(repaired.status.success(), "{label}: {repaired_output}");
+        assert!(
+            repaired_output.contains("accepted missing link"),
+            "{label}: {repaired_output}"
+        );
+        assert!(
+            repaired_output.contains("no filesystem entry was removed"),
+            "{label}: {repaired_output}"
+        );
+        assert!(fixture.journals().is_empty());
+        assert!(fixture.project_tree().is_empty());
+        assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+
+        let resumed = fixture.run("codex", &[]);
+        assert_eq!(
+            resumed.status.code(),
+            Some(FIXTURE_CHILD_STATUS),
+            "{label}: {}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        assert!(fixture.journals().is_empty());
+        assert!(fixture.project_tree().is_empty());
     }
 }
 
@@ -1190,10 +1313,15 @@ fn a_second_claude_invocation_recovers_every_staging_boundary() {
         let recovered = fixture.run("claude", &[]);
         let stderr = String::from_utf8_lossy(&recovered.stderr);
 
+        let expected = if boundary == "entry-removed" {
+            FILESYSTEM_STATUS
+        } else {
+            FIXTURE_CHILD_STATUS
+        };
         assert_eq!(
             recovered.status.code(),
-            Some(FIXTURE_CHILD_STATUS),
-            "Claude recovery must reach its fixture child at {boundary}: {stderr}"
+            Some(expected),
+            "Claude recovery returned the wrong status at {boundary}: {stderr}"
         );
         assert!(
             fixture.project_tree().is_empty(),
@@ -1217,6 +1345,21 @@ fn a_second_claude_invocation_recovers_every_staging_boundary() {
                 "scaffolding alone must not keep a journal: {:?}",
                 fixture.journals()
             );
+        } else if boundary == "entry-removed" {
+            assert!(
+                !fixture.session_tree().is_empty(),
+                "helper evidence must remain after an unjournalled unlink"
+            );
+            assert_eq!(
+                fixture.journals().len(),
+                1,
+                "pathname absence cannot discharge the required link action"
+            );
+            assert!(
+                stderr.contains("recovered Skill-link ownership remains unresolved"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("pathname absence cannot prove"), "{stderr}");
         } else {
             assert!(
                 fixture.session_tree().is_empty(),
@@ -1250,11 +1393,19 @@ fn current_codex_layout_survives_every_reachable_recovery_boundary() {
         let killed = fixture.run_stopping_at("codex", boundary, &[]);
         assert!(!killed.status.success(), "{boundary} must stop the session");
 
+        let unresolved = matches!(
+            boundary,
+            "action-intent" | "temporary-created" | "entry-removed"
+        );
         let recovered = fixture.run("codex", &[]);
         assert_eq!(
             recovered.status.code(),
-            Some(FIXTURE_CHILD_STATUS),
-            "the current layout must recover and launch at {boundary}: {}",
+            Some(if unresolved {
+                FILESYSTEM_STATUS
+            } else {
+                FIXTURE_CHILD_STATUS
+            }),
+            "the current layout returned the wrong status at {boundary}: {}",
             String::from_utf8_lossy(&recovered.stderr)
         );
         assert_eq!(
@@ -1271,6 +1422,14 @@ fn current_codex_layout_survives_every_reachable_recovery_boundary() {
         );
 
         let recovered_tree = fixture.project_tree();
+        if unresolved {
+            assert!(
+                String::from_utf8_lossy(&recovered.stderr)
+                    .contains("recovered Skill-link ownership remains unresolved"),
+                "{}",
+                String::from_utf8_lossy(&recovered.stderr)
+            );
+        }
         if boundary == "temporary-created" {
             assert!(
                 baseline.iter().all(|entry| recovered_tree.contains(entry)),
@@ -1288,7 +1447,25 @@ fn current_codex_layout_survives_every_reachable_recovery_boundary() {
                 recovered_tree, baseline,
                 "only the pre-existing current layout may remain after {boundary}"
             );
-            assert!(fixture.journals().is_empty());
+            if matches!(boundary, "action-intent" | "entry-removed") {
+                assert_eq!(
+                    fixture.journals().len(),
+                    1,
+                    "an all-absent required action cannot be discharged at {boundary}"
+                );
+                assert!(
+                    String::from_utf8_lossy(&recovered.stderr)
+                        .contains("pathname absence cannot prove"),
+                    "{}",
+                    String::from_utf8_lossy(&recovered.stderr)
+                );
+            } else {
+                assert!(
+                    fixture.journals().is_empty(),
+                    "completed recovery retained a journal at {boundary}: {:?}",
+                    fixture.journals()
+                );
+            }
         }
     }
 }
@@ -1384,9 +1561,9 @@ fn auto_link_intent_with_an_unrecorded_kind_retains_every_existing_candidate() {
     let recovered = fixture.run("codex", &[]);
     let stderr = String::from_utf8_lossy(&recovered.stderr);
 
-    assert_eq!(
-        recovered.status.code(),
-        Some(FIXTURE_CHILD_STATUS),
+    assert_eq!(recovered.status.code(), Some(FILESYSTEM_STATUS), "{stderr}");
+    assert!(
+        stderr.contains("recovered Skill-link ownership remains unresolved"),
         "{stderr}"
     );
     assert!(stderr.contains("concrete kind and identity"), "{stderr}");
@@ -1398,6 +1575,28 @@ fn auto_link_intent_with_an_unrecorded_kind_retains_every_existing_candidate() {
         fixture.journals().len(),
         2,
         "the terminal bootstrap journal and the unreconciled auto-link journal remain"
+    );
+
+    let explicit = fixture.cleanup(false);
+    let explicit_output = String::from_utf8_lossy(&explicit.stdout);
+    assert_eq!(
+        explicit.status.code(),
+        Some(FILESYSTEM_STATUS),
+        "{explicit_output}"
+    );
+    assert!(
+        explicit_output.contains("concrete kind and identity"),
+        "{explicit_output}"
+    );
+    assert!(
+        staged_before.iter().all(|path| exists(path)),
+        "explicit cleanup must not turn missing identity evidence into removal authority"
+    );
+    assert_eq!(
+        fixture.journals().len(),
+        1,
+        "only the unresolved auto-link journal remains after explicit cleanup releases the kept \
+         bootstrap transaction"
     );
 }
 
@@ -1464,14 +1663,14 @@ fn claude_recovery_never_removes_a_replaced_staging_entry() {
     assert!(fixture.project_tree().is_empty());
 }
 
-/// A replaced Claude session root is preserved, reported once, and stops being an obligation.
+/// Automatic recovery preserves a surviving Skill link moved with its Claude session root.
 ///
-/// The operator moved `SkillMount`'s private staging root away and left their own directory at the
-/// recorded path. The staged Skill link is therefore absent from every path the journal records, so
-/// no cleanup-critical entry remains: the replacement is preserved untouched and the journal, which
-/// no later pass could ever act on, is retired instead of blocking every future invocation.
+/// Moving the private staging root also moves every link below it. Absence at the recorded child
+/// path therefore does not prove the created link is gone when the enclosing directory identity no
+/// longer matches. Automatic retries retain responsibility; explicit cleanup accepts the
+/// all-absent recorded paths without deleting either the moved link or the replacement root.
 #[test]
-fn claude_recovery_preserves_a_replaced_session_root() {
+fn claude_recovery_retains_a_link_moved_with_its_session_root() {
     let fixture = Fixture::new("claude-replaced-session-root");
     fixture.skill("alpha");
     fixture.run_stopping_at("claude", "journal-active", &[]);
@@ -1494,11 +1693,39 @@ fn claude_recovery_preserves_a_replaced_session_root() {
     assert!(session.join("operator-owned.txt").is_file());
     assert!(moved.join("root/.claude/skills/alpha").is_dir());
     assert!(stderr.contains("preserved scaffolding"), "{stderr}");
+    assert!(stderr.contains("retained"), "{stderr}");
+    assert!(stderr.contains("may have moved"), "{stderr}");
+    assert!(!recovered.status.success(), "{stderr}");
     assert!(fixture.project_tree().is_empty());
+    assert_eq!(
+        fixture.journals().len(),
+        1,
+        "the surviving created Skill link must remain journal-backed"
+    );
+
+    let retried = fixture.run("claude", &[]);
+    let retry_stderr = String::from_utf8_lossy(&retried.stderr);
+    assert!(!retried.status.success(), "{retry_stderr}");
+    assert!(retry_stderr.contains("may have moved"), "{retry_stderr}");
+    assert!(moved.join("root/.claude/skills/alpha").is_dir());
+    assert_eq!(
+        fixture.journals().len(),
+        1,
+        "a later pass must not forget the enclosing-directory uncertainty"
+    );
+
+    let accepted = fixture.cleanup(false);
+    let accepted_output = String::from_utf8_lossy(&accepted.stdout);
+    assert!(accepted.status.success(), "{accepted_output}");
+    assert!(
+        accepted_output.contains("accepted missing link"),
+        "{accepted_output}"
+    );
+    assert!(moved.join("root/.claude/skills/alpha").is_dir());
+    assert!(session.join("operator-owned.txt").is_file());
     assert!(
         fixture.journals().is_empty(),
-        "a journal describing only a replaced staging root is retired: {:?}",
-        fixture.journals()
+        "explicit cleanup releases responsibility for the acknowledged missing paths"
     );
 }
 
@@ -2585,9 +2812,12 @@ fn a_second_omp_invocation_recovers_every_boundary_and_leaves_the_project_clean(
 
         assert_eq!(
             recovered.status.code(),
-            Some(FIXTURE_CHILD_STATUS),
-            "the recovering OMP session must launch and clean up after its fixture child at \
-             {boundary}: {}",
+            Some(if boundary == "entry-removed" {
+                FILESYSTEM_STATUS
+            } else {
+                FIXTURE_CHILD_STATUS
+            }),
+            "the recovering OMP session returned the wrong status at {boundary}: {}",
             String::from_utf8_lossy(&recovered.stderr)
         );
         // Removing a link must never be followed into the directory it pointed at, so the source
@@ -2617,6 +2847,18 @@ fn a_second_omp_invocation_recovers_every_boundary_and_leaves_the_project_clean(
                 fixture.journals().is_empty(),
                 "scaffolding alone must not keep a journal: {:?}",
                 fixture.journals()
+            );
+        } else if boundary == "entry-removed" {
+            assert!(
+                !residue.is_empty(),
+                "created helpers retain evidence after an unjournalled unlink"
+            );
+            assert_eq!(fixture.journals().len(), 1);
+            assert!(
+                String::from_utf8_lossy(&recovered.stderr)
+                    .contains("recovered Skill-link ownership remains unresolved"),
+                "{}",
+                String::from_utf8_lossy(&recovered.stderr)
             );
         } else {
             assert!(
@@ -2652,12 +2894,20 @@ fn an_existing_omp_project_scope_survives_every_reachable_recovery_boundary() {
             String::from_utf8_lossy(&killed.stderr)
         );
 
+        let unresolved = matches!(
+            boundary,
+            "action-intent" | "temporary-created" | "entry-removed"
+        );
         let recovered = fixture.run("omp", &[]);
 
         assert_eq!(
             recovered.status.code(),
-            Some(FIXTURE_CHILD_STATUS),
-            "the existing OMP scope must recover and launch at {boundary}: {}",
+            Some(if unresolved {
+                FILESYSTEM_STATUS
+            } else {
+                FIXTURE_CHILD_STATUS
+            }),
+            "the existing OMP scope returned the wrong status at {boundary}: {}",
             String::from_utf8_lossy(&recovered.stderr)
         );
         assert_eq!(
@@ -2666,6 +2916,14 @@ fn an_existing_omp_project_scope_survives_every_reachable_recovery_boundary() {
             "recovery rewrote a Skill the transaction never created at {boundary}"
         );
 
+        if unresolved {
+            assert!(
+                String::from_utf8_lossy(&recovered.stderr)
+                    .contains("recovered Skill-link ownership remains unresolved"),
+                "{}",
+                String::from_utf8_lossy(&recovered.stderr)
+            );
+        }
         let recovered_tree = fixture.project_tree();
         if boundary == "temporary-created" {
             assert!(
@@ -2685,7 +2943,11 @@ fn an_existing_omp_project_scope_survives_every_reachable_recovery_boundary() {
                 recovered_tree, baseline,
                 "only the pre-existing OMP scope may remain after {boundary}"
             );
-            assert!(fixture.journals().is_empty());
+            if matches!(boundary, "action-intent" | "entry-removed") {
+                assert_eq!(fixture.journals().len(), 1);
+            } else {
+                assert!(fixture.journals().is_empty());
+            }
         }
     }
 }

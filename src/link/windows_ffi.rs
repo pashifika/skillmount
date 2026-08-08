@@ -156,7 +156,6 @@ pub(super) fn open_no_follow(path: &Path, access: Access) -> io::Result<OwnedHan
     // handed over exactly once. `OwnedHandle` closes it on drop.
     Ok(unsafe { OwnedHandle::from_raw_handle(handle.cast()) })
 }
-
 /// A stable identity for an open entry, in whichever form the volume supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FileIdentity {

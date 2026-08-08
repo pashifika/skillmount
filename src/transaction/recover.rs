@@ -118,6 +118,8 @@ pub struct ReconciledTransaction {
     pub agent: AgentId,
     /// Journal that described it.
     pub journal: PathBuf,
+    /// Canonical project recorded by that transaction.
+    pub project_root: PathBuf,
     /// What the removal pass did.
     pub report: CleanupReport,
 }
@@ -254,6 +256,7 @@ fn reconcile_explicit_claims(
     for scanned in claimed {
         let transaction = scanned.journal.transaction_id.to_string();
         let agent = scanned.journal.agent;
+        let project_root = scanned.journal.project_root.clone();
         let mut adopted = match Transaction::adopt(scanned.journal, scanned.path.clone(), locks) {
             Ok(transaction) => transaction,
             Err(error) => {
@@ -266,11 +269,12 @@ fn reconcile_explicit_claims(
                 continue;
             }
         };
-        match adopted.cleanup_required() {
+        match adopted.cleanup_explicit() {
             Ok(outcome) => report.reconciled.push(ReconciledTransaction {
                 transaction,
                 agent,
                 journal: scanned.path,
+                project_root,
                 report: outcome,
             }),
             Err(error) => report.failures.push(ExplicitCleanupFailure {
@@ -350,6 +354,7 @@ pub fn recover_stale(already_held: &mut HeldLocks) -> Result<RecoveryReport, App
         // leave a mismatched file behind to be recovered again on every later run.
         let transaction_id = scanned.journal.transaction_id.to_string();
         let agent = scanned.journal.agent;
+        let project_root = scanned.journal.project_root.clone();
         let journal_path = scanned.path.clone();
         let mut transaction =
             Transaction::adopt(scanned.journal, journal_path.clone(), already_held)?;
@@ -358,6 +363,7 @@ pub fn recover_stale(already_held: &mut HeldLocks) -> Result<RecoveryReport, App
             transaction: transaction_id,
             agent,
             journal: journal_path,
+            project_root,
             report: outcome,
         });
     }
