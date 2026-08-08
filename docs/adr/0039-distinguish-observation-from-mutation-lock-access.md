@@ -1,6 +1,6 @@
 # ADR 0039: Distinguish Observation from Mutation Lock Access
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-08
 - **Supersedes:** the single-access lock-set assumption in ADR 0012 and only the lock-access classification portions of ADRs 0021 and 0034
 
@@ -46,4 +46,4 @@ This ADR preserves ADR 0012's discovery-before-lock, recovery-before-plan, sorte
 
 The decision is enforced by access/key aggregation and lock-acquisition tests in `src/lock/`, schema and access-drift tests in `src/journal/` and `src/transaction/`, adapter resource fixtures, and real-process Codex, Claude, OMP, recovery, read-only, and supervision suites. Acceptance requires native shared/shared overlap, shared/exclusive contention, crash release, doctor observation, sibling-project child overlap, same-destination and physical-alias serialization, and independent ownership-verified cleanup.
 
-Primary-source evidence for the pinned lock implementation is recorded at `rasen/changes/allow-concurrent-agent-sessions-across-projects/evidence/fs4-1.1.0-shared-lock-source.md`. Final verification commands and native CI results are recorded in the same change evidence directory before this ADR becomes Accepted.
+Primary-source evidence for the pinned lock implementation and final verification commands are recorded under `rasen/changes/allow-concurrent-agent-sessions-across-projects/evidence/`. Native acceptance run `31258758913` exercised implementation revision `3fa538fd` on Windows x64, Windows x86, and Apple Silicon macOS; every required runtime, quality, policy, and shell-completion job passed.
