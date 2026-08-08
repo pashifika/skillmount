@@ -172,6 +172,17 @@ impl Fixture {
     }
 
     fn command_for(&self, agent: &str, extra: &[&str], project: &Path, home: &Path) -> Command {
+        self.command_for_launch(agent, extra, project, project, home)
+    }
+
+    fn command_for_launch(
+        &self,
+        agent: &str,
+        extra: &[&str],
+        project_root: &Path,
+        launch_cwd: &Path,
+        home: &Path,
+    ) -> Command {
         fs::create_dir_all(home.join("codex-home")).expect("Codex home fixture");
         let mut command = Command::new(ASM);
         command
@@ -179,9 +190,9 @@ impl Fixture {
             .arg("--skills-dir")
             .arg(&self.sources)
             .arg("--project-root")
-            .arg(project)
+            .arg(project_root)
             .arg("--cwd")
-            .arg(project)
+            .arg(launch_cwd)
             .arg("--agent-bin")
             .arg(&self.agent_bin)
             .args(extra)
@@ -225,7 +236,7 @@ impl Fixture {
             // Contention must be reported rather than waited out, so a serialization test finishes
             // in milliseconds instead of the production timeout.
             .env("SKILLMOUNT_LOCK_WAIT_MS", "200")
-            .current_dir(project);
+            .current_dir(launch_cwd);
         command
     }
 
@@ -529,7 +540,7 @@ fn cleanup_all_reports_an_active_transaction_without_touching_it() {
     let rendered = String::from_utf8_lossy(&cleaned.stdout);
     assert!(rendered.contains("[ACTIVE]"), "{rendered}");
     assert!(
-        rendered.contains("another SkillMount session holds"),
+        rendered.contains("another SkillMount session blocks mutate access"),
         "{rendered}"
     );
     assert!(exists(&mounted), "active mounts are left untouched");
@@ -2494,7 +2505,7 @@ fn two_codex_sessions_on_one_store_serialize() {
         );
         let stderr = String::from_utf8_lossy(&contender.stderr);
         assert!(
-            stderr.contains("another SkillMount session holds"),
+            stderr.contains("another SkillMount session blocks mutate access"),
             "{checkpoint}: {stderr}"
         );
         assert!(
@@ -2506,7 +2517,7 @@ fn two_codex_sessions_on_one_store_serialize() {
 }
 
 #[test]
-fn codex_sessions_reaching_one_nested_collection_through_distinct_links_serialize() {
+fn codex_sessions_observing_one_nested_collection_through_distinct_links_overlap() {
     let fixture = Fixture::new("codex-nested-terminal-lock");
     fixture.skill("alpha");
     let second_project = fixture.root.join("second-project");
@@ -2568,19 +2579,274 @@ fn codex_sessions_reaching_one_nested_collection_through_distinct_links_serializ
     );
     assert_eq!(
         contender.status.code(),
-        Some(75),
-        "distinct logical roots reaching one collection must share its physical lock: {}",
+        Some(FIXTURE_CHILD_STATUS),
+        "distinct destinations may share read-only physical discovery: {}",
         String::from_utf8_lossy(&contender.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&contender.stderr).contains("another SkillMount session holds"),
+        !String::from_utf8_lossy(&contender.stderr)
+            .contains("another SkillMount session blocks mutate access"),
         "{}",
         String::from_utf8_lossy(&contender.stderr)
     );
     assert!(
         !exists(&second_project.join(".agents")),
-        "the contending project must remain untouched"
+        "the concurrent project cleans only its own temporary destination"
     );
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn sibling_codex_sessions_overlap_and_later_sessions_use_the_current_user_namespace() {
+    let fixture = Fixture::new("codex-sibling-current").with_recording_agent();
+    fixture.skill("alpha").skill("beta");
+    let home = fixture.root.join("home");
+    let second_project = fixture.root.join("second-project");
+    let error_project = fixture.root.join("error-project");
+    for path in [
+        &second_project,
+        &error_project,
+        &home.join(".agents/skills"),
+        &home.join("codex-home/skills/.system"),
+        &home.join("admin-skills"),
+    ] {
+        fs::create_dir_all(path).expect("shared Codex fixture root");
+    }
+
+    let first_record = fixture.root.join("codex-first.record");
+    let first_release = fixture.root.join("release-codex-first");
+    let mut first = fixture
+        .command_for("codex", &[], &fixture.project, &home)
+        .env("SKILLMOUNT_FAKE_RECORD", &first_record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "wait-for-file")
+        .env("SKILLMOUNT_FAKE_RELEASE_FILE", &first_release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("first Codex sibling");
+    wait_for_fake_ready(&mut first, &first_record);
+    assert!(exists(&fixture.project.join(".agents/skills/alpha")));
+    assert!(exists(&fixture.project.join(".agents/skills/beta")));
+
+    let user_alpha = home.join(".agents/skills/alpha");
+    fs::create_dir(&user_alpha).expect("later user Skill");
+    fs::write(
+        user_alpha.join("SKILL.md"),
+        "---\nname: alpha\ndescription: later user winner\n---\n",
+    )
+    .expect("later user Skill metadata");
+
+    let second_record = fixture.root.join("codex-second.record");
+    let second_release = fixture.root.join("release-codex-second");
+    let mut second = fixture
+        .command_for("codex", &["--conflict", "skip"], &second_project, &home)
+        .env("SKILLMOUNT_FAKE_RECORD", &second_record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "wait-for-file")
+        .env("SKILLMOUNT_FAKE_RELEASE_FILE", &second_release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("second Codex sibling");
+    wait_for_fake_ready(&mut second, &second_record);
+    assert!(
+        !exists(&second_project.join(".agents/skills/alpha")),
+        "skip preserves the current user winner"
+    );
+    assert!(exists(&second_project.join(".agents/skills/beta")));
+    assert!(
+        exists(&fixture.project.join(".agents/skills/alpha")),
+        "the earlier child remains mounted while the later child runs"
+    );
+
+    let error_record = fixture.root.join("codex-error.record");
+    let refused = fixture
+        .command_for("codex", &["--conflict", "error"], &error_project, &home)
+        .env("SKILLMOUNT_FAKE_RECORD", &error_record)
+        .output()
+        .expect("current Codex conflict");
+    assert_eq!(
+        refused.status.code(),
+        Some(73),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !error_record.exists(),
+        "a refused session launches no child"
+    );
+    assert!(!error_project.join(".agents").exists());
+
+    fs::write(&first_release, "release").expect("release first Codex child");
+    let first_output = first.wait_with_output().expect("first Codex child exits");
+    assert!(
+        first_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    assert!(!fixture.project.join(".agents").exists());
+    assert!(
+        exists(&second_project.join(".agents/skills/beta")),
+        "first cleanup cannot remove the later sibling's mount"
+    );
+
+    fs::write(&second_release, "release").expect("release second Codex child");
+    let second_output = second.wait_with_output().expect("second Codex child exits");
+    assert!(
+        second_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    assert!(!second_project.join(".agents").exists());
+    assert_eq!(
+        fs::read_to_string(user_alpha.join("SKILL.md")).expect("user Skill survives"),
+        "---\nname: alpha\ndescription: later user winner\n---\n"
+    );
+    assert!(fixture.journals().is_empty());
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn a_nested_omp_reader_blocks_a_codex_writer_to_its_missing_ancestor_scope() {
+    let fixture = Fixture::new("cross-agent-missing-scope").with_recording_agent();
+    fixture.skill("alpha");
+    let home = fixture.root.join("home");
+    let nested = fixture.project.join("nested");
+    fs::create_dir_all(fixture.project.join(".git")).expect("repository boundary");
+    fs::create_dir(&nested).expect("nested launch directory");
+
+    let observer_record = fixture.root.join("nested-observer.record");
+    let observer_release = fixture.root.join("release-nested-observer");
+    let mut observer = fixture
+        .command_for_launch("omp", &[], &fixture.project, &nested, &home)
+        .env("SKILLMOUNT_FAKE_RECORD", &observer_record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "wait-for-file")
+        .env("SKILLMOUNT_FAKE_RELEASE_FILE", &observer_release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("nested OMP observer");
+    wait_for_fake_ready(&mut observer, &observer_record);
+    assert!(exists(&nested.join(".omp/skills/alpha")));
+    assert!(
+        !fixture.project.join(".agents").exists(),
+        "the observed ancestor destination starts missing"
+    );
+
+    let writer_record = fixture.root.join("ancestor-writer.record");
+    let writer = fixture
+        .command_for("codex", &[], &fixture.project, &home)
+        .env("SKILLMOUNT_FAKE_RECORD", &writer_record)
+        .output()
+        .expect("Codex writer contention");
+    let writer_stderr = String::from_utf8_lossy(&writer.stderr);
+    assert_eq!(writer.status.code(), Some(75), "{writer_stderr}");
+    assert!(
+        writer_stderr.contains("blocks mutate access")
+            && writer_stderr.contains(".agents")
+            && writer_stderr.contains("skills"),
+        "{writer_stderr}"
+    );
+    assert!(
+        !writer_record.exists(),
+        "the blocked writer launches no child"
+    );
+    assert!(!fixture.project.join(".agents").exists());
+
+    fs::write(&observer_release, "release").expect("release nested observer");
+    let observer_output = observer.wait_with_output().expect("nested observer exits");
+    assert!(
+        observer_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&observer_output.stderr)
+    );
+    assert!(!nested.join(".omp").exists());
+    assert!(fixture.journals().is_empty());
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn an_omp_reader_and_codex_writer_contend_through_distinct_physical_aliases() {
+    let fixture = Fixture::new("cross-agent-physical-alias").with_recording_agent();
+    fixture.skill("alpha");
+    let home = fixture.root.join("home");
+    let writer_project = fixture.root.join("writer-project");
+    let shared = fixture.root.join("shared-skills");
+    fs::create_dir_all(fixture.project.join(".git")).expect("repository boundary");
+    fs::create_dir_all(home.join(".agents")).expect("user provider parent");
+    fs::create_dir_all(writer_project.join(".agents")).expect("writer destination parent");
+    fs::create_dir(&shared).expect("shared physical root");
+    let backend = platform_backend();
+    let canonical = backend
+        .canonical_directory(&shared)
+        .expect("canonical shared root");
+    for (staged_path, final_path) in [
+        (
+            home.join(".agents/.skills.skillmount-fixture"),
+            home.join(".agents/skills"),
+        ),
+        (
+            writer_project.join(".agents/.skills.skillmount-fixture"),
+            writer_project.join(".agents/skills"),
+        ),
+    ] {
+        let staged = backend
+            .create_directory_link(&LinkRequest {
+                source: canonical.clone(),
+                staged_path,
+                mode: LinkMode::Auto,
+            })
+            .expect("cross-Agent directory alias");
+        let outcome = backend
+            .place_no_replace(&staged, &final_path)
+            .expect("place cross-Agent directory alias");
+        assert!(matches!(outcome, PlacementOutcome::Placed(_)));
+    }
+
+    let observer_record = fixture.root.join("alias-observer.record");
+    let observer_release = fixture.root.join("release-alias-observer");
+    let mut observer = fixture
+        .command_for("omp", &[], &fixture.project, &home)
+        .env("SKILLMOUNT_FAKE_RECORD", &observer_record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "wait-for-file")
+        .env("SKILLMOUNT_FAKE_RELEASE_FILE", &observer_release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("OMP physical observer");
+    wait_for_fake_ready(&mut observer, &observer_record);
+    assert!(exists(&fixture.project.join(".omp/skills/alpha")));
+    assert!(!exists(&shared.join("alpha")));
+
+    let writer_record = fixture.root.join("alias-writer.record");
+    let writer = fixture
+        .command_for("codex", &[], &writer_project, &home)
+        .env("SKILLMOUNT_FAKE_RECORD", &writer_record)
+        .output()
+        .expect("cross-Agent physical contention");
+    let writer_stderr = String::from_utf8_lossy(&writer.stderr);
+    assert_eq!(writer.status.code(), Some(75), "{writer_stderr}");
+    assert!(
+        writer_stderr.contains("blocks mutate access")
+            && writer_stderr.contains("writer-project")
+            && writer_stderr.contains("home"),
+        "the folded physical key must retain both logical aliases: {writer_stderr}"
+    );
+    assert!(
+        !writer_record.exists(),
+        "the blocked writer launches no child"
+    );
+    assert!(!exists(&shared.join("alpha")));
+
+    fs::write(&observer_release, "release").expect("release alias observer");
+    let observer_output = observer.wait_with_output().expect("alias observer exits");
+    assert!(
+        observer_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&observer_output.stderr)
+    );
+    assert!(!fixture.project.join(".omp").exists());
+    assert!(!exists(&shared.join("alpha")));
+    assert!(fixture.journals().is_empty());
 }
 
 #[test]
@@ -2606,7 +2872,8 @@ fn two_isolated_claude_sessions_do_not_serialize() {
         String::from_utf8_lossy(&concurrent.stderr)
     );
     assert!(
-        !String::from_utf8_lossy(&concurrent.stderr).contains("another SkillMount session holds"),
+        !String::from_utf8_lossy(&concurrent.stderr)
+            .contains("another SkillMount session blocks mutate access"),
         "isolated staging must not serialize child execution"
     );
 }
@@ -3143,7 +3410,7 @@ fn two_omp_sessions_on_one_project_destination_serialize() {
         );
         let stderr = String::from_utf8_lossy(&contender.stderr);
         assert!(
-            stderr.contains("another SkillMount session holds"),
+            stderr.contains("another SkillMount session blocks mutate access"),
             "{checkpoint}: {stderr}"
         );
         assert!(
@@ -3219,7 +3486,7 @@ fn omp_sessions_reaching_one_destination_through_distinct_links_serialize() {
          {contender_stderr}"
     );
     assert!(
-        contender_stderr.contains("another SkillMount session holds"),
+        contender_stderr.contains("another SkillMount session blocks mutate access"),
         "{contender_stderr}"
     );
     assert!(
@@ -3248,6 +3515,251 @@ fn omp_sessions_reaching_one_destination_through_distinct_links_serialize() {
         remaining.is_empty(),
         "the holder released the shared destination and the contender left nothing: {remaining:?}"
     );
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn sibling_omp_sessions_share_provider_observations_and_clean_in_reverse_launch_order() {
+    let fixture = Fixture::new("omp-sibling-overlap").with_recording_agent();
+    fixture.skill("alpha");
+    let home = fixture.root.join("home");
+    let second_project = fixture.root.join("second-project");
+    for project in [&fixture.project, &second_project] {
+        fs::create_dir_all(project.join(".git")).expect("OMP repository boundary");
+    }
+    fs::create_dir_all(home.join(".agents/skills")).expect("shared provider graph");
+
+    let first_record = fixture.root.join("omp-first.record");
+    let first_release = fixture.root.join("release-omp-first");
+    let mut first = fixture
+        .command_for("omp", &[], &fixture.project, &home)
+        .env("SKILLMOUNT_FAKE_RECORD", &first_record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "wait-for-file")
+        .env("SKILLMOUNT_FAKE_RELEASE_FILE", &first_release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("first OMP sibling");
+    wait_for_fake_ready(&mut first, &first_record);
+    assert!(exists(&fixture.project.join(".omp/skills/alpha")));
+
+    let second_record = fixture.root.join("omp-second.record");
+    let second_release = fixture.root.join("release-omp-second");
+    let mut second = fixture
+        .command_for("omp", &[], &second_project, &home)
+        .env("SKILLMOUNT_FAKE_RECORD", &second_record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "wait-for-file")
+        .env("SKILLMOUNT_FAKE_RELEASE_FILE", &second_release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("second OMP sibling");
+    wait_for_fake_ready(&mut second, &second_record);
+    assert!(exists(&second_project.join(".omp/skills/alpha")));
+    assert!(exists(&fixture.project.join(".omp/skills/alpha")));
+    assert_eq!(fixture.journals().len(), 2);
+
+    fs::write(&second_release, "release").expect("release later OMP child first");
+    let second_output = second.wait_with_output().expect("second OMP child exits");
+    assert!(
+        second_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    assert!(!second_project.join(".omp").exists());
+    assert!(
+        exists(&fixture.project.join(".omp/skills/alpha")),
+        "later cleanup cannot remove the earlier sibling's mount"
+    );
+    assert_eq!(fixture.journals().len(), 1);
+
+    fs::write(&first_release, "release").expect("release first OMP child");
+    let first_output = first.wait_with_output().expect("first OMP child exits");
+    assert!(
+        first_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    assert!(!fixture.project.join(".omp").exists());
+    assert!(fixture.journals().is_empty());
+    assert!(fixture.sources.join("alpha/SKILL.md").is_file());
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn later_omp_sessions_apply_conflict_policy_to_the_current_user_namespace() {
+    let fixture = Fixture::new("omp-later-current").with_recording_agent();
+    fixture.skill("alpha").skill("beta");
+    let home = fixture.root.join("home");
+    let second_project = fixture.root.join("second-project");
+    let error_project = fixture.root.join("error-project");
+    for project in [&fixture.project, &second_project, &error_project] {
+        fs::create_dir_all(project.join(".git")).expect("OMP repository boundary");
+    }
+    let user_root = home.join(".agents/skills");
+    fs::create_dir_all(&user_root).expect("shared OMP user provider");
+
+    let first_record = fixture.root.join("omp-current-first.record");
+    let first_release = fixture.root.join("release-omp-current-first");
+    let mut first = fixture
+        .command_for("omp", &[], &fixture.project, &home)
+        .env("SKILLMOUNT_FAKE_RECORD", &first_record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "wait-for-file")
+        .env("SKILLMOUNT_FAKE_RELEASE_FILE", &first_release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("earlier OMP session");
+    wait_for_fake_ready(&mut first, &first_record);
+
+    let user_alpha = user_root.join("alpha");
+    fs::create_dir(&user_alpha).expect("later user Skill");
+    fs::write(
+        user_alpha.join("SKILL.md"),
+        "---\nname: alpha\ndescription: later OMP user winner\n---\n",
+    )
+    .expect("later OMP user metadata");
+
+    let second_record = fixture.root.join("omp-current-second.record");
+    let second_release = fixture.root.join("release-omp-current-second");
+    let mut second = fixture
+        .command_for("omp", &["--conflict", "skip"], &second_project, &home)
+        .env("SKILLMOUNT_FAKE_RECORD", &second_record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "wait-for-file")
+        .env("SKILLMOUNT_FAKE_RELEASE_FILE", &second_release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("later OMP session");
+    wait_for_fake_ready(&mut second, &second_record);
+    assert!(
+        !exists(&second_project.join(".omp/skills/alpha")),
+        "skip preserves the current user winner"
+    );
+    assert!(exists(&second_project.join(".omp/skills/beta")));
+    assert!(
+        exists(&fixture.project.join(".omp/skills/alpha")),
+        "the earlier OMP child remains active"
+    );
+
+    let error_record = fixture.root.join("omp-current-error.record");
+    let refused = fixture
+        .command_for("omp", &["--conflict", "error"], &error_project, &home)
+        .env("SKILLMOUNT_FAKE_RECORD", &error_record)
+        .output()
+        .expect("current OMP conflict");
+    assert_eq!(
+        refused.status.code(),
+        Some(73),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !error_record.exists(),
+        "a refused OMP session launches no child"
+    );
+    assert!(!error_project.join(".omp").exists());
+
+    fs::write(&second_release, "release").expect("release later OMP child");
+    let second_output = second.wait_with_output().expect("later OMP child exits");
+    assert!(
+        second_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    assert!(!second_project.join(".omp").exists());
+    assert!(exists(&fixture.project.join(".omp/skills/alpha")));
+
+    fs::write(&first_release, "release").expect("release earlier OMP child");
+    let first_output = first.wait_with_output().expect("earlier OMP child exits");
+    assert!(
+        first_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    assert!(!fixture.project.join(".omp").exists());
+    assert_eq!(
+        fs::read_to_string(user_alpha.join("SKILL.md")).expect("user Skill survives"),
+        "---\nname: alpha\ndescription: later OMP user winner\n---\n"
+    );
+    assert!(fixture.journals().is_empty());
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn stale_omp_recovery_cleans_only_the_failed_sibling_while_another_child_is_active() {
+    let fixture = Fixture::new("omp-concurrent-stale-recovery").with_recording_agent();
+    fixture.skill("alpha");
+    let home = fixture.root.join("home");
+    let stale_project = fixture.root.join("stale-project");
+    let recovery_project = fixture.root.join("recovery-project");
+    for project in [&fixture.project, &stale_project, &recovery_project] {
+        fs::create_dir_all(project.join(".git")).expect("OMP repository boundary");
+    }
+    fs::create_dir_all(home.join(".agents/skills")).expect("shared provider root");
+
+    let active_record = fixture.root.join("active-sibling.record");
+    let active_release = fixture.root.join("release-active-sibling");
+    let mut active = fixture
+        .command_for("omp", &[], &fixture.project, &home)
+        .env("SKILLMOUNT_FAKE_RECORD", &active_record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "wait-for-file")
+        .env("SKILLMOUNT_FAKE_RELEASE_FILE", &active_release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("active OMP sibling");
+    wait_for_fake_ready(&mut active, &active_record);
+    let active_mount = fixture.project.join(".omp/skills/alpha");
+    assert!(exists(&active_mount));
+
+    let stopped = fixture
+        .command_for("omp", &[], &stale_project, &home)
+        .env("SKILLMOUNT_STOP_AT", "journal-active")
+        .output()
+        .expect("failure-injected sibling");
+    assert!(!stopped.status.success());
+    assert!(
+        String::from_utf8_lossy(&stopped.stderr).contains("stopping at journal-active"),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(exists(&stale_project.join(".omp/skills/alpha")));
+    assert_eq!(fixture.journals().len(), 2);
+
+    let recovery_record = fixture.root.join("recovery-sibling.record");
+    let recovered = fixture
+        .command_for("omp", &[], &recovery_project, &home)
+        .env("SKILLMOUNT_FAKE_RECORD", &recovery_record)
+        .output()
+        .expect("independent recovery sibling");
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert!(
+        fs::read_to_string(&recovery_record)
+            .expect("recovery child record")
+            .contains("event=ready")
+    );
+    assert!(!stale_project.join(".omp").exists());
+    assert!(!recovery_project.join(".omp").exists());
+    assert!(
+        exists(&active_mount),
+        "stale recovery cannot remove the live sibling's mount"
+    );
+    assert_eq!(fixture.journals().len(), 1);
+
+    fs::write(&active_release, "release").expect("release active sibling");
+    let active_output = active.wait_with_output().expect("active sibling exits");
+    assert!(
+        active_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&active_output.stderr)
+    );
+    assert!(!fixture.project.join(".omp").exists());
+    assert!(fixture.journals().is_empty());
 }
 
 /// Unsettled OMP global state appearing after apply must stop the child and release everything.
@@ -3588,6 +4100,29 @@ fn wait_for(condition: impl Fn() -> bool) {
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("the spawned session never reached an observable state");
+}
+
+#[cfg(feature = "test-fixtures")]
+fn wait_for_fake_ready(child: &mut Child, record: &Path) {
+    let deadline = Instant::now() + HOLD_START_TIMEOUT;
+    while Instant::now() < deadline {
+        if fs::read_to_string(record).is_ok_and(|text| text.contains("event=ready")) {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("inspect fake Agent status") {
+            panic!(
+                "the fake Agent exited before readiness with {status}: {}",
+                fs::read_to_string(record).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let kill = child.kill();
+    let status = child.wait();
+    panic!(
+        "the fake Agent did not become ready within {HOLD_START_TIMEOUT:?}; kill: {kill:?}; \
+         status: {status:?}"
+    );
 }
 
 fn wait_for_hold(child: &mut Child, checkpoint: &str) -> BufReader<ChildStderr> {

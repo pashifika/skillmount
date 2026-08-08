@@ -23,17 +23,20 @@ use std::path::PathBuf;
 
 use crate::domain::AgentId;
 use crate::link::PlatformIdentity;
-use crate::lock::{LockResource, LockResourceIdentity, LockResourceKind};
+use crate::lock::{LockAccess, LockResource, LockResourceIdentity, LockResourceKind};
 use crate::mount::{CleanupDisposition, PathPrecondition};
 
 use codec::Line;
 
-/// Journal schema this build writes and is willing to read.
+/// Journal schema this build writes.
 ///
-/// A journal with any other version is refused rather than guessed at. A future version may record
-/// paths this build would not remove and statuses it would misread, and recovery acts by deleting
-/// entries — the one operation where a wrong guess is unrecoverable.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Schema 1 is also accepted conservatively: because every lock in that format belonged to a
+/// mutation-only session, a missing access label decodes as [`LockAccess::Mutate`]. Any other
+/// version is refused rather than guessed at.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Mutation-only journal schema written before access labels were introduced.
+const LEGACY_SCHEMA_VERSION: u32 = 1;
 
 /// Filename extension every journal uses.
 pub const JOURNAL_EXTENSION: &str = "journal";
@@ -428,6 +431,8 @@ impl JournalAction {
 pub struct JournalLock {
     /// What the resource protects.
     pub kind: LockResourceKind,
+    /// Access the original session held for this resource.
+    pub access: LockAccess,
     /// Resource path as the transaction addressed it.
     pub path: PathBuf,
     /// Canonical directory the resource hangs beneath.
@@ -444,6 +449,7 @@ impl JournalLock {
     pub fn to_resource(&self) -> LockResource {
         LockResource {
             kind: self.kind,
+            access: self.access,
             path: self.path.clone(),
             identity: LockResourceIdentity {
                 anchor: self.anchor.clone(),
@@ -458,6 +464,7 @@ impl From<&LockResource> for JournalLock {
     fn from(resource: &LockResource) -> Self {
         Self {
             kind: resource.kind,
+            access: resource.access,
             path: resource.path.clone(),
             anchor: resource.identity.anchor.clone(),
             suffix: resource.identity.suffix.clone(),
@@ -572,6 +579,7 @@ impl TransactionJournal {
         for lock in &self.locks {
             let mut line = Line::new("lock");
             line.push("kind", codec::encode_text(lock.kind.label()))
+                .push("access", codec::encode_text(lock.access.label()))
                 .push("path", codec::encode_path(&lock.path))
                 .push("anchor", codec::encode_path(&lock.anchor))
                 .push("suffix", codec::encode_path(&lock.suffix))
@@ -632,7 +640,10 @@ impl TransactionJournal {
     /// hard failure rather than something to skip. Skipping would let a journal written by a build
     /// that records more state be read as if it recorded less, and the missing state is exactly the
     /// evidence that decides whether an entry may be removed.
-    fn from_lines(lines: &[Line]) -> Result<Self, String> {
+    fn from_lines(lines: &[Line], schema_version: u32) -> Result<Self, String> {
+        if !matches!(schema_version, LEGACY_SCHEMA_VERSION | SCHEMA_VERSION) {
+            return Err(format!("unsupported journal schema {schema_version}"));
+        }
         let header = require_one(lines, "transaction")?;
         let paths = require_one(lines, "paths")?;
 
@@ -671,6 +682,12 @@ impl TransactionJournal {
                 "lock" => journal.locks.push(JournalLock {
                     kind: LockResourceKind::parse(&text(line, "kind")?)
                         .ok_or_else(|| "unknown lock resource kind".to_owned())?,
+                    access: if schema_version == LEGACY_SCHEMA_VERSION {
+                        LockAccess::Mutate
+                    } else {
+                        LockAccess::parse(&text(line, "access")?)
+                            .ok_or_else(|| "unknown lock access".to_owned())?
+                    },
                     path: path(line, "path")?,
                     anchor: path(line, "anchor")?,
                     suffix: path(line, "suffix")?,

@@ -13,6 +13,12 @@ The deterministic fake-agent and native filesystem suites are the release gate. 
 real-agent checks are additional compatibility evidence and are never inferred from a missing or
 green CI job.
 
+The 2026-08-08 access-aware concurrency coverage launches real SkillMount processes and exercises
+native shared/exclusive operating-system locks, physical aliases, recovery, supervision, and
+ownership-checked cleanup with the repository's fake-Agent child. That is locking and lifecycle
+evidence, not a live Codex, Claude Code, or OMP discovery or link-loading run, so it promotes no row
+in the matrix below.
+
 ## Current matrix
 
 | Agent | Version | OS / architecture | Link kind | Scenario | Date | Outcome | Evidence |

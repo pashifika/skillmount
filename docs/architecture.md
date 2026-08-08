@@ -100,6 +100,12 @@ Agent publishes another banner.
 | `asm cleanup --project-root <path>` | Reconciles every structurally valid, non-completed journal for the canonical project after taking that journal's complete recorded lock set. A `supervising` or kept journal is eligible because invoking this command is the operator's assertion that its process domain is dead and its retained ownership may be released. Existing entries still require ownership verification before removal. When every recorded candidate for a required link is absent, explicit cleanup accepts that action without claiming global absence, reports that no filesystem entry was removed, and completes it. Stdout names every removal, accepted missing-link action, unresolved cleanup-critical entry, and preserved helper; unresolved entries receive the detected-shell recovery footer. |
 | `asm cleanup --all` | Applies the same explicit policy journal by journal across the bounded state store. Corrupt state blocks all mutation; live locks retain their journals and produce category 75; an unresolved existing cleanup-critical entry or filesystem failure takes category 73 precedence. Accepted missing-link actions and preserved scaffolding are reported and return success when no failure remains. Distinct retry operations are stable-deduplicated before the one final footer. |
 
+Mutating Codex, Claude, and OMP sessions may overlap when their destination identities are
+independent, even when they inspect common user, administrator, compatibility, plugin, settings, or
+custom roots. Observation uses shared access; any overlapping logical or physical mutation waits or
+returns category 75 before apply. Every invocation plans from its own stabilized current snapshot;
+an already-running Agent receives no live-update guarantee.
+
 A mutating agent invocation returns the child's ordinary status after successful cleanup. A spawn
 or supervision failure uses the shared typed exit mapping. Automatic or session cleanup failure
 replaces child success with category 73 and remains secondary evidence behind a failed child. An
@@ -243,7 +249,7 @@ adapter passthrough validation -> hard launch-control preflight
   -> ensure the staging-state base when staging is required
   -> mint transaction / staging identity
   -> discovery-only inspection
-  -> acquire logical and physical resource locks
+  -> acquire access-aware logical and physical resource locks
   -> recover eligible incomplete transactions
   -> catalog + discovery + full plan under the locks, through the same gated read-only pipeline
   -> expand or reacquire the lock set until it stabilizes
@@ -277,12 +283,12 @@ conflict until recovery removes it. This ordering is the accepted decision in
 | `src/completion.rs` | Static Bash, Zsh, Fish, and PowerShell generation from the shared command graph, exact product-name binding, literal filesystem candidates, executable filtering, and cold-start opaque-passthrough guards. |
 | `src/paths.rs` | Invocation CWD, launch CWD, project root, source occurrence, executable resolution, and construction of the one selected Agent's resolved configuration roots. |
 | `src/catalog/` | No-follow source discovery, ordered overlay selection, and selected-winner validation against declarative Agent catalog policy. |
-| `src/agent/` | The closed adapter registry, Codex, Claude, and OMP discovery inspection, declarative plan construction, the read-only adapter lifecycle contract, and the shared bounded version observer that only `doctor` calls. |
+| `src/agent/` | The closed adapter registry, Codex, Claude, and OMP discovery inspection, declarative access-intent and mount-plan construction, the read-only adapter lifecycle contract, and the shared bounded version observer that only `doctor` calls. |
 | `src/mount/` | Destination conflict policy, deterministic read-only mount actions, and each action's creation and cleanup-disposition classification. |
-| `src/render.rs` | Read-only plans, normal/verbose session diagnostics, warnings, stable-deduplicated recovery footers, proved PowerShell and Command Prompt encoders, labelled native-vector fallback, and reversible native-value rendering. |
-| `src/lock/` | Logical/physical resource identities and sorted operating-system advisory locks. |
-| `src/journal/` | Versioned, checksummed write-ahead ownership records and durable storage. |
-| `src/transaction/` | Apply, rollback, ordinary cleanup of created Skill links, best-effort pruning of the scaffolding beneath them, kept state, and stale recovery. |
+| `src/render.rs` | Access-aware read-only plans, normal/verbose session diagnostics, warnings, stable-deduplicated recovery footers, proved PowerShell and Command Prompt encoders, labelled native-vector fallback, and reversible native-value rendering. |
+| `src/lock/` | Logical/physical resource identities, strongest-access folding, and sorted shared-observation or exclusive-mutation operating-system advisory locks. |
+| `src/journal/` | Versioned, checksummed write-ahead ownership and lock-access records with conservative legacy decoding and durable storage. |
+| `src/transaction/` | Mutation-authority validation, apply, rollback, ordinary cleanup of created Skill links, best-effort scaffolding pruning, kept state, and access-aware stale recovery. |
 | `src/process/` | Shell-free direct child launch, bounded captured-command containment, inherited session streams, reusable platform interruption, liveness-gated cleanup coordination, presentation-only invocation-shell ancestry classification, structured status, and exit-policy mapping. |
 | `src/link/` | Sealed platform boundary for no-follow inspection, link creation, no-replace placement, and verified entry removal. |
 | `src/state.rs` | Computes state locations and, only after the mutation boundary, creates their requested final directories with platform-specific access restrictions. |
@@ -301,9 +307,10 @@ before constructing any of those contexts.
 ### Dependency and mutation boundaries
 
 The catalog, adapters, and mount planner describe state; they do not change it. In particular, an
-`AgentAdapter` observes agent-specific discovery and returns `DiscoverySnapshot` and `MountPlan`
-values. Discovery classification reaches the sealed link backend through `mount::resolve` for
-no-follow inspection, but the adapter never invokes a mutating platform operation.
+`AgentAdapter` observes agent-specific discovery and returns a `DiscoverySnapshot` whose lock
+resources classify every identity as observation or mutation, plus a declarative `MountPlan`.
+Discovery classification reaches the sealed link backend through `mount::resolve` for no-follow
+inspection, but the adapter never invokes a mutating platform operation or decides lock policy.
 
 `AgentId` is the closed public CLI, catalog-attribution, diagnostic, and journal identity. One
 `AgentDescriptor` per identity is the single source of the persistent journal label, operator
@@ -409,6 +416,14 @@ every canonical directory traversed through recursive discovery contributes a ph
 prevents two distinct links into one nested collection from escaping serialization and prevents a
 conventional `.agents/skills -> .codex/skills` layout from being mistaken for two competing
 namespaces without losing alias-level contention.
+
+Each adapter classifies user, administrator, managed, settings, plugin, compatibility, custom, and
+other non-destination discovery roots as observation unless the transaction may create, place,
+prune, or remove through that identity. Every logical and physical spelling of a destination, its
+backing store, and its creatable helper chain is mutation access. Unique Claude staging roots remain
+mutations even though they do not contend; cross-Agent spellings still fold through common logical
+or physical keys. Classification grants no mutation authority outside an adapter's existing
+destination model.
 
 The Codex model was revalidated on 2026-08-03 against `codex-cli 0.146.0`, current official Skill
 documentation, the pinned open-source loader, home resolver and bundled-Skill installer, and
@@ -585,19 +600,29 @@ copying an environment-specific path from diagnostics.
 
 ## Locks, journals, and recovery
 
-Resource descriptions separate a logical identity from an optional physical identity. The logical
-key uses an existing canonical anchor plus a normalized suffix, so the first process creating a
-missing directory and a later process observing it contend on the same key. A physical identity
-makes aliases and worktrees that reach one existing directory contend as well.
+Every resource description carries `Observe` or `Mutate` access over a logical identity and an
+optional physical identity. The logical key uses an existing canonical anchor plus a normalized
+suffix, so the first process creating a missing directory and a later process observing it contend
+on the same key. A physical identity makes aliases and worktrees that reach one existing directory
+contend as well. Access does not alter either key.
 
-Advisory locks are acquired in sorted key order. A lock file is not liveness evidence because it
-survives process death; only the operating-system lock is. Human-readable holder information lives
-in a sidecar so it remains readable while Windows holds a mandatory byte-range lock.
+Requests that collapse to one key retain all diagnostic paths and fold to the strongest access.
+Observation takes a shared operating-system lock; mutation takes an exclusive lock that excludes
+both readers and writers. Locks are acquired in sorted key order. If reinspection adds an earlier
+key or strengthens held access, the application drops the complete set, reacquires the strongest
+accumulated union in global order, and repeats recovery and discovery across that unlocked gap.
+A lock file is not liveness evidence because it survives process death; only the operating-system
+lock is. Human-readable holder information lives in a transaction-specific sidecar so concurrent
+readers do not overwrite or remove one another's diagnostic text.
 
-A transaction persists its journal before each planned destination mutation can become externally
-visible. The journal distinguishes intent, staged identity, final placement, active use, child
-supervision, cleanup, kept state, and failure. Its path codec round-trips arbitrary Unix bytes and Windows UTF-16,
-including unpaired surrogates, rather than passing ownership evidence through UTF-8.
+A transaction persists a schema-version-2 journal before each planned destination mutation can
+become externally visible. Every recorded lock carries its access; schema version 1 remains
+readable by conservatively mapping each legacy record to `Mutate`. Opening, adoption, and recovery
+require held mutation access for every identity the transaction may own. Observation access is
+compatible discovery evidence, never cleanup authority. The journal distinguishes intent, staged
+identity, final placement, active use, child supervision, cleanup, kept state, and failure. Its path
+codec round-trips arbitrary Unix bytes and Windows UTF-16, including unpaired surrogates, rather
+than passing ownership evidence through UTF-8.
 
 Apply rechecks every planned precondition and uses evidence-bearing, atomic same-filesystem
 no-replace placement. Successful placement returns identity for the object established at the final
@@ -641,10 +666,11 @@ invocation finds that journal with free locks, it cannot infer that the child pr
 empty; automatic recovery quarantines the journal and mounts and blocks mutation with exit category
 75. `asm cleanup` may release it only after the operator has asserted that its process domain is
 dead and the command has acquired its complete recorded lock set. Read-only lock observations use
-the operating-system lock alone; holder sidecars are diagnostic text and never authority.
+the operating-system lock alone; holder sidecars are advisory diagnostics and never authority.
 Unreadable, corrupt, or future-schema journals block both automatic and explicit mutation and are
-retained for operator inspection. A current-schema journal with no resource lock is likewise
-rejected because no mutating session can produce it. [ADR 0022](adr/0022-quarantine-supervising-journals.md) records
+retained for operator inspection. A current-schema journal without mutation access covering each
+owned mutation identity is likewise rejected because no mutating session can produce it. [ADR
+0022](adr/0022-quarantine-supervising-journals.md) records
 the post-launch recovery boundary, and
 [ADR 0025](adr/0025-share-operator-inspection-and-recovery-engines.md) records the explicit operator
 decision layered on it.
@@ -731,8 +757,10 @@ The following are product rules rather than style preferences:
 3. Source precedence never overrides a pre-existing Skill in an inspected discovery scope.
 4. `inspect` and `--dry-run` create no directories, links, locks, journals, recovery mutations, or
    child processes.
-5. Discovery supplies the first lock set; recovery runs under locks before the first complete
-   mutating plan is accepted.
+5. Discovery supplies the first access-aware lock set; requests for one key fold to the strongest
+   access, observation is shared, and mutation excludes both readers and writers. Recovery runs
+   under the complete locks before the first mutating plan is accepted. Any unlocked reacquisition
+   gap invalidates the old snapshot and requires recovery and discovery to run again.
 6. No planned destination mutation occurs before its durable intent, and apply rechecks persisted
    preconditions.
 7. Windows placement verifies and mutates the same no-follow object handle. Windows removal checks
@@ -916,10 +944,11 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
 - no-follow link-chain resolution, evidence-bearing atomic no-replace placement, Windows
   handle-bound mutation after initial observation, Unix ownership-checked pathname mutation under
   cooperative locks, and documented creation-to-observation residual scope;
-- logical and physical resource locks, versioned journals, write-ahead apply, rollback, automatic and
-  session cleanup that reconcile created Skill links only after identity-verified unlink, explicit
-  operator cleanup that can accept all-absent recorded link paths, best-effort scaffolding pruning,
-  terminal kept state, and stale recovery;
+- access-aware logical and physical resource locks with shared observation, exclusive mutation,
+  strongest-access folding, version-2 journals with conservative version-1 decoding, write-ahead
+  apply, rollback, automatic and session cleanup that reconcile created Skill links only after
+  identity-verified unlink, explicit operator cleanup that can accept all-absent recorded link
+  paths, best-effort scaffolding pruning, terminal kept state, and access-authorized stale recovery;
 - generic shell-free child supervision with inherited streams, typed child/interrupt/cleanup
   outcomes, stable exit precedence, reusable native event dispatch, liveness-gated cleanup, Unix
   signal-group handling, Windows console identity and Job Object containment, and feature-gated
@@ -966,7 +995,8 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
 - protected publication of both `v0.2.0` Homebrew Formulae through a reviewed tap pull request,
   followed by public selected-only, completion, co-installation, cross-uninstall, and final
   uninstall verification on Apple Silicon macOS;
-- crash-boundary, concurrency, path-encoding, ownership, and native platform test coverage.
+- crash-boundary, access-aware cross-project and cross-Agent concurrency, physical-alias,
+  path-encoding, ownership, and native platform test coverage.
 
 ### Reserved work
 

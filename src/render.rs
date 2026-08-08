@@ -312,7 +312,8 @@ fn locks(out: &mut String, report: &ReadOnlyReport<'_>) {
     for resource in &report.snapshot.lock_resources {
         let _ = writeln!(
             out,
-            "  {:<16} {}",
+            "  {:<7} {:<16} {}",
+            resource.access.label(),
             resource.kind.label(),
             report.path(&resource.path)
         );
@@ -325,22 +326,22 @@ fn locks(out: &mut String, report: &ReadOnlyReport<'_>) {
 fn verbose_lock_identity(out: &mut String, resource: &LockResource) {
     let _ = writeln!(
         out,
-        "                   anchor {}",
+        "                           anchor {}",
         path_value(&resource.identity.anchor, true)
     );
     let _ = writeln!(
         out,
-        "                   suffix {}",
+        "                           suffix {}",
         path_value(&resource.identity.suffix, true)
     );
     match &resource.identity.physical {
         Some(identity) => {
-            let _ = writeln!(out, "                   physical {identity}");
+            let _ = writeln!(out, "                           physical {identity}");
         }
         None => {
             let _ = writeln!(
                 out,
-                "                   physical (resource does not exist yet)"
+                "                           physical (resource does not exist yet)"
             );
         }
     }

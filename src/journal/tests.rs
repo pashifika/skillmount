@@ -13,7 +13,7 @@ use crate::domain::AgentId;
 use crate::domain::LinkMode;
 use crate::error::{AppError, ExitCategory, JournalError};
 use crate::link::PlatformIdentity;
-use crate::lock::LockResourceKind;
+use crate::lock::{LockAccess, LockResourceKind};
 use crate::mount::{CleanupDisposition, MountAction, PathPrecondition};
 use crate::state::testing::StateRootGuard;
 use crate::test_support::TestDir;
@@ -39,6 +39,7 @@ fn sample(status: TransactionStatus) -> TransactionJournal {
         }],
         locks: vec![JournalLock {
             kind: LockResourceKind::BackingStore,
+            access: LockAccess::Mutate,
             path: PathBuf::from("/projects/app/.codex/skills"),
             anchor: PathBuf::from("/projects/app"),
             suffix: PathBuf::from(".codex/skills"),
@@ -90,8 +91,8 @@ fn sample(status: TransactionStatus) -> TransactionJournal {
 
 fn round_trip(journal: &TransactionJournal) -> Result<TransactionJournal, String> {
     let document = codec::render_document(&journal.to_lines());
-    let lines = codec::parse_document(&document).map_err(|error| error.to_string())?;
-    TransactionJournal::from_lines(&lines)
+    let parsed = codec::parse_document(&document).map_err(|error| error.to_string())?;
+    TransactionJournal::from_lines(&parsed.lines, parsed.schema_version)
 }
 
 #[test]
@@ -106,6 +107,54 @@ fn every_record_and_optional_field_survives_a_round_trip() {
         "an omitted identity must not decode as an empty one, because a recorded-but-empty \
          identity would be compared and a missing one refuses removal"
     );
+}
+
+#[test]
+fn schema_one_locks_decode_conservatively_as_mutation() {
+    let journal = sample(TransactionStatus::Applying);
+    let mut lines = journal.to_lines();
+    for line in &mut lines {
+        if line.record == "lock" {
+            line.remove_field("access");
+        }
+    }
+    let document = codec::render_document_for_schema(&lines, 1);
+    let parsed = codec::parse_document(&document).expect("schema one remains readable");
+
+    let decoded =
+        TransactionJournal::from_lines(&parsed.lines, parsed.schema_version).expect("legacy body");
+
+    assert_eq!(parsed.schema_version, 1);
+    assert!(
+        decoded
+            .locks
+            .iter()
+            .all(|lock| lock.access == LockAccess::Mutate)
+    );
+}
+
+#[test]
+fn schema_two_rejects_a_missing_or_unknown_lock_access() {
+    let journal = sample(TransactionStatus::Planned);
+    for access in [None, Some("execute")] {
+        let mut lines = journal.to_lines();
+        let lock = lines
+            .iter_mut()
+            .find(|line| line.record == "lock")
+            .expect("sample lock");
+        if let Some(access) = access {
+            lock.set_field("access", codec::encode_text(access));
+        } else {
+            lock.remove_field("access");
+        }
+        let document = codec::render_document_for_schema(&lines, super::SCHEMA_VERSION);
+        let parsed = codec::parse_document(&document).expect("document framing");
+
+        let error = TransactionJournal::from_lines(&parsed.lines, parsed.schema_version)
+            .expect_err("schema two requires a known access label");
+
+        assert!(error.contains("access"), "{error}");
+    }
 }
 
 #[test]
@@ -282,7 +331,7 @@ fn an_unknown_record_name_is_refused_rather_than_skipped() {
     unknown.push("data", codec::encode_text("value"));
     lines.push(unknown);
 
-    let error = TransactionJournal::from_lines(&lines)
+    let error = TransactionJournal::from_lines(&lines, super::SCHEMA_VERSION)
         .expect_err("an unrecognised record may carry ownership evidence this build would ignore");
 
     assert!(error.contains("unknown journal record"));

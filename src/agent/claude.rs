@@ -396,6 +396,83 @@ fn inspect_claude_scope(
     Ok(scope)
 }
 
+fn claude_lock_resources(
+    context: &RunContext,
+    discovery_entry: &Path,
+    backing_store: &Path,
+    layout: Option<&StagingLayout>,
+    scopes: &[crate::agent::DiscoveryScope],
+) -> Result<Vec<LockResource>, AppError> {
+    // A staging root is addressed by a session identifier no other process shares. Its session
+    // directory is nevertheless mutation authority: the transaction journal records it as the
+    // owned destination, and every staging helper is beneath it. Project mode writes beneath the
+    // stable project root, which no plan ever creates.
+    let mut resources = if let Some(layout) = layout {
+        vec![
+            LockResource::describe_unanchored(
+                LockResourceKind::DiscoveryEntry,
+                crate::lock::LockAccess::Mutate,
+                &layout.session,
+            ),
+            LockResource::describe_unanchored(
+                LockResourceKind::DiscoveryEntry,
+                crate::lock::LockAccess::Mutate,
+                &layout.add_dir_root,
+            ),
+            LockResource::describe_unanchored(
+                LockResourceKind::BackingStore,
+                crate::lock::LockAccess::Mutate,
+                &layout.skills,
+            ),
+        ]
+    } else {
+        vec![
+            LockResource::describe(
+                LockResourceKind::DiscoveryEntry,
+                crate::lock::LockAccess::Mutate,
+                &context.project_root,
+                discovery_entry,
+            )?,
+            LockResource::describe(
+                LockResourceKind::BackingStore,
+                crate::lock::LockAccess::Mutate,
+                &context.project_root,
+                backing_store,
+            )?,
+        ]
+    };
+    for scope in scopes {
+        let access = if scope.state.entry == backing_store {
+            crate::lock::LockAccess::Mutate
+        } else {
+            crate::lock::LockAccess::Observe
+        };
+        resources.push(if scope.state.entry.starts_with(&context.project_root) {
+            LockResource::describe_entry(
+                LockResourceKind::DiscoveryEntry,
+                access,
+                &context.project_root,
+                &scope.state,
+            )?
+        } else if access == crate::lock::LockAccess::Mutate {
+            LockResource::describe_unanchored(
+                LockResourceKind::DiscoveryEntry,
+                access,
+                &scope.state.entry,
+            )
+        } else {
+            LockResource::describe_shared(
+                LockResourceKind::DiscoveryEntry,
+                access,
+                &scope.state.entry,
+            )?
+        });
+    }
+    resources.sort_by_key(LockResource::ordering_key);
+    resources.dedup();
+    Ok(resources)
+}
+
 /// Verifies the Claude launch invariants that remain mandatory for every observed release.
 fn verify_launch_invariants() -> Result<(), AppError> {
     verify_environment()
@@ -545,33 +622,13 @@ impl AgentAdapter for ClaudeAdapter {
         let mut warnings = Vec::new();
         scopes = dedupe_scopes_by_terminal(scopes, &backing_store);
 
-        // A staging root is addressed by a session identifier no other process shares, so it needs
-        // no anchor that stays stable across runs. Project mode writes into a directory other runs
-        // also address, so its anchor must be the project root, which no plan ever creates.
-        let mut lock_resources = if let Some(layout) = &layout {
-            vec![
-                LockResource::describe_unanchored(
-                    LockResourceKind::DiscoveryEntry,
-                    &layout.add_dir_root,
-                ),
-                LockResource::describe_unanchored(LockResourceKind::BackingStore, &layout.skills),
-            ]
-        } else {
-            vec![
-                LockResource::describe(
-                    LockResourceKind::DiscoveryEntry,
-                    &context.project_root,
-                    &discovery_entry,
-                )?,
-                LockResource::describe(
-                    LockResourceKind::BackingStore,
-                    &context.project_root,
-                    &backing_store,
-                )?,
-            ]
-        };
-        lock_resources.sort_by_key(LockResource::ordering_key);
-        lock_resources.dedup();
+        let lock_resources = claude_lock_resources(
+            context,
+            &discovery_entry,
+            &backing_store,
+            layout.as_ref(),
+            &scopes,
+        )?;
 
         for scope in &scopes {
             warnings.extend(scope.warnings.iter().cloned());

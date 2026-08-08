@@ -53,6 +53,44 @@ impl LockResourceKind {
         }
     }
 }
+/// How a session uses a lock resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LockAccess {
+    /// Namespace evidence that `SkillMount` reads but never changes.
+    Observe,
+    /// A resource that the transaction may create, modify, or remove.
+    Mutate,
+}
+
+impl LockAccess {
+    /// Returns the stable label used in read-only output and journals.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Observe => "observe",
+            Self::Mutate => "mutate",
+        }
+    }
+
+    /// Parses an access label recorded in a journal.
+    #[must_use]
+    pub fn parse(label: &str) -> Option<Self> {
+        match label {
+            "observe" => Some(Self::Observe),
+            "mutate" => Some(Self::Mutate),
+            _ => None,
+        }
+    }
+
+    /// Returns whether this held access satisfies `required`.
+    #[must_use]
+    pub const fn satisfies(self, required: Self) -> bool {
+        matches!(
+            (self, required),
+            (Self::Observe, Self::Observe) | (Self::Mutate, _)
+        )
+    }
+}
 
 /// The stable identity of one lockable resource.
 ///
@@ -85,11 +123,13 @@ impl LockResourceIdentity {
     }
 }
 
-/// A resource the transaction locks, described while planning is still read-only.
+/// A resource and the access a transaction coordinates while planning is still read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockResource {
     /// What the resource protects.
     pub kind: LockResourceKind,
+    /// How the session uses the resource.
+    pub access: LockAccess,
     /// Resource path as the plan intends it.
     pub path: PathBuf,
     /// Stable identity used to derive the lock key.
@@ -106,7 +146,12 @@ impl LockResource {
     ///
     /// Returns [`AppError::Internal`] when `path` is not beneath `anchor`, which is a planning
     /// invariant rather than an operator-visible condition.
-    pub fn describe(kind: LockResourceKind, anchor: &Path, path: &Path) -> Result<Self, AppError> {
+    pub fn describe(
+        kind: LockResourceKind,
+        access: LockAccess,
+        anchor: &Path,
+        path: &Path,
+    ) -> Result<Self, AppError> {
         let suffix = path.strip_prefix(anchor).map_err(|_| {
             AppError::Internal(format!(
                 "lock resource {} is not beneath its anchor {}",
@@ -116,6 +161,7 @@ impl LockResource {
         })?;
         Ok(Self {
             kind,
+            access,
             path: path.to_path_buf(),
             identity: LockResourceIdentity {
                 anchor: anchor.to_path_buf(),
@@ -123,6 +169,40 @@ impl LockResource {
                 physical: physical_identity(path),
             },
         })
+    }
+
+    /// Describes a shared absolute path with a root anchor that cannot move as directories appear.
+    ///
+    /// User, administrator, settings, plugin, and compatibility roots may be missing during one
+    /// session and created before another. Anchoring at the deepest existing directory would give
+    /// those two observations different logical keys. The absolute path's volume root is stable
+    /// across that transition and is never transaction-owned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::Internal`] when `path` is not absolute.
+    pub fn describe_shared(
+        kind: LockResourceKind,
+        access: LockAccess,
+        path: &Path,
+    ) -> Result<Self, AppError> {
+        if !path.is_absolute() {
+            return Err(AppError::Internal(format!(
+                "shared lock resource {} is not absolute",
+                path.display()
+            )));
+        }
+        let anchor = path
+            .ancestors()
+            .last()
+            .filter(|candidate| !candidate.as_os_str().is_empty())
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "shared lock resource {} has no stable root anchor",
+                    path.display()
+                ))
+            })?;
+        Self::describe(kind, access, anchor, path)
     }
 
     /// Describes a resource from an already-classified entry.
@@ -136,10 +216,11 @@ impl LockResource {
     /// Returns [`AppError::Internal`] when the entry is not beneath `anchor`.
     pub fn describe_entry(
         kind: LockResourceKind,
+        access: LockAccess,
         anchor: &Path,
         resolved: &ResolvedEntry,
     ) -> Result<Self, AppError> {
-        let mut resource = Self::describe(kind, anchor, &resolved.entry)?;
+        let mut resource = Self::describe(kind, access, anchor, &resolved.entry)?;
         resource.identity.physical = resolved.terminal.as_deref().and_then(identity_of_existing);
         Ok(resource)
     }
@@ -152,10 +233,11 @@ impl LockResource {
     /// the anchor moving deeper on a later run cannot cause two processes to miss each other.
     /// Anything shared between runs must use [`LockResource::describe`] with an explicit anchor.
     #[must_use]
-    pub fn describe_unanchored(kind: LockResourceKind, path: &Path) -> Self {
+    pub fn describe_unanchored(kind: LockResourceKind, access: LockAccess, path: &Path) -> Self {
         let (anchor, suffix) = split_existing_anchor(path);
         Self {
             kind,
+            access,
             path: path.to_path_buf(),
             identity: LockResourceIdentity {
                 anchor,

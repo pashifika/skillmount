@@ -1207,43 +1207,57 @@ fn every_codex_discovery_root_and_backing_store_is_locked() {
     let resources = snapshot
         .lock_resources
         .iter()
-        .map(|resource| (resource.kind, resource.path.clone()))
+        .map(|resource| (resource.kind, resource.access, resource.path.clone()))
         .collect::<std::collections::BTreeSet<_>>();
     let expected = [
         (
             crate::lock::LockResourceKind::DiscoveryEntry,
+            crate::lock::LockAccess::Mutate,
             project.preferred(),
         ),
         (
             crate::lock::LockResourceKind::DiscoveryEntry,
+            crate::lock::LockAccess::Mutate,
+            project.root.join(".agents"),
+        ),
+        (
+            crate::lock::LockResourceKind::DiscoveryEntry,
+            crate::lock::LockAccess::Observe,
             project.legacy(),
         ),
         (
             crate::lock::LockResourceKind::BackingStore,
+            crate::lock::LockAccess::Mutate,
             project.preferred(),
         ),
         (
             crate::lock::LockResourceKind::DiscoveryEntry,
+            crate::lock::LockAccess::Observe,
             nested.join(PREFERRED),
         ),
         (
             crate::lock::LockResourceKind::DiscoveryEntry,
+            crate::lock::LockAccess::Observe,
             nested.join(LEGACY),
         ),
         (
             crate::lock::LockResourceKind::DiscoveryEntry,
+            crate::lock::LockAccess::Observe,
             project.root.join("home/.agents/skills"),
         ),
         (
             crate::lock::LockResourceKind::DiscoveryEntry,
+            crate::lock::LockAccess::Observe,
             project.root.join("codex-home/skills"),
         ),
         (
             crate::lock::LockResourceKind::DiscoveryEntry,
+            crate::lock::LockAccess::Observe,
             project.root.join("codex-home/skills/.system"),
         ),
         (
             crate::lock::LockResourceKind::DiscoveryEntry,
+            crate::lock::LockAccess::Observe,
             project.root.join("admin/skills"),
         ),
     ]
@@ -1676,7 +1690,21 @@ fn every_staging_lock_resource_keeps_a_logical_key_before_the_root_exists() {
 
     let snapshot = ClaudeAdapter.inspect_discovery(&context).unwrap();
 
-    assert_eq!(snapshot.lock_resources.len(), 2);
+    assert!(!snapshot.lock_resources.is_empty());
+    assert!(
+        snapshot
+            .lock_resources
+            .iter()
+            .any(|resource| resource.access == crate::lock::LockAccess::Mutate),
+        "the unique staging destination and helper chain require mutation access"
+    );
+    assert!(
+        snapshot
+            .lock_resources
+            .iter()
+            .any(|resource| resource.access == crate::lock::LockAccess::Observe),
+        "shared project and user discovery scopes remain observations"
+    );
     for resource in &snapshot.lock_resources {
         assert!(
             !resource.identity.logical_path().as_os_str().is_empty(),

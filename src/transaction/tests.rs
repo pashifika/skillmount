@@ -19,6 +19,7 @@ use crate::journal::{ActionStatus, TransactionStatus, store};
 use crate::link::testing::with_delete_error;
 use crate::link::testing::{HookPoint, with_hook};
 use crate::link::{OwnershipMismatch, platform_backend};
+use crate::lock::LockAccess;
 use crate::lock::acquire::{HeldLocks, LockOwner, LockPolicy};
 use crate::paths::resolve_session;
 use crate::state::testing::StateRootGuard;
@@ -208,6 +209,40 @@ fn a_partially_locked_session_cannot_open_a_transaction() {
     .expect_err("holding some of the locks is not holding the locks");
 
     assert_eq!(error.category(), crate::error::ExitCategory::Internal);
+}
+
+#[test]
+fn observation_locks_cannot_authorize_a_transaction_journal() {
+    let session = Session::codex("txn-observation-locks", &["alpha"], &[]);
+    let mut outcome = session.plan();
+    for resource in &mut outcome.snapshot.lock_resources {
+        resource.access = LockAccess::Observe;
+    }
+    let observed = HeldLocks::acquire(
+        &outcome.snapshot.lock_resources,
+        LockPolicy::immediate(),
+        &LockOwner::preliminary(),
+    )
+    .expect("observation locks are available");
+
+    let error = Transaction::open(
+        &session.context,
+        &outcome.catalog,
+        &outcome.plan,
+        &outcome.snapshot,
+        &observed,
+    )
+    .expect_err("read authority must never authorize a write-ahead journal");
+
+    assert_eq!(error.category(), crate::error::ExitCategory::Internal);
+    assert!(error.to_string().contains("mutation lock resource"));
+    assert!(
+        store::scan()
+            .expect("the state root is readable")
+            .journals
+            .is_empty(),
+        "authority is checked before journal persistence"
+    );
 }
 
 #[test]

@@ -36,6 +36,7 @@ use crate::journal::{
 };
 use crate::link::{LinkBackend, platform_backend};
 use crate::lock::acquire::HeldLocks;
+use crate::lock::{LockAccess, LockResource};
 use crate::mount::{MountAction, MountPlan};
 
 /// Filename prefix every staged entry uses.
@@ -113,11 +114,19 @@ impl Transaction {
     ) -> Result<Self, AppError> {
         // Checked rather than documented. Every removal this transaction will later perform is safe
         // only because no other session can reach the same entry, and that is a property of the
-        // locks, not of the code that removes. A caller that skipped them must fail here, before the
-        // journal exists, rather than produce entries whose safety rests on an assumption.
+        // locks, not of the code that removes. Observation locks still matter for snapshot
+        // stability, but they never authorize a journal that may create or remove an entry.
         if !locks.holds_all(&snapshot.lock_resources) {
             return Err(AppError::Internal(
                 "a transaction may only open while its plan's resource locks are held".to_owned(),
+            ));
+        }
+        let mutation_resources = required_mutation_resources(plan, snapshot)?;
+        if !locks.holds_all(&mutation_resources) {
+            return Err(AppError::Internal(
+                "a transaction may only open while mutation access is held for every owned \
+                 destination"
+                    .to_owned(),
             ));
         }
 
@@ -272,6 +281,52 @@ impl Transaction {
     fn record_error(&mut self, message: String) {
         self.journal.errors.push(message);
     }
+}
+
+/// Returns the mutation resources that authorize every path this transaction may own.
+///
+/// A resource protects its own path and descendants. Reused links are deliberately absent: the
+/// transaction neither creates nor removes them. Requiring the recorded resource itself also
+/// requires its physical key when the destination container already exists.
+fn required_mutation_resources(
+    plan: &MountPlan,
+    snapshot: &DiscoverySnapshot,
+) -> Result<Vec<LockResource>, AppError> {
+    let owned_destinations = plan
+        .actions
+        .iter()
+        .filter_map(|planned| match &planned.operation {
+            MountAction::CreateDirectory { path } => Some(path.as_path()),
+            MountAction::CreateDirectoryLink { destination, .. } => Some(destination.as_path()),
+            MountAction::ReuseExistingLink { .. } => None,
+        });
+    let required_paths = [
+        plan.discovery.entry.as_path(),
+        plan.discovery.backing_store.as_path(),
+    ]
+    .into_iter()
+    .chain(owned_destinations);
+    let mut required = Vec::new();
+
+    for path in required_paths {
+        let resource = snapshot
+            .lock_resources
+            .iter()
+            .filter(|resource| resource.access == LockAccess::Mutate)
+            .filter(|resource| path == resource.path || path.starts_with(&resource.path))
+            .max_by_key(|resource| resource.path.components().count())
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "the plan has no mutation lock resource covering owned destination {}",
+                    path.display()
+                ))
+            })?;
+        if !required.contains(resource) {
+            required.push(resource.clone());
+        }
+    }
+
+    Ok(required)
 }
 
 /// Builds the durable record for one planned action, assigning its staged sibling.

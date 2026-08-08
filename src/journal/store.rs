@@ -111,9 +111,31 @@ impl JournalScan {
 /// rename fails. A failure here is reported before the mutation it was about to describe, so the
 /// caller has not yet changed anything.
 pub fn persist(journal: &TransactionJournal, path: &Path) -> Result<(), AppError> {
+    persist_document(journal, path, &codec::render_document(&journal.to_lines()))
+}
+
+#[cfg(test)]
+pub(crate) fn persist_legacy_for_test(
+    journal: &TransactionJournal,
+    path: &Path,
+) -> Result<(), AppError> {
+    let mut lines = journal.to_lines();
+    for line in &mut lines {
+        if line.record == "lock" {
+            line.remove_field("access");
+        }
+    }
+    let document = codec::render_document_for_schema(&lines, super::LEGACY_SCHEMA_VERSION);
+    persist_document(journal, path, &document)
+}
+
+fn persist_document(
+    journal: &TransactionJournal,
+    path: &Path,
+    document: &[u8],
+) -> Result<(), AppError> {
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     state::ensure_private_directory(directory)?;
-    let document = codec::render_document(&journal.to_lines());
 
     // The temporary name carries the transaction id, so two concurrent transactions never collide
     // and a crashed one leaves a file whose owner is identifiable.
@@ -123,7 +145,7 @@ pub fn persist(journal: &TransactionJournal, path: &Path) -> Result<(), AppError
         std::process::id()
     ));
 
-    write_durably(&temporary, &document).inspect_err(|_| {
+    write_durably(&temporary, document).inspect_err(|_| {
         let _ = fs::remove_file(&temporary);
     })?;
     #[cfg(test)]
@@ -145,7 +167,12 @@ pub fn persist(journal: &TransactionJournal, path: &Path) -> Result<(), AppError
     })?;
     #[cfg(test)]
     injected_failure(PersistFault::AfterReplacement, path)?;
+    #[cfg(test)]
+    injected_failure(PersistFault::DirectorySync, directory)?;
+    #[cfg(unix)]
     flush_directory(directory)?;
+    #[cfg(windows)]
+    flush_directory(directory);
     #[cfg(test)]
     injected_failure(PersistFault::AfterDurability, path)?;
     Ok(())
@@ -305,7 +332,7 @@ pub fn scan() -> Result<JournalScan, AppError> {
 }
 
 fn decode(path: &Path, document: &[u8]) -> Result<TransactionJournal, AppError> {
-    let lines = codec::parse_document(document).map_err(|error| {
+    let parsed = codec::parse_document(document).map_err(|error| {
         AppError::Journal(match error {
             DecodeError::UnsupportedVersion(found) => JournalError::UnsupportedVersion {
                 path: path.to_path_buf(),
@@ -318,7 +345,7 @@ fn decode(path: &Path, document: &[u8]) -> Result<TransactionJournal, AppError> 
             },
         })
     })?;
-    TransactionJournal::from_lines(&lines).map_err(|reason| {
+    TransactionJournal::from_lines(&parsed.lines, parsed.schema_version).map_err(|reason| {
         AppError::Journal(JournalError::Corrupt {
             path: path.to_path_buf(),
             reason,
@@ -401,8 +428,6 @@ fn replace_journal(from: &Path, to: &Path) -> std::io::Result<()> {
 /// Flushes a directory entry so a rename or removal survives power loss.
 #[cfg(unix)]
 fn flush_directory(directory: &Path) -> Result<(), AppError> {
-    #[cfg(test)]
-    injected_failure(PersistFault::DirectorySync, directory)?;
     let handle = File::open(directory).map_err(|error| {
         AppError::Journal(JournalError::Write {
             path: directory.to_path_buf(),
@@ -418,15 +443,8 @@ fn flush_directory(directory: &Path) -> Result<(), AppError> {
 }
 
 /// The Windows replacement call itself is write-through, so no second directory operation exists.
-// The shared cross-platform seam is fallible, and tests inject the otherwise absent Windows error.
 #[cfg(windows)]
-#[allow(clippy::unnecessary_wraps)]
-fn flush_directory(directory: &Path) -> Result<(), AppError> {
-    let _ = directory;
-    #[cfg(test)]
-    injected_failure(PersistFault::DirectorySync, directory)?;
-    Ok(())
-}
+fn flush_directory(_directory: &Path) {}
 
 #[cfg(test)]
 fn injected_failure(phase: PersistFault, path: &Path) -> Result<(), AppError> {

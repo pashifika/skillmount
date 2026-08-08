@@ -880,49 +880,64 @@ fn lock_resources(
 ) -> Result<Vec<LockResource>, AppError> {
     let mut resources = Vec::new();
     for scope in scopes {
+        let access = if scope.state.entry == destination {
+            crate::lock::LockAccess::Mutate
+        } else {
+            crate::lock::LockAccess::Observe
+        };
         resources.push(if scope.state.entry.starts_with(&context.project_root) {
             LockResource::describe_entry(
                 LockResourceKind::DiscoveryEntry,
+                access,
                 &context.project_root,
                 &scope.state,
             )?
         } else {
-            LockResource::describe_unanchored(LockResourceKind::DiscoveryEntry, &scope.state.entry)
+            LockResource::describe_shared(
+                LockResourceKind::DiscoveryEntry,
+                access,
+                &scope.state.entry,
+            )?
         });
     }
-    // Every declarative input that decided the namespace is a resource too: the locked replan
-    // rereads them, so a concurrent session must not be able to rewrite one in between.
+    // Declarative settings, plugin registries, and traversed roots only decide the observed
+    // namespace. SkillMount never rewrites them.
     for input in settings.inputs.iter().chain(plugin_roots.inputs.iter()) {
-        resources.push(LockResource::describe_unanchored(
+        resources.push(LockResource::describe_shared(
             LockResourceKind::DiscoveryEntry,
+            crate::lock::LockAccess::Observe,
             input,
-        ));
+        )?);
     }
     for terminal in physical {
-        resources.push(LockResource::describe_unanchored(
+        resources.push(LockResource::describe_shared(
             LockResourceKind::DiscoveryEntry,
+            crate::lock::LockAccess::Observe,
             terminal,
-        ));
+        )?);
     }
     // The project scope is locked as well, because a plan may create it.
     let scope_directory = context.launch_cwd.join(OMP_CONFIG_DIR_NAME);
     resources.push(LockResource::describe(
         LockResourceKind::DiscoveryEntry,
+        crate::lock::LockAccess::Mutate,
         &context.project_root,
         &scope_directory,
     )?);
     resources.push(LockResource::describe(
         LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
         &context.project_root,
         destination,
     )?);
     // A destination reached through a link shares one physical directory with anything else that
     // links to it, so the canonical backing path contributes its own key.
     if let Some(terminal) = &destination_state.terminal {
-        resources.push(LockResource::describe_unanchored(
+        resources.push(LockResource::describe_shared(
             LockResourceKind::BackingStore,
+            crate::lock::LockAccess::Mutate,
             terminal,
-        ));
+        )?);
     }
 
     resources.sort_by_key(LockResource::ordering_key);
