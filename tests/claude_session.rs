@@ -145,6 +145,18 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.root);
     }
 }
+fn assert_asm_recovery_footer(rendered: &str) {
+    assert_eq!(rendered.matches("Recovery —").count(), 1, "{rendered}");
+    let vector = rendered.contains("executable: asm");
+    let shell_command = rendered.contains("asm cleanup --project-root");
+    assert_ne!(
+        vector, shell_command,
+        "exactly one selected-shell command or native vector is required: {rendered}"
+    );
+    assert!(rendered.contains("cleanup"), "{rendered}");
+    assert!(rendered.contains("--project-root"), "{rendered}");
+    assert!(!rendered.contains("argv["), "{rendered}");
+}
 
 #[test]
 fn three_source_overrides_count_once_normally_and_list_every_origin_verbose() {
@@ -670,15 +682,13 @@ fn child_and_cleanup_exit_precedence_follows_an_unprovable_staging_link() {
         );
         assert!(stderr.contains("  retained path: "), "{stderr}");
         assert!(stderr.contains("  retained journal: "), "{stderr}");
-        assert!(stderr.contains("    executable: asm"), "{stderr}");
-        assert!(stderr.contains("    argument 1: cleanup"), "{stderr}");
+        assert_asm_recovery_footer(&stderr);
         assert!(
-            !stderr.contains("argv["),
-            "raw argv fragments must be gone: {stderr}"
-        );
-        assert!(
-            !stderr.contains("asm cleanup --project-root"),
-            "recovery guidance must not look like a shell command: {stderr}"
+            stderr
+                .find("  retained journal: ")
+                .zip(stderr.find("Recovery —"))
+                .is_some_and(|(journal, footer)| journal < footer),
+            "the complete diagnostic must precede recovery: {stderr}"
         );
     }
 }
@@ -753,7 +763,7 @@ fn project_mode_retains_an_unprovable_link_and_returns_filesystem_status() {
     );
     assert_eq!(fixture.journal_count(), 1, "{stderr}");
     assert!(stderr.contains("error: session cleanup failed"), "{stderr}");
-    assert!(stderr.contains("    executable: asm"), "{stderr}");
+    assert_asm_recovery_footer(&stderr);
 }
 
 #[test]

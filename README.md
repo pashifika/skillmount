@@ -294,24 +294,45 @@ no Agent process still uses them, or sweep every recorded transaction with
 `asm cleanup --all`. The recovery rules and their guarantees are documented in
 [docs/architecture.md](docs/architecture.md).
 
-When a Skill link genuinely cannot be released, the session says so once, on stderr, and names what
-to run:
+When one or more Skill links genuinely cannot be released, the session first reports every
+condition once on stderr, then emits one recovery footer. A direct Windows invocation whose
+ancestry identifies PowerShell receives a single-quoted command:
 
 ```text
 error: session cleanup failed
   reason: a regular directory replaced the entry, so it cannot be proved to belong to this session and was left untouched
-  retained path: /projects/webapp/.omp/skills/team-review
-  retained journal: ~/Library/Application Support/skillmount/transactions/<id>.journal
-  recovery: first confirm that every related Agent process has exited, then invoke this argument vector
+  retained path: C:\projects\O'Brien webapp\.omp\skills\team-review
+  retained journal: C:\Users\me\AppData\Local\skillmount\transactions\<id>.journal
+
+Recovery — run only after confirming that every related Agent process has exited:
+  command 1 (PowerShell):
+    asm cleanup --project-root 'C:\projects\O''Brien webapp'
+```
+
+PowerShell uses `'...'`; an apostrophe inside the value becomes `''`. A direct Command Prompt
+invocation uses its independently verified double-quoted form instead:
+
+```text
+  command 1 (Command Prompt):
+    asm cleanup --project-root "C:\projects\web app"
+```
+
+The executable is `skillmount` when that is the recognized invoked product name and `asm`
+otherwise. If startup ancestry is absent or ambiguous, or a native value cannot be represented
+losslessly in the selected shell, SkillMount prints the authoritative native values instead of
+guessing:
+
+```text
+  command 1 (native argument vector):
     executable: asm
     argument 1: cleanup
     argument 2: --project-root
     argument 3: /projects/webapp
 ```
 
-Those are argument values, not a command to paste into a shell. They stay separate on purpose: a
-path can hold spaces, quotes, or bytes no shell quoting round-trips, so SkillMount prints each value
-on its own labelled line instead of building a command string you would have to trust.
+SkillMount never stores or executes the displayed shell line. Recovery authority still comes from
+the separate native values and the operator's confirmation that every related Agent process has
+exited.
 
 ## Requirements
 

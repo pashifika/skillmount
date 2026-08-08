@@ -9,7 +9,7 @@ use clap::error::ErrorKind;
 
 use crate::agent::{AgentAdapter, DiscoverySnapshot, adapter};
 use crate::catalog::{CatalogRequest, resolve_catalog};
-use crate::cli::{CompletionInput, InspectAgent, ParsedCommand, parse_command_from};
+use crate::cli::{CompletionInput, InspectAgent, ParsedCommand, ProductBinary, parse_command_from};
 use crate::domain::{AgentId, LinkMode, MountMode, RunContext, SkillCatalog};
 use crate::error::{AppError, CatalogError, ExitCategory, LinkError, PlanError};
 use crate::journal::store::RejectedJournal;
@@ -18,7 +18,8 @@ use crate::lock::acquire::{HeldLocks, LockOwner, LockPolicy};
 use crate::mount::MountPlan;
 use crate::paths::{resolve_inspection, resolve_session};
 use crate::process::{
-    CleanupFailure, ProcessSupervisor, SupervisionDiagnostic, SupervisionRequest, map_exit,
+    CleanupFailure, InvocationShell, ProcessSupervisor, SupervisionDiagnostic, SupervisionRequest,
+    invocation_shell, map_exit,
 };
 use crate::render;
 use crate::transaction::cleanup::CleanupReport;
@@ -26,6 +27,11 @@ use crate::transaction::{Transaction, recover};
 
 /// Maximum discovery/recovery passes allowed while a mutating lock set expands.
 const MAX_LOCK_SET_PASSES: usize = 8;
+#[derive(Debug, Clone, Copy)]
+struct InvocationContext {
+    product: ProductBinary,
+    shell: InvocationShell,
+}
 
 pub(crate) fn run_from<I, T>(args: I) -> ExitCode
 where
@@ -33,6 +39,13 @@ where
     T: Into<OsString> + Clone,
 {
     let mut args = args.into_iter().map(Into::into).collect::<Vec<OsString>>();
+    let invocation = InvocationContext {
+        product: args
+            .first()
+            .and_then(|argv0| ProductBinary::from_argv0(argv0))
+            .unwrap_or(ProductBinary::Asm),
+        shell: invocation_shell(),
+    };
     if args.len() == 1 {
         args.push(OsString::from("--help"));
     }
@@ -56,7 +69,7 @@ where
             let mut stdout = io::stdout().lock();
             return match execute_completion(input, &mut stdout) {
                 Ok(code) => ExitCode::from(code),
-                Err(error) => report_error(&error),
+                Err(error) => report_error(&error, invocation),
             };
         }
         command => command,
@@ -65,14 +78,15 @@ where
     let invocation_cwd = match std::env::current_dir() {
         Ok(path) => path,
         Err(error) => {
-            return report_error(&AppError::Internal(format!(
-                "cannot capture invocation CWD: {error}"
-            )));
+            return report_error(
+                &AppError::Internal(format!("cannot capture invocation CWD: {error}")),
+                invocation,
+            );
         }
     };
-    match execute(command, &invocation_cwd) {
+    match execute(command, &invocation_cwd, invocation) {
         Ok(code) => ExitCode::from(code),
-        Err(error) => report_error(&error),
+        Err(error) => report_error(&error, invocation),
     }
 }
 
@@ -86,7 +100,11 @@ fn execute_completion(input: CompletionInput, writer: &mut dyn Write) -> Result<
     }
 }
 
-fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError> {
+fn execute(
+    command: ParsedCommand,
+    invocation_cwd: &Path,
+    invocation: InvocationContext,
+) -> Result<u8, AppError> {
     match command {
         ParsedCommand::Completions(_) => Err(AppError::Internal(
             "completion request reached path-dependent command dispatch".to_owned(),
@@ -95,7 +113,7 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError
             let dry_run = input.options.dry_run;
             let context = resolve_session(input, invocation_cwd)?;
             if !dry_run {
-                return run_session(&context);
+                return run_session(&context, invocation);
             }
             let report = plan_read_only(&context)?;
             emit(&render::render(&render::ReadOnlyReport {
@@ -169,7 +187,12 @@ fn execute(command: ParsedCommand, invocation_cwd: &Path) -> Result<u8, AppError
             Ok(outcome.code)
         }
         ParsedCommand::Cleanup(input) => {
-            let outcome = crate::operator::cleanup::run(&input, invocation_cwd)?;
+            let outcome = crate::operator::cleanup::run(
+                &input,
+                invocation_cwd,
+                invocation.product,
+                invocation.shell,
+            )?;
             emit(&outcome.output)?;
             Ok(outcome.code)
         }
@@ -195,7 +218,7 @@ pub(crate) struct ReadOnlyOutcome {
 /// child was spawned or the managed process domain is empty; uncertain liveness leaves the active
 /// journal untouched for recovery. `--keep-mounts` reaches the transaction's terminal kept state
 /// through that same callback.
-fn run_session(context: &RunContext) -> Result<u8, AppError> {
+fn run_session(context: &RunContext, invocation: InvocationContext) -> Result<u8, AppError> {
     // Root-changing arguments and release-independent Agent controls are rejected before reading
     // or creating SkillMount state. No Agent process runs here: mount visibility and removal are
     // established by the journal, the locks, proven process-domain death, and ownership-verified
@@ -245,7 +268,7 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     // after every restart and after every monotonic expansion.
     let mut stable = None;
     for _ in 0..MAX_LOCK_SET_PASSES {
-        reconcile_incomplete_transactions(&context, &mut locks)?;
+        reconcile_incomplete_transactions(&context, &mut locks, invocation)?;
 
         // Built under the lock and after recovery, because recovery may have removed mounts
         // discovery saw a moment ago. A plan that disagrees with the filesystem it is about to
@@ -326,14 +349,19 @@ fn run_session(context: &RunContext) -> Result<u8, AppError> {
     let request = SupervisionRequest::new(rebuilt.plan.launch.clone());
     let verbose_cleanup = context.options.verbosity > 0;
     let outcome = ProcessSupervisor::new().supervise(request, move || {
-        cleanup_for_supervisor(&mut transaction, &journal_path, verbose_cleanup)
+        cleanup_for_supervisor(
+            &mut transaction,
+            &journal_path,
+            verbose_cleanup,
+            invocation.product,
+        )
     });
     // Lock ownership covers the whole child lifetime and the cleanup callback. Keeping this
     // explicit prevents a future refactor from shortening the guard to the last planning use.
     drop(locks);
 
     let decision = map_exit(&outcome);
-    report_supervision_diagnostics(&decision);
+    report_supervision_diagnostics(&decision, invocation.shell);
     Ok(decision.code)
 }
 
@@ -419,8 +447,9 @@ fn cleanup_for_supervisor(
     transaction: &mut Transaction,
     journal_path: &Path,
     verbose: bool,
+    product: ProductBinary,
 ) -> Result<(), CleanupFailure> {
-    let recovery_command = cleanup_recovery_arguments(&transaction.journal().project_root);
+    let recovery_command = cleanup_recovery_arguments(product, &transaction.journal().project_root);
     match transaction.cleanup() {
         Ok(report) => {
             if verbose {
@@ -498,33 +527,45 @@ fn cleanup_failure_from_report(
     }
 }
 
-fn cleanup_recovery_arguments(project_root: &Path) -> Vec<OsString> {
+fn cleanup_recovery_arguments(product: ProductBinary, project_root: &Path) -> Vec<OsString> {
     vec![
-        OsString::from("asm"),
+        OsString::from(product.registration_name()),
         OsString::from("cleanup"),
         OsString::from("--project-root"),
         project_root.as_os_str().to_os_string(),
     ]
 }
 
-/// The precondition an operator must satisfy before any recovery vector is safe to invoke.
-const RECOVERY_PRECONDITION: &str =
-    "first confirm that every related Agent process has exited, then invoke this argument vector";
-
-fn report_supervision_diagnostics(decision: &crate::process::ExitDecision) {
-    if let Some(primary) = &decision.primary {
-        emit_supervision_diagnostic("error", primary);
-    }
-    for secondary in &decision.secondary {
-        emit_supervision_diagnostic("warning", secondary);
+fn report_supervision_diagnostics(decision: &crate::process::ExitDecision, shell: InvocationShell) {
+    let mut stderr = io::stderr().lock();
+    for line in supervision_diagnostic_report(decision, shell) {
+        let _ = writeln!(stderr, "{line}");
     }
 }
 
-fn emit_supervision_diagnostic(severity: &str, diagnostic: &SupervisionDiagnostic) {
-    let mut stderr = io::stderr().lock();
-    for line in supervision_diagnostic_lines(severity, diagnostic) {
-        let _ = writeln!(stderr, "{line}");
+fn supervision_diagnostic_report(
+    decision: &crate::process::ExitDecision,
+    shell: InvocationShell,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(primary) = &decision.primary {
+        lines.extend(supervision_diagnostic_lines("error", primary));
     }
+    for secondary in &decision.secondary {
+        lines.extend(supervision_diagnostic_lines("warning", secondary));
+    }
+    let recovery_operations = decision
+        .primary
+        .iter()
+        .chain(decision.secondary.iter())
+        .filter_map(|diagnostic| match diagnostic {
+            SupervisionDiagnostic::Cleanup(failure) if !failure.recovery_command.is_empty() => {
+                Some(failure.recovery_command.as_slice())
+            }
+            _ => None,
+        });
+    lines.extend(render::recovery_footer(shell, recovery_operations));
+    lines
 }
 
 /// Renders one diagnostic as already-escaped lines, severity headline first.
@@ -562,10 +603,7 @@ fn cleanup_failure_lines(severity: &str, failure: &CleanupFailure) -> Vec<String
         )),
         None => lines.push("  retained journal: none was available".to_owned()),
     }
-    if !failure.recovery_command.is_empty() {
-        lines.push(format!("  recovery: {RECOVERY_PRECONDITION}"));
-        lines.extend(render::argument_vector("    ", &failure.recovery_command));
-    }
+    // Recovery is rendered once, after every complete primary and secondary diagnostic block.
     lines
 }
 
@@ -598,8 +636,8 @@ fn describe_supervision_diagnostic(diagnostic: &SupervisionDiagnostic) -> String
         SupervisionDiagnostic::ExceptionalUnixStatus { raw_status } => {
             format!("agent returned unrepresentable Unix wait status {raw_status}")
         }
-        // Rendered as a structured block by `cleanup_failure_lines`, which is the only shape that
-        // can carry several paths and an argument vector without repeating anything.
+        // Rendered as a structured block by `cleanup_failure_lines`; recovery is appended once
+        // after every complete primary and secondary diagnostic.
         SupervisionDiagnostic::Cleanup(_) => "session cleanup failed".to_owned(),
     }
 }
@@ -612,6 +650,7 @@ fn describe_supervision_diagnostic(diagnostic: &SupervisionDiagnostic) -> String
 fn reconcile_incomplete_transactions(
     context: &RunContext,
     locks: &mut HeldLocks,
+    invocation: InvocationContext,
 ) -> Result<(), AppError> {
     if context.options.no_recover {
         let blocking = recover::blocking_state(locks)?;
@@ -623,6 +662,7 @@ fn reconcile_incomplete_transactions(
                       was changed"
                 .to_owned(),
             detail: blocking,
+            recovery: Vec::new().into_boxed_slice(),
         });
     }
 
@@ -631,9 +671,8 @@ fn reconcile_incomplete_transactions(
         return Err(unreadable_journals_error(&report.unreadable));
     }
     if !report.quarantined.is_empty() {
-        // One block per quarantined journal: the journal it belongs to, the precondition, and the
-        // argument vector that releases it. Grouping keeps the pairing obvious when several journals
-        // are quarantined at once, which indexed fragments could only imply.
+        // `report.describe` names each quarantined journal once. Native operations stay separate
+        // until the application boundary appends one deduplicated recovery footer.
         let mut detail = report.describe();
         detail.push(
             "state: recovered entries listed above were changed by ownership-checked recovery; the \
@@ -641,26 +680,24 @@ fn reconcile_incomplete_transactions(
                 .to_owned(),
         );
         detail.push(
-            "safe next action: release each quarantined journal below, or account for every \
-             recorded path manually"
+            "safe next action: use the recovery operation below for each quarantined project, or \
+             account for every recorded path manually"
                 .to_owned(),
         );
-        for quarantined in &report.quarantined {
-            detail.push(format!(
-                "  quarantined journal: {}",
-                render::path_value(&quarantined.journal, true)
-            ));
-            detail.push(format!("  recovery: {RECOVERY_PRECONDITION}"));
-            detail.extend(render::argument_vector(
-                "    ",
-                &cleanup_recovery_arguments(&quarantined.project_root),
-            ));
-        }
+        let recovery = report
+            .quarantined
+            .iter()
+            .map(|quarantined| {
+                cleanup_recovery_arguments(invocation.product, &quarantined.project_root)
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         return Err(AppError::TemporaryReport {
             summary:
                 "cannot start a mutating session because process-domain death was never proved"
                     .to_owned(),
             detail,
+            recovery,
         });
     }
     warn(&report.describe());
@@ -689,6 +726,7 @@ fn unreadable_journals_error(rejected: &[RejectedJournal]) -> AppError {
             "cannot start a mutating session while transaction state is unreadable or uses an \
                   unsupported schema; no cleanup was attempted and no new plan was applied"
                 .to_owned(),
+        recovery: Vec::new().into_boxed_slice(),
         detail,
     }
 }
@@ -850,7 +888,7 @@ fn report_clap_fallback(original_kind: ErrorKind) -> ExitCode {
     }
 }
 
-fn report_error(error: &AppError) -> ExitCode {
+fn report_error(error: &AppError, invocation: InvocationContext) -> ExitCode {
     let mut stderr = io::stderr().lock();
     let _ = writeln!(stderr, "error: {}", render::text_value(&error.to_string()));
     if let AppError::TemporaryReport { detail, .. } = error {
@@ -862,6 +900,11 @@ fn report_error(error: &AppError) -> ExitCode {
     }
     for line in error_guidance(error) {
         let _ = writeln!(stderr, "{line}");
+    }
+    if let AppError::TemporaryReport { recovery, .. } = error {
+        for line in render::recovery_footer(invocation.shell, recovery.iter().map(Vec::as_slice)) {
+            let _ = writeln!(stderr, "{line}");
+        }
     }
     ExitCode::from(error.category().code())
 }
@@ -877,10 +920,14 @@ fn error_guidance(error: &AppError) -> Vec<&'static str> {
             "state: no selected Skill was mounted and no existing destination was replaced; any earlier stale recovery was reported separately",
             "safe next action: correct the named catalog entry or source ordering, then retry",
         ],
-        AppError::Plan(PlanError::DestinationConflict { .. }) => vec![
-            "state: the conflicting destination was not replaced; any earlier stale recovery was reported separately",
-            "safe next action: --conflict=skip may preserve an ordinary project directory or different-source directory link while omitting this selected Skill; otherwise account for and repair the existing entry before retrying",
-        ],
+        AppError::Plan(error)
+            if matches!(error.as_ref(), PlanError::DestinationConflict { .. }) =>
+        {
+            vec![
+                "state: the conflicting destination was not replaced; any earlier stale recovery was reported separately",
+                "safe next action: --conflict=skip may preserve an ordinary project directory or different-source directory link while omitting this selected Skill; otherwise account for and repair the existing entry before retrying",
+            ]
+        }
         AppError::Plan(_) => vec![
             "state: the reported destination was not replaced; an ownership-checked rollback completed if mutation had already begun",
             "safe next action: inspect and account for the reported discovery entry before repairing it and retrying",
@@ -921,11 +968,12 @@ mod tests {
 
     use super::{
         error_guidance, execute_completion, junction_policy_warning, supervision_diagnostic_lines,
+        supervision_diagnostic_report,
     };
     use crate::cli::{CompletionInput, CompletionShell, ProductBinary};
     use crate::domain::{AgentId, LinkMode};
     use crate::error::{AppError, ExitCategory, LinkError};
-    use crate::process::{CleanupFailure, SupervisionDiagnostic};
+    use crate::process::{CleanupFailure, ExitDecision, InvocationShell, SupervisionDiagnostic};
 
     struct ErrorWriter {
         kind: io::ErrorKind,
@@ -946,6 +994,17 @@ mod tests {
             shell: CompletionShell::Bash,
             product: ProductBinary::Asm,
         }
+    }
+
+    fn diagnostic_report(diagnostic: SupervisionDiagnostic, shell: InvocationShell) -> Vec<String> {
+        supervision_diagnostic_report(
+            &ExitDecision {
+                code: ExitCategory::Filesystem.code(),
+                primary: Some(diagnostic),
+                secondary: Vec::new(),
+            },
+            shell,
+        )
     }
 
     #[test]
@@ -1021,7 +1080,7 @@ mod tests {
         assert!(!guidance.contains("no selected Skill was mounted"));
     }
 
-    /// One structured block per condition, with every fact exactly once and no shell syntax.
+    /// One structured block per condition, followed by one native fallback footer.
     #[test]
     fn a_cleanup_failure_renders_one_labelled_block_per_condition() {
         let diagnostic = SupervisionDiagnostic::Cleanup(CleanupFailure {
@@ -1039,7 +1098,7 @@ mod tests {
             ],
         });
 
-        let lines = supervision_diagnostic_lines("error", &diagnostic);
+        let lines = diagnostic_report(diagnostic, InvocationShell::Unknown);
         let rendered = lines.join("\n");
 
         assert_eq!(lines[0], "error: session cleanup failed", "{rendered}");
@@ -1070,13 +1129,74 @@ mod tests {
                 && lines.contains(&"    argument 3: /project".to_owned()),
             "{rendered}"
         );
-        assert!(
-            !rendered.contains("argv["),
-            "raw argv fragments are gone: {rendered}"
-        );
+        assert_eq!(rendered.matches("Recovery —").count(), 1, "{rendered}");
+        assert!(!rendered.contains("argv["), "{rendered}");
         assert!(
             !rendered.contains("asm cleanup --project-root"),
-            "recovery must never look like a pasteable command: {rendered}"
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn every_diagnostic_precedes_one_stably_deduplicated_recovery_footer() {
+        let cleanup = |reason: &str, recovery_command: Vec<OsString>| {
+            SupervisionDiagnostic::Cleanup(CleanupFailure {
+                reason: reason.to_owned(),
+                failed_paths: vec![PathBuf::from(format!("/retained/{reason}"))],
+                retained_journal: Some(PathBuf::from(format!("/journal/{reason}"))),
+                recovery_command,
+            })
+        };
+        let first = vec![
+            OsString::from("asm"),
+            OsString::from("cleanup"),
+            OsString::from("--project-root"),
+            OsString::from(r"D:\recovery one"),
+        ];
+        let second = vec![
+            OsString::from("skillmount"),
+            OsString::from("cleanup"),
+            OsString::from("--project-root"),
+            OsString::from(r"D:\recovery two"),
+        ];
+        let decision = ExitDecision {
+            code: ExitCategory::Filesystem.code(),
+            primary: Some(cleanup("first", first.clone())),
+            secondary: vec![cleanup("duplicate", first), cleanup("second", second)],
+        };
+
+        let rendered =
+            supervision_diagnostic_report(&decision, InvocationShell::PowerShell).join("\n");
+
+        let last_diagnostic = rendered
+            .rfind("  retained journal: /journal/second")
+            .expect("last diagnostic fact");
+        let footer = rendered.find("Recovery —").expect("one recovery footer");
+        assert!(last_diagnostic < footer, "{rendered}");
+        assert_eq!(rendered.matches("Recovery —").count(), 1, "{rendered}");
+        assert_eq!(
+            rendered.matches("command 1 (PowerShell):").count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("command 2 (PowerShell):").count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered
+                .matches(r"asm cleanup --project-root 'D:\recovery one'")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered
+                .matches(r"skillmount cleanup --project-root 'D:\recovery two'")
+                .count(),
+            1,
+            "{rendered}"
         );
     }
 
@@ -1132,7 +1252,7 @@ mod tests {
             ],
         });
 
-        let lines = supervision_diagnostic_lines("error", &diagnostic);
+        let lines = diagnostic_report(diagnostic, InvocationShell::Unknown);
         let rendered = lines.join("\n");
 
         assert!(rendered.contains("\\u{A}"), "{rendered}");
@@ -1141,11 +1261,9 @@ mod tests {
         assert!(rendered.contains("\\u{202E}"), "{rendered}");
         assert!(!rendered.contains('\u{1B}'), "{rendered}");
         assert!(!rendered.contains('\u{202E}'), "{rendered}");
-        // Every line the block emits is one this code wrote. A forged value can no longer contribute
-        // a line of its own, even though the block itself is intentionally multiline.
         assert_eq!(
             lines.len(),
-            7,
+            9,
             "only fixed separators may create lines: {rendered}"
         );
         for line in &lines {
@@ -1173,7 +1291,7 @@ mod tests {
             ],
         });
 
-        let rendered = supervision_diagnostic_lines("error", &diagnostic).join("\n");
+        let rendered = diagnostic_report(diagnostic, InvocationShell::Unknown).join("\n");
 
         assert!(
             rendered.contains("argument 1: escaped:/pro\\xFFject"),
@@ -1197,7 +1315,7 @@ mod tests {
             ],
         });
 
-        let rendered = supervision_diagnostic_lines("error", &diagnostic).join("\n");
+        let rendered = diagnostic_report(diagnostic, InvocationShell::PowerShell).join("\n");
 
         assert!(rendered.contains("argument 1: escaped:"), "{rendered}");
         assert!(rendered.contains("\\uD800"), "{rendered}");

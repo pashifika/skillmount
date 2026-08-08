@@ -19,6 +19,7 @@ use skillmount::domain::LinkMode;
 use skillmount::link::{LinkRequest, PlacementOutcome, platform_backend};
 
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
+const SKILLMOUNT: &str = env!("CARGO_BIN_EXE_skillmount");
 /// Recording stand-in for an Agent, used where a test must prove no child ever started.
 ///
 /// The reused `asm` child can only prove an exit status. Proving the negative — that no child was
@@ -369,6 +370,21 @@ fn collect(root: &Path, current: &Path, entries: &mut Vec<String>) {
 fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
+fn assert_recovery_command_or_vector(rendered: &str, product: &str, expected_values: &[&str]) {
+    assert_eq!(rendered.matches("Recovery —").count(), 1, "{rendered}");
+    let vector = rendered.contains(&format!("executable: {product}"));
+    let shell_command = rendered
+        .lines()
+        .any(|line| line.starts_with(&format!("    {product} cleanup")));
+    assert_ne!(
+        vector, shell_command,
+        "exactly one selected-shell command or native vector is required: {rendered}"
+    );
+    for value in expected_values {
+        assert!(rendered.contains(value), "missing {value:?}: {rendered}");
+    }
+    assert!(!rendered.contains("argv["), "{rendered}");
+}
 
 /// Returns the Agent-native passthrough that reaches the reused `asm` child.
 ///
@@ -516,6 +532,40 @@ fn cleanup_all_reports_an_active_transaction_without_touching_it() {
     );
     assert!(exists(&mounted), "active mounts are left untouched");
     assert_eq!(fixture.journals().len(), 1);
+
+    let status = holder.wait().expect("active fixture finishes");
+    let mut diagnostics = String::new();
+    holder_stderr
+        .read_to_string(&mut diagnostics)
+        .expect("holder diagnostics");
+    assert_eq!(status.code(), Some(FIXTURE_CHILD_STATUS), "{diagnostics}");
+}
+#[test]
+fn cleanup_retry_uses_the_recognized_skillmount_product_identity() {
+    let fixture = Fixture::new("explicit-cleanup-product-identity");
+    fixture.skill("alpha");
+    let mut holder = fixture
+        .command("codex", &[])
+        .env("SKILLMOUNT_HOLD_AT", "journal-active")
+        .env("SKILLMOUNT_HOLD_MS", "4000")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("active fixture session");
+    let mut holder_stderr = wait_for_hold(&mut holder, "journal-active");
+
+    let cleaned = Command::new(SKILLMOUNT)
+        .arg("cleanup")
+        .arg("--all")
+        .env("SKILLMOUNT_STATE_DIR", &fixture.state)
+        .current_dir(&fixture.project)
+        .output()
+        .expect("skillmount cleanup should run");
+
+    assert_eq!(cleaned.status.code(), Some(75));
+    let rendered = String::from_utf8_lossy(&cleaned.stdout);
+    assert!(rendered.contains("[ACTIVE]"), "{rendered}");
+    assert_recovery_command_or_vector(&rendered, "skillmount", &["cleanup", "--all"]);
+    assert!(!rendered.contains("executable: asm"), "{rendered}");
 
     let status = holder.wait().expect("active fixture finishes");
     let mut diagnostics = String::new();
@@ -855,23 +905,10 @@ fn cleanup_retains_a_replaced_mount_and_its_journal() {
     assert_eq!(fixture.journals().len(), 1);
     assert!(fixture.sources.join("alpha/SKILL.md").is_file());
     assert!(
-        rendered.contains("retry with this argument vector rather than a shell command"),
+        rendered.contains("Resolve every reported condition before recovery"),
         "{rendered}"
     );
-    assert!(rendered.contains("  executable: asm"), "{rendered}");
-    assert!(rendered.contains("  argument 1: cleanup"), "{rendered}");
-    assert!(
-        rendered.contains("  argument 2: --project-root"),
-        "{rendered}"
-    );
-    assert!(
-        !rendered.contains("argv["),
-        "raw argv fragments must be gone: {rendered}"
-    );
-    assert!(
-        !rendered.contains("asm cleanup --project-root"),
-        "retry guidance must not construct a shell command: {rendered}"
-    );
+    assert_recovery_command_or_vector(&rendered, "asm", &["cleanup", "--project-root"]);
 }
 
 #[test]
@@ -1517,12 +1554,11 @@ fn a_session_stopped_after_supervision_intent_is_quarantined_not_recovered() {
         stderr.contains("process-domain death was never proved"),
         "{stderr}"
     );
-    assert!(stderr.contains("  quarantined journal: "), "{stderr}");
-    assert!(stderr.contains("    argument 1: cleanup"), "{stderr}");
     assert!(
-        !stderr.contains("recovery[0]") && !stderr.contains("argv["),
-        "nested raw recovery fragments must be gone: {stderr}"
+        stderr.contains("was quarantined without cleanup"),
+        "{stderr}"
     );
+    assert_recovery_command_or_vector(&stderr, "asm", &["cleanup", "--project-root"]);
     assert!(
         stderr.contains("the quarantined mounts were not changed"),
         "{stderr}"
@@ -1533,7 +1569,7 @@ fn a_session_stopped_after_supervision_intent_is_quarantined_not_recovered() {
 
 /// One quarantined journal names its own recorded project, never the unrelated current one.
 #[test]
-fn cross_project_quarantine_names_the_recorded_project_recovery_vector() {
+fn cross_project_quarantine_names_the_recorded_project_recovery_operation() {
     let fixture = Fixture::new("cross-project-quarantine-guidance");
     fixture.skill("alpha");
     let stopped = fixture.run_stopping_at("codex", "journal-supervising", &[]);
@@ -1551,17 +1587,25 @@ fn cross_project_quarantine_names_the_recorded_project_recovery_vector() {
     let unrelated_project = fs::canonicalize(&second_project).expect("unrelated project root");
 
     assert_eq!(refused.status.code(), Some(75), "{stderr}");
-    let recovery_project = stderr
-        .lines()
-        .find(|line| line.starts_with("    argument 3: "))
-        .expect("targeted project recovery argument");
+    assert_recovery_command_or_vector(
+        &stderr,
+        "asm",
+        &[
+            "cleanup",
+            "--project-root",
+            recorded_project
+                .to_str()
+                .expect("recorded project is Unicode"),
+        ],
+    );
+    let footer = &stderr[stderr.find("Recovery —").expect("recovery footer")..];
     assert!(
-        recovery_project.contains(&recorded_project.to_string_lossy().into_owned()),
-        "the recovery command must target the quarantined journal's project: {recovery_project}"
+        footer.contains(&recorded_project.to_string_lossy().into_owned()),
+        "recovery must target the quarantined journal's project: {footer}"
     );
     assert!(
-        !recovery_project.contains(&unrelated_project.to_string_lossy().into_owned()),
-        "the current but unrelated project must not be suggested: {recovery_project}"
+        !footer.contains(&unrelated_project.to_string_lossy().into_owned()),
+        "the current but unrelated project must not be suggested: {footer}"
     );
     assert!(exists(&fixture.project.join(".agents/skills/alpha")));
     assert_eq!(fixture.journals().len(), 1);

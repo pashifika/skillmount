@@ -460,7 +460,7 @@ pub enum AppError {
     /// Invalid catalog data.
     Catalog(CatalogError),
     /// A resolved catalog cannot be realized against the observed project state.
-    Plan(PlanError),
+    Plan(Box<PlanError>),
     /// A platform link backend could not complete an operation.
     Link(LinkError),
     /// A transaction journal could not be written, read, or interpreted.
@@ -478,16 +478,19 @@ pub enum AppError {
     Filesystem(String),
     /// Temporary lock or recovery failure.
     Temporary(String),
-    /// A temporary failure whose operator diagnostic is already rendered as escaped lines.
+    /// A temporary failure with independently escaped details and native recovery operations.
     ///
     /// An ordinary message is escaped as one value, which is what stops a path inside it from
     /// forging a line. A few recovery diagnostics are deliberately structured, so they carry their
-    /// own lines, each built from independently escaped values, and are written verbatim.
+    /// own lines. Native recovery operations stay separate until the application boundary appends
+    /// one detected-shell command or labelled-vector footer after every diagnostic.
     TemporaryReport {
         /// One-line summary written as the primary error.
         summary: String,
         /// Already-escaped detail lines, written after the summary.
         detail: Vec<String>,
+        /// Executable-plus-argument sequences rendered only after all detail and guidance.
+        recovery: Box<[Vec<OsString>]>,
     },
     /// User interrupt.
     Interrupted,
@@ -547,7 +550,7 @@ impl Error for AppError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Catalog(error) => Some(error),
-            Self::Plan(error) => Some(error),
+            Self::Plan(error) => Some(error.as_ref()),
             Self::Link(error) => Some(error),
             Self::Journal(error) => Some(error),
             _ => None,
@@ -563,7 +566,7 @@ impl From<CatalogError> for AppError {
 
 impl From<PlanError> for AppError {
     fn from(error: PlanError) -> Self {
-        Self::Plan(error)
+        Self::Plan(Box::new(error))
     }
 }
 

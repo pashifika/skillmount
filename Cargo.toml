@@ -82,8 +82,9 @@ signal-hook = { version = "=0.4.4", default-features = false }
 # keeping raw Unix process and access-check FFI out of shared code.
 nix = { version = "=0.31.3", default-features = false, features = ["fs", "signal", "user"] }
 
-# Junctions are reparse points. Creating, reading, and identifying one needs `DeviceIoControl`,
-# `CreateFileW`, and `GetFileInformationByHandle`, none of which the standard library exposes.
+# Junction handling needs reparse and handle APIs that `std` does not expose. Recovery presentation
+# additionally uses Tool Help snapshots and process-image queries for bounded Windows ancestry
+# classification; both stay inside the audited platform FFI modules.
 [target."cfg(windows)".dependencies]
 # The fake-agent fixture uses `ctrlc` to observe its inherited console events. Product supervision
 # preserves the raw event type through the audited process FFI module instead.
@@ -95,6 +96,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_Ioctl",
     "Win32_System_JobObjects",

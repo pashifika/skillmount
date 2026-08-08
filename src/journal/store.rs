@@ -418,10 +418,13 @@ fn flush_directory(directory: &Path) -> Result<(), AppError> {
 }
 
 /// The Windows replacement call itself is write-through, so no second directory operation exists.
+// The shared cross-platform seam is fallible, and tests inject the otherwise absent Windows error.
 #[cfg(windows)]
-fn flush_directory(_directory: &Path) -> Result<(), AppError> {
+#[allow(clippy::unnecessary_wraps)]
+fn flush_directory(directory: &Path) -> Result<(), AppError> {
+    let _ = directory;
     #[cfg(test)]
-    injected_failure(PersistFault::DirectorySync, _directory)?;
+    injected_failure(PersistFault::DirectorySync, directory)?;
     Ok(())
 }
 

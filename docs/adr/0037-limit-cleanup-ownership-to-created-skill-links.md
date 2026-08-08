@@ -1,6 +1,6 @@
 # ADR 0037: Limit Cleanup Ownership to Created Skill Links
 
-- **Status:** Accepted
+- **Status:** Accepted; vector-only recovery presentation superseded by ADR 0038
 - **Date:** 2026-08-08
 - **Supersedes:** ADR 0014's post-placement incomplete-journal claim and ADR 0015's
   journal-backed retained-candidate rule, both only for helper-directory residue; ADR 0016's
@@ -57,12 +57,12 @@ Because a preserved directory can no longer block another transaction, batch cle
 no policy. Explicit cleanup keeps its single shared-lock claim, its reload under those locks, and
 the ordinary transaction pass, and reconciles claimed journals in deterministic scan order.
 
-Session-cleanup failure, quarantined-journal recovery, and explicit-cleanup retry guidance are
-rendered as one structured block per condition: a severity line, then indented `reason`, retained
-path, retained journal, process-death precondition, and a labelled recovery vector whose executable
-and numbered arguments occupy one line each. Each external value is escaped independently through
-the existing `render` seam. This keeps ADR 0025's rule that recovery is separate native values and
-never an executable shell command string.
+Session-cleanup failure, quarantined-journal recovery, and explicit-cleanup retry guidance render
+every complete structured diagnostic before one recovery footer. Recovery operations remain
+executable-plus-argument native values, each external value retains the existing reversible
+`render` seam, and a labelled vector remains the universal representation. ADR 0038 supersedes only
+the vector-only presentation rule by permitting a proved command for one unambiguously observed
+shell family; unknown or rejected cases still receive the vector.
 
 ## Alternatives
 
@@ -88,8 +88,10 @@ schema migration for no additional behavior.
 **Move directory creation outside the journal.** Rejected because a crash would then leave an
 unrecorded planned mutation, weakening the write-ahead boundary this crate rests on.
 
-**Render a copy-paste shell command.** Rejected for the reason ADR 0025 already records: POSIX
-shells, PowerShell, and native non-Unicode values share no portable quoting contract.
+**Render a portable or unconditional copy-paste shell command.** Rejected for the reason ADR 0025
+already records: POSIX shells, PowerShell, and native non-Unicode values share no portable quoting
+contract. ADR 0038 later accepts only detected-shell commands whose narrow encoder proves an exact
+native round trip, with the labelled vector as fallback.
 
 ## Consequences
 
@@ -113,11 +115,11 @@ shells, PowerShell, and native non-Unicode values share no portable quoting cont
   first-observation evidence boundary and prohibition on unchecked pathname rollback, ADR 0016's
   POSIX-disposition mechanism and its rule that a failed removal is never reported as removed, ADR
   0019's proven-empty process domain before any cleanup callback, ADR 0022's `supervising`
-  quarantine, ADR 0025's shared-lock batch and non-shell recovery rendering, ADR 0027's
-  reload-under-lock and drift failure, and ADR 0034's OMP destination, link ownership, locking,
-  discovery, and launch contract all remain in force. No claim here is stronger than those records
-  support: the guarantee for a preserved directory is that SkillMount did not touch it, not that no
-  other process did.
+  quarantine, ADR 0025's shared-lock batch, ADR 0027's reload-under-lock and drift failure, and ADR
+  0034's OMP destination, link ownership, locking, discovery, and launch contract all remain in
+  force. ADR 0038 alone replaces the vector-only presentation rule. No claim here is stronger than
+  those records support: the guarantee for a preserved directory is that SkillMount did not touch
+  it, not that no other actor will.
 - No recursive remover, junk-file allowlist, shell invocation, dependency, CLI flag, exit category,
   journal schema version, pinned Agent version, unsafe allowlist entry, or supported target changes.
 - `docs/architecture.md`, `README.md`, the six modified capability specifications, and the
@@ -138,8 +140,9 @@ shells, PowerShell, and native non-Unicode values share no portable quoting cont
 - `src/transaction/tests.rs` and `src/journal/tests.rs` pin the exhaustive creation/disposition
   classification, the stable label round trips, and the preserved-scaffolding report channel.
 - `src/app.rs` unit tests pin one block per condition, multiple retained paths, multiple quarantined
-  journals, macOS control bytes, Windows unpaired UTF-16, and forged-line input, and require that no
-  raw `recovery[n] argv[n]` fragment or shell-joined command survives.
+  journals, macOS control bytes, Windows unpaired UTF-16, forged-line input, and one final,
+  stable-deduplicated detected-shell command or native-vector fallback; raw `recovery[n] argv[n]`
+  fragments remain forbidden.
 - `tests/read_only.rs` keeps `inspect` and `--dry-run` free of any directory, link, lock, journal,
   recovery, or child side effect.
 - Native Apple Silicon macOS and native Windows x64/x86 CI run the guarded transaction and Agent

@@ -838,26 +838,31 @@ fn an_unprovable_skill_link_replaces_child_success_and_keeps_child_failure_prima
         );
         assert!(stderr.contains("  retained path: "), "{stderr}");
         assert!(stderr.contains("  retained journal: "), "{stderr}");
+        assert_asm_recovery_footer(&stderr);
         assert!(
             stderr
-                .contains("  recovery: first confirm that every related Agent process has exited"),
-            "{stderr}"
-        );
-        assert!(stderr.contains("    executable: asm"), "{stderr}");
-        assert!(stderr.contains("    argument 1: cleanup"), "{stderr}");
-        assert!(
-            stderr.contains("    argument 2: --project-root"),
-            "{stderr}"
-        );
-        assert!(
-            !stderr.contains("argv["),
-            "raw argv fragments must be gone: {stderr}"
-        );
-        assert!(
-            !stderr.contains("asm cleanup --project-root"),
-            "recovery guidance must not construct a shell command: {stderr}"
+                .find("  retained journal: ")
+                .zip(stderr.find("Recovery —"))
+                .is_some_and(|(journal, footer)| journal < footer),
+            "the complete diagnostic must precede recovery: {stderr}"
         );
     }
+}
+
+fn assert_asm_recovery_footer(rendered: &str) {
+    assert_eq!(rendered.matches("Recovery —").count(), 1, "{rendered}");
+    let vector = rendered.contains("executable: asm");
+    let shell_command = rendered.contains("asm cleanup --project-root");
+    assert_ne!(
+        vector, shell_command,
+        "exactly one selected-shell command or native vector is required: {rendered}"
+    );
+    assert!(rendered.contains("cleanup"), "{rendered}");
+    assert!(rendered.contains("--project-root"), "{rendered}");
+    assert!(
+        !rendered.contains("recovery[0]") && !rendered.contains("argv["),
+        "{rendered}"
+    );
 }
 
 /// Returns every transaction journal in the fixture's private state root.
@@ -919,13 +924,11 @@ fn a_supervising_journal_is_quarantined_while_an_orphan_descendant_remains_alive
         stderr.contains("quarantined mounts were not changed and remain journal-backed"),
         "{stderr}"
     );
-    assert!(stderr.contains("  quarantined journal: "), "{stderr}");
-    assert!(stderr.contains("    executable: asm"), "{stderr}");
-    assert!(stderr.contains("    argument 1: cleanup"), "{stderr}");
     assert!(
-        !stderr.contains("recovery[0]") && !stderr.contains("argv["),
-        "nested raw recovery fragments must be gone: {stderr}"
+        stderr.contains("was quarantined without cleanup"),
+        "{stderr}"
     );
+    assert_asm_recovery_footer(&stderr);
     assert!(
         exists(&mounted),
         "automatic recovery must not remove the live mount"

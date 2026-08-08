@@ -4,16 +4,22 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use crate::cli::CleanupInput;
+use crate::cli::{CleanupInput, ProductBinary};
 use crate::error::{AppError, ExitCategory};
 use crate::paths::resolve_operator_project_root;
-use crate::render::{argument_vector, path_value, text_value};
+use crate::process::InvocationShell;
+use crate::render::{path_value, recovery_footer, text_value};
 use crate::transaction::recover::{ExplicitCleanupReport, cleanup_explicit};
 
 use super::CommandOutcome;
 
 /// Runs scoped or all-journal explicit cleanup and renders every decision.
-pub(crate) fn run(input: &CleanupInput, invocation_cwd: &Path) -> Result<CommandOutcome, AppError> {
+pub(crate) fn run(
+    input: &CleanupInput,
+    invocation_cwd: &Path,
+    product: ProductBinary,
+    shell: InvocationShell,
+) -> Result<CommandOutcome, AppError> {
     let project_root = if input.all {
         None
     } else {
@@ -23,7 +29,7 @@ pub(crate) fn run(input: &CleanupInput, invocation_cwd: &Path) -> Result<Command
         )?)
     };
     let report = cleanup_explicit(project_root.as_deref())?;
-    let output = render_report(project_root.as_deref(), &report);
+    let output = render_report(project_root.as_deref(), &report, product, shell);
     let code = exit_code(&report);
     Ok(CommandOutcome { output, code })
 }
@@ -49,7 +55,12 @@ fn exit_code(report: &ExplicitCleanupReport) -> u8 {
         .map_or(0, |failure| failure.error.category().code())
 }
 
-fn render_report(project_root: Option<&Path>, report: &ExplicitCleanupReport) -> String {
+fn render_report(
+    project_root: Option<&Path>,
+    report: &ExplicitCleanupReport,
+    product: ProductBinary,
+    shell: InvocationShell,
+) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "SkillMount cleanup");
     match project_root {
@@ -90,9 +101,12 @@ fn render_report(project_root: Option<&Path>, report: &ExplicitCleanupReport) ->
     if attention {
         let _ = writeln!(
             output,
-            "No unproven entry was removed. After resolving the reported condition, retry with this argument vector rather than a shell command:"
+            "No unproven entry was removed. Resolve every reported condition before recovery."
         );
-        render_retry_argv(&mut output, project_root);
+        let recovery = retry_argv(product, project_root);
+        for line in recovery_footer(shell, std::iter::once(recovery.as_slice())) {
+            let _ = writeln!(output, "{line}");
+        }
     }
     output
 }
@@ -177,8 +191,11 @@ fn render_cleanup_outcomes(output: &mut String, report: &ExplicitCleanupReport) 
     }
 }
 
-fn render_retry_argv(output: &mut String, project_root: Option<&Path>) {
-    let mut arguments = vec![OsString::from("asm"), OsString::from("cleanup")];
+fn retry_argv(product: ProductBinary, project_root: Option<&Path>) -> Vec<OsString> {
+    let mut arguments = vec![
+        OsString::from(product.registration_name()),
+        OsString::from("cleanup"),
+    ];
     match project_root {
         Some(project_root) => {
             arguments.push(OsString::from("--project-root"));
@@ -186,7 +203,5 @@ fn render_retry_argv(output: &mut String, project_root: Option<&Path>) {
         }
         None => arguments.push(OsString::from("--all")),
     }
-    for line in argument_vector("  ", &arguments) {
-        let _ = writeln!(output, "{line}");
-    }
+    arguments
 }

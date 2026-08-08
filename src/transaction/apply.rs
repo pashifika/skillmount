@@ -309,10 +309,10 @@ impl Transaction {
 
     /// Builds the error for a destination whose observed state contradicts the plan.
     fn drift(path: &Path, reason: &str) -> AppError {
-        AppError::Plan(PlanError::UnsupportedLayout {
+        AppError::Plan(Box::new(PlanError::UnsupportedLayout {
             path: path.to_path_buf(),
             reason: reason.to_owned(),
-        })
+        }))
     }
 
     /// Records a placement result that must be reported but not repaired by this apply attempt.

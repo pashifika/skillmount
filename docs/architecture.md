@@ -97,8 +97,8 @@ Agent publishes another banner.
 | Session with `--no-recover` | Refuses when incomplete state requires reconciliation; otherwise continues through the normal mutating path. |
 | Session encountering a free `supervising` journal | Refuses with category 75 and retains every recorded mount because wrapper-lock release does not prove child-domain death. |
 | `asm doctor` | Resolves every supported Agent executable — explicit paths via `--codex-bin`, `--claude-bin`, or `--omp-bin` — checks release-independent configuration, inspects discovery links, visible-name conflicts, lock liveness, and journals, and runs isolated link-capability probes without SkillMount-owned mutation of project, agent, lock, or journal state. Version capture executes each selected trusted Agent once with literal `--version`: the last-tested banner is `pass`, while a different or unavailable banner is `unverified` and does not fail the command by itself. Executable, configuration, discovery, or capability failures remain `failure` findings and produce category 65. |
-| `asm cleanup --project-root <path>` | Reconciles every structurally valid, non-completed journal for the canonical project after taking that journal's complete recorded lock set. A `supervising` or kept journal is eligible only because invoking this command is the operator's assertion that its process domain is dead or its retained mounts may be released. Its stdout report names every removed link, every unresolved cleanup-critical entry, and every helper directory it preserved. |
-| `asm cleanup --all` | Applies the same journal-by-journal engine across the bounded state store. Corrupt state blocks all mutation; live locks retain their journals and produce category 75; an unresolved cleanup-critical entry or filesystem failure takes category 73 precedence. Preserved scaffolding alone is reported and returns success. |
+| `asm cleanup --project-root <path>` | Reconciles every structurally valid, non-completed journal for the canonical project after taking that journal's complete recorded lock set. A `supervising` or kept journal is eligible only because invoking this command is the operator's assertion that its process domain is dead or its retained mounts may be released. Its stdout report names every removed link, every unresolved cleanup-critical entry, and every helper directory it preserved; unresolved entries are followed by the same detected-shell recovery footer as a session diagnostic. |
+| `asm cleanup --all` | Applies the same journal-by-journal engine across the bounded state store. Corrupt state blocks all mutation; live locks retain their journals and produce category 75; an unresolved cleanup-critical entry or filesystem failure takes category 73 precedence. Preserved scaffolding alone is reported and returns success. Distinct retry operations are stable-deduplicated before the one final footer. |
 
 A mutating agent invocation returns the child's ordinary status after successful cleanup. A spawn
 or supervision failure uses the shared typed exit mapping. Cleanup failure replaces child success
@@ -130,15 +130,33 @@ BrokenPipe as success and maps another output failure to category 70.
 [ADR 0029](adr/0029-generate-static-completions-from-the-shared-cli-graph.md) records the static
 completion boundary.
 
-A genuine session-cleanup failure, a quarantined-journal refusal, and an explicit-cleanup retry are
-each rendered once as a structured block: a severity or summary line, then indented fields naming the
-reason, every retained path, the retained journal, the process-death precondition, and a labelled
-recovery vector whose executable and numbered arguments occupy one line each. Only those fixed labels
-and separators insert a line break; every external value is escaped independently through
-`src/render.rs`, so no path or reason can forge a line, and nothing is ever joined into a shell
-command string.
+A genuine session-cleanup failure, a quarantined-journal refusal, and an explicit-cleanup retry each
+render every complete structured diagnostic before one recovery footer. The native recovery
+operation remains an executable plus separate platform-native arguments and exact operations are
+stable-deduplicated in first-seen order. Near startup, Windows performs one bounded, best-effort
+process-ancestry observation up to a recognized terminal or session-bootstrap prompt boundary;
+boundaries and other wrappers do not choose a shell, while a missing link before the boundary is
+inconsistent evidence. Exactly one observed `powershell.exe`/`pwsh.exe` family selects a PowerShell
+command, exactly one `cmd.exe` family selects a Command Prompt command, and absent, failed,
+prematurely incomplete, or mixed evidence selects the labelled native vector. Unsupported
+platforms use the vector.
+
+Each detected-shell encoder accepts a value only when the corresponding native shell can reproduce
+it exactly. PowerShell uses single-quoted literals with doubled apostrophes, but rejects empty
+arguments because Windows PowerShell 5.1 drops them. Command Prompt uses its native-tested
+double-quote and backslash rules and rejects expansion-sensitive `%` or `!` values. Controls,
+non-Unicode values, and every unproved case also fall back to one labelled executable and numbered
+argument per line. Every external value is escaped independently through `src/render.rs`,
+so no value can forge a diagnostic line. SkillMount never stores, launches, or authorizes cleanup
+from the convenience command; process-death, ownership, scope, and lock gates remain unchanged.
+[ADR 0038](adr/0038-render-recovery-for-the-detected-shell.md) records this presentation boundary.
 
 ## Execution architecture
+
+Every invocation derives the recognized `asm` or `skillmount` product identity from `argv[0]` and
+captures one presentation-only `InvocationShell` hint before command dispatch. Observation failure
+is silent and yields `Unknown`; the hint cannot affect parsing, mutation, child launch, or exit
+selection.
 
 Completion generation branches at the CLI boundary and never enters path or product-state
 resolution:
@@ -255,11 +273,11 @@ conflict until recovery removes it. This ordering is the accepted decision in
 | `src/catalog/` | No-follow source discovery, ordered overlay selection, and selected-winner validation against declarative Agent catalog policy. |
 | `src/agent/` | The closed adapter registry, Codex, Claude, and OMP discovery inspection, declarative plan construction, the read-only adapter lifecycle contract, and the shared bounded version observer that only `doctor` calls. |
 | `src/mount/` | Destination conflict policy, deterministic read-only mount actions, and each action's creation and cleanup-disposition classification. |
-| `src/render.rs` | Read-only plans, normal/verbose session diagnostics, warnings, labelled native argument vectors, and reversible native-value rendering. |
+| `src/render.rs` | Read-only plans, normal/verbose session diagnostics, warnings, stable-deduplicated recovery footers, proved PowerShell and Command Prompt encoders, labelled native-vector fallback, and reversible native-value rendering. |
 | `src/lock/` | Logical/physical resource identities and sorted operating-system advisory locks. |
 | `src/journal/` | Versioned, checksummed write-ahead ownership records and durable storage. |
 | `src/transaction/` | Apply, rollback, ordinary cleanup of created Skill links, best-effort pruning of the scaffolding beneath them, kept state, and stale recovery. |
-| `src/process/` | Shell-free direct child launch, bounded captured-command containment, inherited session streams, reusable platform interruption, liveness-gated cleanup coordination, structured status, and exit-policy mapping. |
+| `src/process/` | Shell-free direct child launch, bounded captured-command containment, inherited session streams, reusable platform interruption, liveness-gated cleanup coordination, presentation-only invocation-shell ancestry classification, structured status, and exit-policy mapping. |
 | `src/link/` | Sealed platform boundary for no-follow inspection, link creation, no-replace placement, and verified entry removal. |
 | `src/state.rs` | Computes state locations and, only after the mutation boundary, creates their requested final directories with platform-specific access restrictions. |
 | `src/native.rs` | Lossless platform-native path encoding for journals and lock keys. |
@@ -327,10 +345,12 @@ mutation and durable ownership. The sealed link backend provides both read-only 
 narrow mutation primitives; it does not decide when a plan should be applied, recovered, or cleaned
 up. There is no recursive removal operation in the link contract.
 
-The process layer exposes two shell-free lifecycle boundaries. Session supervision consumes a
+The process layer exposes two shell-free child lifecycle boundaries. Session supervision consumes a
 completed `LaunchPlan` and a single-use cleanup operation. Version capture configures one dedicated
 native process domain before spawn and exposes only force-before-reap and signal-free emptiness
-proof operations to the observer. The layer does not select an agent executable, inject
+proof operations to the observer. Separately, a read-only startup observation classifies bounded
+Windows process ancestry only as advisory recovery-presentation evidence; it neither starts a shell
+nor participates in liveness proof. The layer does not select an agent executable, inject
 agent-specific arguments, apply a mount transaction, or decide retention policy. `src/app.rs`
 composes the session boundary for all three implemented adapters.
 
@@ -627,20 +647,23 @@ exposes the property-list object. The paths Windows FFI module resolves `FOLDERI
 its COM task allocation. The two `src/link/` modules wrap filesystem operations that have no safe
 standard-library equivalent, including atomic no-replace placement, Windows reparse-point
 observation, handle rename, and handle disposition. The process FFI modules wrap process-lifetime
-Unix signal registration and Windows console-handler and Job Object operations. Each unsafe block has a
-`SAFETY` justification, raw platform types do not cross its module boundary, and event storage,
-process policy, and reparse decoding stay in safe Rust.
+Unix signal registration and Windows console-handler, Job Object, bounded Tool Help ancestry, and
+process-image operations. Each unsafe block has a `SAFETY` justification, raw platform types do not
+cross its module boundary, and event storage, process policy, ancestry classification, and reparse
+decoding stay in safe Rust.
 [ADR 0011](adr/0011-scoped-unsafe-for-platform-link-backends.md) records why `deny` with an audited
 scope replaced crate-wide `forbid`; [ADR 0019](adr/0019-supervise-process-domains-through-reusable-native-dispatchers.md)
-records the two process boundaries;
+records the two child-process boundaries;
 [ADR 0023](adr/0023-pin-the-codex-session-discovery-contract.md) records the fifth and sixth
 boundaries and the pinned Codex child overrides;
 [ADR 0024](adr/0024-pin-the-claude-session-discovery-contract.md) extends the Windows Known Folder
-allowlist for Claude's managed Skill root.
+allowlist for Claude's managed Skill root; [ADR 0038](adr/0038-render-recovery-for-the-detected-shell.md)
+records the bounded ancestry observation in the existing process FFI boundary.
 
-Paths and forwarded arguments remain `PathBuf` and `OsString` through every public seam. They are
-never joined into a shell command or converted lossily for policy, journal, lock, or ownership
-decisions. Diagnostics may render a reversible representation only at the output boundary.
+Paths and forwarded arguments remain `PathBuf` and `OsString` through every authority-bearing seam;
+no rendered text feeds policy, journal, lock, ownership, or process launch. Diagnostics may render
+a reversible native representation or a shell convenience line only at the final output boundary,
+and a shell line is admitted only when its platform encoder proves an exact native round trip.
 
 macOS uses directory symbolic links and `renameatx_np(RENAME_EXCL)`. Windows prefers a directory
 symbolic link and falls back to a junction only for `ERROR_PRIVILEGE_NOT_HELD` in automatic mode;

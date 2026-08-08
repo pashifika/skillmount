@@ -593,6 +593,99 @@ fn second_interrupt_terminates_the_windows_job_descendant_before_cleanup() {
 
 #[cfg(windows)]
 #[test]
+fn powershell_recovery_command_round_trips_native_arguments() {
+    use skillmount::process::test_support::{RecoveryShell, render_recovery_command};
+
+    let root = TestDir::new("powershell-recovery-round-trip");
+    let fake = root.0.join("smfake.exe");
+    fs::copy(FAKE_AGENT, &fake).expect("copy PowerShell recovery receiver");
+    let record = root.0.join("powershell-record.txt");
+    let arguments = [
+        OsString::from("cleanup"),
+        OsString::from("--project-root"),
+        OsString::from(r"D:\Work\O'Brien project"),
+    ];
+    let mut operation = vec![OsString::from("smfake.exe")];
+    operation.extend(arguments.iter().cloned());
+    let rendered = render_recovery_command(RecoveryShell::PowerShell, &operation)
+        .expect("PowerShell encoder accepts display-safe Unicode");
+    let path = fixture_path(&root.0);
+
+    let output = Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(&rendered)
+        .env("PATH", path)
+        .env("SKILLMOUNT_FAKE_RECORD", &record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
+        .current_dir(&root.0)
+        .output()
+        .expect("run rendered PowerShell recovery command");
+
+    assert!(output.status.success(), "{output:?}\n{rendered}");
+    assert_eq!(
+        read_record(&record).arguments,
+        arguments
+            .iter()
+            .map(|argument| os_bytes(argument))
+            .collect::<Vec<_>>(),
+        "{rendered}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn command_prompt_recovery_command_round_trips_a_trailing_separator() {
+    use skillmount::process::test_support::{RecoveryShell, render_recovery_command};
+
+    let root = TestDir::new("cmd-recovery-round-trip");
+    let fake = root.0.join("smfake.exe");
+    fs::copy(FAKE_AGENT, &fake).expect("copy Command Prompt recovery receiver");
+    let record = root.0.join("cmd-record.txt");
+    let arguments = [
+        OsString::from("cleanup"),
+        OsString::from("--project-root"),
+        OsString::from("D:\\Work\\project\\My test\\"),
+    ];
+    let mut operation = vec![OsString::from("smfake.exe")];
+    operation.extend(arguments.iter().cloned());
+    let rendered = render_recovery_command(RecoveryShell::CommandPrompt, &operation)
+        .expect("Command Prompt encoder accepts the ordinary path");
+    let path = fixture_path(&root.0);
+
+    let mut child = Command::new("cmd.exe")
+        .args(["/d", "/v:off", "/q"])
+        .env("PATH", path)
+        .env("SKILLMOUNT_FAKE_RECORD", &record)
+        .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
+        .current_dir(&root.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start Command Prompt recovery receiver");
+    std::io::Write::write_all(
+        child.stdin.as_mut().expect("piped Command Prompt stdin"),
+        format!("{rendered}\r\nexit /b\r\n").as_bytes(),
+    )
+    .expect("paste rendered recovery command");
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .expect("run rendered Command Prompt recovery command");
+
+    assert!(output.status.success(), "{output:?}\n{rendered}");
+    assert_eq!(
+        read_record(&record).arguments,
+        arguments
+            .iter()
+            .map(|argument| os_bytes(argument))
+            .collect::<Vec<_>>(),
+        "{rendered}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_batch_launch_is_rejected_before_implicit_shell_execution() {
     let root = TestDir::new("windows-batch");
     let batch = root.0.join("agent.CMD");
@@ -678,6 +771,14 @@ fn copy_fake_agent(root: &Path) -> PathBuf {
     let destination = root.join(format!("fake agent 日本語{suffix}"));
     fs::copy(FAKE_AGENT, &destination).expect("copy fake agent to edge-case path");
     destination
+}
+#[cfg(windows)]
+fn fixture_path(root: &Path) -> OsString {
+    let mut paths = vec![root.to_path_buf()];
+    if let Some(inherited) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&inherited));
+    }
+    std::env::join_paths(paths).expect("join fixture PATH")
 }
 
 fn read_record(path: &Path) -> FakeRecord {
