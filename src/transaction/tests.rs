@@ -9,16 +9,17 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{Transaction, recover};
+use super::{Transaction, recover, staged_mutation_resources};
 use crate::app::{ReadOnlyOutcome, plan_read_only};
 use crate::cli::{ParsedCommand, parse_command_from};
 use crate::domain::RunContext;
 use crate::error::{AppError, LinkError};
-use crate::journal::{ActionStatus, TransactionStatus, store};
+use crate::journal::{ActionStatus, TransactionId, TransactionStatus, store};
 #[cfg(windows)]
 use crate::link::testing::with_delete_error;
 use crate::link::testing::{HookPoint, with_hook};
 use crate::link::{OwnershipMismatch, platform_backend};
+use crate::lock::LockAccess;
 use crate::lock::acquire::{HeldLocks, LockOwner, LockPolicy};
 use crate::paths::resolve_session;
 use crate::state::testing::StateRootGuard;
@@ -91,8 +92,27 @@ impl Session {
         fs::canonicalize(self.fixture.path().join("sources").join(name)).expect("canonical source")
     }
 
-    fn plan(&self) -> ReadOnlyOutcome {
-        plan_read_only(&self.context).expect("the fixture plans cleanly")
+    fn plan_for_transaction(
+        &self,
+        transaction_id: &TransactionId,
+    ) -> (RunContext, ReadOnlyOutcome) {
+        let context = RunContext {
+            session_id: Some(transaction_id.clone()),
+            ..self.context.clone()
+        };
+        let mut outcome = plan_read_only(&context).expect("the fixture plans cleanly");
+        let staged = staged_mutation_resources(transaction_id, &outcome.plan)
+            .expect("staged paths are absolute");
+        for resource in staged {
+            if !outcome.snapshot.lock_resources.contains(&resource) {
+                outcome.snapshot.lock_resources.push(resource);
+            }
+        }
+        outcome
+            .snapshot
+            .lock_resources
+            .sort_by_key(crate::lock::LockResource::ordering_key);
+        (context, outcome)
     }
 
     /// Takes the plan's locks, exactly as a real session does before opening a transaction.
@@ -109,16 +129,18 @@ impl Session {
     ///
     /// The locks are returned rather than dropped: releasing them would leave the transaction
     /// mutating entries another session could reach, which is exactly what the guard in
-    /// [`Transaction::open`] refuses to allow.
+    /// [`Transaction::open_with`] refuses to allow.
     fn open(&self) -> (Transaction, HeldLocks) {
-        let outcome = self.plan();
+        let transaction_id = TransactionId::mint();
+        let (context, outcome) = self.plan_for_transaction(&transaction_id);
         let locks = Self::lock(&outcome);
-        let transaction = Transaction::open(
-            &self.context,
+        let transaction = Transaction::open_with(
+            &context,
             &outcome.catalog,
             &outcome.plan,
             &outcome.snapshot,
             &locks,
+            transaction_id,
         )
         .expect("the redirected state root is writable");
         (transaction, locks)
@@ -164,14 +186,16 @@ fn a_planned_journal_is_durable_before_anything_is_created() {
 #[test]
 fn a_transaction_refuses_to_open_without_the_locks_its_plan_needs() {
     let session = Session::codex("txn-unlocked", &["alpha"], &[]);
-    let outcome = session.plan();
+    let transaction_id = TransactionId::mint();
+    let (context, outcome) = session.plan_for_transaction(&transaction_id);
 
-    let error = Transaction::open(
-        &session.context,
+    let error = Transaction::open_with(
+        &context,
         &outcome.catalog,
         &outcome.plan,
         &outcome.snapshot,
         &HeldLocks::default(),
+        transaction_id,
     )
     .expect_err("every later removal is safe only because the locks are held");
 
@@ -189,7 +213,8 @@ fn a_transaction_refuses_to_open_without_the_locks_its_plan_needs() {
 #[test]
 fn a_partially_locked_session_cannot_open_a_transaction() {
     let session = Session::codex("txn-partial-locks", &["alpha"], &[]);
-    let outcome = session.plan();
+    let transaction_id = TransactionId::mint();
+    let (context, outcome) = session.plan_for_transaction(&transaction_id);
     // Only the first resource, so at least one key the plan needs is missing.
     let partial = HeldLocks::acquire(
         &outcome.snapshot.lock_resources[..1],
@@ -198,16 +223,53 @@ fn a_partially_locked_session_cannot_open_a_transaction() {
     )
     .expect("uncontended");
 
-    let error = Transaction::open(
-        &session.context,
+    let error = Transaction::open_with(
+        &context,
         &outcome.catalog,
         &outcome.plan,
         &outcome.snapshot,
         &partial,
+        transaction_id,
     )
     .expect_err("holding some of the locks is not holding the locks");
 
     assert_eq!(error.category(), crate::error::ExitCategory::Internal);
+}
+
+#[test]
+fn observation_locks_cannot_authorize_a_transaction_journal() {
+    let session = Session::codex("txn-observation-locks", &["alpha"], &[]);
+    let transaction_id = TransactionId::mint();
+    let (context, mut outcome) = session.plan_for_transaction(&transaction_id);
+    for resource in &mut outcome.snapshot.lock_resources {
+        resource.access = LockAccess::Observe;
+    }
+    let observed = HeldLocks::acquire(
+        &outcome.snapshot.lock_resources,
+        LockPolicy::immediate(),
+        &LockOwner::preliminary(),
+    )
+    .expect("observation locks are available");
+
+    let error = Transaction::open_with(
+        &context,
+        &outcome.catalog,
+        &outcome.plan,
+        &outcome.snapshot,
+        &observed,
+        transaction_id,
+    )
+    .expect_err("read authority must never authorize a write-ahead journal");
+
+    assert_eq!(error.category(), crate::error::ExitCategory::Internal);
+    assert!(error.to_string().contains("mutation lock resource"));
+    assert!(
+        store::scan()
+            .expect("the state root is readable")
+            .journals
+            .is_empty(),
+        "authority is checked before journal persistence"
+    );
 }
 
 #[test]
@@ -488,6 +550,104 @@ fn an_ambiguous_final_entry_is_retained_by_rollback_and_recovery() {
     );
     assert!(session.source("alpha").join("SKILL.md").is_file());
     remove_directory_link(&displaced);
+}
+
+#[test]
+fn recovery_retains_a_journal_without_mutation_authority_and_changes_nothing() {
+    let session = Session::codex("txn-recovery-invalid-authority", &["alpha"], &[]);
+    let mounted = session.project().join(".agents/skills/alpha");
+    let (mut transaction, locks) = session.open();
+    transaction
+        .apply()
+        .expect("the fixture creates a mounted entry");
+    let journal_path = transaction.journal_path().to_path_buf();
+    for lock in &mut transaction.journal_mut().locks {
+        lock.access = LockAccess::Observe;
+    }
+    store::persist(transaction.journal(), &journal_path)
+        .expect("the corrupt durable fixture is written");
+    drop(transaction);
+    drop(locks);
+
+    let mut recovery_locks = HeldLocks::default();
+    let recovery =
+        recover::recover_stale(&mut recovery_locks).expect("invalid authority is reported");
+
+    assert!(recovery.reconciled.is_empty(), "{recovery:?}");
+    assert_eq!(recovery.unreadable.len(), 1, "{recovery:?}");
+    assert_eq!(recovery.unreadable[0].path, journal_path);
+    assert!(
+        recovery.unreadable[0]
+            .reason
+            .contains("at least one resource lock with mutate access"),
+        "{recovery:?}"
+    );
+    assert!(
+        mounted.exists(),
+        "recovery must not unlink an entry named by rejected authority"
+    );
+    assert!(
+        journal_path.exists(),
+        "rejected ownership evidence is retained for operator action"
+    );
+}
+
+#[test]
+fn recovery_staged_candidate_mutation_contends_with_an_exact_observer() {
+    let session = Session::codex("txn-recovery-staged-contention", &["alpha"], &[]);
+    let mounted = session.project().join(".agents/skills/alpha");
+    let (mut transaction, locks) = session.open();
+    transaction
+        .apply()
+        .expect("the fixture creates a mounted entry");
+    let journal_path = transaction.journal_path().to_path_buf();
+    let temporary = transaction
+        .journal()
+        .actions
+        .iter()
+        .find_map(|action| action.temporary_path.clone())
+        .expect("a creating action has a staged sibling");
+    let staged_mutation = transaction
+        .journal()
+        .lock_resources()
+        .into_iter()
+        .find(|resource| resource.path == temporary && resource.access == LockAccess::Mutate)
+        .expect("the exact staged sibling has durable mutation authority");
+    drop(transaction);
+    drop(locks);
+
+    let observed = crate::lock::LockResource::describe_shared(
+        crate::lock::LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &temporary,
+    )
+    .expect("the external observer derives the shared-path identity");
+    assert_eq!(
+        staged_mutation.lock_keys(),
+        observed.lock_keys(),
+        "the journal writer and external observer must meet on the same keys"
+    );
+    let _reader = HeldLocks::acquire(
+        std::slice::from_ref(&observed),
+        LockPolicy::immediate(),
+        &LockOwner {
+            transaction: "staged-observer".to_owned(),
+            pid: 4242,
+        },
+    )
+    .expect("the staged path is available for observation");
+    let mut recovery_locks = HeldLocks::default();
+
+    let recovery =
+        recover::recover_stale(&mut recovery_locks).expect("contention is classified as active");
+
+    assert_eq!(recovery.active, vec![journal_path.clone()]);
+    assert!(recovery.reconciled.is_empty(), "{recovery:?}");
+    assert!(
+        mounted.exists(),
+        "contended recovery changes no mounted entry"
+    );
+    assert!(journal_path.exists(), "the active journal remains durable");
 }
 
 #[test]

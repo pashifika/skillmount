@@ -2,8 +2,10 @@
 
 use std::path::Path;
 
-use super::acquire::{AdvisoryLockState, HeldLocks, LockOwner, LockPolicy, observe};
-use super::{LockResource, LockResourceKind, key};
+use super::acquire::{
+    AdvisoryLockState, HeldLocks, LockOwner, LockPolicy, MissingLockOutcome, observe,
+};
+use super::{LockAccess, LockResource, LockResourceKind, key};
 use crate::mount::resolve::classify;
 use crate::state::testing::StateRootGuard;
 use crate::test_support::{TestDir, symlink_dir_or_skip};
@@ -14,11 +16,21 @@ fn a_logical_key_survives_the_resource_being_created() {
     let anchor = std::fs::canonicalize(fixture.path()).unwrap();
     let store = anchor.join(".codex/skills");
 
-    let before = LockResource::describe(LockResourceKind::BackingStore, &anchor, &store)
-        .expect("the store is beneath its anchor");
+    let before = LockResource::describe(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        &anchor,
+        &store,
+    )
+    .expect("the store is beneath its anchor");
     std::fs::create_dir_all(&store).expect("store fixture");
-    let after = LockResource::describe(LockResourceKind::BackingStore, &anchor, &store)
-        .expect("the store is beneath its anchor");
+    let after = LockResource::describe(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        &anchor,
+        &store,
+    )
+    .expect("the store is beneath its anchor");
 
     assert_eq!(
         before.identity.logical_path(),
@@ -48,15 +60,150 @@ fn a_logical_key_survives_the_resource_being_created() {
 }
 
 #[test]
+fn an_external_observer_contends_with_a_project_writer_for_a_missing_entry() {
+    let fixture = TestDir::new("lock-external-observer-project-writer");
+    let _guard = StateRootGuard::set(fixture.path());
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let destination = root.join("projects/b/.agents/skills");
+
+    let observed = LockResource::describe_shared(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &destination,
+    )
+    .expect("absolute external discovery entry");
+    let missing_writer = LockResource::describe_shared_entry(
+        LockAccess::Mutate,
+        &classify(&destination).expect("missing project destination"),
+    )
+    .expect("absolute project discovery entry");
+
+    assert_eq!(observed.lock_keys(), missing_writer.lock_keys());
+    assert!(observed.identity.physical.is_none());
+    assert!(missing_writer.identity.physical.is_none());
+
+    let held = HeldLocks::acquire(
+        std::slice::from_ref(&observed),
+        LockPolicy::immediate(),
+        &LockOwner::preliminary(),
+    )
+    .expect("external observer acquires the shared lock");
+    let contention = HeldLocks::try_acquire_all(
+        std::slice::from_ref(&missing_writer),
+        &LockOwner::preliminary(),
+    )
+    .expect("the project writer can probe the lock")
+    .expect_err("mutation must contend with the external observation");
+    assert_eq!(contention.key, observed.lock_keys()[0]);
+    drop(held);
+
+    std::fs::create_dir_all(&destination).expect("project destination creation");
+    let existing_observer = LockResource::describe_shared(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &destination,
+    )
+    .expect("existing external discovery entry");
+    let existing_writer = LockResource::describe_shared_entry(
+        LockAccess::Mutate,
+        &classify(&destination).expect("existing project destination"),
+    )
+    .expect("absolute existing project discovery entry");
+
+    assert_eq!(observed.lock_keys()[0], existing_observer.lock_keys()[0]);
+    assert_eq!(
+        existing_observer.lock_keys()[0],
+        existing_writer.lock_keys()[0]
+    );
+    assert!(existing_observer.identity.physical.is_some());
+    assert!(existing_writer.identity.physical.is_some());
+}
+
+#[test]
+fn dual_identity_helpers_preserve_exact_legacy_and_shared_logical_keys() {
+    let fixture = TestDir::new("lock-dual-identity");
+    let _guard = StateRootGuard::set(fixture.path());
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let project = root.join("project");
+    std::fs::create_dir(&project).expect("project fixture");
+    let destination = project.join(".agents/skills");
+    let resolved = classify(&destination).expect("missing destination");
+
+    let [shared, project_legacy] = LockResource::describe_shared_and_legacy_entry(
+        LockAccess::Mutate,
+        Some(&project),
+        &resolved,
+    )
+    .expect("dual project identity");
+    let expected_shared = LockResource::describe_shared_entry(LockAccess::Mutate, &resolved)
+        .expect("shared identity");
+    let expected_project_legacy = LockResource::describe_entry(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Mutate,
+        &project,
+        &resolved,
+    )
+    .expect("legacy project identity");
+
+    assert_eq!(shared.lock_keys()[0], expected_shared.lock_keys()[0]);
+    assert_eq!(
+        project_legacy.lock_keys()[0],
+        expected_project_legacy.lock_keys()[0]
+    );
+    assert_ne!(shared.lock_keys()[0], project_legacy.lock_keys()[0]);
+
+    let [external_shared, external_legacy] = LockResource::describe_shared_and_legacy_unanchored(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &destination,
+    )
+    .expect("dual external identity");
+    let expected_external_legacy = LockResource::describe_unanchored(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &destination,
+    );
+
+    assert_eq!(external_shared.lock_keys()[0], shared.lock_keys()[0]);
+    assert_eq!(
+        external_legacy.lock_keys()[0],
+        expected_external_legacy.lock_keys()[0]
+    );
+
+    let _new_observer = HeldLocks::acquire(
+        &[external_shared, external_legacy],
+        LockPolicy::immediate(),
+        &LockOwner::preliminary(),
+    )
+    .expect("new observer acquires both logical identities");
+    let contention = HeldLocks::try_acquire_all(
+        std::slice::from_ref(&expected_project_legacy),
+        &LockOwner::preliminary(),
+    )
+    .expect("legacy writer can probe")
+    .expect_err("origin/dev/0.3.x writer key must contend with the new observer");
+    assert_eq!(contention.key, expected_project_legacy.lock_keys()[0]);
+}
+
+#[test]
 fn the_anchor_is_never_recomputed_from_directories_the_plan_creates() {
     let fixture = TestDir::new("lock-anchor-fixed");
     let anchor = std::fs::canonicalize(fixture.path()).unwrap();
     let store = anchor.join(".codex/skills");
 
-    let before = LockResource::describe(LockResourceKind::BackingStore, &anchor, &store)
-        .expect("beneath anchor");
+    let before = LockResource::describe(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        &anchor,
+        &store,
+    )
+    .expect("beneath anchor");
     std::fs::create_dir_all(&store).expect("store fixture");
-    let unanchored = LockResource::describe_unanchored(LockResourceKind::BackingStore, &store);
+    let unanchored = LockResource::describe_unanchored(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        &store,
+    );
 
     assert_eq!(before.identity.suffix, Path::new(".codex/skills"));
     assert_eq!(
@@ -82,12 +229,14 @@ fn two_routes_to_one_store_report_the_same_physical_identity() {
 
     let direct = LockResource::describe_entry(
         LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
         &anchor,
         &classify(&store).unwrap(),
     )
     .expect("beneath anchor");
     let through_link = LockResource::describe_entry(
         LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
         &anchor,
         &classify(&alias).unwrap(),
     )
@@ -105,6 +254,39 @@ fn two_routes_to_one_store_report_the_same_physical_identity() {
         direct.lock_keys()[1],
         through_link.lock_keys()[1],
         "the shared physical key is what actually serializes them"
+    );
+}
+
+#[test]
+fn mutation_authority_canonicalizes_parents_without_following_the_final_entry() {
+    let fixture = TestDir::new("lock-authority-parent-alias");
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let canonical_parent = root.join("canonical-parent");
+    std::fs::create_dir_all(&canonical_parent).expect("canonical parent fixture");
+    let alias_parent = root.join("alias-parent");
+    if !symlink_dir_or_skip(&canonical_parent, &alias_parent) {
+        return;
+    }
+
+    let final_path = canonical_parent.join("owned-entry");
+    let resource = LockResource::describe_unanchored(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Mutate,
+        &final_path,
+    );
+    let unrelated_target = root.join("unrelated-target");
+    std::fs::create_dir_all(&unrelated_target).expect("unrelated target fixture");
+    if !symlink_dir_or_skip(&unrelated_target, &final_path) {
+        return;
+    }
+
+    assert!(
+        resource.authorizes_mutation_of(&alias_parent.join("owned-entry")),
+        "canonicalizing the aliased parent must recover the held logical identity"
+    );
+    assert!(
+        !resource.authorizes_mutation_of(&unrelated_target),
+        "authority belongs to the final directory entry, not the target it now reaches"
     );
 }
 
@@ -127,6 +309,7 @@ fn a_worktree_reaching_a_shared_store_shares_only_the_physical_key() {
         resources.push(
             LockResource::describe_entry(
                 LockResourceKind::BackingStore,
+                crate::lock::LockAccess::Mutate,
                 &project,
                 &classify(&entry).unwrap(),
             )
@@ -153,12 +336,14 @@ fn key_derivation_cannot_be_confused_by_moving_a_separator() {
     let root = std::fs::canonicalize(fixture.path()).unwrap();
     let split_low = LockResource::describe(
         LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
         &root,
         &root.join("ab").join("c"),
     )
     .unwrap();
     let split_high = LockResource::describe(
         LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
         &root.join("ab"),
         &root.join("ab").join("c"),
     );
@@ -178,27 +363,154 @@ fn the_two_resource_kinds_never_share_a_logical_key() {
     let root = std::fs::canonicalize(fixture.path()).unwrap();
     let path = root.join("skills");
 
-    let entry = LockResource::describe(LockResourceKind::DiscoveryEntry, &root, &path).unwrap();
-    let store = LockResource::describe(LockResourceKind::BackingStore, &root, &path).unwrap();
+    let entry = LockResource::describe(
+        LockResourceKind::DiscoveryEntry,
+        crate::lock::LockAccess::Mutate,
+        &root,
+        &path,
+    )
+    .unwrap();
+    let store = LockResource::describe(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        &root,
+        &path,
+    )
+    .unwrap();
 
     assert_ne!(entry.lock_keys()[0], store.lock_keys()[0]);
 }
 
 #[test]
-fn one_existing_directory_reached_as_two_kinds_shares_a_physical_key() {
+fn one_existing_directory_reached_across_access_and_resource_kinds_shares_a_physical_key() {
     let fixture = TestDir::new("lock-kindless-physical");
     let root = std::fs::canonicalize(fixture.path()).unwrap();
     let path = root.join("skills");
     std::fs::create_dir_all(&path).expect("store fixture");
 
-    let entry = LockResource::describe(LockResourceKind::DiscoveryEntry, &root, &path).unwrap();
-    let store = LockResource::describe(LockResourceKind::BackingStore, &root, &path).unwrap();
+    let entry = LockResource::describe(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &root,
+        &path,
+    )
+    .unwrap();
+    let store = LockResource::describe(
+        LockResourceKind::BackingStore,
+        LockAccess::Mutate,
+        &root,
+        &path,
+    )
+    .unwrap();
 
     assert_eq!(
         entry.lock_keys()[1],
         store.lock_keys()[1],
-        "the physical key omits the kind on purpose: it is the same directory either way"
+        "physical identity crosses Agent resource kinds and observation/mutation intent"
     );
+}
+
+#[test]
+fn access_mode_does_not_change_logical_or_physical_keys() {
+    let fixture = TestDir::new("lock-access-stable-keys");
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let path = root.join("skills");
+    std::fs::create_dir_all(&path).expect("store fixture");
+
+    let observed = LockResource::describe(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &root,
+        &path,
+    )
+    .unwrap();
+    let mutated = LockResource::describe(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Mutate,
+        &root,
+        &path,
+    )
+    .unwrap();
+
+    assert_eq!(observed.lock_keys(), mutated.lock_keys());
+    assert_eq!(observed.identity, mutated.identity);
+    assert_ne!(observed.access, mutated.access);
+}
+
+#[test]
+fn duplicate_logical_requests_fold_to_the_strongest_access() {
+    let fixture = TestDir::new("lock-access-fold-logical");
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let path = root.join("skills");
+    let template = LockResource::describe(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &root,
+        &path,
+    )
+    .unwrap();
+    let logical_key = template.lock_keys()[0].clone();
+
+    for (left, right, expected) in [
+        (
+            LockAccess::Observe,
+            LockAccess::Observe,
+            LockAccess::Observe,
+        ),
+        (LockAccess::Observe, LockAccess::Mutate, LockAccess::Mutate),
+        (LockAccess::Mutate, LockAccess::Mutate, LockAccess::Mutate),
+    ] {
+        let mut first = template.clone();
+        first.access = left;
+        let mut second = template.clone();
+        second.access = right;
+        let requests = super::acquire::sorted_keys_for_test(&[first, second]);
+        let (_, access, resources) = requests
+            .iter()
+            .find(|(key, _, _)| key == &logical_key)
+            .expect("logical request");
+
+        assert_eq!(*access, expected, "{left:?} plus {right:?}");
+        assert_eq!(resources, std::slice::from_ref(&path));
+    }
+}
+
+#[test]
+fn mixed_kind_physical_requests_retain_paths_and_fold_to_mutation() {
+    let fixture = TestDir::new("lock-access-fold-physical");
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let store = root.join("store");
+    std::fs::create_dir_all(&store).expect("store fixture");
+    let alias = root.join("alias");
+    if !symlink_dir_or_skip(&store, &alias) {
+        return;
+    }
+
+    let observed = LockResource::describe_entry(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &root,
+        &classify(&alias).unwrap(),
+    )
+    .unwrap();
+    let mutated = LockResource::describe_entry(
+        LockResourceKind::BackingStore,
+        LockAccess::Mutate,
+        &root,
+        &classify(&store).unwrap(),
+    )
+    .unwrap();
+    let physical_key = observed.lock_keys()[1].clone();
+    let requests = super::acquire::sorted_keys_for_test(&[observed, mutated]);
+    let (_, access, resources) = requests
+        .iter()
+        .find(|(key, _, _)| key == &physical_key)
+        .expect("shared physical request");
+
+    assert_eq!(*access, LockAccess::Mutate);
+    assert_eq!(resources.len(), 2);
+    assert!(resources.contains(&alias));
+    assert!(resources.contains(&store));
 }
 
 #[test]
@@ -208,6 +520,7 @@ fn a_resource_outside_its_anchor_is_an_internal_error() {
 
     let error = LockResource::describe(
         LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
         &anchor,
         Path::new("/elsewhere/skills"),
     )
@@ -220,8 +533,13 @@ fn a_resource_outside_its_anchor_is_an_internal_error() {
 fn a_lock_filename_is_a_bounded_portable_digest() {
     let fixture = TestDir::new("lock-filename");
     let root = std::fs::canonicalize(fixture.path()).unwrap();
-    let resource =
-        LockResource::describe(LockResourceKind::BackingStore, &root, &root.join("a/b/c")).unwrap();
+    let resource = LockResource::describe(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        &root,
+        &root.join("a/b/c"),
+    )
+    .unwrap();
 
     let name = resource.lock_keys()[0].file_name();
 
@@ -239,10 +557,20 @@ fn a_lock_filename_is_a_bounded_portable_digest() {
 
 /// Builds two resources that produce four distinct keys, discovered in opposite orders.
 fn opposing_resources(root: &Path) -> (Vec<LockResource>, Vec<LockResource>) {
-    let first = LockResource::describe(LockResourceKind::BackingStore, root, &root.join("one"))
-        .expect("beneath root");
-    let second = LockResource::describe(LockResourceKind::DiscoveryEntry, root, &root.join("two"))
-        .expect("beneath root");
+    let first = LockResource::describe(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        root,
+        &root.join("one"),
+    )
+    .expect("beneath root");
+    let second = LockResource::describe(
+        LockResourceKind::DiscoveryEntry,
+        crate::lock::LockAccess::Mutate,
+        root,
+        &root.join("two"),
+    )
+    .expect("beneath root");
     (vec![first.clone(), second.clone()], vec![second, first])
 }
 
@@ -254,11 +582,11 @@ fn sessions_that_discover_resources_in_opposite_orders_lock_in_one_order() {
 
     let forward_keys = super::acquire::sorted_keys_for_test(&forward)
         .into_iter()
-        .map(|(key, _)| key)
+        .map(|(key, _, _)| key)
         .collect::<Vec<_>>();
     let reverse_keys = super::acquire::sorted_keys_for_test(&reverse)
         .into_iter()
-        .map(|(key, _)| key)
+        .map(|(key, _, _)| key)
         .collect::<Vec<_>>();
 
     assert_eq!(
@@ -337,8 +665,20 @@ fn one_resource_reached_twice_takes_a_single_lock() {
     // The Codex layout: the discovery entry and the backing store are one directory, so their
     // physical keys coincide. Requesting both must not deadlock against itself.
     let resources = vec![
-        LockResource::describe(LockResourceKind::DiscoveryEntry, &root, &store).unwrap(),
-        LockResource::describe(LockResourceKind::BackingStore, &root, &store).unwrap(),
+        LockResource::describe(
+            LockResourceKind::DiscoveryEntry,
+            LockAccess::Mutate,
+            &root,
+            &store,
+        )
+        .unwrap(),
+        LockResource::describe(
+            LockResourceKind::BackingStore,
+            LockAccess::Mutate,
+            &root,
+            &store,
+        )
+        .unwrap(),
     ];
 
     let held = HeldLocks::acquire(
@@ -357,6 +697,113 @@ fn one_resource_reached_twice_takes_a_single_lock() {
 }
 
 #[test]
+fn observers_share_while_mutation_excludes_every_other_access() {
+    let fixture = TestDir::new("lock-shared-exclusive");
+    let _guard = StateRootGuard::set(fixture.path());
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let path = root.join("shared");
+    let observed = LockResource::describe(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &root,
+        &path,
+    )
+    .unwrap();
+    let mut mutated = observed.clone();
+    mutated.access = LockAccess::Mutate;
+
+    let reader_a = HeldLocks::acquire(
+        std::slice::from_ref(&observed),
+        LockPolicy::immediate(),
+        &LockOwner {
+            transaction: "reader-a".to_owned(),
+            pid: 1001,
+        },
+    )
+    .expect("first observer");
+    let reader_b = HeldLocks::acquire(
+        std::slice::from_ref(&observed),
+        LockPolicy::immediate(),
+        &LockOwner {
+            transaction: "reader-b".to_owned(),
+            pid: 1002,
+        },
+    )
+    .expect("second observer");
+
+    assert!(reader_a.holds_all(std::slice::from_ref(&observed)));
+    assert!(!reader_a.holds_all(std::slice::from_ref(&mutated)));
+    let contention =
+        HeldLocks::try_acquire_all(std::slice::from_ref(&mutated), &LockOwner::preliminary())
+            .unwrap()
+            .expect_err("mutation must contend with both observers");
+    assert_eq!(contention.access, LockAccess::Mutate);
+
+    drop(reader_a);
+    assert!(
+        HeldLocks::try_acquire_all(std::slice::from_ref(&mutated), &LockOwner::preliminary())
+            .unwrap()
+            .is_err(),
+        "one remaining observer still excludes mutation"
+    );
+    drop(reader_b);
+
+    let writer =
+        HeldLocks::try_acquire_all(std::slice::from_ref(&mutated), &LockOwner::preliminary())
+            .unwrap()
+            .expect("mutation is available after all observers release");
+    assert!(writer.holds_all(std::slice::from_ref(&mutated)));
+    assert!(
+        writer.holds_all(std::slice::from_ref(&observed)),
+        "mutation access satisfies an observation request"
+    );
+    assert!(
+        HeldLocks::try_acquire_all(&[observed], &LockOwner::preliminary())
+            .unwrap()
+            .is_err(),
+        "mutation excludes a later observer"
+    );
+}
+
+#[test]
+fn observation_to_mutation_requires_a_fresh_acquisition_pass() {
+    let fixture = TestDir::new("lock-access-promotion");
+    let _guard = StateRootGuard::set(fixture.path());
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let path = root.join("shared");
+    let observed = LockResource::describe(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &root,
+        &path,
+    )
+    .unwrap();
+    let mut mutated = observed.clone();
+    mutated.access = LockAccess::Mutate;
+    let mut held = HeldLocks::acquire(
+        std::slice::from_ref(&observed),
+        LockPolicy::immediate(),
+        &LockOwner::preliminary(),
+    )
+    .expect("observation lock");
+
+    assert!(held.requires_reacquire(std::slice::from_ref(&mutated)));
+    assert!(matches!(
+        held.try_acquire_missing(std::slice::from_ref(&mutated), &LockOwner::preliminary())
+            .unwrap(),
+        MissingLockOutcome::RequiresReacquire
+    ));
+    let error = held
+        .acquire_more(
+            std::slice::from_ref(&mutated),
+            LockPolicy::immediate(),
+            &LockOwner::preliminary(),
+        )
+        .expect_err("in-place promotion must be refused");
+    assert_eq!(error.category(), crate::error::ExitCategory::Internal);
+}
+
+#[test]
 fn a_first_creator_and_a_later_observer_cannot_apply_concurrently() {
     let fixture = TestDir::new("lock-first-creator");
     let _guard = StateRootGuard::set(fixture.path());
@@ -364,7 +811,13 @@ fn a_first_creator_and_a_later_observer_cannot_apply_concurrently() {
     let store = root.join(".codex/skills");
 
     // One session plans the store before it exists and takes its lock.
-    let planned = LockResource::describe(LockResourceKind::BackingStore, &root, &store).unwrap();
+    let planned = LockResource::describe(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        &root,
+        &store,
+    )
+    .unwrap();
     let held = HeldLocks::acquire(
         std::slice::from_ref(&planned),
         LockPolicy::immediate(),
@@ -374,7 +827,13 @@ fn a_first_creator_and_a_later_observer_cannot_apply_concurrently() {
 
     // The store appears, and a second session observes it.
     std::fs::create_dir_all(&store).expect("store fixture");
-    let observed = LockResource::describe(LockResourceKind::BackingStore, &root, &store).unwrap();
+    let observed = LockResource::describe(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        &root,
+        &store,
+    )
+    .unwrap();
 
     assert!(
         held.holds(&observed.lock_keys()[0]),
@@ -397,8 +856,13 @@ fn a_lock_that_is_dropped_becomes_available_again() {
     let fixture = TestDir::new("lock-release");
     let _guard = StateRootGuard::set(fixture.path());
     let root = std::fs::canonicalize(fixture.path()).unwrap();
-    let resource =
-        LockResource::describe(LockResourceKind::BackingStore, &root, &root.join("s")).unwrap();
+    let resource = LockResource::describe(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        &root,
+        &root.join("s"),
+    )
+    .unwrap();
 
     let held = HeldLocks::acquire(
         std::slice::from_ref(&resource),
@@ -429,10 +893,20 @@ fn a_partial_acquisition_releases_what_it_already_took() {
     let fixture = TestDir::new("lock-partial");
     let _guard = StateRootGuard::set(fixture.path());
     let root = std::fs::canonicalize(fixture.path()).unwrap();
-    let free =
-        LockResource::describe(LockResourceKind::BackingStore, &root, &root.join("free")).unwrap();
-    let busy =
-        LockResource::describe(LockResourceKind::BackingStore, &root, &root.join("busy")).unwrap();
+    let free = LockResource::describe(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        &root,
+        &root.join("free"),
+    )
+    .unwrap();
+    let busy = LockResource::describe(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        &root,
+        &root.join("busy"),
+    )
+    .unwrap();
     let _blocker = HeldLocks::acquire(
         std::slice::from_ref(&busy),
         LockPolicy::immediate(),
@@ -464,9 +938,20 @@ fn a_missing_key_contention_keeps_the_partly_overlapping_resource_path() {
         return;
     }
 
-    let full = LockResource::describe(LockResourceKind::BackingStore, &root, &store).unwrap();
-    let alias_resource =
-        LockResource::describe(LockResourceKind::BackingStore, &root, &alias).unwrap();
+    let full = LockResource::describe(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        &root,
+        &store,
+    )
+    .unwrap();
+    let alias_resource = LockResource::describe(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        &root,
+        &alias,
+    )
+    .unwrap();
     let _physical_blocker = HeldLocks::acquire(
         std::slice::from_ref(&alias_resource),
         LockPolicy::immediate(),
@@ -482,10 +967,12 @@ fn a_missing_key_contention_keeps_the_partly_overlapping_resource_path() {
     )
     .expect("the current process already holds only the logical key");
 
-    let contention = current
+    let MissingLockOutcome::Contended(contention) = current
         .try_acquire_missing(std::slice::from_ref(&full), &LockOwner::preliminary())
         .expect("lock files are available")
-        .expect_err("the exact missing physical key is held by the alias");
+    else {
+        panic!("the exact missing physical key must be held by the alias");
+    };
 
     assert_eq!(contention.resources, vec![store]);
 }
@@ -497,6 +984,7 @@ fn an_expired_wait_names_the_contended_resource_as_a_temporary_failure() {
     let root = std::fs::canonicalize(fixture.path()).unwrap();
     let resource = LockResource::describe(
         LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
         &root,
         &root.join(".codex/skills"),
     )
@@ -521,13 +1009,34 @@ fn an_expired_wait_names_the_contended_resource_as_a_temporary_failure() {
     assert!(message.contains("nothing was changed"), "{message}");
 }
 
+fn holder_records(resource: &LockResource) -> Vec<std::path::PathBuf> {
+    let directory = crate::state::lock_base()
+        .unwrap()
+        .join(format!("{}.owners", resource.lock_keys()[0]));
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut records = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    records.sort();
+    records
+}
+
 #[test]
 fn holder_diagnostics_are_recorded_without_becoming_liveness_evidence() {
     let fixture = TestDir::new("lock-holder");
     let _guard = StateRootGuard::set(fixture.path());
     let root = std::fs::canonicalize(fixture.path()).unwrap();
-    let resource =
-        LockResource::describe(LockResourceKind::BackingStore, &root, &root.join("s")).unwrap();
+    let resource = LockResource::describe(
+        LockResourceKind::BackingStore,
+        LockAccess::Mutate,
+        &root,
+        &root.join("s"),
+    )
+    .unwrap();
     let owner = LockOwner {
         transaction: "abc123".to_owned(),
         pid: 4242,
@@ -539,13 +1048,9 @@ fn holder_diagnostics_are_recorded_without_becoming_liveness_evidence() {
         &owner,
     )
     .expect("uncontended");
-    // Read *while the lock is held*, which is the only moment the description is useful and the
-    // one Windows makes hard: a byte-range lock there is mandatory, so a description written into
-    // the lock file itself would be unreadable through any other handle. The sidecar exists for
-    // exactly this assertion.
-    let description = crate::state::lock_base()
-        .unwrap()
-        .join(format!("{}.owner", resource.lock_keys()[0]));
+    let records = holder_records(&resource);
+    assert_eq!(records.len(), 1);
+    let description = records[0].clone();
     let contents = std::fs::read_to_string(&description)
         .expect("the holder description is readable while the lock is held");
     let lock_file = crate::state::lock_base()
@@ -566,18 +1071,22 @@ fn holder_diagnostics_are_recorded_without_becoming_liveness_evidence() {
     );
     assert!(
         !description.exists(),
-        "releasing the lock clears the description, so a contention message never names a session \
-         that already finished"
+        "releasing the lock clears only this holder's description"
     );
 }
 
 #[test]
-fn advisory_observation_is_read_only_and_uses_the_kernel_lock_as_liveness() {
+fn advisory_observation_detects_shared_and_exclusive_locks_without_writing() {
     let fixture = TestDir::new("lock-observe");
     let _guard = StateRootGuard::set(fixture.path());
     let root = std::fs::canonicalize(fixture.path()).unwrap();
-    let resource =
-        LockResource::describe(LockResourceKind::BackingStore, &root, &root.join("s")).unwrap();
+    let mut resource = LockResource::describe(
+        LockResourceKind::BackingStore,
+        LockAccess::Mutate,
+        &root,
+        &root.join("s"),
+    )
+    .unwrap();
     let lock_base = crate::state::lock_base().unwrap();
     assert!(!lock_base.exists());
 
@@ -589,32 +1098,50 @@ fn advisory_observation_is_read_only_and_uses_the_kernel_lock_as_liveness() {
     );
     assert!(
         !lock_base.exists(),
-        "observation must not create a lock directory or file"
+        "observation must not create a lock directory, file, or sidecar"
     );
 
-    let held = HeldLocks::acquire(
-        std::slice::from_ref(&resource),
-        LockPolicy::immediate(),
-        &LockOwner {
-            transaction: "observed".to_owned(),
-            pid: 4242,
-        },
-    )
-    .expect("fixture lock");
-    let active = observe(std::slice::from_ref(&resource)).expect("held lock is observable");
-    assert!(active.iter().any(|entry| matches!(
-        &entry.state,
-        AdvisoryLockState::Held { holder: Some(holder) } if holder.contains("transaction=observed")
-    )));
+    for (access, transaction) in [
+        (LockAccess::Observe, "shared-observer"),
+        (LockAccess::Mutate, "exclusive-mutator"),
+    ] {
+        resource.access = access;
+        let held = HeldLocks::acquire(
+            std::slice::from_ref(&resource),
+            LockPolicy::immediate(),
+            &LockOwner {
+                transaction: transaction.to_owned(),
+                pid: 4242,
+            },
+        )
+        .expect("fixture lock");
+        let records_before = holder_records(&resource);
+        let active = observe(std::slice::from_ref(&resource)).expect("held lock is observable");
 
-    drop(held);
-    let released = observe(&[resource]).expect("released lock is observable");
-    assert!(
-        released
-            .iter()
-            .all(|entry| entry.state == AdvisoryLockState::Free),
-        "a leftover lock file is not liveness evidence"
-    );
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].access, access);
+        assert_eq!(active[0].key, resource.lock_keys()[0]);
+        assert!(matches!(
+            &active[0].state,
+            AdvisoryLockState::Held { holder: Some(holder) }
+                if holder.contains(&format!("transaction={transaction}"))
+        ));
+        assert_eq!(
+            holder_records(&resource),
+            records_before,
+            "observation must not add or replace holder text"
+        );
+
+        drop(held);
+        let released =
+            observe(std::slice::from_ref(&resource)).expect("released lock is observable");
+        assert!(
+            released
+                .iter()
+                .all(|entry| entry.state == AdvisoryLockState::Free),
+            "a leftover lock file is not liveness evidence"
+        );
+    }
 }
 
 #[test]
@@ -622,19 +1149,24 @@ fn a_stale_holder_record_never_authorizes_taking_the_lock_or_blocks_it() {
     let fixture = TestDir::new("lock-pid-reuse");
     let _guard = StateRootGuard::set(fixture.path());
     let root = std::fs::canonicalize(fixture.path()).unwrap();
-    let resource =
-        LockResource::describe(LockResourceKind::BackingStore, &root, &root.join("s")).unwrap();
+    let resource = LockResource::describe(
+        LockResourceKind::BackingStore,
+        LockAccess::Mutate,
+        &root,
+        &root.join("s"),
+    )
+    .unwrap();
     let directory = crate::state::lock_base().unwrap();
     crate::state::ensure_private_directory(&directory).unwrap();
-    // A crashed session's leftovers: an empty lock file and a description naming a pid the
-    // operating system has since handed to something else. Nothing is holding the lock.
     std::fs::write(directory.join(resource.lock_keys()[0].file_name()), b"")
-        .expect("fixture write");
+        .expect("fixture lock file");
+    let holder_directory = directory.join(format!("{}.owners", resource.lock_keys()[0]));
+    crate::state::ensure_private_directory(&holder_directory).unwrap();
     std::fs::write(
-        directory.join(format!("{}.owner", resource.lock_keys()[0])),
+        holder_directory.join("stale.owner"),
         format!("transaction=dead pid={}\n", std::process::id()),
     )
-    .expect("fixture write");
+    .expect("fixture owner record");
 
     let taken =
         HeldLocks::try_acquire_all(std::slice::from_ref(&resource), &LockOwner::preliminary())
@@ -642,16 +1174,99 @@ fn a_stale_holder_record_never_authorizes_taking_the_lock_or_blocks_it() {
 
     assert!(
         taken.is_ok(),
-        "a leftover file must not block a session, whatever pid it names"
+        "a leftover record must not block a session, whatever pid it names"
     );
     let held = taken.expect("checked above");
     assert!(
         HeldLocks::try_acquire_all(&[resource], &LockOwner::preliminary())
             .unwrap()
             .is_err(),
-        "and once the lock is really held, the same file must not authorize a second holder"
+        "a real kernel lock must still exclude another mutator"
     );
     drop(held);
+}
+
+#[test]
+fn contention_remains_authoritative_when_holder_text_is_absent() {
+    let fixture = TestDir::new("lock-holder-absent");
+    let _guard = StateRootGuard::set(fixture.path());
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let resource = LockResource::describe(
+        LockResourceKind::BackingStore,
+        LockAccess::Mutate,
+        &root,
+        &root.join("s"),
+    )
+    .unwrap();
+    let held = HeldLocks::acquire(
+        std::slice::from_ref(&resource),
+        LockPolicy::immediate(),
+        &LockOwner {
+            transaction: "hidden".to_owned(),
+            pid: 4242,
+        },
+    )
+    .expect("fixture holder");
+    for record in holder_records(&resource) {
+        std::fs::remove_file(record).expect("remove advisory text");
+    }
+
+    let contention = HeldLocks::try_acquire_all(&[resource], &LockOwner::preliminary())
+        .unwrap()
+        .expect_err("kernel lock still contends");
+    assert!(contention.holder.is_none());
+    drop(held);
+}
+
+#[test]
+fn one_reader_never_erases_another_readers_holder_record() {
+    let fixture = TestDir::new("lock-holder-overlap");
+    let _guard = StateRootGuard::set(fixture.path());
+    let root = std::fs::canonicalize(fixture.path()).unwrap();
+    let resource = LockResource::describe(
+        LockResourceKind::DiscoveryEntry,
+        LockAccess::Observe,
+        &root,
+        &root.join("s"),
+    )
+    .unwrap();
+    let reader_a = HeldLocks::acquire(
+        std::slice::from_ref(&resource),
+        LockPolicy::immediate(),
+        &LockOwner {
+            transaction: "reader-a".to_owned(),
+            pid: 1001,
+        },
+    )
+    .expect("reader a");
+    let reader_b = HeldLocks::acquire(
+        std::slice::from_ref(&resource),
+        LockPolicy::immediate(),
+        &LockOwner {
+            transaction: "reader-b".to_owned(),
+            pid: 1002,
+        },
+    )
+    .expect("reader b");
+    assert_eq!(holder_records(&resource).len(), 2);
+
+    drop(reader_a);
+    let remaining = holder_records(&resource);
+    assert_eq!(remaining.len(), 1);
+    let remaining_text = std::fs::read_to_string(&remaining[0]).unwrap();
+    assert!(remaining_text.contains("transaction=reader-b"));
+
+    let mut mutated = resource.clone();
+    mutated.access = LockAccess::Mutate;
+    let contention = HeldLocks::try_acquire_all(&[mutated], &LockOwner::preliminary())
+        .unwrap()
+        .expect_err("remaining reader excludes mutation");
+    let holder = contention.holder.expect("remaining reader is diagnostic");
+    assert!(holder.contains("transaction=reader-b"), "{holder}");
+    assert!(!holder.contains("transaction=reader-a"), "{holder}");
+
+    drop(reader_b);
+    assert!(holder_records(&resource).is_empty());
 }
 
 #[test]
@@ -661,10 +1276,12 @@ fn resources_without_a_shared_key_do_not_serialize() {
     let root = std::fs::canonicalize(fixture.path()).unwrap();
     let first = LockResource::describe_unanchored(
         LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
         &root.join("session-a/root/.claude/skills"),
     );
     let second = LockResource::describe_unanchored(
         LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
         &root.join("session-b/root/.claude/skills"),
     );
 
@@ -698,7 +1315,13 @@ fn journal_locks_round_trip_into_the_same_keys() {
     let root = std::fs::canonicalize(fixture.path()).unwrap();
     let store = root.join("skills");
     std::fs::create_dir_all(&store).expect("store fixture");
-    let resource = LockResource::describe(LockResourceKind::BackingStore, &root, &store).unwrap();
+    let resource = LockResource::describe(
+        LockResourceKind::BackingStore,
+        crate::lock::LockAccess::Mutate,
+        &root,
+        &store,
+    )
+    .unwrap();
 
     let recorded = crate::journal::JournalLock::from(&resource);
     let rebuilt: LockResource = recorded.to_resource();

@@ -206,6 +206,27 @@ impl Drop for Fixture {
     }
 }
 
+fn assert_access_aware_lock_plan(rendered: &str) {
+    let has = |access: &str, kind: &str| {
+        rendered.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next() == Some(access) && fields.next() == Some(kind)
+        })
+    };
+    assert!(
+        has("observe", "discovery-entry"),
+        "the read-only plan must label observed discovery evidence: {rendered}"
+    );
+    assert!(
+        has("mutate", "discovery-entry"),
+        "the read-only plan must label its mutation-capable namespace: {rendered}"
+    );
+    assert!(
+        has("mutate", "backing-store"),
+        "the read-only plan must label its mutation-capable backing store: {rendered}"
+    );
+}
+
 /// Provides a native executable for the mutation-boundary launch sentinel.
 fn fake_agent_executable(root: &Path, sentinel: &Path) -> PathBuf {
     #[cfg(unix)]
@@ -385,6 +406,7 @@ fn inspect_reports_every_registered_agent_without_touching_anything() {
     assert!(rendered.contains("2.1.220 (Claude Code)"));
     assert!(rendered.contains("omp/17.2.9"));
     assert_eq!(rendered.matches("executable not queried").count(), 3);
+    assert_access_aware_lock_plan(&rendered);
 }
 
 #[test]
@@ -706,6 +728,7 @@ fn a_codex_dry_run_plans_the_whole_layout_without_creating_it() {
     assert!(!fixture.project.join(".agents").exists());
     assert!(rendered.contains("codex-cli 0.146.0"));
     assert!(rendered.contains("advisory evidence; executable not queried"));
+    assert_access_aware_lock_plan(&rendered);
 }
 
 /// A verbose read-only plan says which entries a later cleanup is obliged to reconcile.
@@ -923,6 +946,7 @@ fn a_claude_dry_run_never_creates_a_session_root() {
     );
     assert!(rendered.contains("2.1.220 (Claude Code)"));
     assert!(rendered.contains("advisory evidence; executable not queried"));
+    assert_access_aware_lock_plan(&rendered);
 }
 
 #[test]
@@ -1591,6 +1615,7 @@ fn an_omp_dry_run_plans_the_project_scope_without_creating_it() {
     );
     assert!(rendered.contains("omp/17.2.9"), "{rendered}");
     assert!(rendered.contains("advisory evidence; executable not queried"));
+    assert_access_aware_lock_plan(&rendered);
     // A dry run records the executable an operator named and never resolves, validates, or queries
     // it, so the rendered path is the one that was passed while the banner stays advisory.
     assert!(

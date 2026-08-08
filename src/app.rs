@@ -23,7 +23,7 @@ use crate::process::{
 };
 use crate::render;
 use crate::transaction::cleanup::CleanupReport;
-use crate::transaction::{Transaction, recover};
+use crate::transaction::{Transaction, recover, staged_mutation_resources};
 
 /// Maximum discovery/recovery passes allowed while a mutating lock set expands.
 const MAX_LOCK_SET_PASSES: usize = 8;
@@ -258,42 +258,13 @@ fn run_session(context: &RunContext, invocation: InvocationContext) -> Result<u8
 
     let preliminary = adapter.inspect_discovery(&context)?;
     crate::checkpoint::reached(crate::checkpoint::Checkpoint::DiscoveryInspected, 1);
-    let mut required_resources = preliminary.lock_resources;
-    let mut locks = HeldLocks::acquire(&required_resources, policy, &owner)?;
-
-    // Recovery or an external filesystem change can make the rebuilt snapshot add a physical key.
-    // A new key that sorts after the held set can be appended safely. A key that sorts before it
-    // requires dropping the set and taking the complete union in one order. That unlocked gap is
-    // never hidden from the rest of the pipeline: recovery and filesystem inspection run again
-    // after every restart and after every monotonic expansion.
-    let mut stable = None;
-    for _ in 0..MAX_LOCK_SET_PASSES {
-        reconcile_incomplete_transactions(&context, &mut locks, invocation)?;
-
-        // Built under the lock and after recovery, because recovery may have removed mounts
-        // discovery saw a moment ago. A plan that disagrees with the filesystem it is about to
-        // change is exactly what every precondition check exists to catch.
-        let rebuilt = plan_read_only(&context)?;
-        if locks.holds_all(&rebuilt.snapshot.lock_resources) {
-            stable = Some(rebuilt);
-            break;
-        }
-
-        extend_resources(&mut required_resources, &rebuilt.snapshot.lock_resources);
-        if locks.requires_reacquire(&rebuilt.snapshot.lock_resources) {
-            drop(locks);
-            locks = HeldLocks::acquire(&required_resources, policy, &owner)?;
-            continue;
-        }
-
-        locks.acquire_more(&rebuilt.snapshot.lock_resources, policy, &owner)?;
-    }
-    let rebuilt = stable.ok_or_else(|| {
-        AppError::Temporary(format!(
-            "the resource lock set did not stabilize after {MAX_LOCK_SET_PASSES} inspections; \
-             nothing was mounted"
-        ))
-    })?;
+    let (rebuilt, locks) = stabilize_resource_locks(
+        &context,
+        invocation,
+        policy,
+        &owner,
+        preliminary.lock_resources,
+    )?;
 
     // Lock acquisition may wait behind a long-running session while managed configuration or
     // another hard launch control changes, so repeat those release-independent checks after the
@@ -363,6 +334,76 @@ fn run_session(context: &RunContext, invocation: InvocationContext) -> Result<u8
     let decision = map_exit(&outcome);
     report_supervision_diagnostics(&decision, invocation.shell);
     Ok(decision.code)
+}
+
+/// Expands and reacquires the session's lock set until recovery and discovery agree on it.
+fn stabilize_resource_locks(
+    context: &RunContext,
+    invocation: InvocationContext,
+    policy: LockPolicy,
+    owner: &LockOwner,
+    mut required_resources: Vec<crate::lock::LockResource>,
+) -> Result<(ReadOnlyOutcome, HeldLocks), AppError> {
+    let transaction_id = context.session_id.as_ref().ok_or_else(|| {
+        AppError::Internal(
+            "a mutating lock stabilization pass requires a transaction identifier".to_owned(),
+        )
+    })?;
+    let mut locks = HeldLocks::acquire(&required_resources, policy, owner)?;
+    let mut stable = None;
+    let mut recovery_candidates = Vec::new();
+
+    // Recovery, transaction-specific staged actions, or an external filesystem change can make the
+    // rebuilt snapshot add a key. A new key that sorts after the held set can be appended safely.
+    // A key that sorts before the held set requires dropping and reacquiring the complete union in
+    // one order. That unlocked gap is never hidden from the rest of the pipeline: recovery and
+    // filesystem inspection run again after every restart and monotonic expansion.
+    for _ in 0..MAX_LOCK_SET_PASSES {
+        let recovery_resources = reconcile_incomplete_transactions(
+            context,
+            &mut locks,
+            &mut recovery_candidates,
+            invocation,
+        )?;
+        if !recovery_resources.is_empty() {
+            extend_resources(&mut required_resources, &recovery_resources);
+            drop(locks);
+            locks = HeldLocks::acquire(&required_resources, policy, owner)?;
+            continue;
+        }
+
+        // Built under the lock and after recovery, because recovery may have removed mounts
+        // discovery saw a moment ago. A plan that disagrees with the filesystem it is about to
+        // change is exactly what every precondition check exists to catch.
+        let mut rebuilt = plan_read_only(context)?;
+        let staged_resources = staged_mutation_resources(transaction_id, &rebuilt.plan)?;
+        extend_resources(&mut rebuilt.snapshot.lock_resources, &staged_resources);
+        rebuilt
+            .snapshot
+            .lock_resources
+            .sort_by_key(crate::lock::LockResource::ordering_key);
+        if locks.holds_all(&rebuilt.snapshot.lock_resources) {
+            stable = Some(rebuilt);
+            break;
+        }
+
+        extend_resources(&mut required_resources, &rebuilt.snapshot.lock_resources);
+        if locks.requires_reacquire(&rebuilt.snapshot.lock_resources) {
+            drop(locks);
+            locks = HeldLocks::acquire(&required_resources, policy, owner)?;
+            continue;
+        }
+
+        locks.acquire_more(&rebuilt.snapshot.lock_resources, policy, owner)?;
+    }
+
+    let rebuilt = stable.ok_or_else(|| {
+        AppError::Temporary(format!(
+            "the resource lock set did not stabilize after {MAX_LOCK_SET_PASSES} inspections; \
+             nothing was mounted"
+        ))
+    })?;
+    Ok((rebuilt, locks))
 }
 
 fn render_session_output(context: &RunContext, outcome: &ReadOnlyOutcome) -> String {
@@ -657,12 +698,13 @@ fn describe_supervision_diagnostic(diagnostic: &SupervisionDiagnostic) -> String
 fn reconcile_incomplete_transactions(
     context: &RunContext,
     locks: &mut HeldLocks,
+    recovery_candidates: &mut Vec<std::path::PathBuf>,
     invocation: InvocationContext,
-) -> Result<(), AppError> {
+) -> Result<Vec<crate::lock::LockResource>, AppError> {
     if context.options.no_recover {
         let blocking = recover::blocking_state(locks)?;
         if blocking.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         return Err(AppError::TemporaryReport {
             summary: "--no-recover forbids reconciling incomplete transaction state, and nothing \
@@ -673,7 +715,8 @@ fn reconcile_incomplete_transactions(
         });
     }
 
-    let report = recover::recover_stale(locks)?;
+    let report = recover::recover_stale_after_reacquire(locks, recovery_candidates)?;
+    recovery_candidates.clear();
     if !report.unreadable.is_empty() {
         return Err(unreadable_journals_error(&report.unreadable));
     }
@@ -739,8 +782,12 @@ fn reconcile_incomplete_transactions(
             recovery,
         });
     }
+    if !report.reacquire.is_empty() {
+        recovery_candidates.extend(report.reinspect.iter().cloned());
+        return Ok(report.reacquire);
+    }
     warn(&report.describe());
-    Ok(())
+    Ok(Vec::new())
 }
 
 /// Builds the fail-closed operator diagnostic for journals this build cannot account for.
@@ -770,13 +817,21 @@ fn unreadable_journals_error(rejected: &[RejectedJournal]) -> AppError {
     }
 }
 
-/// Extends an accumulated lock-resource description without duplicating identical observations.
+/// Extends an accumulated lock-resource description and folds an exact repeated observation to
+/// its strongest access. Distinct paths remain distinct so contention diagnostics keep every
+/// spelling that led to one logical or physical key.
 fn extend_resources(
     resources: &mut Vec<crate::lock::LockResource>,
     additional: &[crate::lock::LockResource],
 ) {
     for resource in additional {
-        if !resources.contains(resource) {
+        if let Some(existing) = resources.iter_mut().find(|existing| {
+            existing.kind == resource.kind
+                && existing.path == resource.path
+                && existing.identity == resource.identity
+        }) {
+            existing.access = existing.access.max(resource.access);
+        } else {
             resources.push(resource.clone());
         }
     }
@@ -1013,8 +1068,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        cleanup_failure_from_report, error_guidance, execute_completion, junction_policy_warning,
-        supervision_diagnostic_lines, supervision_diagnostic_report,
+        cleanup_failure_from_report, error_guidance, execute_completion, extend_resources,
+        junction_policy_warning, supervision_diagnostic_lines, supervision_diagnostic_report,
     };
     use crate::cli::{CompletionInput, CompletionShell, ProductBinary};
     use crate::domain::{AgentId, LinkMode};
@@ -1052,6 +1107,24 @@ mod tests {
             },
             shell,
         )
+    }
+
+    #[test]
+    fn stabilization_accumulates_the_strongest_access_for_one_resource() {
+        let path = PathBuf::from("shared");
+        let observed = crate::lock::LockResource::describe_unanchored(
+            crate::lock::LockResourceKind::DiscoveryEntry,
+            crate::lock::LockAccess::Observe,
+            &path,
+        );
+        let mut mutated = observed.clone();
+        mutated.access = crate::lock::LockAccess::Mutate;
+        let mut resources = vec![observed.clone()];
+
+        extend_resources(&mut resources, std::slice::from_ref(&mutated));
+        extend_resources(&mut resources, &[observed]);
+
+        assert_eq!(resources, vec![mutated]);
     }
 
     #[test]

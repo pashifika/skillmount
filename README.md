@@ -18,6 +18,7 @@ and `skillmount`, a descriptive fallback that behaves the same way.
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Oh My Pi sessions](#oh-my-pi-sessions)
+- [Concurrent sessions](#concurrent-sessions)
 - [Commands and options](#commands-and-options)
 - [Shell completion](#shell-completion)
 - [Health checks and cleanup](#health-checks-and-cleanup)
@@ -227,6 +228,19 @@ Attaching to or hot-reloading Skills into an OMP process SkillMount did not laun
 — OMP loads Skills once at
 startup, so start a new session instead. The recorded OMP evidence, including the platforms it
 does and does not cover, lives in [docs/compatibility.md](docs/compatibility.md).
+
+## Concurrent sessions
+
+Independent project sessions can overlap, even when they inspect the same user, administrator,
+settings, plugin, compatibility, or custom Skill roots. Each invocation stabilizes its own current
+namespace before planning, so a later session applies `--conflict=error` or `--conflict=skip` to
+what exists at its launch. An already-running Agent is not guaranteed to receive a live update;
+start a new session when it must see newly added Skills.
+
+Logical or physical destination overlap is still exclusive. A contender waits for the active
+session to release the destination and, if contention remains, exits with status 75 before applying
+anything. Physical aliases such as directory links do not bypass that protection, and one session
+never uses shared discovery access as authority to clean another session's entries.
 
 ## Commands and options
 
