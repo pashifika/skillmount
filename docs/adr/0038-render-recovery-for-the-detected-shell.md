@@ -51,8 +51,9 @@ After every complete error or warning block, one recovery footer SHALL render ea
 operation once in first-seen order:
 
 1. For a known PowerShell family and non-empty display-safe Unicode values, render one PowerShell
-   command with each native value represented as a single-quoted literal and embedded apostrophes
-   doubled. An empty native argument uses the vector because Windows PowerShell 5.1 drops it.
+   command. Emit only `[A-Za-z0-9_.-]+` values as bare words; represent every other native value as
+   a single-quoted literal, double embedded apostrophes, and prefix a quoted executable with `&`.
+   An empty native argument uses the vector because Windows PowerShell 5.1 drops it.
 2. For a known Command Prompt family and values admitted by the native-tested encoder, render one
    Command Prompt command with exact argument grouping. Expansion-sensitive percent or exclamation
    values, controls, non-Unicode values, and unproved quoting cases are rejected to the fallback.

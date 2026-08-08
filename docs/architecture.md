@@ -142,8 +142,9 @@ prematurely incomplete, or mixed evidence selects the labelled native vector. Un
 platforms use the vector.
 
 Each detected-shell encoder accepts a value only when the corresponding native shell can reproduce
-it exactly. PowerShell uses single-quoted literals with doubled apostrophes, but rejects empty
-arguments because Windows PowerShell 5.1 drops them. Command Prompt uses its native-tested
+it exactly. PowerShell emits only `[A-Za-z0-9_.-]+` values as bare words and uses single-quoted
+literals with doubled apostrophes for every other value, but rejects empty arguments because
+Windows PowerShell 5.1 drops them. Command Prompt uses its native-tested
 double-quote and backslash rules and rejects expansion-sensitive `%` or `!` values. Controls,
 non-Unicode values, and every unproved case also fall back to one labelled executable and numbered
 argument per line. Every external value is escaped independently through `src/render.rs`,

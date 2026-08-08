@@ -218,7 +218,7 @@ impl Transaction {
     }
 
     /// Undoes everything already created, then records the failure durably.
-    pub(super) fn roll_back(&mut self, cause: AppError) -> Box<super::apply::ApplyFailure> {
+    pub(super) fn roll_back(&mut self, cause: AppError) -> super::apply::ApplyFailure {
         let mut retained = Vec::new();
         let mut preserved = Vec::new();
         let mut rollback_errors = Vec::new();
@@ -249,11 +249,11 @@ impl Transaction {
             rollback_errors.push(error.to_string());
         }
 
-        Box::new(super::apply::ApplyFailure {
+        super::apply::ApplyFailure {
             cause,
             retained,
             rollback_errors,
-        })
+        }
     }
 
     /// Walks pending create actions newest-first, reconciling only what it can still prove.

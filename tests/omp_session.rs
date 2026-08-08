@@ -116,12 +116,12 @@ impl Fixture {
         fs::write(&path, body).expect("global OMP settings");
     }
 
-    /// Builds a verbose dry run whose launch CWD may sit below the project root.
+    /// Builds a session whose launch CWD may sit below the project root.
     ///
     /// [`Self::wrapper_command`] passes one path as both roots, which the CLI accepts only while
     /// the launch CWD is itself the inferred project root. An ancestor-walk fixture needs the two
     /// to differ, so it names the repository anchor as the project root explicitly.
-    fn discovery_command(&self, launch_cwd: &Path) -> Command {
+    fn project_session_command(&self, launch_cwd: &Path) -> Command {
         let mut command = Command::new(ASM);
         command
             .arg("omp")
@@ -132,10 +132,15 @@ impl Fixture {
             .arg("--cwd")
             .arg(launch_cwd)
             .arg("--agent-bin")
-            .arg(FAKE_OMP)
-            .arg("--dry-run")
-            .arg("--verbose");
+            .arg(FAKE_OMP);
         self.configure_environment(&mut command);
+        command
+    }
+
+    /// Builds a verbose dry run whose launch CWD may sit below the project root.
+    fn discovery_command(&self, launch_cwd: &Path) -> Command {
+        let mut command = self.project_session_command(launch_cwd);
+        command.arg("--dry-run").arg("--verbose");
         command
     }
 
@@ -480,6 +485,73 @@ fn unrelated_content_under_the_omp_scope_survives_without_failing_the_session() 
     );
     assert!(!stderr.contains("session cleanup failed"), "{stderr}");
     assert!(!stderr.contains("recovery:"), "{stderr}");
+}
+
+/// A nested launch directory owns the OMP scope the child actually reads, not the repository root.
+///
+/// This mutating path combines the nested-CWD contract with post-launch foreign content and a
+/// failing child. Cleanup must remove the created link, preserve the content, retire the journal,
+/// and return the child status without redirecting the mount to an ancestor scope.
+#[test]
+fn a_nested_omp_scope_preserves_unrelated_content_and_child_status() {
+    let fixture = Fixture::new("nested-scope-residue");
+    let source = fixture.skill(&fixture.left, "alpha", "fixture");
+    let launch_cwd = fixture.project.join("nested/deeper");
+    fs::create_dir_all(&launch_cwd).expect("nested launch CWD");
+    let scope = launch_cwd.join(".omp");
+    let destination = scope.join("skills");
+    let mounted = destination.join("alpha");
+    let residue = scope.join("session-state.json");
+    let expected_paths = std::env::join_paths([&mounted]).expect("fixture path list");
+
+    let output = fixture
+        .project_session_command(&launch_cwd)
+        .arg("--")
+        .arg("prompt")
+        .env("SKILLMOUNT_FAKE_EXPECT_PATHS", expected_paths)
+        .env("SKILLMOUNT_FAKE_CREATE_FILE", &residue)
+        .env("SKILLMOUNT_FAKE_EXIT", "3")
+        .output()
+        .expect("asm should launch fake OMP from the nested directory");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    let record = fs::read_to_string(&fixture.record).expect("fake OMP launch record");
+    assert_eq!(
+        fs::canonicalize(PathBuf::from(recorded_os(&record, "cwd"))).expect("canonical child CWD"),
+        fs::canonicalize(&launch_cwd).expect("canonical nested launch CWD"),
+        "the child must run in the nested launch CWD"
+    );
+    assert_eq!(
+        recorded_os_values(&record, "visible"),
+        [mounted.clone().into_os_string()],
+        "the child must read the Skill from the nested OMP scope"
+    );
+    assert_eq!(
+        recorded_os_values(&record, "visible-target"),
+        [fs::canonicalize(&source)
+            .expect("canonical source Skill")
+            .into_os_string()]
+    );
+    assert_eq!(
+        fs::read_to_string(&residue).expect("nested OMP content must survive cleanup"),
+        "created by fake agent\n"
+    );
+    assert!(!exists(&mounted), "the created Skill link must be removed");
+    assert!(
+        !exists(&destination),
+        "the empty nested helper directory should be pruned"
+    );
+    assert!(
+        !exists(&fixture.omp_scope()),
+        "the repository-root OMP scope must never be used"
+    );
+    assert_eq!(
+        fixture.journals(),
+        Vec::<PathBuf>::new(),
+        "foreign scaffolding alone must not retain recovery evidence"
+    );
+    assert!(!stderr.contains("session cleanup failed"), "{stderr}");
 }
 
 /// The same contract on native Windows, for both eligible mount-link implementations.

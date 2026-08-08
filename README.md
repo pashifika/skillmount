@@ -296,7 +296,7 @@ no Agent process still uses them, or sweep every recorded transaction with
 
 When one or more Skill links genuinely cannot be released, the session first reports every
 condition once on stderr, then emits one recovery footer. A direct Windows invocation whose
-ancestry identifies PowerShell receives a single-quoted command:
+ancestry identifies PowerShell receives a command whose path is a single-quoted literal:
 
 ```text
 error: session cleanup failed
@@ -309,7 +309,8 @@ Recovery — run only after confirming that every related Agent process has exit
     asm cleanup --project-root 'C:\projects\O''Brien webapp'
 ```
 
-PowerShell uses `'...'`; an apostrophe inside the value becomes `''`. A direct Command Prompt
+PowerShell emits only the narrow ASCII safe-word set `[A-Za-z0-9_.-]+` unquoted and uses `'...'`
+for every other accepted value; an apostrophe inside the value becomes `''`. A direct Command Prompt
 invocation uses its independently verified double-quoted form instead:
 
 ```text

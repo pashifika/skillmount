@@ -103,18 +103,18 @@ impl Transaction {
     /// than the success value and would otherwise widen every frame on the happy path.
     pub fn apply(&mut self) -> Result<(), Box<ApplyFailure>> {
         if let Err(error) = self.advance(TransactionStatus::Applying) {
-            return Err(Self::fail_without_rollback(error));
+            return Err(Box::new(Self::fail_without_rollback(error)));
         }
         reached(Checkpoint::JournalApplying, 1);
 
         for index in 0..self.journal.actions.len() {
             if let Err(error) = self.apply_one(index) {
-                return Err(self.roll_back(error));
+                return Err(Box::new(self.roll_back(error)));
             }
         }
 
         if let Err(error) = self.advance(TransactionStatus::Active) {
-            return Err(self.roll_back(error));
+            return Err(Box::new(self.roll_back(error)));
         }
         reached(Checkpoint::JournalActive, 1);
         Ok(())
@@ -333,12 +333,12 @@ impl Transaction {
     }
 
     /// Records a failure that happened before anything could have been created.
-    fn fail_without_rollback(cause: AppError) -> Box<ApplyFailure> {
-        Box::new(ApplyFailure {
+    fn fail_without_rollback(cause: AppError) -> ApplyFailure {
+        ApplyFailure {
             cause,
             retained: Vec::new(),
             rollback_errors: Vec::new(),
-        })
+        }
     }
 }
 
