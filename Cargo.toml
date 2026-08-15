@@ -47,7 +47,7 @@ all = "deny"
 pedantic = "deny"
 
 [dependencies]
-clap = { version = "=4.6.5", features = ["derive"] }
+clap = { version = "=4.6.6", features = ["derive"] }
 # Completion generation uses only the stable ahead-of-time API. Keep default and unstable dynamic
 # features disabled so this read-only command does not acquire callback or executable-probing code.
 clap_complete = { version = "=4.6.8", default-features = false }
