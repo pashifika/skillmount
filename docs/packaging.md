@@ -426,3 +426,22 @@ remain under `RUNNER_TEMP`; identity mismatches or restoration failures stop wit
 retained there. Like any process cleanup, this cannot run after SIGKILL or host loss, so the helper
 refuses execution outside disposable macOS Actions runners. It is not a local Homebrew maintenance
 command. Regression tests exercise successful and failed installation scopes and refused local use.
+
+## Upgrade-rehearsal cleanup
+
+The acceptance harness disables automatic Homebrew cleanup, so a successful upgrade can retain
+both the old and new kegs. Ordinary uninstall scenarios still use `brew uninstall --formula`.
+Final cleanup and the upgrade-stage finalizer use `brew uninstall --formula --force` only for
+recorded installations of the isolated acceptance Formula pair, after the preflight has refused
+any pre-existing product installation. Homebrew's formula-specific `--force` removes all installed
+versions before uninstall drops formula trust and the harness untaps, as confirmed in the observed
+[Homebrew 7.0.11 uninstall implementation](https://github.com/Homebrew/brew/blob/7.0.11/Library/Homebrew/cmd/uninstall.rb).
+The harness verifies that the recorded cellar is absent or empty before dropping installation
+tracking; unknown or remaining entries retain tracking and fail the report. It does not run broad
+`brew cleanup`, ignore dependencies, or remove unrelated Formulae. Nonzero cleanup remains a
+failed report, even when every lifecycle phase passed.
+
+This fixes the v0.3.0 promotion rehearsal in
+[CI run 41051878406](https://github.com/pashifika/skillmount/actions/runs/41051878406): all lifecycle
+phases, including the v0.2.0 upgrade, passed, but cleanup left the old v0.2.0 keg and subsequent
+untap failed because uninstall had dropped formula trust. That historical run remains failed.

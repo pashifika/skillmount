@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1922,17 +1923,54 @@ class Harness:
         self.formula_paths = placed
         return placed
 
-    def uninstall(self, package_id: str, *, phase: Phase | None = None) -> CommandEvidence:
-        """Uninstall exactly one Formula this harness installed."""
+    def uninstall(
+        self, package_id: str, *, phase: Phase | None = None, all_versions: bool = False
+    ) -> CommandEvidence:
+        """Uninstall one owned Formula; cleanup also removes retained upgrade kegs."""
 
+        if all_versions and (package_id not in self.installed or package_id not in FORMULA_IDS):
+            raise HomebrewAcceptanceError(
+                f"refusing all-version cleanup of unowned Formula {package_id!r}"
+            )
+        arguments = ["uninstall", "--formula"]
+        if all_versions:
+            # Homebrew preserves the old keg during our no-auto-cleanup upgrade rehearsal.
+            # The clean-state preflight excludes pre-existing packages, and only recorded
+            # installs in the disposable acceptance tap are eligible for this cleanup.
+            arguments.append("--force")
         evidence = self.gateway.brew(
-            "uninstall", "--formula", self.formula_reference(package_id), timeout=DEFAULT_TIMEOUT
+            *arguments, self.formula_reference(package_id), timeout=DEFAULT_TIMEOUT
         )
         if phase is not None:
             phase.record(evidence)
         else:
             self.cleanup_commands.append(evidence)
+        if all_versions and evidence.returncode != 0:
+            self.cleanup_findings.append(
+                f"cleanup could not uninstall {package_id}: "
+                f"{bounded_text(evidence.stderr or evidence.stdout).strip()}"
+            )
         if evidence.returncode == 0:
+            if all_versions:
+                cellar = self.installed[package_id]
+                try:
+                    try:
+                        observed = cellar.lstat()
+                    except FileNotFoundError:
+                        remains = False
+                    else:
+                        remains = not stat.S_ISDIR(observed.st_mode) or any(cellar.iterdir())
+                except OSError as error:
+                    self.cleanup_findings.append(
+                        f"cleanup could not verify the owned cellar {cellar}: {error}"
+                    )
+                    return evidence
+                if remains:
+                    self.cleanup_findings.append(
+                        f"cleanup of {package_id} reported success but owned cellar {cellar} "
+                        "still contains entries; retaining installation tracking"
+                    )
+                    return evidence
             self.installed.pop(package_id, None)
         return evidence
 
@@ -2113,12 +2151,7 @@ class Harness:
         """Undo every install, the disposable tap, and every trust entry it added."""
 
         for package_id in list(self.installed):
-            evidence = self.uninstall(package_id)
-            if evidence.returncode != 0:
-                self.cleanup_findings.append(
-                    f"cleanup could not uninstall {package_id}: "
-                    f"{bounded_text(evidence.stderr or evidence.stdout).strip()}"
-                )
+            self.uninstall(package_id, all_versions=True)
         if self.tapped:
             evidence = self.gateway.brew("untap", ACCEPTANCE_TAP)
             self.cleanup_commands.append(evidence)
@@ -2699,7 +2732,7 @@ class Harness:
         finally:
             candidate_formula.write_text(candidate_text, encoding="utf-8")
             for installed in list(self.installed):
-                self.uninstall(installed)
+                self.uninstall(installed, all_versions=True)
 
     def settle_upgrade(self, phase: Phase, decision: UpgradeDecision) -> None:
         """Record an upgrade rehearsal that could not run."""

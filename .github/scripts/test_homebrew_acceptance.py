@@ -13,6 +13,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
@@ -1735,6 +1736,96 @@ class BrewInvocationTests(FixtureCase):
         )
         self.assertEqual(subject.installed, {})
         self.assertEqual(len(subject.cleanup_commands), 1)
+
+    def test_upgrade_cleanup_removes_both_owned_versions_before_untap(self) -> None:
+        """An old keg plus dropped trust must not make final untap fail."""
+
+        cellar = self.root / "Cellar" / "skillmount"
+        for version in ("0.2.0", "0.3.0"):
+            (cellar / version).mkdir(parents=True)
+        unrelated = self.root / "Cellar" / "unrelated" / "1.0"
+        unrelated.mkdir(parents=True)
+        (unrelated / "sentinel").write_text("unchanged")
+
+        class UpgradeGateway(ScriptedGateway):
+            trusted = True
+
+            def brew(inner, *arguments, timeout=harness.DEFAULT_TIMEOUT):
+                del timeout
+                argv = ("brew", *arguments)
+                inner.calls.append(argv)
+                if arguments[0] == "uninstall":
+                    self.assertEqual(arguments[-1], acceptance_reference("skillmount"))
+                    versions = list(cellar.iterdir()) if "--force" in arguments else [cellar / "0.3.0"]
+                    for keg in versions:
+                        keg.rmdir()
+                    inner.trusted = False
+                    return harness.CommandEvidence(argv, 0, "", "")
+                if arguments[0] == "untap":
+                    if any(cellar.iterdir()) and not inner.trusted:
+                        return harness.CommandEvidence(argv, 1, "", "untrusted old keg")
+                    return harness.CommandEvidence(argv, 0, "", "")
+                if arguments == ("tap",):
+                    return harness.CommandEvidence(argv, 0, "", "")
+                raise AssertionError(f"unexpected command: {argv}")
+
+        gateway = UpgradeGateway({})
+        subject = harness.Harness(gateway, options_for(self.root))
+        subject.installed["skillmount"] = cellar
+        subject.tapped = True
+        subject.cleanup()
+        self.assertEqual(gateway.calls[0], (
+            "brew", "uninstall", "--formula", "--force", acceptance_reference("skillmount")
+        ))
+        self.assertEqual(list(cellar.iterdir()), [])
+        self.assertEqual((unrelated / "sentinel").read_text(), "unchanged")
+        self.assertEqual(subject.installed, {})
+        self.assertEqual(subject.cleanup_findings, [])
+
+    def test_successful_cleanup_with_remaining_keg_keeps_tracking_and_fails(self) -> None:
+        """A zero exit cannot hide a leftover old keg or lose cleanup ownership."""
+
+        gateway, subject = self.harness_for({("brew", "uninstall"): (0, "", "")})
+        cellar = self.root / "Cellar" / "skillmount"
+        (cellar / "0.2.0").mkdir(parents=True)
+        subject.installed["skillmount"] = cellar
+        subject.uninstall("skillmount", all_versions=True)
+        self.assertIn("skillmount", subject.installed)
+        self.assertIn("still contains entries", " ".join(subject.cleanup_findings))
+        self.assertEqual(harness.aggregate_status([], subject.cleanup_findings), "failed")
+
+    def test_cleanup_stat_error_keeps_tracking_and_failure_evidence(self) -> None:
+        """An inaccessible cellar is unknown, never evidence of absence."""
+
+        gateway, subject = self.harness_for({("brew", "uninstall"): (0, "", "")})
+        subject.installed["skillmount"] = self.root / "Cellar" / "skillmount"
+        with mock.patch.object(Path, "lstat", side_effect=PermissionError("denied")):
+            subject.uninstall("skillmount", all_versions=True)
+        self.assertIn("skillmount", subject.installed)
+        self.assertIn("could not verify", " ".join(subject.cleanup_findings))
+        self.assertEqual(harness.aggregate_status([], subject.cleanup_findings), "failed")
+
+    def test_upgrade_finalizer_failure_is_not_erased_by_later_cleanup(self) -> None:
+        """The shared all-version path records a failure before any retry."""
+
+        gateway, subject = self.harness_for({("brew", "uninstall"): (1, "", "locked")})
+        subject.installed["skillmount"] = self.root / "Cellar" / "skillmount"
+        subject.uninstall("skillmount", all_versions=True)
+        gateway.responses[("brew", "uninstall")] = (0, "", "")
+        subject.uninstall("skillmount", all_versions=True)
+        self.assertEqual(subject.installed, {})
+        self.assertIn("locked", " ".join(subject.cleanup_findings))
+        self.assertEqual(harness.aggregate_status([], subject.cleanup_findings), "failed")
+
+    def test_all_version_cleanup_refuses_unrecorded_or_unrelated_formula(self) -> None:
+        """The stronger cleanup is unavailable outside the harness-owned pair."""
+
+        subject = harness.Harness(ForbiddenGateway(), options_for(self.root))
+        for package_id in ("skillmount", "unrelated"):
+            if package_id == "unrelated":
+                subject.installed[package_id] = self.root / "Cellar" / package_id
+            with self.assertRaisesRegex(harness.HomebrewAcceptanceError, "unowned Formula"):
+                subject.uninstall(package_id, all_versions=True)
 
     def test_failed_uninstall_keeps_the_package_and_reports_it(self) -> None:
         """Keep a Formula recorded when its uninstall failed, and report cleanup."""
