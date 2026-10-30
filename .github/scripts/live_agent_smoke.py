@@ -24,6 +24,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -365,20 +367,69 @@ class WindowsJob:
                 f"TerminateJobObject failed: {ctypes.WinError(ctypes.get_last_error())}"
             )
 
+    def active_processes(self) -> int:
+        """Query this owned Job, never infer descendant death from the direct child exit."""
+        if self.handle is None:
+            raise RuntimeError("cannot inspect a closed process Job Object")
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicAccountingInformation(ctypes.Structure):
+            _fields_ = (
+                ("total_user_time", ctypes.c_longlong),
+                ("total_kernel_time", ctypes.c_longlong),
+                ("period_user_time", ctypes.c_longlong),
+                ("period_kernel_time", ctypes.c_longlong),
+                ("total_page_fault_count", wintypes.DWORD),
+                ("total_processes", wintypes.DWORD),
+                ("active_processes", wintypes.DWORD),
+                ("total_terminated_processes", wintypes.DWORD),
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.QueryInformationJobObject.argtypes = (
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+        )
+        kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+        information = BasicAccountingInformation()
+        if not kernel32.QueryInformationJobObject(
+            self.handle, 1, ctypes.byref(information), ctypes.sizeof(information), None
+        ):
+            raise RuntimeError(
+                f"QueryInformationJobObject failed: {ctypes.WinError(ctypes.get_last_error())}"
+            )
+        return information.active_processes
+
+    def terminate_and_wait(self, timeout: float = 5.0) -> None:
+        """Bound teardown before callers remove a process's temporary working directory."""
+        self.terminate()
+        deadline = time.monotonic() + timeout
+        while self.active_processes() != 0:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("process Job Object did not become empty after termination")
+            time.sleep(0.01)
+
     def close(self) -> None:
         if self.handle is None:
             return
         import ctypes
         from ctypes import wintypes
 
-        handle, self.handle = self.handle, None
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        if not kernel32.CloseHandle(handle):
-            raise RuntimeError(
-                f"CloseHandle for process Job Object failed: {ctypes.WinError(ctypes.get_last_error())}"
-            )
+        # Kill-on-close requests termination but is asynchronous: communicate() only waits for
+        # the direct bootstrap. Detached-output descendants can still hold the probe CWD open.
+        # Prove the owned Job empty while the handle remains queryable, then release it.
+        # This does not promise that unrelated filesystem handles have also been released.
+        try:
+            self.terminate_and_wait()
+        finally:
+            handle, self.handle = self.handle, None
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            if not kernel32.CloseHandle(handle):
+                raise RuntimeError(
+                    f"CloseHandle for process Job Object failed: {ctypes.WinError(ctypes.get_last_error())}"
+                )
 
 
 def terminate_process_tree(
@@ -530,8 +581,39 @@ def isolated_probe_environment(environment: dict[str, str], root: Path) -> dict[
     return clean
 
 
+def cleanup_temporary_directory(temporary: tempfile.TemporaryDirectory[str], timeout: float = 5.0) -> None:
+    """Retry only Windows sharing violations while removing a directory we created."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            temporary.cleanup()
+            return
+        except OSError as error:
+            # Job membership has already been checked separately by run_command. A filesystem
+            # handle outside that Job can briefly prevent deletion even after its count is zero.
+            # Never turn access errors, persistent locks, or process teardown failures into success.
+            if getattr(error, "winerror", None) != 32 or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+@contextmanager
+def owned_temporary_directory(*, prefix: str) -> Iterator[str]:
+    temporary = tempfile.TemporaryDirectory(prefix=prefix)
+    try:
+        yield temporary.name
+    except BaseException as error:
+        try:
+            cleanup_temporary_directory(temporary)
+        except OSError as cleanup_error:
+            raise error from cleanup_error
+        raise
+    else:
+        cleanup_temporary_directory(temporary)
+
+
 def capture_cli_probe(binary: Path, flag: str, environment: dict[str, str]) -> CommandResult:
-    with tempfile.TemporaryDirectory(prefix="skillmount-agent-probe-") as temporary:
+    with owned_temporary_directory(prefix="skillmount-agent-probe-") as temporary:
         root = Path(temporary)
         completed = run_command(
             [str(binary), flag], environment=isolated_probe_environment(environment, root),
@@ -979,7 +1061,7 @@ def main() -> int:
             elif not case.opt_in and not args.probes_only:
                 raise RuntimeError(f"required credential {case.credential_name} is unavailable")
 
-        with tempfile.TemporaryDirectory(prefix="skillmount live smoke-") as temporary:
+        with owned_temporary_directory(prefix="skillmount live smoke-") as temporary:
             root = Path(temporary)
             project = root / "project"
             project.mkdir()

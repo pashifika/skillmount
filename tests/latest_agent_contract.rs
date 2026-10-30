@@ -1,9 +1,13 @@
 //! Latest-agent boundary regressions use isolated roots and never run a real agent.
 
 use std::fs;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture(PathBuf);
 
@@ -13,8 +17,24 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("skillmount-latest-{}-{nonce}", std::process::id()));
+        Self::with_nonce(nonce)
+    }
+
+    fn with_nonce(nonce: u128) -> Self {
+        // Clock resolution does not guarantee distinct timestamps across parallel tests.
+        // Claim the root exclusively so stale roots are never adopted or removed by us.
+        let root = loop {
+            let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let candidate = std::env::temp_dir().join(format!(
+                "skillmount-latest-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("create fixture {}: {error}", candidate.display()),
+            }
+        };
         for relative in ["project/.git", "sources/alpha", "home", "codex-home"] {
             fs::create_dir_all(root.join(relative)).unwrap();
         }
@@ -61,8 +81,57 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            if std::thread::panicking() {
+                eprintln!(
+                    "cleanup fixture {} after test failure: {error}",
+                    self.0.display()
+                );
+            } else {
+                panic!("cleanup fixture {}: {error}", self.0.display());
+            }
+        }
     }
+}
+
+#[test]
+fn concurrent_fixtures_with_identical_timestamps_remain_isolated() {
+    let fixtures = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| Fixture::with_nonce(0)))
+            .collect();
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let roots: std::collections::BTreeSet<_> = fixtures.iter().map(|fixture| &fixture.0).collect();
+    assert_eq!(roots.len(), fixtures.len());
+    for fixture in &fixtures {
+        assert!(fixture.0.join("sources/alpha/SKILL.md").is_file());
+    }
+    let mut fixtures = fixtures;
+    let removed = fixtures.pop().unwrap();
+    let removed_root = removed.0.clone();
+    drop(removed);
+    assert!(!removed_root.exists());
+    for fixture in &fixtures {
+        assert!(fixture.0.join("sources/alpha/SKILL.md").is_file());
+    }
+}
+
+#[test]
+fn fixture_cleanup_preserves_the_original_panic() {
+    let error = std::panic::catch_unwind(|| {
+        let fixture = Fixture::new();
+        fs::remove_dir_all(&fixture.0).unwrap();
+        panic!("original fixture failure");
+    })
+    .expect_err("the original failure must remain visible");
+    assert_eq!(
+        error.downcast_ref::<&str>(),
+        Some(&"original fixture failure")
+    );
 }
 
 #[test]
