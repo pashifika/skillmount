@@ -8,7 +8,6 @@ use std::process::ExitCode;
 use clap::error::ErrorKind;
 
 use crate::agent::{AgentAdapter, DiscoverySnapshot, adapter};
-use crate::catalog::{CatalogRequest, resolve_catalog};
 use crate::cli::{CompletionInput, InspectAgent, ParsedCommand, ProductBinary, parse_command_from};
 use crate::domain::{AgentId, LinkMode, MountMode, RunContext, SkillCatalog};
 use crate::error::{AppError, CatalogError, ExitCategory, LinkError, PlanError};
@@ -472,6 +471,7 @@ fn verify_spawn_boundary(
         &outcome.snapshot,
         &outcome.plan,
     );
+    let compatibility = compatibility.and_then(|()| transaction.verify_config_files());
     if let Err(error) = compatibility {
         match transaction.cleanup_required() {
             Ok(report) => warn(&report.describe()),
@@ -865,16 +865,7 @@ fn build_read_only(
         adapter.validate_launch_invariants(context)?;
     }
 
-    let destination_stores = adapter.destination_stores(context);
-    let catalog = resolve_catalog(
-        &context.skill_sources,
-        &CatalogRequest {
-            agent: context.agent_id(),
-            policy: adapter.catalog_policy(),
-            validation: context.options.validation,
-            destination_stores: &destination_stores,
-        },
-    )?;
+    let catalog = adapter.resolve_catalog(context)?;
     let mut snapshot = adapter.inspect_discovery(context)?;
     let plan = adapter.build_mount_plan(context, &catalog, &snapshot)?;
     snapshot

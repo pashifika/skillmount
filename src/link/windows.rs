@@ -26,9 +26,9 @@ use crate::domain::LinkMode;
 use crate::error::LinkError;
 use crate::link::resolve::targets_match;
 use crate::link::{
-    CreatedLink, CreatedLinkKind, EntryKind, LinkBackend, LinkRequest, LinkTarget, OwnedDirectory,
-    Ownership, PathEntry, PlacementMismatch, PlacementOutcome, PlacementResidue, PlatformIdentity,
-    RemoveOutcome, directory_placement_mismatch, link_placement_mismatch, sealed,
+    CreatedLink, CreatedLinkKind, EntryKind, LinkBackend, LinkRequest, LinkTarget, OwnedConfigFile,
+    OwnedDirectory, Ownership, PathEntry, PlacementMismatch, PlacementOutcome, PlacementResidue,
+    PlatformIdentity, RemoveOutcome, directory_placement_mismatch, link_placement_mismatch, sealed,
     verify_directory_ownership, verify_ownership,
 };
 
@@ -335,6 +335,116 @@ impl LinkBackend for WindowsBackend {
             }));
         }
         Ok(PlacementOutcome::Placed(placed))
+    }
+
+    fn verify_config_file(&self, file: &OwnedConfigFile) -> Result<bool, LinkError> {
+        let Some(opened) = Self::open_entry(&file.path, Access::ReadRemove)? else {
+            return Ok(false);
+        };
+        Ok(Self::config_ownership(&opened, file)? == Ownership::Owned)
+    }
+
+    fn create_config_file(
+        &self,
+        path: &Path,
+        contents: &str,
+    ) -> Result<OwnedConfigFile, LinkError> {
+        use std::io::Write;
+        if contents.len() > super::MAX_CONFIG_BYTES {
+            return Err(inspect_error(
+                path,
+                &io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "configuration exceeds size bound",
+                ),
+            ));
+        }
+        let mut file =
+            windows_ffi::create_config_file(path).map_err(|error| inspect_error(path, &error))?;
+        file.write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|error| inspect_error(path, &error))?;
+        let handle: OwnedHandle = file
+            .try_clone()
+            .map_err(|error| inspect_error(path, &error))?
+            .into();
+        let entry = Self::observe_handle(path, &handle)?;
+        let recorded = OwnedConfigFile {
+            path: path.to_path_buf(),
+            identity: entry.identity,
+            contents: contents.to_owned(),
+        };
+        if super::verify_config_ownership(&self.inspect_no_follow(path)?, &recorded)
+            != Ownership::Owned
+        {
+            return Err(inspect_error(
+                path,
+                &io::Error::other("created configuration changed; retained for recovery"),
+            ));
+        }
+        Ok(recorded)
+    }
+
+    fn place_config_file_no_replace(
+        &self,
+        file: &OwnedConfigFile,
+        destination: &Path,
+    ) -> Result<PlacementOutcome<OwnedConfigFile>, LinkError> {
+        let Some(opened) = Self::open_entry(&file.path, Access::ReadRemove)? else {
+            return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                path: file.path.clone(),
+                mismatch: super::PlacementMismatch::Missing,
+            }));
+        };
+        if let Some(mismatch) = super::placement_mismatch(Self::config_ownership(&opened, file)?) {
+            return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                path: file.path.clone(),
+                mismatch,
+            }));
+        }
+        if !rename_opened_no_replace(&opened.handle, &file.path, destination)? {
+            return Ok(PlacementOutcome::DestinationExists);
+        }
+        let placed = file.relocated_to(destination);
+        let live = match self.inspect_no_follow(destination) {
+            Ok(live) => live,
+            Err(error) => {
+                return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                    path: destination.to_path_buf(),
+                    mismatch: PlacementMismatch::InspectionFailed(error.to_string()),
+                }));
+            }
+        };
+        if let Some(mismatch) =
+            super::placement_mismatch(super::verify_config_ownership(&live, &placed))
+        {
+            return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                path: destination.to_path_buf(),
+                mismatch,
+            }));
+        }
+        Ok(PlacementOutcome::Placed(placed))
+    }
+
+    fn remove_config_file(&self, file: &OwnedConfigFile) -> Result<RemoveOutcome, LinkError> {
+        let Some(opened) = Self::open_entry(&file.path, Access::ReadRemove)? else {
+            return Ok(RemoveOutcome::AlreadyAbsent);
+        };
+        match Self::config_ownership(&opened, file)? {
+            Ownership::Absent => Ok(RemoveOutcome::AlreadyAbsent),
+            Ownership::Mismatch(mismatch) => Ok(RemoveOutcome::OwnershipMismatch(mismatch)),
+            Ownership::Owned => {
+                windows_ffi::delete_by_handle(&opened.handle).map_err(|error| {
+                    LinkError::Remove {
+                        path: file.path.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                let identity = opened.entry.identity.clone();
+                drop(opened);
+                self.confirm_removal(&file.path, identity.as_ref())
+            }
+        }
     }
 
     fn remove_empty_directory(
@@ -844,4 +954,31 @@ fn retained_directory_create_error(path: &Path, reason: &str) -> LinkError {
             path.display()
         ),
     )
+}
+
+impl WindowsBackend {
+    /// Compares exact contents through the same no-follow handle retained for mutation.
+    fn config_ownership(
+        opened: &OpenedEntry,
+        recorded: &OwnedConfigFile,
+    ) -> Result<Ownership, LinkError> {
+        let ownership = super::verify_config_ownership(&opened.entry, recorded);
+        if ownership != Ownership::Owned {
+            return Ok(ownership);
+        }
+        let mut file = fs::File::from(
+            opened
+                .handle
+                .try_clone()
+                .map_err(|error| inspect_error(&recorded.path, &error))?,
+        );
+        if !super::config_file_matches(&mut file, &recorded.contents)
+            .map_err(|error| inspect_error(&recorded.path, &error))?
+        {
+            return Ok(Ownership::Mismatch(
+                super::OwnershipMismatch::ContentsChanged,
+            ));
+        }
+        Ok(Ownership::Owned)
+    }
 }

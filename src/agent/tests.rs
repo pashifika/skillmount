@@ -594,7 +594,8 @@ fn a_link_to_the_selected_source_is_reused_and_never_owned() {
     assert!(
         plan.created_actions()
             .all(|action| match &action.operation {
-                MountAction::CreateDirectory { path } => path != &store.join("alpha"),
+                MountAction::CreateDirectory { path }
+                | MountAction::CreateConfigFile { path, .. } => path != &store.join("alpha"),
                 MountAction::CreateDirectoryLink { destination, .. } =>
                     destination != &store.join("alpha"),
                 MountAction::ReuseExistingLink { .. } => false,
@@ -1340,41 +1341,20 @@ fn every_codex_discovery_root_and_backing_store_is_locked() {
 }
 
 #[test]
-fn omp_emits_shared_and_legacy_keys_for_observation_and_mutation() {
-    let project = Project::new("omp-dual-lock-identities");
-    let context = project.context(AgentId::Omp, MountMode::Project, ConflictPolicy::Error);
+fn omp_observes_settings_and_mutates_only_its_private_session_directory() {
+    let project = Project::new("omp-config-locks");
+    let context = project.context(AgentId::Omp, MountMode::Staging, ConflictPolicy::Error);
     let snapshot = OmpAdapter
         .inspect_discovery(&context)
-        .expect("OMP discovery snapshot");
-
-    let destination = project.root.join(".omp/skills");
-    let legacy_writer = crate::lock::LockResource::describe_entry(
-        crate::lock::LockResourceKind::DiscoveryEntry,
-        crate::lock::LockAccess::Mutate,
-        &project.root,
-        &classify(&destination).expect("missing OMP destination"),
-    )
-    .expect("origin/dev/0.3.x OMP writer identity");
-    assert_dual_discovery_keys(
-        &snapshot,
-        &destination,
-        crate::lock::LockAccess::Mutate,
-        &legacy_writer,
-    );
-
-    let observed = project.root.join("home/.omp/agent/skills");
-    let legacy_observer = crate::lock::LockResource::describe_entry(
-        crate::lock::LockResourceKind::DiscoveryEntry,
-        crate::lock::LockAccess::Observe,
-        &project.root,
-        &classify(&observed).expect("missing OMP user scope"),
-    )
-    .expect("origin/dev/0.3.x OMP observer identity");
-    assert_dual_discovery_keys(
-        &snapshot,
-        &observed,
-        crate::lock::LockAccess::Observe,
-        &legacy_observer,
+        .expect("OMP settings snapshot");
+    assert!(snapshot.visible_skills.is_empty());
+    assert!(snapshot.scopes.is_empty());
+    assert_ne!(snapshot.backing_store, project.root.join(".omp/skills"));
+    assert!(
+        snapshot
+            .lock_resources
+            .iter()
+            .any(|resource| resource.access == crate::lock::LockAccess::Observe)
     );
 }
 

@@ -134,3 +134,42 @@ scenario, date, result, revision, and a retained log or CI run. `pass` and `fail
 completed scenario. `observed` records a narrower fact such as a version probe and never promotes
 another Agent/platform/link scenario. `unverified` means the scenario did not run or its evidence
 is incomplete.
+
+## 2026-10-30 current-release smoke preparation
+
+The native smoke is pinned to Codex CLI 0.166.0, Claude Code 2.1.314, and opt-in OMP 18.14.0, the latest stable upstream releases observed on this date:
+
+- https://github.com/openai/codex/releases/tag/rust-v0.166.0
+- https://github.com/anthropics/claude-code/releases/tag/v2.1.314
+- https://github.com/can1357/oh-my-pi/releases/tag/v18.14.0
+
+Exact npm platform package metadata and all four downloaded archives were checked against the committed SHA-512 SRI values. The allowlisted headless runtime members were then extracted successfully on the preparation host: Codex macOS 4 members, Codex Windows 6 members, and Claude one binary per platform. Codex 0.166.0 no longer includes the former macOS bundled-zsh member; its optional voice assets are outside this headless smoke. This is package integrity/layout evidence, not execution on macOS or Windows.
+
+Sources:
+- https://registry.npmjs.org/@openai%2Fcodex/0.166.0-darwin-arm64
+- https://registry.npmjs.org/@openai%2Fcodex/0.166.0-win32-x64
+- https://registry.npmjs.org/@anthropic-ai%2Fclaude-code-darwin-arm64/2.1.314
+- https://registry.npmjs.org/@anthropic-ai%2Fclaude-code-win32-x64/2.1.314
+
+OMP's macOS arm64 and Windows x64 SHA-256 values were checked in both the official release API asset metadata and the published SHA256SUMS.txt. Downloads now fail closed against those committed values before execution; the harness also checks the selected OMP binary against the matching target digest and rechecks its hash before any credential-bearing launch. Unlike 17.2.9, this release has a published checksum file. It still has no Windows x86 agent binary, so the x86 OMP case remains unavailable.
+
+https://github.com/can1357/oh-my-pi/releases/download/v18.14.0/SHA256SUMS.txt
+
+The new explicit probes-only workflow option runs credential-free version/help and SkillMount doctor probes under isolated homes/configuration roots. Success is recorded as `observed`, with every Skill-discovery result explicitly `unverified`; it does not certify an authenticated session, skill loading, cleanup or link behavior. The workflow does not supply provider credentials in this mode. Normal authenticated mode remains separate and missing/rejected authentication remains unverified.
+
+The OMP authenticated scenario follows native first-custom-root bare-name semantics instead of imposing SkillMount's Codex/Claude rightmost overlay oracle. It passes source roots in their original order, expects the base plus first-root bare-name result, does not pass a link mode to the OMP adapter, and records `skills.customDirectories`/no link. Additional OMP aliases are not treated as a failure merely because they exist. Codex/Claude retain their existing rightmost overlay scenario.
+
+Native execution and authenticated discovery for these new pins are still unverified until actual runs are recorded. Do not promote compatibility matrix rows from these preparation checks or deterministic harness tests alone.
+
+Pull requests into main or dev/** now run the same native jobs in forced credential-free mode, including OMP on macOS arm64/Windows x64. Provider-secret expressions require a manual workflow_dispatch and probes_only=false; authenticated discovery remains manual-only. Summary schema is now 2 because the former global link-kind and winner-3 fields became agent-specific mechanism/expected-response evidence. The supply-chain manifest remains schema 1.
+
+Credential-free PR runs also execute a separate `omp skill list --json` native-loader probe using a temporary PI_CONFIG_FILES overlay (the subcommand does not forward root --config). It checks first-root bare-name identity, retained duplicate source aliases, a non-shadowed base, and tilde/relative directories containing spaces. It creates no project .omp/skills destination. A pass records raw OMP discovery only; authenticated SkillMount wrapper-session integration remains explicitly unverified. The same harness probe genuinely passed on Linux x86_64 using official OMP 18.14.0, SHA-256 e7dd2b606c4ebe9d1a7bcfad1b8820db968cd6b05409fed1c6bc8db0b6a95a8f, on 2026-10-30. Its private fixture was removed after the run. Native macOS/Windows results still require their actual CI runs.
+
+### Current adapter contract review
+
+Codex rust-v0.166.0 source and current Claude CLI/Skills docs were reviewed on 2026-10-30.
+Regressions cover exec fork/worktree rejection, selected Codex product metadata restrictions,
+Claude operator/restricted controls, reserved names and linked-worktree fallback. Previous exact
+banner baselines for Codex/Claude remain historical evidence; source review is not authenticated
+latest-runtime certification. OMP's older link-based rows above are historical and do not certify
+the v0.3.0 native-directory mechanism (ADR 0040).

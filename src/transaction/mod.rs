@@ -21,6 +21,8 @@ pub mod cleanup;
 pub mod recover;
 
 #[cfg(test)]
+mod config_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::BTreeMap;
@@ -90,6 +92,15 @@ impl Transaction {
             return Err(AppError::Internal(
                 "a transaction may only open while its plan's resource locks are held".to_owned(),
             ));
+        }
+        for planned in &plan.actions {
+            if let MountAction::CreateConfigFile { contents, .. } = &planned.operation {
+                if contents.len() > crate::link::MAX_CONFIG_BYTES {
+                    return Err(AppError::Usage(
+                        "session configuration exceeds the journal content bound".to_owned(),
+                    ));
+                }
+            }
         }
         let actions = plan
             .actions
@@ -184,24 +195,48 @@ impl Transaction {
         &self.path
     }
 
-    /// Returns every still-pending created Skill link path for a cleanup failure diagnostic.
+    /// Returns every still-pending cleanup-critical entry path for a failure diagnostic.
     ///
     /// This is evidence, not removal authority. The caller uses it only when journal persistence
     /// fails before cleanup can return a structured report, so the operator still learns which
     /// mounted entries remain.
     pub(crate) fn cleanup_critical_paths(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
-        for action in self
-            .journal
-            .cleanup_candidates()
-            .filter(|action| action.operation == ActionOperation::CreateDirectoryLink)
-        {
+        for action in self.journal.cleanup_candidates().filter(|action| {
+            action.operation.cleanup_disposition() == crate::mount::CleanupDisposition::Required
+        }) {
             let path = action.current_path();
             if !paths.contains(path) {
                 paths.push(path.clone());
             }
         }
         paths
+    }
+
+    /// Rechecks every applied configuration file immediately before child exposure.
+    ///
+    /// # Errors
+    /// Refuses missing, replaced, modified, or unobservable files without launching a child.
+    pub fn verify_config_files(&self) -> Result<(), AppError> {
+        for action in &self.journal.actions {
+            if action.operation != ActionOperation::CreateConfigFile {
+                continue;
+            }
+            let file = crate::link::OwnedConfigFile {
+                path: action.final_path.clone(),
+                identity: action.identity.clone(),
+                contents: action.config_contents.clone().ok_or_else(|| {
+                    AppError::Internal("configuration action lacks content evidence".to_owned())
+                })?,
+            };
+            if action.status != ActionStatus::Applied || !self.backend.verify_config_file(&file)? {
+                return Err(AppError::Temporary(format!(
+                    "session configuration changed before launch: {}",
+                    file.path.display()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Durably records that a child may begin using the mounted entries.
@@ -263,7 +298,9 @@ pub(crate) fn staged_mutation_resources(
     let mut resources = Vec::new();
     for planned in &plan.actions {
         let final_path = match &planned.operation {
-            MountAction::CreateDirectory { path } => path,
+            MountAction::CreateDirectory { path } | MountAction::CreateConfigFile { path, .. } => {
+                path
+            }
             MountAction::CreateDirectoryLink { destination, .. } => destination,
             MountAction::ReuseExistingLink { .. } => continue,
         };
@@ -360,6 +397,12 @@ fn journal_action(
             None,
             RecordedKind::Directory,
         ),
+        MountAction::CreateConfigFile { path, .. } => (
+            ActionOperation::CreateConfigFile,
+            path.clone(),
+            None,
+            RecordedKind::File,
+        ),
         MountAction::CreateDirectoryLink {
             source,
             destination,
@@ -388,6 +431,10 @@ fn journal_action(
     };
 
     JournalAction {
+        config_contents: match &planned.operation {
+            MountAction::CreateConfigFile { contents, .. } => Some(contents.clone()),
+            _ => None,
+        },
         id: planned.id,
         operation,
         expected_precondition: planned.expected_precondition,

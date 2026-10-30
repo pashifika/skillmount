@@ -12,10 +12,18 @@ import tarfile
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 from pathlib import Path
 
 from live_agent_smoke import (
     AGENT_CASES,
+    CommandResult,
+    OMP_SHA256,
+    capture_cli_probe,
+    main,
+    create_sources,
+    probe_omp_discovery,
     EXPECTED_RESPONSE,
     PROMPT_TOKEN,
     case_command,
@@ -29,10 +37,95 @@ from live_agent_smoke import (
     unknown_result,
     verify_evidence_safe,
 )
-from prepare_live_agents import extract_regular_file, sri, verify_archive
+from prepare_live_agents import PACKAGES, extract_regular_file, sri, verify_archive
 
 
 class LiveAgentSmokeTests(unittest.TestCase):
+    def test_credential_free_probes_use_isolated_home_and_no_overlays(self) -> None:
+        inherited = {
+            **os.environ, "CODEX_API_KEY": "unit-secret", "OMP_PROFILE": "personal",
+            "PI_CONFIG_FILES": "/personal/config.yml", "HOME": "/personal/home",
+        }
+        def observe(command, *, environment, timeout, cwd):
+            self.assertNotIn("CODEX_API_KEY", environment)
+            self.assertNotIn("OMP_PROFILE", environment)
+            self.assertNotIn("PI_CONFIG_FILES", environment)
+            self.assertNotEqual(environment["HOME"], inherited["HOME"])
+            self.assertTrue(Path(environment["HOME"]).is_dir())
+            self.assertTrue(Path(environment["CODEX_HOME"]).is_relative_to(cwd))
+            self.assertEqual(command[-1], "--help")
+            return CommandResult(0, "help output", "", False)
+        with patch("live_agent_smoke.run_command", side_effect=observe):
+            self.assertEqual(capture_cli_probe(Path(sys.executable), "--help", inherited).stdout,
+                             "help output")
+
+    def test_probes_only_never_authenticates_or_claims_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            args = SimpleNamespace(
+                asm=Path(sys.executable), codex_bin=Path(sys.executable),
+                claude_bin=Path(sys.executable), omp_bin=None, agent_manifest=manifest,
+                evidence_dir=root / "evidence", wrapper_target="aarch64-apple-darwin",
+                link_mode="symlink", probes_only=True,
+            )
+            with patch("live_agent_smoke.parse_args", return_value=args), \
+                 patch("live_agent_smoke.load_agent_manifest", return_value={}), \
+                 patch("live_agent_smoke.capture_version", side_effect=[
+                     "SkillMount test", AGENT_CASES["codex"].banner, AGENT_CASES["claude"].banner,
+                 ]), \
+                 patch("live_agent_smoke.capture_cli_probe", return_value=CommandResult(0, "help", "", False)), \
+                 patch("live_agent_smoke.run_command", return_value=CommandResult(0, "doctor", "", False)), \
+                 patch("live_agent_smoke.run_agent") as launch, \
+                 patch("builtins.print"), \
+                 patch.dict(os.environ, {"CODEX_API_KEY": "unit-secret", "ANTHROPIC_API_KEY": "other-secret"}):
+                self.assertEqual(main(), 0)
+                launch.assert_not_called()
+            summary = json.loads((args.evidence_dir / "summary.json").read_text())
+            self.assertEqual(summary["outcome"], "observed")
+            self.assertEqual(summary["schema"], 2)
+            self.assertEqual({r["outcome"] for r in summary["results"]}, {"unverified"})
+            self.assertIn("authenticated wrapper discovery unverified", summary["scenario"])
+
+    def test_native_omp_probe_checks_sources_and_aliases_without_wrapper_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            evidence = root / "evidence"
+            evidence.mkdir()
+            sources = create_sources(root, "overlay", "base")
+            entries = [
+                {"name": "base", "filePath": str(sources[0] / "base" / "SKILL.md")},
+                {"name": "overlay", "filePath": str(sources[0] / "overlay" / "SKILL.md")},
+                {"name": "source-2/overlay", "filePath": str(sources[1] / "overlay" / "SKILL.md")},
+                {"name": "source-3/overlay", "filePath": str(sources[2] / "overlay" / "SKILL.md")},
+            ]
+            def observe(command, *, environment, timeout, cwd):
+                self.assertEqual(command[1:], ["skill", "list", "--json"])
+                self.assertNotIn("ANTHROPIC_API_KEY", environment)
+                self.assertEqual(cwd, project)
+                config = json.loads(Path(environment["PI_CONFIG_FILES"]).read_text())
+                self.assertEqual(config["skills"]["customDirectories"],
+                                 list(map(str, sources)) + ["~/tilde skills", "relative skills"])
+                more = [
+                    {"name": "skillmount-native-tilde", "filePath": str(
+                        Path(environment["HOME"]) / "tilde skills" / "skillmount-native-tilde" / "SKILL.md")},
+                    {"name": "skillmount-native-relative", "filePath": str(
+                        project / "relative skills" / "skillmount-native-relative" / "SKILL.md")},
+                ]
+                return CommandResult(0, json.dumps({"skills": entries + more}), "", False)
+            with patch("live_agent_smoke.run_command", side_effect=observe):
+                result = probe_omp_discovery(Path(sys.executable), root, project, sources,
+                    "overlay", "base", {"ANTHROPIC_API_KEY": "secret"}, evidence, {})
+                self.assertEqual(result["outcome"], "pass")
+                self.assertEqual(result["wrapper_session_integration"], "unverified")
+                entries[1]["filePath"] = str(sources[2] / "overlay" / "SKILL.md")
+                with self.assertRaisesRegex(RuntimeError, "first-root"):
+                    probe_omp_discovery(Path(sys.executable), root, project, sources,
+                        "overlay", "base", {}, evidence, {})
+
     def test_each_agent_receives_only_its_credential_and_logs_are_redacted(self) -> None:
         inherited = {
             **os.environ,
@@ -208,7 +301,7 @@ class OptInOmpCaseTests(unittest.TestCase):
         script = (
             "import os, sys; from pathlib import Path; "
             "Path(sys.argv[1]).write_text(chr(10).join(sys.argv[2:]), encoding='utf-8'); "
-            f"print({EXPECTED_RESPONSE!r} if os.environ.get('ANTHROPIC_API_KEY') else 'unauthenticated')"
+            f"print({AGENT_CASES['omp'].expected_response!r} if os.environ.get('ANTHROPIC_API_KEY') else 'unauthenticated')"
         )
         command = case_command(
             asm=root / "asm",
@@ -234,18 +327,19 @@ class OptInOmpCaseTests(unittest.TestCase):
             secrets=secrets,
         )
 
-    def test_omp_is_registered_as_an_opt_in_project_case_mounting_into_dot_omp_skills(self) -> None:
+    def test_omp_uses_native_first_root_oracle_without_a_link_destination(self) -> None:
         case = AGENT_CASES["omp"]
         self.assertEqual(case.executable, "omp")
-        self.assertEqual(case.banner, "omp/17.2.9")
+        self.assertEqual(case.banner, "omp/18.14.0")
         self.assertTrue(case.banner.startswith("omp/"))
-        self.assertEqual(case.destination, ".omp/skills")
+        self.assertIsNone(case.destination)
         self.assertEqual(case.credential_name, "ANTHROPIC_API_KEY")
         self.assertTrue(case.opt_in)
         self.assertFalse(AGENT_CASES["codex"].opt_in or AGENT_CASES["claude"].opt_in)
         # OMP answers `--mode text` in prose, so its response is read as text, not as JSON records.
-        self.assertEqual(evaluate_output("omp", EXPECTED_RESPONSE + "\n"), (True, False, True))
+        self.assertEqual(evaluate_output("omp", case.expected_response + "\n"), (True, False, True))
         self.assertIn("SHA256SUMS.txt", case.integrity)
+        self.assertEqual(evaluate_output("omp", EXPECTED_RESPONSE), (False, True, True))
 
     def test_an_unselected_or_uncredentialed_omp_case_is_unknown_rather_than_failed(self) -> None:
         case = AGENT_CASES["omp"]
@@ -279,7 +373,7 @@ class OptInOmpCaseTests(unittest.TestCase):
             )
         )
 
-    def test_windows_x86_is_skipped_because_17_2_9_publishes_no_32_bit_asset(self) -> None:
+    def test_windows_x86_is_skipped_because_18_14_0_publishes_no_32_bit_asset(self) -> None:
         case = AGENT_CASES["omp"]
         skipped = skip_reason(
             case,
@@ -288,7 +382,7 @@ class OptInOmpCaseTests(unittest.TestCase):
             credential="unit-credential",
             banner_reason=None,
         )
-        self.assertEqual(skipped, "no 32-bit OMP asset is published for 17.2.9")
+        self.assertEqual(skipped, "no 32-bit OMP asset is published for 18.14.0")
         self.assertEqual(unknown_result(case, skipped)["outcome"], "unknown")
         # The x86 workflow leg supplies no binary either, and the published-asset reason still wins
         # over the unselected one so the evidence names why that runner can never exercise OMP.
@@ -302,7 +396,7 @@ class OptInOmpCaseTests(unittest.TestCase):
             ),
             skipped,
         )
-        # 17.2.9 does publish omp-windows-x64.exe, so the 64-bit Windows leg stays exercised.
+        # 18.14.0 does publish omp-windows-x64.exe, so the 64-bit Windows leg stays exercised.
         self.assertIsNone(
             skip_reason(
                 case,
@@ -326,6 +420,7 @@ class OptInOmpCaseTests(unittest.TestCase):
             forwarded = argv_dump.read_text(encoding="utf-8").splitlines()
             self.assertNotIn(secret, "\n".join(forwarded))
             self.assertNotIn(PROMPT_TOKEN, forwarded)
+            self.assertNotIn("--link-mode", forwarded)
             # A mutating OMP session forwards the operator's passthrough and nothing else.
             self.assertEqual(
                 forwarded[forwarded.index("--") + 1 :],
@@ -361,15 +456,37 @@ class OptInOmpCaseTests(unittest.TestCase):
             self.omp_stub_run(root, root / "argv.txt", "sk-omp-unit-credential-value")
 
             project = root / "project"
-            destination = project / AGENT_CASES["omp"].destination
-            self.assertTrue(destination.is_relative_to(project))
-            self.assertFalse(destination.is_relative_to(checkout))
+            self.assertIsNone(AGENT_CASES["omp"].destination)
+            self.assertFalse((project / ".omp" / "skills").exists())
+            self.assertFalse(project.is_relative_to(checkout))
             self.assertTrue((root / "omp-state").is_relative_to(root))
             self.assertTrue((root / "evidence" / "omp.stdout.log").is_file())
         self.assertEqual(self.checkout_snapshot(), before)
 
 
 class AgentPackageTests(unittest.TestCase):
+    def test_committed_package_pins_match_probe_versions_and_omp_workflow(self) -> None:
+        for packages in PACKAGES.values():
+            for package in packages:
+                self.assertIn(package.version.split("-")[0], AGENT_CASES[package.agent].banner)
+                self.assertTrue(package.integrity.startswith("sha512-"))
+        workflow = (Path(__file__).parents[1] / "workflows" / "live-agent-smoke.yml").read_text()
+        self.assertIn("OMP_TAG: v18.14.0", workflow)
+        for digest in OMP_SHA256.values():
+            self.assertIn(digest, workflow)
+
+    def test_pr_workflow_forces_probes_and_never_supplies_provider_credentials(self) -> None:
+        workflow = (Path(__file__).parents[1] / "workflows" / "live-agent-smoke.yml").read_text()
+        self.assertIn("  pull_request:", workflow)
+        self.assertEqual(workflow.count(
+            "${{ (github.event_name == 'pull_request' || inputs.probes_only) && '--probes-only' || '' }}"
+        ), 2)
+        secret_lines = [line.strip() for line in workflow.splitlines() if "secrets." in line]
+        self.assertEqual(len(secret_lines), 4)
+        for line in secret_lines:
+            self.assertIn("github.event_name == 'workflow_dispatch' && !inputs.probes_only && secrets.", line)
+            self.assertTrue(line.endswith("|| '' }}"))
+
     @unittest.skipUnless(os.name == "nt", "Windows command resolution regression")
     def test_prepare_cli_launches_windows_npm_cmd_from_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -406,7 +523,7 @@ class AgentPackageTests(unittest.TestCase):
                 f"prepare CLI did not launch npm.cmd:\n{completed.stderr}",
             )
             self.assertIn(
-                "pack @openai/codex@0.146.0-win32-x64 --ignore-scripts --json",
+                "pack @openai/codex@0.166.0-win32-x64 --ignore-scripts --json",
                 marker.read_text(encoding="utf-8"),
             )
 
@@ -420,9 +537,9 @@ class AgentPackageTests(unittest.TestCase):
                 "print(json.dumps({\n"
                 "    '@openai/codex': {\n"
                 "        'name': '@openai/codex',\n"
-                "        'version': '0.146.0-win32-x64',\n"
+                "        'version': '0.166.0-win32-x64',\n"
                 "        'integrity': "
-                "'sha512-b3lxMYeR0+IhstNo4JjX1P9cPc1xwVcCVkPd1lD1wpWPJ0SBhpIkPczwbu3ZRkJcdyl342+rgyf4DUrbZLdrGA==',\n"
+                "'sha512-NS8Ps5oG5r19pCrMCUXwUqOui6odnUIoBlQkrjCJ+h1k6KiwCzC/+mI9d3nSZCqFoVONPBTmqyq8NYq3YaFGyA==',\n"
                 "        'filename': '../unsafe.tgz',\n"
                 "    },\n"
                 "}))\n",

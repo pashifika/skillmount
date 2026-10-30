@@ -46,7 +46,7 @@ enum CliCommand {
 
 #[derive(Debug, Args)]
 struct SessionArgs {
-    /// Skill directory or direct Skill; repeat for a rightmost-wins overlay.
+    /// Skill source; Codex/Claude use rightmost-wins, OMP delegates ordered collection roots.
     #[arg(
         long = "skills-dir",
         value_name = "PATH",
@@ -110,7 +110,7 @@ struct SessionArgs {
 
 #[derive(Debug, Args)]
 struct InspectArgs {
-    /// Skill directory or direct Skill; repeat for a rightmost-wins overlay.
+    /// Skill source; Codex/Claude use rightmost-wins, OMP delegates ordered collection roots.
     #[arg(
         long = "skills-dir",
         value_name = "PATH",
@@ -564,15 +564,15 @@ mod tests {
     }
 
     #[test]
-    fn omp_staging_is_rejected_and_project_is_its_default() {
+    fn omp_project_is_rejected_and_staging_is_its_default() {
         let error = parse_command_from([
             "asm",
             "omp",
             "--skills-dir",
             "skills",
-            "--mount-mode=staging",
+            "--mount-mode=project",
         ])
-        .expect_err("OMP has no isolated staging namespace");
+        .expect_err("OMP uses a private config overlay, not project mounts");
         assert_eq!(error.kind(), ErrorKind::InvalidValue);
         assert!(error.to_string().contains("incompatible with OMP"));
 
@@ -583,7 +583,7 @@ mod tests {
             panic!("the omp command must produce a session");
         };
         assert_eq!(input.agent, AgentId::Omp);
-        assert_eq!(input.options.mount_mode, MountMode::Project);
+        assert_eq!(input.options.mount_mode, MountMode::Staging);
     }
 
     #[test]

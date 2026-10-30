@@ -1,6 +1,10 @@
 name: Live agent smoke
 
 on:
+  pull_request:
+    branches:
+      - main
+      - "dev/**"
   workflow_dispatch:
     inputs:
       platform:
@@ -14,13 +18,20 @@ on:
           - windows
       include_omp:
         description: >-
-          Also exercise the opt-in OMP case. OMP 17.2.9 publishes no SHA256SUMS.txt, so its release
-          asset is recorded by observed sha256 instead of being integrity-locked, and it publishes
+          Also exercise the opt-in OMP case. OMP 18.14.0 is verified against a committed
+          SHA-256 from its published SHA256SUMS.txt. It publishes
           no 32-bit asset, so the Windows x86 leg reports the case as unknown.
         required: false
         default: false
         type: boolean
 
+      probes_only:
+        description: Version/help/doctor only, without credentials; not Skill discovery
+        required: false
+        default: false
+        type: boolean
+
+# PR runs only credential-free probes. Authenticated discovery is an explicit manual action.
 permissions:
   contents: read
 
@@ -30,7 +41,7 @@ env:
 jobs:
   macos-arm64:
     name: macOS arm64 / symlink
-    if: ${{ inputs.platform == 'all' || inputs.platform == 'macos-arm64' }}
+    if: ${{ github.event_name == 'pull_request' || inputs.platform == 'all' || inputs.platform == 'macos-arm64' }}
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -44,17 +55,17 @@ jobs:
           --platform macos-arm64
           --output-dir "${{ runner.temp }}/live-agents"
       - name: Fetch the opt-in OMP release asset
-        if: ${{ inputs.include_omp }}
+        if: ${{ github.event_name == 'pull_request' || inputs.include_omp }}
         env:
-          OMP_TAG: v17.2.9
+          OMP_TAG: v18.14.0
           OMP_ASSET: omp-darwin-arm64
         run: |
-          # Unlike the npm-packaged agents, this tag has no published SHA256SUMS.txt, so there is no
-          # digest to lock against: the smoke records the sha256 it observes as evidence instead.
+          # SHA-256 reviewed from the published v18.14.0 SHA256SUMS.txt.
           mkdir -p "${{ runner.temp }}/live-agents/omp"
           curl -fsSL --retry 3 --retry-connrefused \
             -o "${{ runner.temp }}/live-agents/omp/omp" \
             "https://github.com/can1357/oh-my-pi/releases/download/$OMP_TAG/$OMP_ASSET"
+          echo "608843959ab34295d52460dd09dd7d548b6c903c08a83c67954c2d4c36fd1f5a  ${{ runner.temp }}/live-agents/omp/omp" | shasum -a 256 -c -
           chmod +x "${{ runner.temp }}/live-agents/omp/omp"
       - name: Build native SkillMount
         run: |
@@ -62,8 +73,8 @@ jobs:
           cargo build --locked --bin asm
       - name: Run real-agent discovery smoke
         env:
-          CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CODEX_API_KEY: ${{ github.event_name == 'workflow_dispatch' && !inputs.probes_only && secrets.OPENAI_API_KEY || '' }}
+          ANTHROPIC_API_KEY: ${{ github.event_name == 'workflow_dispatch' && !inputs.probes_only && secrets.ANTHROPIC_API_KEY || '' }}
         run: >-
           python3 .github/scripts/live_agent_smoke.py
           --asm target/debug/asm
@@ -73,7 +84,8 @@ jobs:
           --claude-bin "${{ runner.temp }}/live-agents/claude/claude"
           --agent-manifest "${{ runner.temp }}/live-agents/manifest.json"
           --evidence-dir "${{ runner.temp }}/live-agent-evidence"
-          ${{ inputs.include_omp && format('--omp-bin "{0}/live-agents/omp/omp"', runner.temp) || '' }}
+          ${{ (github.event_name == 'pull_request' || inputs.probes_only) && '--probes-only' || '' }}
+          ${{ (github.event_name == 'pull_request' || inputs.include_omp) && format('--omp-bin "{0}/live-agents/omp/omp"', runner.temp) || '' }}
       - name: Upload evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -84,7 +96,7 @@ jobs:
 
   windows:
     name: Windows ${{ matrix.arch }} / junction
-    if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
+    if: ${{ github.event_name == 'pull_request' || inputs.platform == 'all' || inputs.platform == 'windows' }}
     runs-on: windows-2025
     timeout-minutes: 30
     strategy:
@@ -107,20 +119,20 @@ jobs:
             --platform windows-x64 `
             --output-dir "$env:RUNNER_TEMP/live-agents"
       - name: Fetch the opt-in OMP release asset
-        if: ${{ inputs.include_omp && matrix.arch == 'x64' }}
+        if: ${{ (github.event_name == 'pull_request' || inputs.include_omp) && matrix.arch == 'x64' }}
         shell: pwsh
         env:
-          OMP_TAG: v17.2.9
+          OMP_TAG: v18.14.0
           OMP_ASSET: omp-windows-x64.exe
         run: |
-          # 17.2.9 ships no 32-bit OMP asset, so only this x64 leg can select the case, and the tag
-          # has no published SHA256SUMS.txt to lock the download against; the smoke records the
-          # sha256 it observes as evidence instead.
+          # 18.14.0 ships no 32-bit OMP asset. SHA-256 is from its SHA256SUMS.txt.
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP/live-agents/omp" | Out-Null
           $ProgressPreference = 'SilentlyContinue'
           Invoke-WebRequest -MaximumRetryCount 3 -RetryIntervalSec 5 `
             -Uri "https://github.com/can1357/oh-my-pi/releases/download/$env:OMP_TAG/$env:OMP_ASSET" `
             -OutFile "$env:RUNNER_TEMP/live-agents/omp/omp.exe"
+          $digest = (Get-FileHash "$env:RUNNER_TEMP/live-agents/omp/omp.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($digest -ne "620a5935cdb6a9ed52d8b0c93892d6b5bb84155244a98f3be82af0455177bf29") { throw "OMP SHA-256 mismatch" }
       - name: Build native SkillMount target
         shell: bash
         run: |
@@ -129,8 +141,8 @@ jobs:
           cargo build --locked --target "${{ matrix.target }}" --bin asm
       - name: Run real-agent discovery smoke
         env:
-          CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CODEX_API_KEY: ${{ github.event_name == 'workflow_dispatch' && !inputs.probes_only && secrets.OPENAI_API_KEY || '' }}
+          ANTHROPIC_API_KEY: ${{ github.event_name == 'workflow_dispatch' && !inputs.probes_only && secrets.ANTHROPIC_API_KEY || '' }}
         run: >-
           python .github/scripts/live_agent_smoke.py
           --asm "target/${{ matrix.target }}/debug/asm.exe"
@@ -140,7 +152,8 @@ jobs:
           --claude-bin "${{ runner.temp }}/live-agents/claude/claude.exe"
           --agent-manifest "${{ runner.temp }}/live-agents/manifest.json"
           --evidence-dir "${{ runner.temp }}/live-agent-evidence"
-          ${{ inputs.include_omp && matrix.arch == 'x64' && format('--omp-bin "{0}/live-agents/omp/omp.exe"', runner.temp) || '' }}
+          ${{ (github.event_name == 'pull_request' || inputs.probes_only) && '--probes-only' || '' }}
+          ${{ (github.event_name == 'pull_request' || inputs.include_omp) && matrix.arch == 'x64' && format('--omp-bin "{0}/live-agents/omp/omp.exe"', runner.temp) || '' }}
       - name: Upload evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

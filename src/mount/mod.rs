@@ -95,6 +95,13 @@ pub enum MountAction {
         /// Directory to create.
         path: PathBuf,
     },
+    /// Create a session-owned UTF-8 configuration file without replacing an existing entry.
+    CreateConfigFile {
+        /// Absolute destination in the private session directory.
+        path: PathBuf,
+        /// Exact bounded contents retained as cleanup evidence.
+        contents: String,
+    },
     /// Create a directory link at `destination` pointing at `source`.
     CreateDirectoryLink {
         /// Canonical directory the link refers to.
@@ -123,6 +130,7 @@ impl MountAction {
     pub const fn verb(&self) -> &'static str {
         match self {
             Self::CreateDirectory { .. } => "MKDIR",
+            Self::CreateConfigFile { .. } => "CONFIG",
             Self::CreateDirectoryLink { .. } => "LINK",
             Self::ReuseExistingLink { .. } => "REUSE",
         }
@@ -133,7 +141,9 @@ impl MountAction {
     #[must_use]
     pub const fn creates_entry(&self) -> bool {
         match self {
-            Self::CreateDirectory { .. } | Self::CreateDirectoryLink { .. } => true,
+            Self::CreateDirectory { .. }
+            | Self::CreateDirectoryLink { .. }
+            | Self::CreateConfigFile { .. } => true,
             Self::ReuseExistingLink { .. } => false,
         }
     }
@@ -142,7 +152,9 @@ impl MountAction {
     #[must_use]
     pub const fn cleanup_disposition(&self) -> CleanupDisposition {
         match self {
-            Self::CreateDirectoryLink { .. } => CleanupDisposition::Required,
+            Self::CreateDirectoryLink { .. } | Self::CreateConfigFile { .. } => {
+                CleanupDisposition::Required
+            }
             Self::CreateDirectory { .. } => CleanupDisposition::BestEffort,
             Self::ReuseExistingLink { .. } => CleanupDisposition::None,
         }

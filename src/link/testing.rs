@@ -394,6 +394,45 @@ impl LinkBackend for RecordingBackend {
         })
     }
 
+    fn verify_config_file(&self, file: &super::OwnedConfigFile) -> Result<bool, LinkError> {
+        Err(LinkError::Unsupported {
+            path: file.path.clone(),
+            reason: "configuration files use native backend tests".to_owned(),
+        })
+    }
+
+    fn create_config_file(
+        &self,
+        path: &Path,
+        _contents: &str,
+    ) -> Result<super::OwnedConfigFile, LinkError> {
+        Err(LinkError::Unsupported {
+            path: path.to_path_buf(),
+            reason: "configuration files use native backend tests".to_owned(),
+        })
+    }
+
+    fn place_config_file_no_replace(
+        &self,
+        file: &super::OwnedConfigFile,
+        _destination: &Path,
+    ) -> Result<PlacementOutcome<super::OwnedConfigFile>, LinkError> {
+        Err(LinkError::Unsupported {
+            path: file.path.clone(),
+            reason: "configuration files use native backend tests".to_owned(),
+        })
+    }
+
+    fn remove_config_file(
+        &self,
+        file: &super::OwnedConfigFile,
+    ) -> Result<RemoveOutcome, LinkError> {
+        Err(LinkError::Unsupported {
+            path: file.path.clone(),
+            reason: "configuration files use native backend tests".to_owned(),
+        })
+    }
+
     fn create_directory(&self, path: &Path) -> Result<OwnedDirectory, LinkError> {
         self.record(Call::Create(path.to_path_buf()));
         if self.lookup(path).is_some() {

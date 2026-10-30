@@ -277,6 +277,20 @@ pub(crate) trait AgentAdapter {
     /// Returns the Agent-required catalog facts for one selected Skill.
     fn catalog_policy(&self) -> CatalogPolicy;
 
+    /// Resolves the catalog under this adapter's selection contract.
+    fn resolve_catalog(&self, context: &RunContext) -> Result<SkillCatalog, AppError> {
+        let destination_stores = self.destination_stores(context);
+        crate::catalog::resolve_catalog(
+            &context.skill_sources,
+            &crate::catalog::CatalogRequest {
+                agent: context.agent_id(),
+                policy: self.catalog_policy(),
+                validation: context.options.validation,
+                destination_stores: &destination_stores,
+            },
+        )
+    }
+
     /// Returns every future destination store, used only for source/destination cycle rejection.
     fn destination_stores(&self, context: &RunContext) -> Vec<PathBuf>;
 
