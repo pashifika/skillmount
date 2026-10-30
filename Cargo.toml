@@ -47,10 +47,10 @@ all = "deny"
 pedantic = "deny"
 
 [dependencies]
-clap = { version = "=4.6.5", features = ["derive"] }
+clap = { version = "=4.6.7", features = ["derive"] }
 # Completion generation uses only the stable ahead-of-time API. Keep default and unstable dynamic
 # features disabled so this read-only command does not acquire callback or executable-probing code.
-clap_complete = { version = "=4.6.8", default-features = false }
+clap_complete = { version = "=4.6.9", default-features = false }
 # Real operating-system advisory locks. `flock` and `LockFileEx` are the liveness signal the
 # transaction layer needs, and neither is reachable from the standard library. `fs4` wraps exactly
 # those two calls, keeps locking-related unsafe within the two audited link FFI modules (ADR 0011),
@@ -59,7 +59,7 @@ fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 # Codex plugin manifests are JSON rather than YAML. Keep the reviewed parser pinned and
 # regression-test duplicate-field/type handling when adopting upstream dependency updates.
-serde_json = "=1.0.151"
+serde_json = "=1.0.154"
 serde_yaml_ng = "=0.10.0"
 # Lock filenames are SHA-256 digests of tagged identity bytes, so two spellings of one resource
 # reach the same file. Only `alloc`-free digesting is used.
@@ -75,7 +75,7 @@ toml = { version = "=1.1.4", default-features = false, features = ["parse", "ser
 libc = "=0.2.191"
 # Product handlers record event identity directly in an atomic ledger through the audited Unix FFI
 # boundary. Only the feature-gated fake agent uses signal-hook's iterator support.
-signal-hook = { version = "=0.4.4", default-features = false }
+signal-hook = { version = "=0.4.5", default-features = false }
 # `kill`/`killpg` and effective-user execute checks are exposed through maintained safe APIs,
 # keeping raw Unix process and access-check FFI out of shared code.
 nix = { version = "=0.31.3", default-features = false, features = ["fs", "signal", "user"] }

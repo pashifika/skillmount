@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde_yaml_ng::{Mapping, Value};
 
 const CHECKOUT_REVISION: &str = "3d3c42e5aac5ba805825da76410c181273ba90b1";
-const UPLOAD_REVISION: &str = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+const UPLOAD_REVISION: &str = "cf430e030ddbb5b0abf93d22962f4752f3646cd9";
 const DOWNLOAD_REVISION: &str = "9000827ccba6bdab643e8b6fd33ac0654aef8333";
 
 fn mapping(value: &Value) -> &Mapping {

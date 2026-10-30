@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
@@ -33,6 +33,9 @@ impl Fixture {
         for path in [&project, &home, &sources, &root.join("codex-home")] {
             fs::create_dir_all(path).expect("operator fixture directory");
         }
+        // These fixtures declare an isolated project root; ambient Git ancestors must not
+        // change the root inferred by the real child process.
+        fs::create_dir(project.join(".git")).expect("operator fixture repository anchor");
         Self {
             root,
             project,
@@ -642,23 +645,10 @@ fn doctor_reports_a_lock_held_active_transaction_without_mutation() {
     fixture.skill("alpha");
     let hold_log = fixture.root.join("hold.log");
     let release = fixture.root.join("release");
-    let stderr = fs::File::create(&hold_log).expect("hold log");
-    let mut holder = fixture
-        .session_command(&[])
-        .env("SKILLMOUNT_HOLD_AT", "journal-active")
-        .env("SKILLMOUNT_HOLD_MS", "15000")
-        .env("SKILLMOUNT_HOLD_UNTIL", &release)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .expect("active fixture session");
-    wait_for(|| {
-        fs::read_to_string(&hold_log).is_ok_and(|text| {
-            text.split_inclusive('\n').any(|line| {
-                line.ends_with('\n') && line.contains("failure injection holding at journal-active")
-            })
-        })
-    });
+    let mut holder = CheckpointHolder::spawn(fixture.session_command(&[]), &hold_log, &release);
+    holder
+        .wait_for_checkpoint()
+        .unwrap_or_else(|error| panic!("{error}"));
     let before = snapshot(&fixture.root);
 
     let output = fixture.doctor();
@@ -684,8 +674,7 @@ fn doctor_reports_a_lock_held_active_transaction_without_mutation() {
         "doctor mutated the active fixture"
     );
 
-    fs::write(&release, b"release\n").expect("release active fixture");
-    let status = holder.wait().expect("active fixture should finish");
+    let status = holder.release_and_wait();
     assert_eq!(
         status.code(),
         Some(64),
@@ -786,15 +775,133 @@ fn install_agent_alias(directory: &Path, name: &str) {
     }
 }
 
-fn wait_for(condition: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if condition() {
-            return;
+/// Owns the pre-spawn holder so every assertion/unwind releases and reaps it before fixture removal.
+struct CheckpointHolder {
+    child: Child,
+    log: PathBuf,
+    release: PathBuf,
+}
+
+impl CheckpointHolder {
+    fn spawn(mut command: Command, log: &Path, release: &Path) -> Self {
+        let stderr = fs::File::create(log).expect("checkpoint holder log");
+        let child = command
+            .env("SKILLMOUNT_HOLD_AT", "journal-active")
+            .env("SKILLMOUNT_HOLD_MS", "15000")
+            .env("SKILLMOUNT_HOLD_UNTIL", release)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .expect("checkpoint holder process");
+        Self {
+            child,
+            log: log.to_owned(),
+            release: release.to_owned(),
         }
-        std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("the spawned session did not reach its checkpoint");
+
+    fn wait_for_checkpoint(&mut self) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let diagnostics = fs::read_to_string(&self.log).unwrap_or_default();
+            if let Some(status) = self.child.try_wait().expect("poll checkpoint holder") {
+                // The child may have emitted its final diagnostic after the first read.
+                let diagnostics = fs::read_to_string(&self.log).unwrap_or_default();
+                return Err(format!(
+                    "checkpoint holder exited before journal-active ({status}): {diagnostics}"
+                ));
+            }
+            if diagnostics.split_inclusive('\n').any(|line| {
+                line.ends_with('\n') && line.contains("failure injection holding at journal-active")
+            }) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let diagnostics = fs::read_to_string(&self.log).unwrap_or_default();
+                return Err(format!(
+                    "checkpoint holder did not reach journal-active within setup bound; pid={}: {diagnostics}",
+                    self.child.id()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn release_and_wait(&mut self) -> ExitStatus {
+        fs::write(&self.release, b"release\n").expect("release checkpoint holder");
+        self.child
+            .wait()
+            .expect("released checkpoint holder should finish")
+    }
+}
+
+impl Drop for CheckpointHolder {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release, b"release\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn checkpoint_wait_reports_an_early_exit_with_its_diagnostics() {
+    let fixture = Fixture::new("checkpoint-early-exit");
+    let mut command = fixture.command();
+    command.arg("not-a-command");
+    let mut holder = CheckpointHolder::spawn(
+        command,
+        &fixture.root.join("hold.log"),
+        &fixture.root.join("release"),
+    );
+    let error = holder
+        .wait_for_checkpoint()
+        .expect_err("invalid command never reaches checkpoint");
+    assert!(error.contains("exited before journal-active"), "{error}");
+    assert!(error.contains("not-a-command"), "{error}");
+}
+
+#[test]
+fn checkpoint_holder_is_released_and_reaped_during_unwind() {
+    let fixture = Fixture::new("checkpoint-unwind");
+    fixture.skill("alpha");
+    let log = fixture.root.join("hold.log");
+    let release = fixture.root.join("release");
+    let reached = std::cell::Cell::new(false);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut holder = CheckpointHolder::spawn(fixture.session_command(&[]), &log, &release);
+        holder
+            .wait_for_checkpoint()
+            .unwrap_or_else(|error| panic!("{error}"));
+        reached.set(true);
+        panic!("deliberate fixture unwind");
+    }));
+    assert!(
+        reached.get(),
+        "the deliberate unwind must happen after checkpoint readiness"
+    );
+    assert!(result.is_err());
+    assert!(release.exists(), "holder drop must release its checkpoint");
+    assert!(!fixture.project.join(".agents/skills/alpha").exists());
+    let output = fixture.doctor();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout)
+            .contains(" is active and its OS advisory lock is held")
+    );
 }
 
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, String> {
