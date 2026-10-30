@@ -177,3 +177,23 @@ the v0.3.0 native-directory mechanism (ADR 0040).
 The OMP diagnostic binary is always provisioned for the all-agent doctor probe. Manual
 `include_omp` selects the authenticated OMP scenario only; leaving it false no longer removes
 OMP from mandatory diagnostics. `--omp-probe-bin` identifies this diagnostics-only role.
+
+### 2026-10-30 native credential-free observations
+
+[Live agent smoke run 41050170503](https://github.com/pashifika/skillmount/actions/runs/41050170503),
+attempt 1, exercised PR head `1f5c75b3cb99b77430203736d94f80659d83f4fc` through tested merge
+`8167a28a90406bad3e73135d0132065b62e6d7a2`. All three downloaded evidence ZIPs matched their
+GitHub API SHA-256 digests. Their summaries and doctor logs record:
+
+| Native host / wrapper | Observed versions | Help / doctor | Raw OMP loader |
+|---|---|---|---|
+| macOS ARM64 / ARM64 | Codex 0.166.0, Claude 2.1.314, OMP 18.14.0 | All help exits 0; doctor 0 (12 pass, 1 warning, 0 failure, 6 unverified) | Pass: six Skills, no links |
+| Windows x64 / x64 | Codex 0.166.0, Claude 2.1.314, OMP 18.14.0 | All help exits 0; doctor 0 (13 pass, 1 warning, 0 failure, 5 unverified) | Pass: six Skills, no links |
+| Windows x64 / i686 wrapper, x64 agents | Codex 0.166.0, Claude 2.1.314, OMP 18.14.0 | All help exits 0; doctor 0 (13 pass, 1 warning, 0 failure, 5 unverified) | Pass: six Skills, no links |
+
+Evidence artifact IDs are respectively `12974621328`, `12974132697`, and `12974486960`.
+These rows establish **observed** executable/doctor/raw-loader behavior only. Every authenticated
+scenario and `wrapper_session_integration` remains explicitly **unverified**. They do not certify
+full product CI, authenticated Skill loading, session lifetime, or cleanup. The separate product
+suite at this revision still exposed a stale transaction diagnostic assertion; its correction and
+fresh exact-head release gates are required independently of this probe evidence.

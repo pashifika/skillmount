@@ -3309,7 +3309,8 @@ fn unsettled_omp_global_configuration_before_spawn_is_not_migrated() {
     let (status, diagnostics) = release_omp(session, diagnostics, &release);
     assert_ne!(status, 0, "{diagnostics}");
     assert!(
-        diagnostics.contains("have not been migrated"),
+        diagnostics.contains("legacy settings may require migration")
+            && diagnostics.contains("native OMP configuration"),
         "{diagnostics}"
     );
     assert!(!fixture.record.exists());
