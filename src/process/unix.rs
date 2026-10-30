@@ -22,6 +22,66 @@ pub(super) fn validate_executable(_executable: &Path) -> io::Result<()> {
     Ok(())
 }
 
+pub(super) struct CaptureDomain {
+    group: Option<Pid>,
+    root_reaped: bool,
+}
+
+impl CaptureDomain {
+    #[allow(clippy::unnecessary_wraps)]
+    pub(super) fn prepare(command: &mut Command) -> io::Result<Self> {
+        command.process_group(0);
+        Ok(Self {
+            group: None,
+            root_reaped: false,
+        })
+    }
+
+    pub(super) fn attach(&mut self, child: &Child) -> io::Result<()> {
+        self.group = Some(child_pid(child)?);
+        Ok(())
+    }
+
+    pub(super) fn terminate(&self, child: &mut Child) -> io::Result<()> {
+        let Some(group) = self.group else {
+            return child.kill();
+        };
+        match killpg(group, Signal::SIGKILL) {
+            Ok(()) | Err(Errno::ESRCH | Errno::EPERM) => Ok(()),
+            Err(group_error) => child.kill().map_err(|child_error| {
+                io::Error::other(format!(
+                    "cannot terminate capture process group ({group_error}) or root process ({child_error})"
+                ))
+            }),
+        }
+    }
+
+    pub(super) fn mark_root_reaped(&mut self) {
+        self.root_reaped = true;
+    }
+
+    pub(super) fn is_empty(&self) -> io::Result<bool> {
+        let Some(group) = self.group else {
+            return Ok(true);
+        };
+        match killpg(group, None) {
+            Err(Errno::ESRCH) => Ok(true),
+            Ok(()) | Err(Errno::EPERM) => Ok(false),
+            Err(error) => Err(errno_to_io(error)),
+        }
+    }
+}
+
+impl Drop for CaptureDomain {
+    fn drop(&mut self) {
+        if !self.root_reaped {
+            if let Some(group) = self.group {
+                let _ = killpg(group, Signal::SIGKILL);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Grouping {
     SharedForeground,

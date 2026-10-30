@@ -28,30 +28,31 @@ class Package:
     executable: str
 
 
+# Reviewed 2026-10-30 against official npm package metadata and downloaded archives.
+# Only headless runtime members are extracted; optional Codex voice assets are not exercised.
 PACKAGES = {
     "macos-arm64": (
         Package(
             agent="codex",
-            spec="@openai/codex@0.146.0-darwin-arm64",
+            spec="@openai/codex@0.166.0-darwin-arm64",
             package_name="@openai/codex",
-            version="0.146.0-darwin-arm64",
-            integrity="sha512-nb61yX4r5L6Z0dlC4o3u0GAK1YCd4TUvjaB382bajDoh84V+uv2hTBIVZ++fgXWV9yoeuNrNnNcn7GoTGOe2Tg==",
+            version="0.166.0-darwin-arm64",
+            integrity="sha512-5fWH6qqUInACcRADIewjlnRxDb4QLe0uriwehiZz0+viuAAB8I+WWefqw4xwHvyKaxeiGX4uK56+vrgfvFk3FQ==",
             archive_root="package/vendor/aarch64-apple-darwin/",
             members=(
                 "package/vendor/aarch64-apple-darwin/bin/codex",
                 "package/vendor/aarch64-apple-darwin/bin/codex-code-mode-host",
                 "package/vendor/aarch64-apple-darwin/codex-package.json",
                 "package/vendor/aarch64-apple-darwin/codex-path/rg",
-                "package/vendor/aarch64-apple-darwin/codex-resources/zsh/bin/zsh",
             ),
             executable="codex/bin/codex",
         ),
         Package(
             agent="claude",
-            spec="@anthropic-ai/claude-code-darwin-arm64@2.1.220",
+            spec="@anthropic-ai/claude-code-darwin-arm64@2.1.314",
             package_name="@anthropic-ai/claude-code-darwin-arm64",
-            version="2.1.220",
-            integrity="sha512-rmtd41Bf+n+YnhjSjtQ8WG5qy8KKogUp3YRfQrkLsTgPUD0H3j869rBInBJT3SHrKQ0hLghQLGM73CC1C+USLQ==",
+            version="2.1.314",
+            integrity="sha512-kJ6VL1bKqDQuehX854xQnEu6siu4g0YESCB837pzDtsTvJeyruqE0EO4kZbSwH01LABGMs/WK5pMLkKABB8p4w==",
             archive_root="package/",
             members=("package/claude",),
             executable="claude/claude",
@@ -60,10 +61,10 @@ PACKAGES = {
     "windows-x64": (
         Package(
             agent="codex",
-            spec="@openai/codex@0.146.0-win32-x64",
+            spec="@openai/codex@0.166.0-win32-x64",
             package_name="@openai/codex",
-            version="0.146.0-win32-x64",
-            integrity="sha512-b3lxMYeR0+IhstNo4JjX1P9cPc1xwVcCVkPd1lD1wpWPJ0SBhpIkPczwbu3ZRkJcdyl342+rgyf4DUrbZLdrGA==",
+            version="0.166.0-win32-x64",
+            integrity="sha512-NS8Ps5oG5r19pCrMCUXwUqOui6odnUIoBlQkrjCJ+h1k6KiwCzC/+mI9d3nSZCqFoVONPBTmqyq8NYq3YaFGyA==",
             archive_root="package/vendor/x86_64-pc-windows-msvc/",
             members=(
                 "package/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
@@ -77,10 +78,10 @@ PACKAGES = {
         ),
         Package(
             agent="claude",
-            spec="@anthropic-ai/claude-code-win32-x64@2.1.220",
+            spec="@anthropic-ai/claude-code-win32-x64@2.1.314",
             package_name="@anthropic-ai/claude-code-win32-x64",
-            version="2.1.220",
-            integrity="sha512-UGrjH8cGhC6PzhTyZSdgf/RpKxpfk9XJZ/RT/wsG2AJg9yEJLjLg6/TrnlL8RFbEv6Zahu0Quytc02UOpA/GiA==",
+            version="2.1.314",
+            integrity="sha512-2G/cedIZd28TUgsL2tGMFILlCwU4qRw6PP1VtH0ANe2oJCenJEWJC2GvQqXM5EhzW7QqxmcWry4SVlt6UO3OLg==",
             archive_root="package/",
             members=("package/claude.exe",),
             executable="claude/claude.exe",

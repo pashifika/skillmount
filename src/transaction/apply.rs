@@ -25,7 +25,8 @@ use crate::domain::LinkMode;
 use crate::error::{AppError, LinkError, PlanError};
 use crate::journal::{ActionOperation, ActionStatus, RecordedKind, TransactionStatus};
 use crate::link::{
-    CreatedLink, EntryKind, LinkRequest, OwnedDirectory, PlacementOutcome, PlacementResidue,
+    CreatedLink, EntryKind, LinkRequest, OwnedConfigFile, OwnedDirectory, PlacementOutcome,
+    PlacementResidue,
 };
 use crate::mount::PathPrecondition;
 
@@ -92,7 +93,7 @@ impl fmt::Display for ApplyFailure {
 impl Transaction {
     /// Applies every planned action, rolling back in reverse order if any of them fails.
     ///
-    /// On success the journal is durably `active` and every owned action is `applied`. On failure
+    /// On success the journal is durably `active` and every created action is `applied`. On failure
     /// the journal is durably `failed`, carries the original error and every rollback error, and
     /// the transaction owns nothing that could still be verified and removed.
     ///
@@ -103,18 +104,18 @@ impl Transaction {
     /// than the success value and would otherwise widen every frame on the happy path.
     pub fn apply(&mut self) -> Result<(), Box<ApplyFailure>> {
         if let Err(error) = self.advance(TransactionStatus::Applying) {
-            return Err(Self::fail_without_rollback(error));
+            return Err(Box::new(Self::fail_without_rollback(error)));
         }
         reached(Checkpoint::JournalApplying, 1);
 
         for index in 0..self.journal.actions.len() {
             if let Err(error) = self.apply_one(index) {
-                return Err(self.roll_back(error));
+                return Err(Box::new(self.roll_back(error)));
             }
         }
 
         if let Err(error) = self.advance(TransactionStatus::Active) {
-            return Err(self.roll_back(error));
+            return Err(Box::new(self.roll_back(error)));
         }
         reached(Checkpoint::JournalActive, 1);
         Ok(())
@@ -125,9 +126,9 @@ impl Transaction {
         let sequence = u32::try_from(index + 1).unwrap_or(u32::MAX);
         match self.journal.actions[index].operation {
             ActionOperation::ReuseExistingLink => self.confirm_reuse(index),
-            ActionOperation::CreateDirectory | ActionOperation::CreateDirectoryLink => {
-                self.create_and_place(index, sequence)
-            }
+            ActionOperation::CreateDirectory
+            | ActionOperation::CreateDirectoryLink
+            | ActionOperation::CreateConfigFile => self.create_and_place(index, sequence),
         }
     }
 
@@ -171,7 +172,7 @@ impl Transaction {
             .temporary_path
             .clone()
             .ok_or_else(|| {
-                AppError::Internal("an owned action must record its staged sibling".to_owned())
+                AppError::Internal("a created action must record its staged sibling".to_owned())
             })?;
 
         self.check_precondition(index, &final_path)?;
@@ -198,6 +199,21 @@ impl Transaction {
                     return Err(Self::drift(
                         &final_path,
                         "another process created the destination after this plan was built",
+                    ));
+                }
+                PlacementOutcome::OwnershipMismatch(residue) => {
+                    return Err(self.placement_failure(index, &residue));
+                }
+            },
+            Staged::ConfigFile(file) => match self
+                .backend
+                .place_config_file_no_replace(&file, &final_path)?
+            {
+                PlacementOutcome::Placed(placed) => Placed::ConfigFile(placed),
+                PlacementOutcome::DestinationExists => {
+                    return Err(Self::drift(
+                        &final_path,
+                        "another process created the configuration destination",
                     ));
                 }
                 PlacementOutcome::OwnershipMismatch(residue) => {
@@ -232,6 +248,11 @@ impl Transaction {
                 self.journal.actions[index].kind = link.kind.into();
                 self.journal.actions[index].link_target = Some(link.target);
             }
+            Placed::ConfigFile(file) => {
+                self.journal.actions[index]
+                    .identity
+                    .clone_from(&file.identity);
+            }
             Placed::Directory(directory) => {
                 self.journal.actions[index]
                     .identity
@@ -251,6 +272,20 @@ impl Transaction {
     /// convert an ordinary crash into permanent residue.
     fn create_staged(&mut self, index: usize, temporary: &Path) -> Result<Staged, AppError> {
         match self.journal.actions[index].operation {
+            ActionOperation::CreateConfigFile => {
+                let contents = self.journal.actions[index]
+                    .config_contents
+                    .as_deref()
+                    .ok_or_else(|| {
+                        AppError::Internal("configuration action lacks contents".to_owned())
+                    })?;
+                let created = self.backend.create_config_file(temporary, contents)?;
+                self.journal.actions[index]
+                    .identity
+                    .clone_from(&created.identity);
+                self.journal.actions[index].kind = RecordedKind::File;
+                Ok(Staged::ConfigFile(created))
+            }
             ActionOperation::CreateDirectory => {
                 let created = self.backend.create_directory(temporary)?;
                 self.journal.actions[index]
@@ -309,10 +344,10 @@ impl Transaction {
 
     /// Builds the error for a destination whose observed state contradicts the plan.
     fn drift(path: &Path, reason: &str) -> AppError {
-        AppError::Plan(PlanError::UnsupportedLayout {
+        AppError::Plan(Box::new(PlanError::UnsupportedLayout {
             path: path.to_path_buf(),
             reason: reason.to_owned(),
-        })
+        }))
     }
 
     /// Records a placement result that must be reported but not repaired by this apply attempt.
@@ -333,12 +368,12 @@ impl Transaction {
     }
 
     /// Records a failure that happened before anything could have been created.
-    fn fail_without_rollback(cause: AppError) -> Box<ApplyFailure> {
-        Box::new(ApplyFailure {
+    fn fail_without_rollback(cause: AppError) -> ApplyFailure {
+        ApplyFailure {
             cause,
             retained: Vec::new(),
             rollback_errors: Vec::new(),
-        })
+        }
     }
 }
 
@@ -346,12 +381,14 @@ impl Transaction {
 enum Staged {
     Link(CreatedLink),
     Directory(OwnedDirectory),
+    ConfigFile(OwnedConfigFile),
 }
 
 /// Verified evidence relocated to an action's final path.
 enum Placed {
     Link(CreatedLink),
     Directory(OwnedDirectory),
+    ConfigFile(OwnedConfigFile),
 }
 
 /// Maps a recorded kind back to the link mode the backend should honour.
@@ -361,7 +398,7 @@ const fn requested_mode(kind: RecordedKind) -> LinkMode {
     match kind {
         RecordedKind::Symlink => LinkMode::Symlink,
         RecordedKind::Junction => LinkMode::Junction,
-        RecordedKind::Directory | RecordedKind::Undecided => LinkMode::Auto,
+        RecordedKind::Directory | RecordedKind::File | RecordedKind::Undecided => LinkMode::Auto,
     }
 }
 

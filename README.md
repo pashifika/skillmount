@@ -1,10 +1,11 @@
 # SkillMount
 
-Mount external Agent Skills into one Codex CLI or Claude Code session, then clean up
+Mount external Agent Skills into one Codex CLI, Claude Code, or Oh My Pi session, then clean up
 automatically.
 
-Codex CLI and Claude Code discover Skills only in their own directories. When your Skills live in
-a shared or external folder, you end up copying them into every project and removing them by hand.
+Codex CLI, Claude Code, and Oh My Pi discover Skills only in their own directories. When your
+Skills live in a shared or external folder, you end up copying them into every project and
+removing them by hand.
 SkillMount removes that chore. It links the Skills you select into the place the agent searches,
 launches the agent for you, and deletes exactly the links it created once the session ends.
 
@@ -16,6 +17,8 @@ and `skillmount`, a descriptive fallback that behaves the same way.
 - [Features](#features)
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Oh My Pi sessions](#oh-my-pi-sessions)
+- [Concurrent sessions](#concurrent-sessions)
 - [Commands and options](#commands-and-options)
 - [Shell completion](#shell-completion)
 - [Health checks and cleanup](#health-checks-and-cleanup)
@@ -28,7 +31,7 @@ and `skillmount`, a descriptive fallback that behaves the same way.
 
 - **Session-scoped mounts:** Skills appear when the agent starts and disappear when it exits, so
   your project directory stays clean.
-- **Layered catalogs:** repeat `--skills-dir` to stack Skill collections; the rightmost source
+- **Layered catalogs (Codex/Claude):** repeat `--skills-dir` to stack Skill collections; the rightmost source
   wins each Skill name.
 - **Conflict safety:** an existing Skill is never replaced, and a name clash stops the session
   before anything changes.
@@ -126,8 +129,11 @@ Preview a Codex session plan, still read-only:
 asm codex --skills-dir ~/agent-skills --dry-run -- exec "Summarize this project's build steps"
 ```
 
+The preview prints the adapter's dated last-tested banner but does not query the installed Agent.
+
 Run the session for real. SkillMount mounts the Skills, launches Codex, and cleans up after the
-agent exits:
+Agent exits. Normal sessions neither query the installed Agent banner nor emit a version
+compatibility warning; use `asm doctor` when you need local version evidence:
 
 ```bash
 asm codex --skills-dir ~/agent-skills -- exec "Summarize this project's build steps"
@@ -140,25 +146,107 @@ to Claude through `--add-dir`, so the project itself is not modified:
 asm claude --skills-dir ~/agent-skills -- -p "Review the staged diff with the team review Skill"
 ```
 
-Everything after the standalone `--` is passed to the agent unchanged. Repeat `--skills-dir` to
-overlay collections, and add `--agent-bin path/to/codex` to pin a specific agent executable
-instead of searching `PATH`.
+Oh My Pi receives native `skills.customDirectories` through a temporary session configuration;
+no Skill links or project settings are written:
+
+```bash
+asm omp --skills-dir ~/agent-skills -- -p "Summarize this project's build steps"
+```
+
+Everything after the standalone `--` is passed to the Agent unchanged. Repeat `--skills-dir` to
+overlay collections, and add `--agent-bin path/to/codex` to select a specific executable instead of
+searching `PATH`.
 
 Treat mounted Skills as code you chose to run: review their contents and provenance before making
 them visible to an agent.
+
+## Oh My Pi sessions
+
+`asm omp` and `skillmount omp` launch a new supervised foreground OMP session. Unlike
+Codex/Claude, OMP owns Skill discovery, selection, filters, aliases and duplicate resolution.
+SkillMount adds collection roots through OMP's native `skills.customDirectories`, using a private
+session-only `--config` file. It never edits your `.omp/config.yml` or creates `.omp/skills` links.
+
+```bash
+asm omp --skills-dir ~/agent-skills -- -p "Summarize this project's build steps"
+asm omp --skills-dir ~/rust-skills --skills-dir ~/fe-skills -- --skills 'rust-*'
+asm omp --skills-dir ~/agent-skills --dry-run
+asm inspect --agent omp --skills-dir ~/agent-skills
+asm doctor --project-root . --omp-bin /opt/homebrew/bin/omp
+```
+
+Already configured directories are preserved first; CLI roots follow in their declared order.
+OMP scans immediate `<root>/<entry>/SKILL.md` children, not individual `SKILL.md` roots or nested
+collections. Pass the containing collection, not an individual Skill. OMP gives the first custom
+occurrence its bare name; differing duplicates can remain under namespaced aliases, while identical
+content can collapse. **OMP does not use SkillMount's Codex/Claude rightmost-wins or conflict policy.**
+Default `inspect` covers all agents: an individual Skill input still reports Codex/Claude, but
+returns a partial failure naming OMP's collection-only requirement. Use a collection for all-agent
+success, or `inspect --agent codex` / `--agent claude` for a direct Skill.
+
+Configured filters and `--skills`/`--no-skills` remain OMP policy; SkillMount does not promise that
+every directory entry will load or that only one duplicate remains visible.
+
+For example, existing project configuration needs no links and is not rewritten:
+
+```yaml
+skills:
+  customDirectories:
+    - ~/Work/omp-skills/rust-skills
+    - ~/Work/omp-skills/fe-skills
+```
+
+Because OMP replaces arrays across settings layers, SkillMount snapshots the effective initial
+custom-directory array before appending CLI roots. Changes to that array during the session take
+effect in a **new** wrapped session; other settings retain OMP's own behavior. Projection is bounded:
+plain YAML/JSON/TOML settings only, at most 1 MiB per file and 1024 combined directories. Unsupported
+OpenCode JSONC syntax/substitutions, malformed settings, and unmigrated legacy settings fail with an
+explanation rather than silently discarding configuration. A database alone may be an ordinary
+default install, but SkillMount cannot prove it has no legacy settings without reading SQLite.
+Establish or migrate YAML through native OMP configuration, or run OMP directly; do not create an
+empty YAML file blindly, because that can suppress real migration. Start OMP directly for other
+unsupported input.
+
+OMP uses private staging only. Non-default `--link-mode`, `--conflict=skip`, `--validation`, and
+`--keep-mounts` are rejected rather than ignored. Root/profile/config relocation, extension-changing
+CLI flags, session resume/fork/restore/import, server modes and operator subcommands remain rejected.
+A home-directory launch requires your own `--allow-home`. Model, prompt, filters and approval flags
+are forwarded unchanged; SkillMount does not add permissions, authentication or auto-approval.
+
+The owned config stays available until the entire managed process domain is dead, including
+reloading and background children. Cleanup checks the exact recorded file identity and content;
+changed or replaced files are retained with recovery evidence, never removed as user-owned data.
+Old link-based journals remain readable for cleanup, but older binaries cannot clean the new config
+operation: finish or recover active sessions with this release before downgrading.
+See [the native-directory decision](docs/adr/0040-delegate-omp-discovery-through-owned-config.md)
+and [compatibility evidence](docs/compatibility.md).
+
+## Concurrent sessions
+
+Independent project sessions can overlap, even when they inspect the same user, administrator,
+settings, plugin, compatibility, or custom Skill roots. Each invocation stabilizes its own current
+namespace before planning, so a later session applies `--conflict=error` or `--conflict=skip` to
+what exists at its launch. An already-running Agent is not guaranteed to receive a live update;
+start a new session when it must see newly added Skills.
+
+Logical or physical destination overlap is still exclusive. A contender waits for the active
+session to release the destination and, if contention remains, exits with status 75 before applying
+anything. Physical aliases such as directory links do not bypass that protection, and one session
+never uses shared discovery access as authority to clean another session's entries.
 
 ## Commands and options
 
 ```
 codex         Run a Codex session with the selected Skills
 claude        Resolve Skills for a future Claude Code session
+omp           Run an Oh My Pi session with the selected Skills
 completions   Generate a shell completion script on standard output
 inspect       Inspect and validate a catalog without modifying the filesystem
 doctor        Inspect agent, discovery, link, lock, and transaction health
-cleanup       Reconcile transaction-owned residue from durable evidence
+cleanup       Reconcile residue from durable transaction evidence
 ```
 
-The session commands `codex` and `claude` share these options:
+The session commands `codex`, `claude`, and `omp` share these options:
 
 ```
 --skills-dir <PATH>    Skill directory or direct Skill; repeat for a rightmost-wins overlay
@@ -170,14 +258,15 @@ The session commands `codex` and `claude` share these options:
 --conflict <POLICY>    Existing-destination policy: error, skip [default: error]
 --validation <LEVEL>   Metadata validation policy: basic, strict, none [default: basic]
 --dry-run              Keep later planning read-only
---keep-mounts          Retain later transaction-owned mounts for diagnostics
+--keep-mounts          Retain later session mounts for diagnostics
 --no-recover           Disable later stale-transaction recovery
 -v, --verbose          Increase diagnostic verbosity
 ```
 
 `--conflict skip` keeps an existing Skill and quietly drops the colliding mount instead of
 failing. `--validation none` relaxes metadata checks only; structural and safety checks always
-run.
+run. `omp` mounts only into the project scope, so `--mount-mode=staging` is rejected as a usage
+error.
 
 ## Shell completion
 
@@ -211,17 +300,65 @@ asm doctor --project-root ~/projects/webapp
 asm cleanup --project-root ~/projects/webapp
 ```
 
-`doctor` reports agent versions, discovery layout, link capability, locks, and leftover journals
-without changing project or SkillMount state. `cleanup` releases mounts left behind by an
-interrupted session; run it only after confirming no agent process still uses them, or sweep every
-recorded transaction with `asm cleanup --all`. The recovery rules and their guarantees are
-documented in [docs/architecture.md](docs/architecture.md).
+`doctor` reports Agent version evidence, discovery layout, link capability, locks, and leftover
+journals without changing project or SkillMount state. The last-tested banner is a `pass`; a
+different or unavailable banner is `unverified` and does not fail `doctor` unless another check
+fails. `cleanup` releases mounts left behind by an interrupted session; run it only after confirming
+no Agent process still uses them, or sweep every recorded transaction with
+`asm cleanup --all`. The recovery rules and their guarantees are documented in
+[docs/architecture.md](docs/architecture.md).
+
+When one or more Skill links genuinely cannot be released, the session first reports every
+condition once on stderr, then emits one recovery footer. A direct Windows invocation whose
+ancestry identifies PowerShell receives a command whose path is a single-quoted literal:
+
+```text
+error: session cleanup failed
+  reason: a regular directory replaced the entry, so it cannot be proved to belong to this session and was left untouched
+  retained path: C:\projects\O'Brien webapp\.omp\skills\team-review
+  retained journal: C:\Users\me\AppData\Local\skillmount\transactions\<id>.journal
+
+Recovery — run only after confirming that every related Agent process has exited:
+  command 1 (PowerShell):
+    asm cleanup --project-root 'C:\projects\O''Brien webapp'
+```
+
+PowerShell emits only the narrow ASCII safe-word set `[A-Za-z0-9_.-]+` unquoted and uses `'...'`
+for every other accepted value; an apostrophe inside the value becomes `''`. A direct Command Prompt
+invocation uses its independently verified double-quoted form instead:
+
+```text
+  command 1 (Command Prompt):
+    asm cleanup --project-root "C:\projects\web app"
+```
+
+The executable is `skillmount` when that is the recognized invoked product name and `asm`
+otherwise. If startup ancestry is absent or ambiguous, or a native value cannot be represented
+losslessly in the selected shell, SkillMount prints the authoritative native values instead of
+guessing:
+
+```text
+  command 1 (native argument vector):
+    executable: asm
+    argument 1: cleanup
+    argument 2: --project-root
+    argument 3: /projects/webapp
+```
+
+SkillMount never stores or executes the displayed shell line. Recovery authority still comes from
+the separate native values and the operator's confirmation that every related Agent process has
+exited.
 
 ## Requirements
 
 - Supported hosts: Windows 10 version 1709 or later (x64 and x86) and macOS on Apple Silicon.
-- Sessions launch exactly the pinned agent releases: Codex CLI 0.146.0 and Claude Code 2.1.220.
-  Dated compatibility observations live in [docs/compatibility.md](docs/compatibility.md).
+- The adapters' dated last-tested banners are `codex-cli 0.146.0`, `2.1.220 (Claude Code)`, and
+  `omp/18.14.0`. These are evidence baselines, not an exact-version allowlist. Normal sessions do
+  not query or warn about the installed banner; `asm doctor` classifies a different or unavailable
+  banner as `unverified` until the live-agent workflow is recorded in
+  [docs/compatibility.md](docs/compatibility.md).
+- Release-independent discovery, configuration, and foreground-lifecycle controls still fail
+  closed independently of banner evidence.
 - Building from source requires Rust 1.85.0 or newer.
 
 ## Documentation
@@ -229,7 +366,7 @@ documented in [docs/architecture.md](docs/architecture.md).
 | Document | What it covers |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | Module boundaries, safety invariants, implementation status |
-| [docs/compatibility.md](docs/compatibility.md) | Pinned agent versions and dated observations |
+| [docs/compatibility.md](docs/compatibility.md) | Last-tested Agent evidence and dated observations |
 | [docs/packaging.md](docs/packaging.md) | Package channels, availability, maintainer runbook |
 | [docs/releasing.md](docs/releasing.md) | Building and publishing a stable release |
 

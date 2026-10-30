@@ -21,6 +21,8 @@ pub mod cleanup;
 pub mod recover;
 
 #[cfg(test)]
+mod config_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::BTreeMap;
@@ -32,18 +34,12 @@ use crate::domain::{LinkMode, RunContext, SkillCatalog};
 use crate::error::AppError;
 use crate::journal::{
     ActionOperation, ActionStatus, JournalAction, JournalLock, RecordedKind, SourceResolution,
-    TransactionId, TransactionJournal, TransactionStatus, store,
+    TransactionId, TransactionJournal, TransactionStatus, staged_sibling, store,
 };
 use crate::link::{LinkBackend, platform_backend};
 use crate::lock::acquire::HeldLocks;
+use crate::lock::{LockAccess, LockResource, LockResourceKind};
 use crate::mount::{MountAction, MountPlan};
-
-/// Filename prefix every staged entry uses.
-///
-/// The leading dot keeps a staged entry out of the way of an agent that lists the store while a
-/// transaction is in flight, and the fixed prefix means a leftover from a crashed run is
-/// identifiable on sight even before its journal is read.
-const STAGING_PREFIX: &str = ".skillmount-";
 
 /// One open transaction and the journal that describes it.
 ///
@@ -70,39 +66,16 @@ impl fmt::Debug for Transaction {
 }
 
 impl Transaction {
-    /// Builds the complete `planned` journal for `plan` and persists it before anything is created.
+    /// Opens a transaction whose identifier was minted before lock-set stabilization.
     ///
-    /// `locks` must already hold every key the snapshot's resources need. Nothing on the filesystem
-    /// is touched by this call except the journal itself, which lives outside the project.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AppError::Internal`] when the caller does not hold the plan's locks, and
-    /// [`AppError::Journal`] when the journal cannot be made durable. In both cases no mutation has
-    /// been attempted.
-    pub fn open(
-        context: &RunContext,
-        catalog: &SkillCatalog,
-        plan: &MountPlan,
-        snapshot: &DiscoverySnapshot,
-        locks: &HeldLocks,
-    ) -> Result<Self, AppError> {
-        Self::open_with(
-            context,
-            catalog,
-            plan,
-            snapshot,
-            locks,
-            TransactionId::mint(),
-        )
-    }
-
-    /// Opens a transaction with a caller-supplied identifier, so the staging root and the journal
-    /// name can share one value.
+    /// The caller must use the same identifier to derive every staged-sibling resource before
+    /// acquisition. Minting here would make those exact logical keys unknowable to the caller.
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [`Transaction::open`].
+    /// Returns [`AppError::Internal`] when the caller does not hold the complete plan and mutation
+    /// lock set, and [`AppError::Journal`] when the journal cannot be made durable. In both cases no
+    /// destination mutation has been attempted.
     pub fn open_with(
         context: &RunContext,
         catalog: &SkillCatalog,
@@ -113,23 +86,39 @@ impl Transaction {
     ) -> Result<Self, AppError> {
         // Checked rather than documented. Every removal this transaction will later perform is safe
         // only because no other session can reach the same entry, and that is a property of the
-        // locks, not of the code that removes. A caller that skipped them must fail here, before the
-        // journal exists, rather than produce entries whose safety rests on an assumption.
+        // locks, not of the code that removes. Observation locks still matter for snapshot
+        // stability, but they never authorize a journal that may create or remove an entry.
         if !locks.holds_all(&snapshot.lock_resources) {
             return Err(AppError::Internal(
                 "a transaction may only open while its plan's resource locks are held".to_owned(),
             ));
         }
-
+        for planned in &plan.actions {
+            if let MountAction::CreateConfigFile { contents, .. } = &planned.operation {
+                if contents.len() > crate::link::MAX_CONFIG_BYTES {
+                    return Err(AppError::Usage(
+                        "session configuration exceeds the journal content bound".to_owned(),
+                    ));
+                }
+            }
+        }
         let actions = plan
             .actions
             .iter()
             .map(|planned| journal_action(&transaction_id, planned))
             .collect::<Vec<_>>();
+        let mutation_resources = required_mutation_resources(&actions, plan, snapshot)?;
+        if !locks.holds_all(&mutation_resources) {
+            return Err(AppError::Internal(
+                "a transaction may only open while mutation access is held for every owned \
+                 destination"
+                    .to_owned(),
+            ));
+        }
 
         let journal = TransactionJournal {
             transaction_id,
-            agent: context.agent,
+            agent: context.agent_id(),
             owner_pid: std::process::id(),
             status: TransactionStatus::Planned,
             project_root: context.project_root.clone(),
@@ -206,6 +195,50 @@ impl Transaction {
         &self.path
     }
 
+    /// Returns every still-pending cleanup-critical entry path for a failure diagnostic.
+    ///
+    /// This is evidence, not removal authority. The caller uses it only when journal persistence
+    /// fails before cleanup can return a structured report, so the operator still learns which
+    /// mounted entries remain.
+    pub(crate) fn cleanup_critical_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for action in self.journal.cleanup_candidates().filter(|action| {
+            action.operation.cleanup_disposition() == crate::mount::CleanupDisposition::Required
+        }) {
+            let path = action.current_path();
+            if !paths.contains(path) {
+                paths.push(path.clone());
+            }
+        }
+        paths
+    }
+
+    /// Rechecks every applied configuration file immediately before child exposure.
+    ///
+    /// # Errors
+    /// Refuses missing, replaced, modified, or unobservable files without launching a child.
+    pub fn verify_config_files(&self) -> Result<(), AppError> {
+        for action in &self.journal.actions {
+            if action.operation != ActionOperation::CreateConfigFile {
+                continue;
+            }
+            let file = crate::link::OwnedConfigFile {
+                path: action.final_path.clone(),
+                identity: action.identity.clone(),
+                contents: action.config_contents.clone().ok_or_else(|| {
+                    AppError::Internal("configuration action lacks content evidence".to_owned())
+                })?,
+            };
+            if action.status != ActionStatus::Applied || !self.backend.verify_config_file(&file)? {
+                return Err(AppError::Temporary(format!(
+                    "session configuration changed before launch: {}",
+                    file.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Durably records that a child may begin using the mounted entries.
     ///
     /// This transition precedes every spawn attempt. If the wrapper disappears afterwards, free
@@ -254,6 +287,99 @@ impl Transaction {
     }
 }
 
+/// Returns the exact mutation resources for transaction-unique staged siblings.
+///
+/// These are added only after a mutating session has minted its transaction id. Dry-run planning
+/// never calls this helper, so its deterministic placeholder plan remains lock- and id-free.
+pub(crate) fn staged_mutation_resources(
+    transaction_id: &TransactionId,
+    plan: &MountPlan,
+) -> Result<Vec<LockResource>, AppError> {
+    let mut resources = Vec::new();
+    for planned in &plan.actions {
+        let final_path = match &planned.operation {
+            MountAction::CreateDirectory { path } | MountAction::CreateConfigFile { path, .. } => {
+                path
+            }
+            MountAction::CreateDirectoryLink { destination, .. } => destination,
+            MountAction::ReuseExistingLink { .. } => continue,
+        };
+        let temporary = staged_sibling(transaction_id, planned.id, final_path);
+        resources.push(LockResource::describe_shared(
+            LockResourceKind::DiscoveryEntry,
+            LockAccess::Mutate,
+            &temporary,
+        )?);
+    }
+    resources.sort_by_key(LockResource::ordering_key);
+    resources.dedup();
+    Ok(resources)
+}
+
+/// Returns the mutation resources that authorize every path this transaction may own.
+///
+/// A resource protects its own coherent logical path and descendants. Reused links are deliberately
+/// absent: the transaction neither creates nor removes them. Returning the recorded resource itself
+/// also retains its physical key when the destination container already exists.
+fn required_mutation_resources(
+    actions: &[JournalAction],
+    plan: &MountPlan,
+    snapshot: &DiscoverySnapshot,
+) -> Result<Vec<LockResource>, AppError> {
+    let mut required_paths = vec![
+        (
+            plan.discovery.entry.clone(),
+            Some(LockResourceKind::DiscoveryEntry),
+            false,
+        ),
+        (
+            plan.discovery.backing_store.clone(),
+            Some(LockResourceKind::BackingStore),
+            false,
+        ),
+    ];
+    for action in actions
+        .iter()
+        .filter(|action| action.operation.creates_entry())
+    {
+        if let Some(temporary) = &action.temporary_path {
+            required_paths.push((
+                temporary.clone(),
+                Some(LockResourceKind::DiscoveryEntry),
+                true,
+            ));
+        }
+        required_paths.push((action.final_path.clone(), None, false));
+    }
+    let mut required = Vec::new();
+
+    for (path, kind, exact) in required_paths {
+        let resource = snapshot
+            .lock_resources
+            .iter()
+            .filter(|resource| kind.is_none_or(|required| resource.kind == required))
+            .filter(|resource| {
+                if exact {
+                    resource.authorizes_exact_mutation_of(&path)
+                } else {
+                    resource.authorizes_mutation_of(&path)
+                }
+            })
+            .max_by_key(|resource| resource.identity.logical_path().components().count())
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "the plan has no mutation lock resource covering owned destination {}",
+                    path.display()
+                ))
+            })?;
+        if !required.contains(resource) {
+            required.push(resource.clone());
+        }
+    }
+
+    Ok(required)
+}
+
 /// Builds the durable record for one planned action, assigning its staged sibling.
 ///
 /// The staged name is derived here rather than in the planner because it embeds the transaction
@@ -270,6 +396,12 @@ fn journal_action(
             path.clone(),
             None,
             RecordedKind::Directory,
+        ),
+        MountAction::CreateConfigFile { path, .. } => (
+            ActionOperation::CreateConfigFile,
+            path.clone(),
+            None,
+            RecordedKind::File,
         ),
         MountAction::CreateDirectoryLink {
             source,
@@ -299,11 +431,18 @@ fn journal_action(
     };
 
     JournalAction {
+        config_contents: match &planned.operation {
+            MountAction::CreateConfigFile { contents, .. } => Some(contents.clone()),
+            _ => None,
+        },
         id: planned.id,
         operation,
         expected_precondition: planned.expected_precondition,
+        // Both create operations receive a transaction-unique staged sibling. Cleanup authority
+        // differs between a Skill link and a helper directory, but the write-ahead sequence that
+        // brings either into existence does not.
         temporary_path: operation
-            .is_transaction_owned()
+            .creates_entry()
             .then(|| staged_sibling(transaction_id, planned.id, &final_path)),
         final_path,
         source_canonical,
@@ -318,14 +457,4 @@ fn journal_action(
         },
         identity: None,
     }
-}
-
-/// Returns the transaction-unique sibling an entry is staged at.
-///
-/// A sibling, not a temporary directory elsewhere: placement is an atomic rename, and a rename is
-/// only atomic within one filesystem. Staging in the destination's own directory is the only way to
-/// guarantee that on a host where the store sits on a different volume from anything else.
-fn staged_sibling(transaction_id: &TransactionId, action_id: u32, final_path: &Path) -> PathBuf {
-    let parent = final_path.parent().unwrap_or_else(|| Path::new(""));
-    parent.join(format!("{STAGING_PREFIX}{transaction_id}-{action_id}.tmp"))
 }

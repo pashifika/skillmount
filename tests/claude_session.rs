@@ -54,6 +54,8 @@ impl Fixture {
         ] {
             fs::create_dir_all(directory).expect("fixture directory");
         }
+        // Never inherit a repository marker from the host temporary-directory ancestors.
+        fs::create_dir(fixture.project.join(".git")).expect("isolated repository root");
         fixture
     }
 
@@ -106,11 +108,6 @@ impl Fixture {
             .env("SKILLMOUNT_STATE_DIR", &self.state)
             .env("SKILLMOUNT_FAKE_RECORD", &self.record)
             .env("SKILLMOUNT_FAKE_VERSION_RECORD", &self.version_record)
-            .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", "2.1.220 (Claude Code)")
-            .env(
-                "SKILLMOUNT_FAKE_UNSUPPORTED_VERSION_OUTPUT",
-                "2.1.221 (Claude Code)",
-            )
             .env("SKILLMOUNT_FAKE_BEHAVIOR", "exit")
             .current_dir(&self.project);
         command
@@ -149,6 +146,18 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+fn assert_asm_recovery_footer(rendered: &str) {
+    assert_eq!(rendered.matches("Recovery —").count(), 1, "{rendered}");
+    let vector = rendered.contains("executable: asm");
+    let shell_command = rendered.contains("asm cleanup --project-root");
+    assert_ne!(
+        vector, shell_command,
+        "exactly one selected-shell command or native vector is required: {rendered}"
+    );
+    assert!(rendered.contains("cleanup"), "{rendered}");
+    assert!(rendered.contains("--project-root"), "{rendered}");
+    assert!(!rendered.contains("argv["), "{rendered}");
 }
 
 #[test]
@@ -190,6 +199,25 @@ fn three_source_overrides_count_once_normally_and_list_every_origin_verbose() {
     assert!(output.stdout.is_empty());
 }
 
+/// A mutating session spawns exactly one Agent process: the supervised session child.
+///
+/// [ADR 0036](../docs/adr/0036-confine-agent-version-observation-to-doctor.md) removed the
+/// pre-state `--version` observation, so the absence of the record file is the observable proof.
+fn assert_no_version_process_and_no_compatibility_warning(fixture: &Fixture, stderr: &str) {
+    assert!(
+        !fixture.version_record.exists(),
+        "a mutating session must not run --version"
+    );
+    assert!(
+        !stderr.contains("version compatibility is unverified"),
+        "a session must emit no compatibility warning: {stderr}"
+    );
+    assert!(
+        fixture.record.is_file(),
+        "the supervised session child must still start"
+    );
+}
+
 #[test]
 fn selected_winners_are_visible_only_in_the_injected_root_then_cleanup_succeeds() {
     let fixture = Fixture::new("happy-path");
@@ -216,6 +244,7 @@ fn selected_winners_are_visible_only_in_the_injected_root_then_cleanup_succeeds(
         .arg("prompt with spaces")
         .env("SKILLMOUNT_FAKE_EXPECT_ADD_DIR_SKILLS", expected_names)
         .env("SKILLMOUNT_FAKE_EXPECT_PATHS", expected_existing)
+        .current_dir(&fixture.root)
         .output()
         .expect("asm should launch fake Claude");
 
@@ -274,13 +303,7 @@ fn selected_winners_are_visible_only_in_the_injected_root_then_cleanup_succeeds(
     }));
     assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
     assert_eq!(fixture.journal_count(), 0);
-    assert_eq!(
-        fs::read_to_string(&fixture.version_record)
-            .expect("version probe record")
-            .lines()
-            .count(),
-        3
-    );
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
     for (root, before) in watched {
         assert_eq!(snapshot(&root), before, "{} changed", root.display());
     }
@@ -311,7 +334,7 @@ fn machine_readable_claude_stdout_is_not_prefixed_by_wrapper_diagnostics() {
 }
 
 #[test]
-fn disabling_flags_and_unsupported_versions_fail_before_state_or_child_launch() {
+fn discovery_changing_and_detached_controls_fail_before_state_or_child_launch() {
     for rejected in ["--bare", "--safe-mode", "--disable-slash-commands"] {
         let fixture = Fixture::new(rejected.trim_start_matches('-'));
         fixture.skill(&fixture.left, "alpha", "fixture");
@@ -406,22 +429,6 @@ fn disabling_flags_and_unsupported_versions_fail_before_state_or_child_launch() 
     assert!(String::from_utf8_lossy(&output.stderr).contains("CLAUDE_CODE_SIMPLE"));
     assert!(!fixture.state.exists());
     assert!(!fixture.record.exists());
-
-    let fixture = Fixture::new("unsupported-version");
-    fixture.skill(&fixture.left, "alpha", "fixture");
-    let output = fixture
-        .command()
-        .arg("--")
-        .arg("prompt")
-        .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", "2.1.219 (Claude Code)")
-        .output()
-        .expect("asm should reject an unsupported Claude release");
-
-    assert_eq!(output.status.code(), Some(64));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("2.1.220"));
-    assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
-    assert_eq!(fixture.journal_count(), 0);
-    assert!(!fixture.record.exists());
 }
 
 #[test]
@@ -433,6 +440,7 @@ fn non_session_subcommands_fail_before_state_or_child_launch() {
         "doctor",
         "gateway",
         "install",
+        "import",
         "mcp",
         "plugin",
         "plugins",
@@ -502,38 +510,84 @@ fn an_invalid_rightmost_claude_winner_never_falls_back_or_launches() {
 }
 
 #[test]
-fn a_version_change_at_the_spawn_boundary_overrides_keep_and_cleans_staging() {
-    let fixture = Fixture::new("upgrade-after-apply");
+fn a_drifted_claude_banner_neither_warns_nor_starts_a_version_process() {
+    let fixture = Fixture::new("drifted-banner");
     fixture.skill(&fixture.left, "alpha", "fixture");
 
+    let output = fixture
+        .command()
+        .arg("--")
+        .arg("prompt")
+        .env("SKILLMOUNT_FAKE_VERSION_OUTPUT", "2.1.222 (Claude Code)")
+        .env("SKILLMOUNT_FAKE_EXIT", "2")
+        .output()
+        .expect("asm should launch a drifted Claude build");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
+    assert!(!stderr.contains("2.1.222 (Claude Code)"), "{stderr}");
+    assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
+    assert_eq!(fixture.journal_count(), 0);
+}
+
+#[test]
+fn a_claude_build_without_usable_version_evidence_still_keeps_mounts() {
+    let fixture = Fixture::new("unusable-version-keep");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+
+    // The fake agent would fail `--version` if anything asked; nothing does.
     let output = fixture
         .command()
         .arg("--keep-mounts")
         .arg("--")
         .arg("prompt")
-        .env("SKILLMOUNT_FAKE_UNSUPPORTED_VERSION_AT", "3")
+        .env("SKILLMOUNT_FAKE_VERSION_EXIT", "9")
         .output()
-        .expect("asm should reject a changed child release");
+        .expect("asm should ignore an unusable --version");
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(64));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("2.1.220"));
-    assert!(
-        !fixture.record.exists(),
-        "the incompatible child must not start"
-    );
-    assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
-    assert_eq!(fixture.journal_count(), 0);
-    assert_eq!(
-        fs::read_to_string(&fixture.version_record)
-            .expect("version probe record")
-            .lines()
-            .count(),
-        3
-    );
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
+    assert_eq!(fixture.sessions().len(), 1);
+    assert_eq!(fixture.journal_count(), 1);
 }
 
+/// Unknown options are forwarded for compatibility, not certified as harmless.
+///
+/// Known discovery and lifecycle controls remain hard failures. Forwarding a token absent from the
+/// pinned tables neither predicts its future Agent semantics nor expands ADR 0019's process-domain
+/// proof.
 #[test]
-fn child_and_cleanup_exit_precedence_preserves_unowned_session_content() {
+fn an_unclassified_passthrough_option_is_forwarded_unchanged() {
+    let fixture = Fixture::new("unclassified-option");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+
+    let output = fixture
+        .command()
+        .arg("--")
+        .arg("--future-control")
+        .arg("future-value")
+        .arg("prompt")
+        .output()
+        .expect("asm should forward an unclassified option");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_no_version_process_and_no_compatibility_warning(&fixture, &stderr);
+    let record = fs::read_to_string(&fixture.record).expect("fake Claude record");
+    let arguments = recorded_os_values(&record, "arg");
+    let tail = arguments
+        .windows(3)
+        .find(|window| window[0] == OsStr::new("--future-control"))
+        .expect("the unclassified option reaches the child");
+    assert_eq!(tail[1], OsStr::new("future-value"));
+    assert_eq!(tail[2], OsStr::new("prompt"));
+}
+
+/// Preserving scaffolding is silent; only an unprovable Skill link changes the outcome.
+#[test]
+fn preserved_session_scaffolding_propagates_the_child_status_without_a_cleanup_block() {
     let clean = Fixture::new("child-nonzero");
     clean.skill(&clean.left, "alpha", "fixture");
     let output = clean
@@ -547,10 +601,8 @@ fn child_and_cleanup_exit_precedence_preserves_unowned_session_content() {
     assert_eq!(clean.sessions(), Vec::<PathBuf>::new());
     assert_eq!(clean.journal_count(), 0);
 
-    for (label, child_code, expected_code) in
-        [("cleanup-primary", "0", 73), ("child-primary", "2", 2)]
-    {
-        let fixture = Fixture::new(label);
+    for child_code in ["0", "2"] {
+        let fixture = Fixture::new(&format!("session-scaffolding-{child_code}"));
         fixture.skill(&fixture.left, "alpha", "fixture");
         let output = fixture
             .command()
@@ -562,23 +614,158 @@ fn child_and_cleanup_exit_precedence_preserves_unowned_session_content() {
             .expect("asm should retain unexpected session content");
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        assert_eq!(output.status.code(), Some(expected_code), "{stderr}");
+        assert_eq!(
+            output.status.code(),
+            Some(child_code.parse::<i32>().expect("fixture child code")),
+            "{stderr}"
+        );
         let record = fs::read_to_string(&fixture.record).expect("fake Claude record");
         let created = PathBuf::from(recorded_os_value(&record, "created"));
         assert_eq!(
             fs::read_to_string(&created).expect("unowned file survives cleanup"),
             "created by fake agent\n"
         );
-        assert_eq!(fixture.journal_count(), 1);
-        if child_code == "0" {
-            assert!(stderr.contains("error: session cleanup failed"), "{stderr}");
-        } else {
-            assert!(
-                stderr.contains("warning: session cleanup failed"),
-                "{stderr}"
-            );
-        }
+        assert_eq!(
+            fixture.journal_count(),
+            0,
+            "preserved scaffolding alone must not retain recovery evidence: {stderr}"
+        );
+        assert!(
+            !stderr.contains("session cleanup failed"),
+            "successful preservation emits neither block: {stderr}"
+        );
     }
+}
+
+/// A replaced staging Skill link is the residue that still decides the session outcome.
+#[test]
+fn child_and_cleanup_exit_precedence_follows_an_unprovable_staging_link() {
+    for (label, child_code, expected_code) in
+        [("cleanup-primary", "0", 73), ("child-primary", "9", 9)]
+    {
+        let fixture = Fixture::new(label);
+        fixture.skill(&fixture.left, "alpha", "fixture");
+        let output = fixture
+            .command()
+            .arg("--")
+            .arg("prompt")
+            .env("SKILLMOUNT_FAKE_REPLACE_IN_ADD_DIR", ".claude/skills/alpha")
+            .env("SKILLMOUNT_FAKE_EXIT", child_code)
+            .output()
+            .expect("asm should retain an unprovable staging link");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(output.status.code(), Some(expected_code), "{stderr}");
+        let record = fs::read_to_string(&fixture.record).expect("fake Claude record");
+        let replaced = PathBuf::from(recorded_os_value(&record, "replaced"));
+        assert_eq!(
+            fs::read_to_string(replaced.join("their-own-work.txt"))
+                .expect("the replacement survives cleanup"),
+            "replaced by fake agent\n"
+        );
+        assert_eq!(
+            fixture.journal_count(),
+            1,
+            "an unprovable Skill link keeps its recovery evidence: {stderr}"
+        );
+        let severity = if child_code == "0" {
+            "error"
+        } else {
+            "warning"
+        };
+        assert!(
+            stderr.contains(&format!("{severity}: session cleanup failed")),
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.matches("session cleanup failed").count(),
+            1,
+            "each fact is reported once: {stderr}"
+        );
+        assert!(stderr.contains("  retained path: "), "{stderr}");
+        assert!(stderr.contains("  retained journal: "), "{stderr}");
+        assert_asm_recovery_footer(&stderr);
+        assert!(
+            stderr
+                .find("  retained journal: ")
+                .zip(stderr.find("Recovery —"))
+                .is_some_and(|(journal, footer)| journal < footer),
+            "the complete diagnostic must precede recovery: {stderr}"
+        );
+    }
+}
+
+/// Project mode removes its created Skill link and leaves the `.claude/skills` chain behind.
+///
+/// The scaffolding it establishes in the operator's own project is exactly the case where deleting
+/// content would be worst, so a helper directory another writer touched is preserved and the session
+/// still completes.
+#[test]
+fn project_mode_removes_its_link_and_preserves_unexpected_helper_content() {
+    let fixture = Fixture::new("project-mode-content");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+    let mounted = fixture.project.join(".claude/skills/alpha");
+    let user_file = fixture.project.join(".claude/skills/user-note.txt");
+
+    let output = fixture
+        .command()
+        .arg("--mount-mode=project")
+        .arg("--")
+        .arg("prompt")
+        .env("SKILLMOUNT_FAKE_CREATE_FILE", &user_file)
+        .output()
+        .expect("asm should run a project-mode Claude session");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&user_file).expect("project content survives cleanup"),
+        "created by fake agent\n"
+    );
+    assert!(
+        fs::symlink_metadata(&mounted).is_err(),
+        "the created project Skill link is cleanup-critical: {stderr}"
+    );
+    assert!(fixture.project.join(".claude/skills").is_dir());
+    assert_eq!(
+        fixture.journal_count(),
+        0,
+        "preserved project scaffolding must not retain recovery evidence: {stderr}"
+    );
+    assert_eq!(
+        fixture.sessions(),
+        Vec::<PathBuf>::new(),
+        "project mode establishes no staging root: {stderr}"
+    );
+    assert!(!stderr.contains("session cleanup failed"), "{stderr}");
+}
+
+/// A replaced project-mode Skill link keeps its journal and fails the otherwise successful session.
+#[test]
+fn project_mode_retains_an_unprovable_link_and_returns_filesystem_status() {
+    let fixture = Fixture::new("project-mode-replaced");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+    let mounted = fixture.project.join(".claude/skills/alpha");
+
+    let output = fixture
+        .command()
+        .arg("--mount-mode=project")
+        .arg("--")
+        .arg("prompt")
+        .env("SKILLMOUNT_FAKE_REPLACE_ENTRY", &mounted)
+        .output()
+        .expect("asm should retain an unprovable project link");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(73), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(mounted.join("their-own-work.txt"))
+            .expect("the replacement survives cleanup"),
+        "replaced by fake agent\n"
+    );
+    assert_eq!(fixture.journal_count(), 1, "{stderr}");
+    assert!(stderr.contains("error: session cleanup failed"), "{stderr}");
+    assert_asm_recovery_footer(&stderr);
 }
 
 #[test]
@@ -652,10 +839,10 @@ fn two_fake_claude_children_overlap_with_distinct_owned_roots() {
     let second_record = fixture.root.join("second.record");
     let release = fixture.root.join("release");
 
-    let first = spawn_waiting(&fixture, &first_record, "first.version", &release);
-    wait_until_ready(&first_record);
-    let second = spawn_waiting(&fixture, &second_record, "second.version", &release);
-    wait_until_ready(&second_record);
+    let mut first = spawn_waiting(&fixture, &first_record, "first.version", &release);
+    first.wait_until_ready();
+    let mut second = spawn_waiting(&fixture, &second_record, "second.version", &release);
+    second.wait_until_ready();
 
     let first_root = recorded_injected_root(&first_record);
     let second_root = recorded_injected_root(&second_record);
@@ -665,8 +852,8 @@ fn two_fake_claude_children_overlap_with_distinct_owned_roots() {
     assert_eq!(fixture.sessions().len(), 2);
 
     fs::write(&release, b"release\n").expect("release both fake children");
-    assert_success(&wait_output(first));
-    assert_success(&wait_output(second));
+    first.finish();
+    second.finish();
     assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
     assert_eq!(fixture.journal_count(), 0);
 }
@@ -703,8 +890,127 @@ fn both_installed_binary_names_run_the_same_claude_session_contract() {
     assert_eq!(fixture.journal_count(), 0);
 }
 
-fn spawn_waiting(fixture: &Fixture, record: &Path, version_name: &str, release: &Path) -> Child {
-    fixture
+// Setup includes filesystem identity checks and stale-journal observation. Its budget is
+// distinct from the fake agent's startup handshake; neither is a product performance SLA.
+const START_PHASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct WaitingSession {
+    child: Option<Child>,
+    record: PathBuf,
+    log: PathBuf,
+    release: PathBuf,
+}
+
+impl WaitingSession {
+    fn wait_until_ready(&mut self) {
+        let mut deadline = Instant::now() + START_PHASE_TIMEOUT;
+        let mut launched = false;
+        loop {
+            let record = fs::read_to_string(&self.record).unwrap_or_default();
+            if record.contains("event=ready\n") {
+                return;
+            }
+            let log = fs::read_to_string(&self.log).unwrap_or_default();
+            let status = self
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .expect("inspect wrapper status");
+            assert!(
+                status.is_none(),
+                "wrapper exited before ready: {status:?}\n{log}\n{record}"
+            );
+            // Reset exactly once at the launch boundary, never on arbitrary log activity.
+            if !launched && log.contains("Launching claude...") {
+                launched = true;
+                deadline = Instant::now() + START_PHASE_TIMEOUT;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} timed out in {} phase; wrapper still running\n{log}\n{record}",
+                self.record.display(),
+                if launched {
+                    "agent readiness"
+                } else {
+                    "wrapper setup"
+                }
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn finish(mut self) {
+        let deadline = Instant::now() + START_PHASE_TIMEOUT;
+        loop {
+            if let Some(status) = self
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .expect("wrapper status")
+            {
+                assert!(
+                    status.success(),
+                    "wrapper failed: {status}\n{}",
+                    fs::read_to_string(&self.log).unwrap_or_default()
+                );
+                self.child.take();
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "wrapper did not exit after release\n{}",
+                fs::read_to_string(&self.log).unwrap_or_default()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for WaitingSession {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        // Also runs during assertion unwinding, before the fixture removes the release path.
+        let _ = fs::write(&self.release, b"release\n");
+        let deadline = Instant::now() + START_PHASE_TIMEOUT;
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Windows owns the child tree in a kill-on-close Job Object. On Unix stop the
+        // recorded fake agent's supervised process group before killing/reaping its wrapper.
+        #[cfg(unix)]
+        if let Ok(record) = fs::read_to_string(&self.record) {
+            if let Some(pid) = record.lines().find_map(|line| {
+                line.strip_prefix("pid=")
+                    .and_then(|p| p.parse::<i32>().ok())
+                    .filter(|pid| *pid > 0)
+            }) {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn spawn_waiting(
+    fixture: &Fixture,
+    record: &Path,
+    version_name: &str,
+    release: &Path,
+) -> WaitingSession {
+    let log = record.with_extension("log");
+    let output = fs::File::create(&log).expect("wrapper diagnostic log");
+    let child = fixture
         .command()
         .arg("--")
         .arg("prompt")
@@ -715,8 +1021,40 @@ fn spawn_waiting(fixture: &Fixture, record: &Path, version_name: &str, release: 
         )
         .env("SKILLMOUNT_FAKE_BEHAVIOR", "wait-for-file")
         .env("SKILLMOUNT_FAKE_RELEASE_FILE", release)
+        .stdout(Stdio::from(output.try_clone().expect("clone log handle")))
+        .stderr(Stdio::from(output))
         .spawn()
-        .expect("spawn waiting Claude session")
+        .expect("spawn waiting Claude session");
+    WaitingSession {
+        child: Some(child),
+        record: record.to_owned(),
+        log,
+        release: release.to_owned(),
+    }
+}
+
+#[test]
+fn waiting_claude_is_released_and_reaped_when_an_assertion_panics() {
+    let fixture = Fixture::new("panic-cleanup");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+    let release = fixture.root.join("release");
+    let result = std::panic::catch_unwind(|| {
+        let mut session = spawn_waiting(&fixture, &fixture.record, "version", &release);
+        session.wait_until_ready();
+        panic!("exercise test guard unwinding");
+    });
+    let panic = result.expect_err("deliberate assertion must unwind");
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"exercise test guard unwinding")
+    );
+    assert!(
+        fs::read_to_string(&fixture.record)
+            .unwrap()
+            .contains("event=released\n")
+    );
+    assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
+    assert_eq!(fixture.journal_count(), 0);
 }
 
 fn wait_until_ready(record: &Path) {
@@ -742,12 +1080,6 @@ fn recorded_injected_root(record: &Path) -> PathBuf {
         .find(|pair| pair[0] == OsStr::new("--add-dir"))
         .map(|pair| PathBuf::from(&pair[1]))
         .expect("fake Claude record has an injected --add-dir pair")
-}
-
-fn wait_output(child: Child) -> Output {
-    child
-        .wait_with_output()
-        .expect("waiting Claude session exits")
 }
 
 fn assert_success(output: &Output) {

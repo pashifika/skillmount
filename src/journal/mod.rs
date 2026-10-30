@@ -19,24 +19,30 @@ mod codec;
 mod tests;
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::domain::AgentId;
 use crate::link::PlatformIdentity;
-use crate::lock::{LockResource, LockResourceIdentity, LockResourceKind};
-use crate::mount::PathPrecondition;
+use crate::lock::{LockAccess, LockResource, LockResourceIdentity, LockResourceKind};
+use crate::mount::{CleanupDisposition, PathPrecondition};
 
 use codec::Line;
 
-/// Journal schema this build writes and is willing to read.
+/// Journal schema this build writes.
 ///
-/// A journal with any other version is refused rather than guessed at. A future version may record
-/// paths this build would not remove and statuses it would misread, and recovery acts by deleting
-/// entries — the one operation where a wrong guess is unrecoverable.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Schema 1 is also accepted conservatively: because every lock in that format belonged to a
+/// mutation-only session, a missing access label decodes as [`LockAccess::Mutate`]. Any other
+/// version is refused rather than guessed at.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Mutation-only journal schema written before access labels were introduced.
+const LEGACY_SCHEMA_VERSION: u32 = 1;
 
 /// Filename extension every journal uses.
 pub const JOURNAL_EXTENSION: &str = "journal";
+
+/// Filename prefix every staged entry uses.
+const STAGING_PREFIX: &str = ".skillmount-";
 
 /// The identity of one transaction, used for its journal name and its staged entries.
 ///
@@ -95,6 +101,17 @@ impl fmt::Display for TransactionId {
     }
 }
 
+/// Returns the transaction-unique sibling an entry is staged at before atomic placement.
+#[must_use]
+pub(crate) fn staged_sibling(
+    transaction_id: &TransactionId,
+    action_id: u32,
+    final_path: &Path,
+) -> PathBuf {
+    let parent = final_path.parent().unwrap_or_else(|| Path::new(""));
+    parent.join(format!("{STAGING_PREFIX}{transaction_id}-{action_id}.tmp"))
+}
+
 /// How far a transaction has durably progressed.
 ///
 /// Only [`TransactionStatus::Completed`] and [`TransactionStatus::Kept`] are terminal. Every other
@@ -113,7 +130,7 @@ pub enum TransactionStatus {
     Supervising,
     /// Ordinary cleanup is in progress.
     Cleaning,
-    /// Cleanup finished and nothing transaction-owned remains to reconcile.
+    /// Cleanup finished and nothing cleanup-critical remains to reconcile.
     Completed,
     /// The operator asked for the mounts to be retained.
     Kept,
@@ -189,7 +206,15 @@ pub enum ActionStatus {
     Applied,
     /// The entry already existed and belongs to someone else; cleanup never touches it.
     Reused,
-    /// The entry was verified and removed, or was already absent.
+    /// Cleanup has no remaining responsibility for the entry this action created.
+    ///
+    /// The exact claim depends on the operation's [`CleanupDisposition`]. For a
+    /// [`CleanupDisposition::Required`] link the entry was verified and removed, or was already
+    /// absent, so it is physically gone. For a [`CleanupDisposition::BestEffort`] helper directory
+    /// this records reconciliation only: the pass may have preserved a non-empty, replaced, or
+    /// unremovable directory, because nothing a child could load depends on it once every required
+    /// entry is reconciled. The label itself is unchanged, so an older build reads a newly written
+    /// journal exactly as before.
     RolledBack,
 }
 
@@ -238,9 +263,11 @@ impl ActionStatus {
 pub enum ActionOperation {
     /// Create a helper directory the plan needs.
     CreateDirectory,
+    /// Create an owned session configuration file.
+    CreateConfigFile,
     /// Create a directory link for a selected Skill.
     CreateDirectoryLink,
-    /// Record an entry that already satisfies the mount and is not transaction-owned.
+    /// Record an entry that already satisfies the mount and that this transaction did not create.
     ReuseExistingLink,
 }
 
@@ -250,6 +277,7 @@ impl ActionOperation {
     pub const fn label(self) -> &'static str {
         match self {
             Self::CreateDirectory => "mkdir",
+            Self::CreateConfigFile => "config",
             Self::CreateDirectoryLink => "link",
             Self::ReuseExistingLink => "reuse",
         }
@@ -260,22 +288,43 @@ impl ActionOperation {
     pub fn parse(label: &str) -> Option<Self> {
         match label {
             "mkdir" => Some(Self::CreateDirectory),
+            "config" => Some(Self::CreateConfigFile),
             "link" => Some(Self::CreateDirectoryLink),
             "reuse" => Some(Self::ReuseExistingLink),
             _ => None,
         }
     }
 
-    /// Returns whether cleanup owns whatever this action produced.
+    /// Returns whether this operation creates an entry, and therefore needs a staged sibling and
+    /// write-ahead progress.
     #[must_use]
-    pub const fn is_transaction_owned(self) -> bool {
-        matches!(self, Self::CreateDirectory | Self::CreateDirectoryLink)
+    pub const fn creates_entry(self) -> bool {
+        match self {
+            Self::CreateDirectory | Self::CreateDirectoryLink | Self::CreateConfigFile => true,
+            Self::ReuseExistingLink => false,
+        }
+    }
+
+    /// Returns how much authority cleanup has over the entry this operation produced.
+    ///
+    /// The disposition is derived from the label already on disk rather than serialized beside it.
+    /// A journal written before this rule existed therefore receives the same policy without a
+    /// schema change, and no journal can record a kind and a disposition that disagree.
+    #[must_use]
+    pub const fn cleanup_disposition(self) -> CleanupDisposition {
+        match self {
+            Self::CreateDirectoryLink | Self::CreateConfigFile => CleanupDisposition::Required,
+            Self::CreateDirectory => CleanupDisposition::BestEffort,
+            Self::ReuseExistingLink => CleanupDisposition::None,
+        }
     }
 }
 
 /// The kind of entry an action produces, as recorded for later verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordedKind {
+    /// A regular session configuration file.
+    File,
     /// A regular directory recorded at this transaction's initial evidence boundary.
     Directory,
     /// A directory symbolic link.
@@ -292,6 +341,7 @@ impl RecordedKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Directory => "directory",
+            Self::File => "file",
             Self::Symlink => "symlink",
             Self::Junction => "junction",
             Self::Undecided => "undecided",
@@ -303,6 +353,7 @@ impl RecordedKind {
     pub fn parse(label: &str) -> Option<Self> {
         match label {
             "directory" => Some(Self::Directory),
+            "file" => Some(Self::File),
             "symlink" => Some(Self::Symlink),
             "junction" => Some(Self::Junction),
             "undecided" => Some(Self::Undecided),
@@ -336,6 +387,8 @@ pub struct SourceResolution {
 /// One durable action record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalAction {
+    /// Exact configuration bytes, present only for a configuration-file action.
+    pub config_contents: Option<String>,
     /// Plan position, starting at 1.
     pub id: u32,
     /// What the action does.
@@ -402,6 +455,8 @@ impl JournalAction {
 pub struct JournalLock {
     /// What the resource protects.
     pub kind: LockResourceKind,
+    /// Access the original session held for this resource.
+    pub access: LockAccess,
     /// Resource path as the transaction addressed it.
     pub path: PathBuf,
     /// Canonical directory the resource hangs beneath.
@@ -418,6 +473,7 @@ impl JournalLock {
     pub fn to_resource(&self) -> LockResource {
         LockResource {
             kind: self.kind,
+            access: self.access,
             path: self.path.clone(),
             identity: LockResourceIdentity {
                 anchor: self.anchor.clone(),
@@ -432,6 +488,7 @@ impl From<&LockResource> for JournalLock {
     fn from(resource: &LockResource) -> Self {
         Self {
             kind: resource.kind,
+            access: resource.access,
             path: resource.path.clone(),
             anchor: resource.identity.anchor.clone(),
             suffix: resource.identity.suffix.clone(),
@@ -495,14 +552,15 @@ impl TransactionJournal {
         resources
     }
 
-    /// Returns the transaction-owned actions that may have created something, newest first.
+    /// Returns the actions that may have created something, newest first.
     ///
-    /// Reverse plan order is the only safe rollback order: a helper directory is created before the
-    /// links inside it, so undoing it first would leave a non-empty directory that cleanup then
-    /// refuses to remove.
-    pub fn reversible_actions(&self) -> impl Iterator<Item = &JournalAction> {
+    /// Reverse plan order is the only safe order: a helper directory is created before the links
+    /// inside it, so visiting the directory first would always find it non-empty. A best-effort
+    /// directory whose action is already reconciled is excluded exactly like a removed link — the
+    /// action, not the filesystem, records that cleanup has no remaining responsibility for it.
+    pub fn cleanup_candidates(&self) -> impl Iterator<Item = &JournalAction> {
         self.actions.iter().rev().filter(|action| {
-            action.operation.is_transaction_owned() && action.status.may_have_created_something()
+            action.operation.creates_entry() && action.status.may_have_created_something()
         })
     }
 
@@ -545,6 +603,7 @@ impl TransactionJournal {
         for lock in &self.locks {
             let mut line = Line::new("lock");
             line.push("kind", codec::encode_text(lock.kind.label()))
+                .push("access", codec::encode_text(lock.access.label()))
                 .push("path", codec::encode_path(&lock.path))
                 .push("anchor", codec::encode_path(&lock.anchor))
                 .push("suffix", codec::encode_path(&lock.suffix))
@@ -568,6 +627,10 @@ impl TransactionJournal {
                 .push("kind", codec::encode_text(action.kind.label()))
                 .push("status", codec::encode_text(action.status.label()))
                 .push("final", codec::encode_path(&action.final_path))
+                .push_optional(
+                    "contents",
+                    action.config_contents.as_deref().map(codec::encode_text),
+                )
                 .push_optional(
                     "temp",
                     action.temporary_path.as_deref().map(codec::encode_path),
@@ -605,7 +668,10 @@ impl TransactionJournal {
     /// hard failure rather than something to skip. Skipping would let a journal written by a build
     /// that records more state be read as if it recorded less, and the missing state is exactly the
     /// evidence that decides whether an entry may be removed.
-    fn from_lines(lines: &[Line]) -> Result<Self, String> {
+    fn from_lines(lines: &[Line], schema_version: u32) -> Result<Self, String> {
+        if !matches!(schema_version, LEGACY_SCHEMA_VERSION | SCHEMA_VERSION) {
+            return Err(format!("unsupported journal schema {schema_version}"));
+        }
         let header = require_one(lines, "transaction")?;
         let paths = require_one(lines, "paths")?;
 
@@ -644,6 +710,12 @@ impl TransactionJournal {
                 "lock" => journal.locks.push(JournalLock {
                     kind: LockResourceKind::parse(&text(line, "kind")?)
                         .ok_or_else(|| "unknown lock resource kind".to_owned())?,
+                    access: if schema_version == LEGACY_SCHEMA_VERSION {
+                        LockAccess::Mutate
+                    } else {
+                        LockAccess::parse(&text(line, "access")?)
+                            .ok_or_else(|| "unknown lock access".to_owned())?
+                    },
                     path: path(line, "path")?,
                     anchor: path(line, "anchor")?,
                     suffix: path(line, "suffix")?,
@@ -651,6 +723,7 @@ impl TransactionJournal {
                         .map(|value| PlatformIdentity::from_recorded(&value)),
                 }),
                 "action" => journal.actions.push(JournalAction {
+                    config_contents: optional_text(line, "contents")?,
                     id: text(line, "id")?
                         .parse()
                         .map_err(|_| "an action id is not a number".to_owned())?,
@@ -674,14 +747,24 @@ impl TransactionJournal {
             }
         }
 
-        journal.validate()?;
+        journal.validate(schema_version)?;
         Ok(journal)
     }
 
     /// Rejects a structurally decodable journal whose contents cannot be acted on safely.
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, schema_version: u32) -> Result<(), String> {
         if self.locks.is_empty() {
             return Err("a mutating transaction must record at least one resource lock".to_owned());
+        }
+        let resources = self.lock_resources();
+        if !resources
+            .iter()
+            .any(|resource| resource.access.satisfies(LockAccess::Mutate))
+        {
+            return Err(
+                "a mutating transaction must record at least one resource lock with mutate access"
+                    .to_owned(),
+            );
         }
 
         let mut previous = 0;
@@ -690,6 +773,13 @@ impl TransactionJournal {
                 return Err("action ids must be unique and ascending".to_owned());
             }
             previous = action.id;
+
+            if schema_version == LEGACY_SCHEMA_VERSION
+                && action.operation == ActionOperation::CreateConfigFile
+            {
+                return Err("configuration files require schema two mutation authority".to_owned());
+            }
+            validate_action_kind_and_config_evidence(action)?;
 
             if action.operation == ActionOperation::ReuseExistingLink
                 && action.status != ActionStatus::Reused
@@ -706,9 +796,134 @@ impl TransactionJournal {
             {
                 return Err("a link action must record its canonical source".to_owned());
             }
+            if action.operation.creates_entry() {
+                let expected = staged_sibling(&self.transaction_id, action.id, &action.final_path);
+                if action.temporary_path.as_ref() != Some(&expected) {
+                    return Err(format!(
+                        "action {} temporary path must be its transaction-unique staged sibling {}",
+                        action.id,
+                        expected.display()
+                    ));
+                }
+            } else if action.temporary_path.is_some() {
+                return Err("a reuse action cannot record a temporary path".to_owned());
+            }
+        }
+
+        require_mutation_authority(
+            &resources,
+            &self.discovery_entry,
+            Some(LockResourceKind::DiscoveryEntry),
+            "discovery entry",
+        )?;
+        require_mutation_authority(
+            &resources,
+            &self.backing_store,
+            Some(LockResourceKind::BackingStore),
+            "backing store",
+        )?;
+        for action in self
+            .actions
+            .iter()
+            .filter(|action| action.operation.creates_entry())
+        {
+            if schema_version == SCHEMA_VERSION {
+                let temporary = action
+                    .temporary_path
+                    .as_deref()
+                    .expect("creating-action shape was validated above");
+                require_exact_mutation_authority(
+                    &resources,
+                    temporary,
+                    LockResourceKind::DiscoveryEntry,
+                    &format!("action {} temporary path", action.id),
+                )?;
+            }
+            require_mutation_authority(
+                &resources,
+                &action.final_path,
+                None,
+                &format!("action {} final path", action.id),
+            )?;
         }
         Ok(())
     }
+}
+
+/// Checks entry kinds and keeps config byte evidence separate from link and directory records.
+fn validate_action_kind_and_config_evidence(action: &JournalAction) -> Result<(), String> {
+    let valid_kind = match action.operation {
+        ActionOperation::CreateDirectory => action.kind == RecordedKind::Directory,
+        ActionOperation::CreateConfigFile => action.kind == RecordedKind::File,
+        ActionOperation::CreateDirectoryLink => matches!(
+            action.kind,
+            RecordedKind::Undecided | RecordedKind::Symlink | RecordedKind::Junction
+        ),
+        ActionOperation::ReuseExistingLink => action.kind == RecordedKind::Undecided,
+    };
+    if !valid_kind {
+        return Err(format!(
+            "a {} action cannot record the {} entry kind",
+            action.operation.label(),
+            action.kind.label()
+        ));
+    }
+
+    match (&action.config_contents, action.operation) {
+        (Some(contents), ActionOperation::CreateConfigFile)
+            if contents.len() <= crate::link::MAX_CONFIG_BYTES
+                && action.source_canonical.is_none()
+                && action.link_target.is_none() =>
+        {
+            Ok(())
+        }
+        (None, operation) if operation != ActionOperation::CreateConfigFile => Ok(()),
+        _ => Err("configuration action has invalid content evidence".to_owned()),
+    }
+}
+
+/// Requires a mutation resource whose durable logical identity encloses `path`.
+///
+/// Returning the recorded resource rather than rebuilding one is essential: recovery later acquires
+/// its complete logical and optional physical key set. Its diagnostic path spelling is not authority.
+fn require_mutation_authority(
+    resources: &[LockResource],
+    path: &Path,
+    kind: Option<LockResourceKind>,
+    description: &str,
+) -> Result<(), String> {
+    if resources.iter().any(|resource| {
+        kind.is_none_or(|required| resource.kind == required)
+            && resource.authorizes_mutation_of(path)
+    }) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "the journal has no mutation lock resource whose logical identity covers its \
+         {description} {}",
+        path.display()
+    ))
+}
+
+/// Requires mutation access under the exact logical key another path observer derives.
+fn require_exact_mutation_authority(
+    resources: &[LockResource],
+    path: &Path,
+    kind: LockResourceKind,
+    description: &str,
+) -> Result<(), String> {
+    if resources
+        .iter()
+        .any(|resource| resource.kind == kind && resource.authorizes_exact_mutation_of(path))
+    {
+        return Ok(());
+    }
+
+    Err(format!(
+        "the journal has no exact mutation lock resource covering its {description} {}",
+        path.display()
+    ))
 }
 
 fn require_one<'a>(lines: &'a [Line], record: &str) -> Result<&'a Line, String> {
