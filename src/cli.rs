@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
-use crate::domain::{AgentId, ConflictPolicy, LinkMode, MountMode, RunOptions, ValidationLevel};
+use crate::domain::{
+    AgentDescriptor, AgentId, ConflictPolicy, LinkMode, MountMode, RunOptions, ValidationLevel,
+};
 use crate::error::AppError;
 
 #[derive(Debug, Parser)]
@@ -30,19 +32,21 @@ enum CliCommand {
     Codex(SessionArgs),
     /// Resolve Skills for a future Claude Code session.
     Claude(SessionArgs),
+    /// Run an Oh My Pi session with the selected Skills.
+    Omp(SessionArgs),
     /// Generate a shell completion script on standard output.
     Completions(CompletionArgs),
     /// Inspect and validate a catalog without modifying the filesystem.
     Inspect(InspectArgs),
     /// Inspect agent, discovery, link, lock, and transaction health.
     Doctor(DoctorArgs),
-    /// Reconcile transaction-owned residue from durable evidence.
+    /// Reconcile residue from durable transaction evidence.
     Cleanup(CleanupArgs),
 }
 
 #[derive(Debug, Args)]
 struct SessionArgs {
-    /// Skill directory or direct Skill; repeat for a rightmost-wins overlay.
+    /// Skill source; Codex/Claude use rightmost-wins, OMP delegates ordered collection roots.
     #[arg(
         long = "skills-dir",
         value_name = "PATH",
@@ -87,7 +91,7 @@ struct SessionArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Retain later transaction-owned mounts for diagnostics.
+    /// Retain later session mounts for diagnostics.
     #[arg(long)]
     keep_mounts: bool,
 
@@ -106,7 +110,7 @@ struct SessionArgs {
 
 #[derive(Debug, Args)]
 struct InspectArgs {
-    /// Skill directory or direct Skill; repeat for a rightmost-wins overlay.
+    /// Skill source; Codex/Claude use rightmost-wins, OMP delegates ordered collection roots.
     #[arg(
         long = "skills-dir",
         value_name = "PATH",
@@ -152,6 +156,14 @@ struct DoctorArgs {
         value_hint = clap::ValueHint::ExecutablePath
     )]
     claude_bin: Option<PathBuf>,
+
+    /// Explicit Oh My Pi executable path; otherwise search PATH.
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_hint = clap::ValueHint::ExecutablePath
+    )]
+    omp_bin: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -179,7 +191,7 @@ pub(crate) enum CompletionShell {
     PowerShell,
 }
 
-/// Installed product name to which one generated script is bound.
+/// Recognized installed product identity used by completions and recovery presentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProductBinary {
     /// Primary `asm` executable.
@@ -196,7 +208,7 @@ impl ProductBinary {
         }
     }
 
-    fn from_argv0(argv0: &OsStr) -> Option<Self> {
+    pub(crate) fn from_argv0(argv0: &OsStr) -> Option<Self> {
         let name = Path::new(argv0).file_name()?;
         #[cfg(windows)]
         {
@@ -262,6 +274,7 @@ enum RawValidationLevel {
 pub(crate) enum InspectAgent {
     Codex,
     Claude,
+    Omp,
     All,
 }
 
@@ -289,8 +302,8 @@ pub(crate) struct InspectInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DoctorInput {
     pub(crate) project_root: Option<PathBuf>,
-    pub(crate) codex_bin: Option<PathBuf>,
-    pub(crate) claude_bin: Option<PathBuf>,
+    /// Explicit executable overrides, in registered Agent order.
+    pub(crate) agent_bins: Vec<(AgentId, Option<PathBuf>)>,
 }
 
 /// Parsed explicit-recovery values.
@@ -335,6 +348,7 @@ where
     match cli.command {
         CliCommand::Codex(args) => session_input(AgentId::Codex, args),
         CliCommand::Claude(args) => session_input(AgentId::Claude, args),
+        CliCommand::Omp(args) => session_input(AgentId::Omp, args),
         CliCommand::Completions(args) => {
             let product = product.ok_or_else(|| {
                 command().error(
@@ -355,8 +369,17 @@ where
         })),
         CliCommand::Doctor(args) => Ok(ParsedCommand::Doctor(DoctorInput {
             project_root: args.project_root,
-            codex_bin: args.codex_bin,
-            claude_bin: args.claude_bin,
+            agent_bins: AgentId::ALL
+                .iter()
+                .map(|agent| {
+                    let explicit = match agent {
+                        AgentId::Codex => args.codex_bin.clone(),
+                        AgentId::Claude => args.claude_bin.clone(),
+                        AgentId::Omp => args.omp_bin.clone(),
+                    };
+                    (*agent, explicit)
+                })
+                .collect(),
         })),
         CliCommand::Cleanup(args) => Ok(ParsedCommand::Cleanup(CleanupInput {
             project_root: args.project_root,
@@ -384,15 +407,11 @@ fn normalize_session(agent: AgentId, args: SessionArgs) -> Result<SessionInput, 
         }
     };
 
-    let mount_mode = match (agent, args.mount_mode) {
-        (AgentId::Codex, RawMountMode::Auto | RawMountMode::Project)
-        | (AgentId::Claude, RawMountMode::Project) => MountMode::Project,
-        (AgentId::Claude, RawMountMode::Auto | RawMountMode::Staging) => MountMode::Staging,
-        (AgentId::Codex, RawMountMode::Staging) => {
-            return Err(AppError::Usage(
-                "--mount-mode=staging is incompatible with Codex".to_owned(),
-            ));
-        }
+    let descriptor = agent.descriptor();
+    let mount_mode = match args.mount_mode {
+        RawMountMode::Auto => descriptor.default_mount_mode(),
+        RawMountMode::Project => explicit_mount_mode(descriptor, MountMode::Project)?,
+        RawMountMode::Staging => explicit_mount_mode(descriptor, MountMode::Staging)?,
     };
 
     Ok(SessionInput {
@@ -413,6 +432,28 @@ fn normalize_session(agent: AgentId, args: SessionArgs) -> Result<SessionInput, 
             verbosity: args.verbosity,
         },
     })
+}
+
+/// Accepts an explicitly named mount location only where the selected Agent supports it.
+fn explicit_mount_mode(
+    descriptor: &AgentDescriptor,
+    requested: MountMode,
+) -> Result<MountMode, AppError> {
+    if descriptor.supports_explicit_mount_mode(requested) {
+        return Ok(requested);
+    }
+    Err(AppError::Usage(format!(
+        "--mount-mode={} is incompatible with {}",
+        mount_mode_token(requested),
+        descriptor.display_name()
+    )))
+}
+
+const fn mount_mode_token(mode: MountMode) -> &'static str {
+    match mode {
+        MountMode::Project => "project",
+        MountMode::Staging => "staging",
+    }
 }
 
 impl From<RawConflictPolicy> for ConflictPolicy {
@@ -520,6 +561,57 @@ mod tests {
         ])
         .expect_err("staging should be rejected");
         assert_eq!(error.kind(), ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn omp_project_is_rejected_and_staging_is_its_default() {
+        let error = parse_command_from([
+            "asm",
+            "omp",
+            "--skills-dir",
+            "skills",
+            "--mount-mode=project",
+        ])
+        .expect_err("OMP uses a private config overlay, not project mounts");
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        assert!(error.to_string().contains("incompatible with OMP"));
+
+        let ParsedCommand::Session(input) =
+            parse_command_from(["asm", "omp", "--skills-dir", "skills"])
+                .expect("an OMP session parses")
+        else {
+            panic!("the omp command must produce a session");
+        };
+        assert_eq!(input.agent, AgentId::Omp);
+        assert_eq!(input.options.mount_mode, MountMode::Staging);
+    }
+
+    #[test]
+    fn doctor_normalizes_one_ordered_request_per_registered_agent() {
+        let ParsedCommand::Doctor(input) =
+            parse_command_from(["asm", "doctor", "--omp-bin", "/bin/omp"]).expect("doctor parses")
+        else {
+            panic!("the doctor command must produce a doctor request");
+        };
+        assert_eq!(
+            input
+                .agent_bins
+                .iter()
+                .map(|(agent, _)| *agent)
+                .collect::<Vec<_>>(),
+            AgentId::ALL.to_vec(),
+            "requests follow the single registered order"
+        );
+        assert_eq!(
+            input
+                .agent_bins
+                .iter()
+                .filter(|(_, explicit)| explicit.is_some())
+                .map(|(agent, _)| *agent)
+                .collect::<Vec<_>>(),
+            vec![AgentId::Omp],
+            "each override stays independent"
+        );
     }
 
     #[test]
@@ -654,10 +746,15 @@ mod tests {
             ("claude", "cwd", ValueHint::DirPath),
             ("claude", "project_root", ValueHint::DirPath),
             ("claude", "agent_bin", ValueHint::ExecutablePath),
+            ("omp", "skills_dirs", ValueHint::DirPath),
+            ("omp", "cwd", ValueHint::DirPath),
+            ("omp", "project_root", ValueHint::DirPath),
+            ("omp", "agent_bin", ValueHint::ExecutablePath),
             ("inspect", "skills_dirs", ValueHint::DirPath),
             ("doctor", "project_root", ValueHint::DirPath),
             ("doctor", "codex_bin", ValueHint::ExecutablePath),
             ("doctor", "claude_bin", ValueHint::ExecutablePath),
+            ("doctor", "omp_bin", ValueHint::ExecutablePath),
             ("cleanup", "project_root", ValueHint::DirPath),
         ];
 

@@ -5,14 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
+use crate::agent::version::VersionSpec;
 use crate::agent::{
     AgentAdapter, DiscoveryScope, DiscoverySnapshot, ExistingSkill, ScopeKind,
     dedupe_scopes_by_terminal, discovery_indexes, insert_direct_deterministically,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::domain::{AgentId, RunContext, SkillCatalog, SkillNameKey};
+use crate::domain::{AgentId, CatalogPolicy, RunContext, SkillCatalog, SkillNameKey};
 use crate::error::{AppError, PlanError};
 use crate::lock::{LockResource, LockResourceKind};
 use crate::mount::plan::apply_conflict_policy;
@@ -38,10 +38,10 @@ const MAX_DISCOVERY_DEPTH: usize = 6;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Per-entry accounting used by Codex in addition to the serialized path.
 const DISCOVERY_RESPONSE_ITEM_OVERHEAD_BYTES: usize = 64;
-/// Codex release whose discovery and embedded-Skill contract this adapter implements.
-pub(crate) const SUPPORTED_CODEX_VERSION: &str = "0.146.0";
-const SUPPORTED_CODEX_VERSION_OUTPUT: &str = "codex-cli 0.146.0";
-const VERSION_OUTPUT_LIMIT: usize = 1024;
+/// Codex banner attached to the adapter's last-tested discovery evidence.
+const LAST_TESTED_CODEX_BANNER: &str = "codex-cli 0.146.0";
+const CODEX_VERSION_SPEC: VersionSpec =
+    VersionSpec::new(LAST_TESTED_CODEX_BANNER, "SKILLMOUNT_TEST_CODEX_VERSION");
 /// Local fail-closed bound for a plugin manifest used only to determine namespace behavior.
 const MAX_PLUGIN_MANIFEST_BYTES: u64 = 64 * 1024;
 const SYSTEM_SKILL_NAMES: [&str; 6] = [
@@ -76,6 +76,8 @@ pub(crate) struct CodexDestination {
     pub(crate) entry: PathBuf,
     /// Observed state of that path.
     pub(crate) entry_state: PathKind,
+    /// Canonical directory that path resolves to, when it resolves through a link.
+    pub(crate) entry_canonical: Option<PathBuf>,
     /// Directories the plan must create first, parents before children.
     pub(crate) create_directories: Vec<PathBuf>,
 }
@@ -117,6 +119,7 @@ pub(crate) fn resolve_destination(
         PathKind::Directory | PathKind::DirectoryLink => Ok(CodexDestination {
             entry: preferred.entry.clone(),
             entry_state: preferred.kind,
+            entry_canonical: super::canonical_backing(&preferred.entry, preferred),
             create_directories: Vec::new(),
         }),
         PathKind::Missing => resolve_missing_preferred(project_root, preferred),
@@ -140,11 +143,13 @@ fn resolve_missing_preferred(
         PathKind::Directory | PathKind::DirectoryLink => Ok(CodexDestination {
             entry: preferred.entry.clone(),
             entry_state: PathKind::Missing,
+            entry_canonical: None,
             create_directories: vec![preferred.entry.clone()],
         }),
         PathKind::Missing => Ok(CodexDestination {
             entry: preferred.entry.clone(),
             entry_state: PathKind::Missing,
+            entry_canonical: None,
             create_directories: vec![agents_parent, preferred.entry.clone()],
         }),
         other => Err(PlanError::AmbiguousDiscoveryEntry {
@@ -191,74 +196,47 @@ impl CodexAdapter {
 
     /// Collects user, bundled-system, and administrator roots the supported Codex loader reads.
     fn global_scopes(context: &RunContext) -> Result<Vec<DiscoveryScope>, AppError> {
-        let mut system = inspect_codex_scope(
-            ScopeKind::CodexSystem,
-            &context.codex_home.join("skills/.system"),
-        )?;
-        reserve_embedded_system_skills(&mut system, &context.codex_home);
+        let codex = context.agent.codex()?;
+        let mut system =
+            inspect_codex_scope(ScopeKind::CodexSystem, &codex.home.join("skills/.system"))?;
+        reserve_embedded_system_skills(&mut system, &codex.home);
         let mut scopes = vec![
-            inspect_codex_scope(
-                ScopeKind::CodexUserAgents,
-                &context.user_home.join(PREFERRED),
-            )?,
-            inspect_codex_scope(
-                ScopeKind::CodexUserLegacy,
-                &context.codex_home.join("skills"),
-            )?,
+            inspect_codex_scope(ScopeKind::CodexUserAgents, &codex.user_home.join(PREFERRED))?,
+            inspect_codex_scope(ScopeKind::CodexUserLegacy, &codex.home.join("skills"))?,
             system,
         ];
-        if let Some(admin) = &context.codex_admin_skills {
+        if let Some(admin) = &codex.admin_skills {
             scopes.push(inspect_codex_scope(ScopeKind::CodexAdmin, admin)?);
         }
         Ok(scopes)
     }
 }
 
-/// Proves that the executable and higher-precedence configuration match the loader contract.
-pub(crate) fn verify_supported_launch(context: &RunContext) -> Result<(), AppError> {
-    verify_managed_configuration(context)?;
-    verify_version_text(&reported_version(context)?)
-}
-
-/// Captures the bounded, text version banner used by operator diagnostics and launch checks.
-pub(crate) fn reported_version(context: &RunContext) -> Result<String, AppError> {
-    // Integration suites reuse test executables whose real version banners intentionally are not
-    // Codex. The escape hatch is absent from release builds, like failure checkpoints and the
-    // isolated administrator-root override.
-    #[cfg(debug_assertions)]
-    if let Some(version) = std::env::var_os("SKILLMOUNT_TEST_CODEX_VERSION") {
-        return Ok(version.to_string_lossy().trim().to_owned());
-    }
-
-    let output = Command::new(&context.agent_bin)
-        .arg("--version")
-        .current_dir(&context.invocation_cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| AppError::MissingInput {
-            path: context.agent_bin.clone(),
-            reason: format!("cannot query Codex version: {error}"),
-        })?;
-    if !output.status.success() {
-        return Err(AppError::MissingInput {
-            path: context.agent_bin.clone(),
-            reason: format!("Codex --version exited with {}", output.status),
-        });
-    }
-    if output.stdout.len() > VERSION_OUTPUT_LIMIT || output.stderr.len() > VERSION_OUTPUT_LIMIT {
-        return Err(AppError::Usage(format!(
-            "Codex --version output exceeds the {VERSION_OUTPUT_LIMIT}-byte compatibility bound"
-        )));
-    }
-    let version = std::str::from_utf8(&output.stdout)
-        .map_err(|_| AppError::Usage("Codex --version output is not valid UTF-8".to_owned()))?;
-    Ok(version.trim().to_owned())
+/// Verifies the Codex launch invariants that remain mandatory for every observed release.
+fn verify_launch_invariants(context: &RunContext) -> Result<(), AppError> {
+    verify_managed_configuration(context)
 }
 
 /// Verifies higher-precedence configuration that can change the inspected discovery model.
-pub(crate) fn verify_managed_configuration(context: &RunContext) -> Result<(), AppError> {
+fn verify_managed_configuration(context: &RunContext) -> Result<(), AppError> {
+    // A debug-only marker lets the process-level transaction suite introduce the same hard
+    // condition after planning. Release binaries contain neither the lookup nor this test seam.
+    #[cfg(debug_assertions)]
+    if let Some(path) =
+        std::env::var_os("SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG_PATH").map(PathBuf::from)
+    {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Err(unsupported_managed_configuration()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Usage(format!(
+                    "cannot inspect the deterministic Codex managed-configuration marker {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
     #[cfg(debug_assertions)]
     if let Some(value) = std::env::var_os("SKILLMOUNT_TEST_CODEX_MANAGED_CONFIG") {
         return match value.to_str() {
@@ -271,7 +249,7 @@ pub(crate) fn verify_managed_configuration(context: &RunContext) -> Result<(), A
     }
 
     #[cfg(windows)]
-    let managed_file = context.codex_home.join("managed_config.toml");
+    let managed_file = context.agent.codex()?.home.join("managed_config.toml");
     #[cfg(unix)]
     let managed_file = PathBuf::from("/etc/codex/managed_config.toml");
     match fs::symlink_metadata(&managed_file) {
@@ -307,17 +285,9 @@ fn unsupported_managed_configuration() -> AppError {
     )
 }
 
-/// Checks a captured version banner against the adapter-pinned release.
-pub(crate) fn verify_version_text(version: &str) -> Result<(), AppError> {
-    if version.trim() == SUPPORTED_CODEX_VERSION_OUTPUT {
-        Ok(())
-    } else {
-        Err(AppError::Usage(format!(
-            "Codex {} is required by this adapter, but --version reported {:?}",
-            SUPPORTED_CODEX_VERSION,
-            version.trim()
-        )))
-    }
+/// Returns the dated version evidence used by the shared advisory observer.
+const fn version_spec() -> VersionSpec {
+    CODEX_VERSION_SPEC
 }
 
 /// Reserves the embedded names installed by the supported Codex before it loads any Skill root.
@@ -787,9 +757,10 @@ fn inspect_codex_skill(
 /// change `name` into `plugin:name`, while `SkillMount`'s injected enable rule still addresses the
 /// portable base name. Existing discovered Skills may be indexed conservatively by that base name,
 /// but a selected source must never cross the launch boundary under a different logical name.
-pub(crate) fn verify_selected_plugin_namespaces(catalog: &SkillCatalog) -> Result<(), AppError> {
+fn verify_selected_plugin_namespaces(catalog: &SkillCatalog) -> Result<(), AppError> {
     for resolution in &catalog.resolutions {
         let source = &resolution.selected.origin.source_canonical;
+        verify_skill_product_policy(source)?;
         if let Some(manifest) = nearest_plugin_manifest(source)? {
             return Err(PlanError::UnsupportedLayout {
                 path: manifest,
@@ -800,6 +771,66 @@ pub(crate) fn verify_selected_plugin_namespaces(catalog: &SkillCatalog) -> Resul
             }
             .into());
         }
+    }
+    Ok(())
+}
+
+/// Optional metadata can suppress a Skill before name-based enable rules are applied.
+fn verify_skill_product_policy(source: &Path) -> Result<(), AppError> {
+    let path = source.join("agents/openai.yaml");
+    let failure = |reason: String| {
+        AppError::from(PlanError::UnsupportedLayout {
+            path: path.clone(),
+            reason: format!("cannot prove selected Codex Skill visibility: {reason}"),
+        })
+    };
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(failure(error.to_string())),
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(failure(
+                "optional metadata must be a regular file".to_owned(),
+            ));
+        }
+    }
+    let bytes = crate::catalog::frontmatter::read_bounded_regular_file(
+        &path,
+        "Codex optional Skill metadata",
+        64 * 1024,
+    )
+    .map_err(failure)?;
+    let value: serde_yaml_ng::Value = serde_yaml_ng::from_slice(&bytes)
+        .map_err(|error| failure(format!("invalid optional metadata: {error}")))?;
+    let Some(policy) = value.get("policy").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let Some(mapping) = policy.as_mapping() else {
+        return Err(failure("policy must be a mapping".to_owned()));
+    };
+    let Some(products) = mapping.get(serde_yaml_ng::Value::String("products".to_owned())) else {
+        return Ok(());
+    };
+    let Some(products) = products.as_sequence() else {
+        return Err(failure("policy.products must be an array".to_owned()));
+    };
+    if products.is_empty() {
+        return Ok(());
+    }
+    let mut allows_codex = false;
+    for product in products {
+        match product.as_str() {
+            Some("codex" | "CODEX") => allows_codex = true,
+            Some("chatgpt" | "CHATGPT" | "atlas" | "ATLAS") => {}
+            _ => {
+                return Err(failure(
+                    "policy.products contains an unrecognized product".to_owned(),
+                ));
+            }
+        }
+    }
+    if !allows_codex {
+        return Err(failure("policy.products excludes Codex; SkillMount does not override the Skill author's product restriction".to_owned()));
     }
     Ok(())
 }
@@ -871,7 +902,8 @@ fn is_hidden(name: &OsStr) -> bool {
 
 /// Returns whether a forwarded Codex argument changes the CWD used for project discovery.
 fn changes_codex_root(argument: &OsStr) -> bool {
-    argument == OsStr::new("-C")
+    argument == OsStr::new("--worktree")
+        || argument == OsStr::new("-C")
         || argument == OsStr::new("--cd")
         || os_starts_with(argument, "--cd=")
         || (os_starts_with(argument, "-C") && argument != OsStr::new("-C"))
@@ -958,7 +990,7 @@ fn validate_codex_command(args: &[OsString]) -> Result<(), AppError> {
     }
     if command == OsStr::new("exec") || command == OsStr::new("e") {
         if let Some((_, nested)) = first_exec_positional(&args[command_index + 1..]) {
-            if nested == OsStr::new("resume") {
+            if nested == OsStr::new("resume") || nested == OsStr::new("fork") {
                 return Err(unsupported_resume(nested));
             }
             if nested == OsStr::new("help") {
@@ -1050,9 +1082,16 @@ fn option_consumes_value(argument: &OsStr, option_set: RootOptionSet) -> bool {
         return true;
     }
     matches!(option_set, RootOptionSet::Exec)
-        && ["--output-schema", "--color", "-o", "--output-last-message"]
-            .iter()
-            .any(|option| argument == OsStr::new(option))
+        && [
+            "--output-schema",
+            "--color",
+            "-o",
+            "--output-last-message",
+            "--thread-source",
+            "--cyber-access-program",
+        ]
+        .iter()
+        .any(|option| argument == OsStr::new(option))
 }
 
 fn unsupported_resume(command: &OsStr) -> AppError {
@@ -1135,29 +1174,56 @@ fn os_starts_with(value: &OsStr, prefix: &str) -> bool {
     value.starts_with(&prefix)
 }
 
-/// Describes a scope with a stable project anchor when possible and a self anchor otherwise.
-fn scope_root_lock(context: &RunContext, scope: &DiscoveryScope) -> Result<LockResource, AppError> {
-    if scope.state.entry.starts_with(&context.project_root) {
-        LockResource::describe_entry(
-            LockResourceKind::DiscoveryEntry,
-            &context.project_root,
-            &scope.state,
-        )
-    } else {
-        Ok(LockResource::describe_unanchored(
-            LockResourceKind::DiscoveryEntry,
-            &scope.state.entry,
-        ))
-    }
+/// Describes every discovery scope under both its shared and `origin/dev/0.3.x` identities.
+fn scope_root_locks(
+    context: &RunContext,
+    scope: &DiscoveryScope,
+    access: crate::lock::LockAccess,
+) -> Result<[LockResource; 2], AppError> {
+    let legacy_anchor = scope
+        .state
+        .entry
+        .starts_with(&context.project_root)
+        .then_some(context.project_root.as_path());
+    LockResource::describe_shared_and_legacy_entry(access, legacy_anchor, &scope.state)
 }
 
 impl AgentAdapter for CodexAdapter {
-    fn id(&self) -> AgentId {
-        AgentId::Codex
+    fn version_spec(&self) -> VersionSpec {
+        version_spec()
     }
 
-    fn default_executable(&self) -> &'static OsStr {
-        OsStr::new("codex")
+    fn catalog_policy(&self) -> CatalogPolicy {
+        // Codex indexes a Skill by its frontmatter name and discovers only an exact regular
+        // `SKILL.md` directory entry, so these requirements hold even when generic metadata
+        // validation is disabled: the injected enable rule must address the same logical name the
+        // child loads.
+        CatalogPolicy {
+            requires_exact_skill_md_entry: true,
+            always_parses_metadata: true,
+            requires_name: true,
+            requires_description: true,
+            requires_matching_name: true,
+        }
+    }
+
+    fn destination_stores(&self, context: &RunContext) -> Vec<PathBuf> {
+        vec![Self::preferred_entry(context)]
+    }
+
+    fn validate_launch_invariants(&self, context: &RunContext) -> Result<(), AppError> {
+        verify_launch_invariants(context)
+    }
+
+    fn validate_spawn_boundary(
+        &self,
+        context: &RunContext,
+        catalog: &SkillCatalog,
+        _discovery: &DiscoverySnapshot,
+        _plan: &MountPlan,
+    ) -> Result<(), AppError> {
+        verify_launch_invariants(context)?;
+        verify_selected_plugin_namespaces(catalog)
     }
 
     fn validate_passthrough_args(&self, args: &[OsString]) -> Result<Vec<Diagnostic>, AppError> {
@@ -1250,29 +1316,41 @@ impl AgentAdapter for CodexAdapter {
 
         let mut lock_resources = Vec::new();
         for scope in &scopes {
-            lock_resources.push(scope_root_lock(context, scope)?);
+            let access = if scope.state.entry == destination.entry {
+                crate::lock::LockAccess::Mutate
+            } else {
+                crate::lock::LockAccess::Observe
+            };
+            lock_resources.extend(scope_root_locks(context, scope, access)?);
             for terminal in &scope.observed_directories {
                 if scope.state.terminal.as_deref() != Some(terminal.as_path()) {
-                    lock_resources.push(LockResource::describe_unanchored(
+                    lock_resources.extend(LockResource::describe_shared_and_legacy_unanchored(
                         LockResourceKind::DiscoveryEntry,
+                        crate::lock::LockAccess::Observe,
                         terminal,
-                    ));
+                    )?);
                 }
             }
         }
         let agents_parent = classify(&context.project_root.join(".agents"))?;
+        lock_resources.push(LockResource::describe_shared_entry(
+            crate::lock::LockAccess::Mutate,
+            &agents_parent,
+        )?);
         if matches!(
             agents_parent.kind,
             PathKind::Directory | PathKind::DirectoryLink
         ) {
             lock_resources.push(LockResource::describe_entry(
                 LockResourceKind::DiscoveryEntry,
+                crate::lock::LockAccess::Mutate,
                 &context.project_root,
                 &agents_parent,
             )?);
         }
         lock_resources.push(LockResource::describe(
             LockResourceKind::BackingStore,
+            crate::lock::LockAccess::Mutate,
             &context.project_root,
             &destination.entry,
         )?);
@@ -1309,6 +1387,7 @@ impl AgentAdapter for CodexAdapter {
             visible_skills,
             mount_entries,
             discovery_entry: preferred_path,
+            backing_store_canonical: destination.entry_canonical,
             backing_store: destination.entry,
             backing_store_state: destination.entry_state,
             lock_resources,
@@ -1349,11 +1428,11 @@ impl AgentAdapter for CodexAdapter {
             actions: actions.into_actions(),
             preserved,
             launch: LaunchPlan {
-                executable: context.agent_bin.clone(),
+                executable: context.executable().to_path_buf(),
                 cwd: context.launch_cwd.clone(),
                 injected_args,
                 passthrough_args: context.passthrough_args.clone(),
-                environment_overrides: context.codex_home_override.as_ref().map_or_else(
+                environment_overrides: context.agent.codex()?.home_override.as_ref().map_or_else(
                     Vec::new,
                     |path| {
                         vec![(
@@ -1370,12 +1449,42 @@ impl AgentAdapter for CodexAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        DISCOVERY_RESPONSE_ITEM_OVERHEAD_BYTES, MAX_DISCOVERY_RESPONSE_BYTES,
-        codex_directory_entry_name_is_representable, codex_path_uri_upper_bound,
-        reserve_codex_response_bytes, verify_version_text,
+        DISCOVERY_RESPONSE_ITEM_OVERHEAD_BYTES, LAST_TESTED_CODEX_BANNER,
+        MAX_DISCOVERY_RESPONSE_BYTES, codex_directory_entry_name_is_representable,
+        codex_path_uri_upper_bound, reserve_codex_response_bytes, version_spec,
     };
+    use crate::agent::AgentAdapter;
     use std::ffi::OsString;
     use std::path::Path;
+
+    #[test]
+    fn latest_codex_relocation_and_nested_fork_are_rejected() {
+        for values in [
+            vec!["--worktree", "exec", "prompt"],
+            vec!["exec", "--worktree", "prompt"],
+            vec!["exec", "fork", "session-id"],
+            vec!["exec", "--thread-source", "cli", "fork", "session-id"],
+            vec![
+                "exec",
+                "--cyber-access-program",
+                "standard",
+                "fork",
+                "session-id",
+            ],
+        ] {
+            let args = values.iter().map(OsString::from).collect::<Vec<_>>();
+            assert!(
+                super::CodexAdapter
+                    .validate_passthrough_args(&args)
+                    .is_err(),
+                "{values:?}"
+            );
+        }
+        let args = ["exec", "--thread-source", "cli", "describe fork"].map(OsString::from);
+        super::CodexAdapter
+            .validate_passthrough_args(&args)
+            .expect("ordinary prompt");
+    }
 
     #[test]
     fn codex_walk_response_budget_accepts_the_boundary_and_rejects_the_next_entry() {
@@ -1393,14 +1502,11 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_gate_accepts_only_the_pinned_codex_release() {
-        verify_version_text("codex-cli 0.146.0\n").expect("supported Codex version");
-        for unsupported in ["codex-cli 0.145.0", "codex-cli 0.147.0", "SkillMount 0.1.0"] {
-            assert!(
-                verify_version_text(unsupported).is_err(),
-                "{unsupported} must not borrow the 0.146.0 discovery contract"
-            );
-        }
+    fn version_spec_names_the_last_tested_codex_evidence() {
+        assert_eq!(
+            version_spec().last_tested_banner(),
+            LAST_TESTED_CODEX_BANNER
+        );
     }
 
     #[cfg(unix)]

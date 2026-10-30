@@ -13,7 +13,7 @@ use std::fs::{self, DirEntry};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::domain::{AgentId, SkillCatalog, SourceOccurrence, ValidationLevel};
+use crate::domain::{AgentId, CatalogPolicy, SkillCatalog, SourceOccurrence, ValidationLevel};
 use crate::error::AppError;
 
 pub(crate) use discover::RawCandidate;
@@ -32,8 +32,14 @@ pub(crate) fn find_exact_entry(directory: &Path, name: &OsStr) -> io::Result<Opt
 /// Read-only inputs that control catalog validation.
 #[derive(Debug, Clone)]
 pub struct CatalogRequest<'a> {
-    /// Adapter whose metadata contract is active.
+    /// Adapter whose metadata contract is active; used only to name it in a diagnostic.
     pub agent: AgentId,
+    /// Declarative Agent requirements contributed by the selected adapter.
+    ///
+    /// A policy may only strengthen compatibility requirements. Structural, canonicalization,
+    /// destination-cycle, portable-name, selection-order, and no-fallback checks stay
+    /// unconditional.
+    pub policy: CatalogPolicy,
     /// Metadata validation policy.
     pub validation: ValidationLevel,
     /// Future destination stores used only for cycle detection.

@@ -5,8 +5,15 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use crate::cli::SessionInput;
-use crate::domain::{AgentId, RunContext, SourceOccurrence};
+use crate::domain::{
+    AgentId, ClaudeAgent, CodexAgent, OmpAgent, ResolvedAgent, RunContext, SourceOccurrence,
+};
 use crate::error::AppError;
+
+/// Literal OMP configuration-directory name, used verbatim for a project scope.
+pub(crate) const OMP_CONFIG_DIR_NAME: &str = ".omp";
+/// Application name OMP appends to an XDG base directory.
+const OMP_APP_NAME: &str = "omp";
 
 #[cfg(windows)]
 mod windows_ffi;
@@ -15,6 +22,7 @@ pub(crate) fn resolve_session(
     input: SessionInput,
     invocation_cwd: &Path,
 ) -> Result<RunContext, AppError> {
+    let descriptor = input.agent.descriptor();
     let invocation_cwd = canonical_directory(invocation_cwd)?;
     let launch_cwd = match input.cwd.as_deref() {
         Some(path) => canonical_directory(&absolute_from(&invocation_cwd, path)?)?,
@@ -31,7 +39,7 @@ pub(crate) fn resolve_session(
     if !launch_cwd.starts_with(&project_root) {
         return Err(AppError::Usage(format!(
             "{} project root {} does not contain launch CWD {}",
-            agent_label(input.agent),
+            descriptor.display_name(),
             project_root.display(),
             launch_cwd.display()
         )));
@@ -39,62 +47,151 @@ pub(crate) fn resolve_session(
     if project_root != inferred_project_root {
         return Err(AppError::Usage(format!(
             "{} project root {} does not match the default root {} inferred from launch CWD {}; --project-root cannot change the root used by the child",
-            agent_label(input.agent),
+            descriptor.display_name(),
             project_root.display(),
             inferred_project_root.display(),
             launch_cwd.display()
         )));
     }
 
-    let user_home = agent_user_home(input.agent)?;
-    let (codex_home, codex_home_override) = if input.agent == AgentId::Codex {
-        codex_home(&user_home, &invocation_cwd)?
-    } else {
-        (user_home.join(".codex"), None)
-    };
-    let claude_config_dir = claude_config_dir(&user_home, &launch_cwd)?;
-
     let skill_sources = resolve_source_occurrences(&input.skills_dirs, &invocation_cwd)?;
     let resolve_agent_executable = !input.options.dry_run;
-    let agent_bin = match input.agent_bin {
-        Some(path) => {
-            let resolved = absolute_from(&invocation_cwd, &path)?;
-            if resolve_agent_executable {
-                validate_explicit_executable(&resolved)?
-            } else {
-                resolved
+    let agent = resolve_agent(input.agent, &invocation_cwd, &launch_cwd, || {
+        match input.agent_bin {
+            Some(path) => {
+                let resolved = absolute_from(&invocation_cwd, &path)?;
+                if resolve_agent_executable {
+                    validate_explicit_executable(&resolved)
+                } else {
+                    Ok(resolved)
+                }
             }
+            None if resolve_agent_executable => {
+                resolve_path_executable(descriptor.executable_name(), &invocation_cwd)
+            }
+            None => Ok(PathBuf::from(descriptor.executable_name())),
         }
-        None if resolve_agent_executable => {
-            resolve_path_executable(input.agent.executable_name(), &invocation_cwd)?
-        }
-        None => PathBuf::from(input.agent.executable_name()),
-    };
+    })?;
 
     Ok(RunContext {
-        agent: input.agent,
+        agent,
         invocation_cwd,
         launch_cwd,
         project_root,
-        user_home,
-        codex_home,
-        codex_home_override,
-        codex_admin_skills: codex_admin_skills(),
-        claude_config_dir,
-        claude_managed_skills: claude_managed_skills(),
         skill_sources,
         session_id: None,
-        agent_bin,
         passthrough_args: input.passthrough_args,
         options: input.options,
     })
 }
 
-const fn agent_label(agent: AgentId) -> &'static str {
+/// Resolves only the selected Agent's configuration roots.
+///
+/// Configuration belonging solely to an Agent that was not selected is never read, canonicalized,
+/// validated, or diagnosed here: that variable belongs to a process this run will not launch, so
+/// letting it fail the selected session would be a false negative rather than isolation.
+fn resolve_agent(
+    agent: AgentId,
+    invocation_cwd: &Path,
+    config_cwd: &Path,
+    executable: impl FnOnce() -> Result<PathBuf, AppError>,
+) -> Result<ResolvedAgent, AppError> {
     match agent {
-        AgentId::Codex => "Codex",
-        AgentId::Claude => "Claude",
+        AgentId::Codex => {
+            let user_home = codex_user_home()?;
+            let (home, home_override) = codex_home(&user_home, invocation_cwd)?;
+            let admin_skills = codex_admin_skills();
+            Ok(ResolvedAgent::Codex(CodexAgent {
+                executable: executable()?,
+                user_home,
+                home,
+                home_override,
+                admin_skills,
+            }))
+        }
+        AgentId::Claude => {
+            let user_home = crate::state::user_home()?;
+            let config_dir = claude_config_dir(&user_home, config_cwd)?;
+            let managed_skills = claude_managed_skills();
+            Ok(ResolvedAgent::Claude(ClaudeAgent {
+                executable: executable()?,
+                config_dir,
+                managed_skills,
+            }))
+        }
+        AgentId::Omp => {
+            let user_home = crate::state::user_home()?;
+            // Only the default profile is resolved here. A named profile relocates every OMP root,
+            // so the adapter rejects `OMP_PROFILE` and `PI_PROFILE` as a hard launch invariant
+            // before any SkillMount state is read; these roots are never used in that case.
+            let config_root = user_home.join(omp_config_dir_name());
+            let agent_dir = omp_agent_dir(&config_root, config_cwd);
+            let plugins_dir = omp_plugins_dir(&config_root, &agent_dir);
+            Ok(ResolvedAgent::Omp(OmpAgent {
+                executable: executable()?,
+                user_home,
+                config_root,
+                agent_dir,
+                plugins_dir,
+            }))
+        }
     }
+}
+
+/// Mirrors OMP's configuration-root directory name.
+///
+/// OMP reads `PI_CONFIG_DIR` for the user root but uses the literal `.omp` constant for a project
+/// scope, so this name must never be applied to `<project>/.omp/skills`.
+fn omp_config_dir_name() -> OsString {
+    std::env::var_os("PI_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from(OMP_CONFIG_DIR_NAME))
+}
+
+/// Mirrors OMP's agent-directory resolution for the default profile.
+///
+/// `PI_CODING_AGENT_DIR` is applied exactly as OMP applies it: `dirs.ts:246` runs `path.resolve` on
+/// the value with no tilde expansion, so a literal `~/...` value stays relative like it does there.
+/// The base is the child's own process CWD, which is `launch_cwd` - not `SkillMount`'s invocation
+/// directory. `--cwd` can move them apart, and resolving against the wrong one would inspect a
+/// different `<agentDir>/skills`, `managed-skills`, `config.yml`, and `settings.json` than the
+/// child reads.
+///
+/// Joining onto the already-absolute `launch_cwd` cannot fail, so no fallible resolution against
+/// the ambient process CWD is needed - and none is used, because defaulting on failure would
+/// silently make every user-scope OMP root relative to wherever `SkillMount` happened to run.
+fn omp_agent_dir(config_root: &Path, launch_cwd: &Path) -> PathBuf {
+    let Some(value) = std::env::var_os("PI_CODING_AGENT_DIR").filter(|value| !value.is_empty())
+    else {
+        return config_root.join("agent");
+    };
+    let requested = PathBuf::from(value);
+    if requested.is_absolute() {
+        lexical_normalize(&requested)
+    } else {
+        lexical_normalize(&launch_cwd.join(requested))
+    }
+}
+
+/// Mirrors OMP's user extension-package root.
+///
+/// The XDG data base is consulted only on the platforms OMP consults it on, only while the agent
+/// directory is still the default, and only when the target already exists. `dirs.ts:277` gates on
+/// `fs.existsSync`, not on the entry being a directory, so this reproduces existence exactly:
+/// requiring a directory would send `SkillMount` to the fallback root while OMP used the XDG one.
+/// Nothing about this root affects a Skill scope; it only decides where enabled packages are
+/// enumerated from.
+fn omp_plugins_dir(config_root: &Path, agent_dir: &Path) -> PathBuf {
+    let default_agent_dir = config_root.join("agent");
+    if cfg!(any(target_os = "linux", target_os = "macos")) && agent_dir == default_agent_dir {
+        if let Some(base) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+            let app_root = PathBuf::from(base).join(OMP_APP_NAME);
+            if app_root.exists() {
+                return app_root.join("plugins");
+            }
+        }
+    }
+    config_root.join("plugins")
 }
 
 fn validate_explicit_executable(path: &Path) -> Result<PathBuf, AppError> {
@@ -238,36 +335,23 @@ pub(crate) fn resolve_inspection(
     validation: crate::domain::ValidationLevel,
     invocation_cwd: &Path,
 ) -> Result<RunContext, AppError> {
+    let descriptor = agent.descriptor();
     let invocation_cwd = canonical_directory(invocation_cwd)?;
     let project_root = nearest_git_root(&invocation_cwd)?.unwrap_or_else(|| invocation_cwd.clone());
-    let user_home = agent_user_home(agent)?;
-    let (codex_home, codex_home_override) = if agent == AgentId::Codex {
-        codex_home(&user_home, &invocation_cwd)?
-    } else {
-        (user_home.join(".codex"), None)
-    };
-    let claude_config_dir = claude_config_dir(&user_home, &invocation_cwd)?;
+    let agent = resolve_agent(agent, &invocation_cwd, &invocation_cwd, || {
+        Ok(PathBuf::from(descriptor.executable_name()))
+    })?;
     Ok(RunContext {
         agent,
         launch_cwd: invocation_cwd.clone(),
         skill_sources: resolve_source_occurrences(skills_dirs, &invocation_cwd)?,
         invocation_cwd,
         project_root,
-        user_home,
-        codex_home,
-        codex_home_override,
-        codex_admin_skills: codex_admin_skills(),
-        claude_config_dir,
-        claude_managed_skills: claude_managed_skills(),
         session_id: None,
-        agent_bin: PathBuf::from(agent.executable_name()),
         passthrough_args: Vec::new(),
         options: crate::domain::RunOptions {
             link_mode: crate::domain::LinkMode::Auto,
-            mount_mode: match agent {
-                AgentId::Codex => crate::domain::MountMode::Project,
-                AgentId::Claude => crate::domain::MountMode::Staging,
-            },
+            mount_mode: descriptor.default_mount_mode(),
             conflict: crate::domain::ConflictPolicy::Error,
             validation,
             dry_run: true,
@@ -297,38 +381,24 @@ pub(crate) fn resolve_operator_context(
     explicit_agent_bin: Option<&Path>,
     invocation_cwd: &Path,
 ) -> Result<RunContext, AppError> {
+    let descriptor = agent.descriptor();
     let invocation_cwd = canonical_directory(invocation_cwd)?;
     let project_root = canonical_directory(project_root)?;
-    let user_home = agent_user_home(agent)?;
-    let (codex_home, codex_home_override) = if agent == AgentId::Codex {
-        codex_home(&user_home, &invocation_cwd)?
-    } else {
-        (user_home.join(".codex"), None)
-    };
-    let claude_config_dir = claude_config_dir(&user_home, &project_root)?;
-    let agent_bin = resolve_agent_executable(agent, explicit_agent_bin, &invocation_cwd)?;
+    let agent = resolve_agent(agent, &invocation_cwd, &project_root, || {
+        resolve_agent_executable(agent, explicit_agent_bin, &invocation_cwd)
+    })?;
 
     Ok(RunContext {
         agent,
         invocation_cwd,
         launch_cwd: project_root.clone(),
         project_root,
-        user_home,
-        codex_home,
-        codex_home_override,
-        codex_admin_skills: codex_admin_skills(),
-        claude_config_dir,
-        claude_managed_skills: claude_managed_skills(),
         skill_sources: Vec::new(),
         session_id: None,
-        agent_bin,
         passthrough_args: Vec::new(),
         options: crate::domain::RunOptions {
             link_mode: crate::domain::LinkMode::Auto,
-            mount_mode: match agent {
-                AgentId::Codex => crate::domain::MountMode::Project,
-                AgentId::Claude => crate::domain::MountMode::Staging,
-            },
+            mount_mode: descriptor.default_mount_mode(),
             conflict: crate::domain::ConflictPolicy::Error,
             validation: crate::domain::ValidationLevel::Basic,
             dry_run: true,
@@ -337,13 +407,6 @@ pub(crate) fn resolve_operator_context(
             verbosity: 0,
         },
     })
-}
-
-fn agent_user_home(agent: AgentId) -> Result<PathBuf, AppError> {
-    match agent {
-        AgentId::Codex => codex_user_home(),
-        AgentId::Claude => crate::state::user_home(),
-    }
 }
 
 /// Mirrors the home resolver used by Codex's user-wide `.agents/skills` root.
@@ -698,9 +761,10 @@ mod tests {
         match std::os::windows::fs::symlink_dir(target, link) {
             Ok(()) => true,
             Err(error) => {
-                if std::env::var_os("SKILLMOUNT_REQUIRE_LINKS").is_some() {
-                    panic!("directory-link fixture is required: {error}");
-                }
+                assert!(
+                    std::env::var_os("SKILLMOUNT_REQUIRE_LINKS").is_none(),
+                    "directory-link fixture is required: {error}"
+                );
                 false
             }
         }
@@ -733,7 +797,7 @@ mod tests {
             fs::canonicalize(fixture.0.join("project")).unwrap()
         );
         assert_eq!(
-            context.agent_bin,
+            context.executable(),
             absolute_from(&context.invocation_cwd, Path::new("bin/claude")).unwrap()
         );
         assert_eq!(
@@ -983,9 +1047,10 @@ mod tests {
         let alias = fixture.0.join("codex.exe");
         fs::write(&batch, "@exit /b 0\r\n").expect("batch fixture");
         if let Err(error) = std::os::windows::fs::symlink_file(&batch, &alias) {
-            if std::env::var_os("SKILLMOUNT_REQUIRE_LINKS").is_some() {
-                panic!("file-link fixture is required: {error}");
-            }
+            assert!(
+                std::env::var_os("SKILLMOUNT_REQUIRE_LINKS").is_none(),
+                "file-link fixture is required: {error}"
+            );
             return;
         }
 

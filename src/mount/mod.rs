@@ -52,6 +52,41 @@ impl PathPrecondition {
     }
 }
 
+/// How much authority cleanup has over the entry one action produces.
+///
+/// The two facts a transaction needs are different questions. Whether an action *creates* something
+/// decides staging and write-ahead progress; how much a later pass may *insist* on removing it
+/// decides whether residue can fail a session. Collapsing them once made an unrelated writer's file
+/// under a created discovery directory into a failed mount cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupDisposition {
+    /// A created Skill link, the only entry through which a selected external Skill is visible.
+    ///
+    /// Cleanup must reconcile it: removal needs matching kind, target, and identity evidence, and an
+    /// entry that cannot be proved gone retains the journal and replaces a successful child status.
+    Required,
+    /// Discovery scaffolding this transaction established so the links above could exist.
+    ///
+    /// It is pruned only while it remains identity-matching and empty, never recursively, and is
+    /// preserved untouched otherwise. Once every required entry is reconciled, nothing a child could
+    /// load depends on it, so preserving it is housekeeping rather than unresolved ownership.
+    BestEffort,
+    /// Nothing was created, so there is nothing for cleanup to own.
+    None,
+}
+
+impl CleanupDisposition {
+    /// Returns the stable label used in read-only output.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Required => "cleanup-critical",
+            Self::BestEffort => "scaffolding",
+            Self::None => "not owned",
+        }
+    }
+}
+
 /// One filesystem operation a transaction performs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MountAction {
@@ -59,6 +94,13 @@ pub enum MountAction {
     CreateDirectory {
         /// Directory to create.
         path: PathBuf,
+    },
+    /// Create a session-owned UTF-8 configuration file without replacing an existing entry.
+    CreateConfigFile {
+        /// Absolute destination in the private session directory.
+        path: PathBuf,
+        /// Exact bounded contents retained as cleanup evidence.
+        contents: String,
     },
     /// Create a directory link at `destination` pointing at `source`.
     CreateDirectoryLink {
@@ -73,7 +115,7 @@ pub enum MountAction {
     /// A directory or directory link already resolves to the intended source, so nothing is
     /// created.
     ///
-    /// A reused entry is never transaction-owned and must never be removed at cleanup.
+    /// Nothing is created for a reused entry, so cleanup must never remove it.
     ReuseExistingLink {
         /// Canonical directory the existing entry refers to.
         source: PathBuf,
@@ -88,18 +130,34 @@ impl MountAction {
     pub const fn verb(&self) -> &'static str {
         match self {
             Self::CreateDirectory { .. } => "MKDIR",
+            Self::CreateConfigFile { .. } => "CONFIG",
             Self::CreateDirectoryLink { .. } => "LINK",
             Self::ReuseExistingLink { .. } => "REUSE",
         }
     }
 
-    /// Returns whether cleanup owns the entry this action produces.
+    /// Returns whether this action creates an entry, and therefore needs a staged sibling and
+    /// write-ahead progress.
     #[must_use]
-    pub const fn is_transaction_owned(&self) -> bool {
-        matches!(
-            self,
-            Self::CreateDirectory { .. } | Self::CreateDirectoryLink { .. }
-        )
+    pub const fn creates_entry(&self) -> bool {
+        match self {
+            Self::CreateDirectory { .. }
+            | Self::CreateDirectoryLink { .. }
+            | Self::CreateConfigFile { .. } => true,
+            Self::ReuseExistingLink { .. } => false,
+        }
+    }
+
+    /// Returns how much authority cleanup has over the entry this action produces.
+    #[must_use]
+    pub const fn cleanup_disposition(&self) -> CleanupDisposition {
+        match self {
+            Self::CreateDirectoryLink { .. } | Self::CreateConfigFile { .. } => {
+                CleanupDisposition::Required
+            }
+            Self::CreateDirectory { .. } => CleanupDisposition::BestEffort,
+            Self::ReuseExistingLink { .. } => CleanupDisposition::None,
+        }
     }
 }
 
@@ -187,11 +245,11 @@ pub struct MountPlan {
 }
 
 impl MountPlan {
-    /// Returns the actions cleanup owns.
-    pub fn owned_actions(&self) -> impl Iterator<Item = &PlannedMountAction> {
+    /// Returns the actions that create an entry, in plan order.
+    pub fn created_actions(&self) -> impl Iterator<Item = &PlannedMountAction> {
         self.actions
             .iter()
-            .filter(|action| action.operation.is_transaction_owned())
+            .filter(|action| action.operation.creates_entry())
     }
 }
 

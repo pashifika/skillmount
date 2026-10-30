@@ -17,9 +17,10 @@ use crate::domain::LinkMode;
 use crate::error::LinkError;
 use crate::link::resolve::targets_match;
 use crate::link::{
-    CreatedLink, CreatedLinkKind, EntryKind, LinkBackend, LinkRequest, LinkTarget, OwnedDirectory,
-    Ownership, PathEntry, PlacementMismatch, PlacementOutcome, PlacementResidue, PlatformIdentity,
-    RemoveOutcome, directory_placement_mismatch, link_placement_mismatch, sealed, verify_ownership,
+    CreatedLink, CreatedLinkKind, EntryKind, LinkBackend, LinkRequest, LinkTarget, OwnedConfigFile,
+    OwnedDirectory, Ownership, PathEntry, PlacementMismatch, PlacementOutcome, PlacementResidue,
+    PlatformIdentity, RemoveOutcome, directory_placement_mismatch, link_placement_mismatch, sealed,
+    verify_ownership,
 };
 
 /// The macOS backend.
@@ -56,11 +57,7 @@ impl LinkBackend for UnixBackend {
             path: path.to_path_buf(),
             kind,
             target,
-            identity: Some(PlatformIdentity::from_pair(
-                "unix",
-                metadata.dev(),
-                metadata.ino(),
-            )),
+            identity: Some(identity(&metadata)),
         })
     }
 
@@ -151,6 +148,100 @@ impl LinkBackend for UnixBackend {
             source_canonical,
             identity: created.identity,
         })
+    }
+
+    fn verify_config_file(&self, file: &OwnedConfigFile) -> Result<bool, LinkError> {
+        Ok(self.config_ownership(file)? == Ownership::Owned)
+    }
+
+    fn create_config_file(
+        &self,
+        path: &Path,
+        contents: &str,
+    ) -> Result<OwnedConfigFile, LinkError> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        if contents.len() > super::MAX_CONFIG_BYTES {
+            return Err(inspect_error(
+                path,
+                &io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "configuration exceeds size bound",
+                ),
+            ));
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|error| inspect_error(path, &error))?;
+        file.write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|error| inspect_error(path, &error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| inspect_error(path, &error))?;
+        let recorded = OwnedConfigFile {
+            path: path.to_path_buf(),
+            identity: Some(identity(&metadata)),
+            contents: contents.to_owned(),
+        };
+        match self.config_ownership(&recorded)? {
+            Ownership::Owned => Ok(recorded),
+            _ => Err(inspect_error(
+                path,
+                &io::Error::other("created configuration changed; retained for recovery"),
+            )),
+        }
+    }
+
+    fn place_config_file_no_replace(
+        &self,
+        file: &OwnedConfigFile,
+        destination: &Path,
+    ) -> Result<PlacementOutcome<OwnedConfigFile>, LinkError> {
+        if let Some(mismatch) = super::placement_mismatch(self.config_ownership(file)?) {
+            return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                path: file.path.clone(),
+                mismatch,
+            }));
+        }
+        if !place_path_no_replace(&file.path, destination)? {
+            return Ok(PlacementOutcome::DestinationExists);
+        }
+        let placed = file.relocated_to(destination);
+        match self.config_ownership(&placed) {
+            Ok(ownership) => {
+                if let Some(mismatch) = super::placement_mismatch(ownership) {
+                    return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                        path: destination.to_path_buf(),
+                        mismatch,
+                    }));
+                }
+            }
+            Err(error) => {
+                return Ok(PlacementOutcome::OwnershipMismatch(PlacementResidue {
+                    path: destination.to_path_buf(),
+                    mismatch: PlacementMismatch::InspectionFailed(error.to_string()),
+                }));
+            }
+        }
+        Ok(PlacementOutcome::Placed(placed))
+    }
+
+    fn remove_config_file(&self, file: &OwnedConfigFile) -> Result<RemoveOutcome, LinkError> {
+        match self.config_ownership(file)? {
+            Ownership::Absent => Ok(RemoveOutcome::AlreadyAbsent),
+            Ownership::Mismatch(mismatch) => Ok(RemoveOutcome::OwnershipMismatch(mismatch)),
+            Ownership::Owned => {
+                fs::remove_file(&file.path).map_err(|error| LinkError::Remove {
+                    path: file.path.clone(),
+                    reason: error.to_string(),
+                })?;
+                Ok(RemoveOutcome::Removed)
+            }
+        }
     }
 
     fn create_directory(&self, path: &Path) -> Result<OwnedDirectory, LinkError> {
@@ -314,6 +405,9 @@ impl LinkBackend for UnixBackend {
         }
     }
 }
+fn identity(metadata: &fs::Metadata) -> PlatformIdentity {
+    PlatformIdentity::from_pair("unix", metadata.dev(), metadata.ino())
+}
 
 /// Runs the backend-private atomic pathname rename, returning `false` for destination contention.
 fn place_path_no_replace(staged: &Path, destination: &Path) -> Result<bool, LinkError> {
@@ -359,5 +453,40 @@ fn retained_create_error(request: &LinkRequest, reason: &str) -> LinkError {
              across unlink; inspect the retained staged path {}",
             request.staged_path.display()
         ),
+    }
+}
+
+impl UnixBackend {
+    /// Checks the no-follow open object and rechecks the pathname immediately before mutation.
+    fn config_ownership(&self, recorded: &OwnedConfigFile) -> Result<Ownership, LinkError> {
+        let live = self.inspect_no_follow(&recorded.path)?;
+        let ownership = super::verify_config_ownership(&live, recorded);
+        if ownership != Ownership::Owned {
+            return Ok(ownership);
+        }
+        let mut file = super::unix_ffi::open_config_no_follow(&recorded.path)
+            .map_err(|error| inspect_error(&recorded.path, &error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| inspect_error(&recorded.path, &error))?;
+        if !metadata.is_file() {
+            return Ok(Ownership::Mismatch(super::OwnershipMismatch::NotAFile));
+        }
+        if Some(identity(&metadata)) != recorded.identity {
+            return Ok(Ownership::Mismatch(
+                super::OwnershipMismatch::IdentityChanged,
+            ));
+        }
+        if !super::config_file_matches(&mut file, &recorded.contents)
+            .map_err(|error| inspect_error(&recorded.path, &error))?
+        {
+            return Ok(Ownership::Mismatch(
+                super::OwnershipMismatch::ContentsChanged,
+            ));
+        }
+        Ok(super::verify_config_ownership(
+            &self.inspect_no_follow(&recorded.path)?,
+            recorded,
+        ))
     }
 }

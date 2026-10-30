@@ -29,12 +29,12 @@ files. The supported package targets are Apple Silicon macOS for Homebrew and Wi
 for Chocolatey. Homebrew Core, casks, bottles, Linux, macOS Intel, Windows ARM64, WinGet, Scoop,
 and crates.io are out of scope.
 
-Current state: the protected `pashifika/homebrew-tap` exists in its never-published bootstrap state,
-but no Formula or publisher credential exists. Chocolatey profile
-[`pashifika`](https://community.chocolatey.org/profiles/pashifika) exists with no published package;
-neither ID appears in the public feed, ownership remains unobserved until first submission, and the
-protected publisher credential is absent. Package-manager version `0.2.0` is not yet publicly
-available, so every install command in this document remains unavailable and is documented as such.
+Current state: both Homebrew Formulae are published at `0.2.0` in
+[`pashifika/homebrew-tap`](https://github.com/pashifika/homebrew-tap/tree/main/Formula), with
+selected-only native installation evidence recorded below. Chocolatey publication and moderation
+remain separate per-package states; the commands below are not advertised as available until their
+public endpoints and clean Windows installations pass. Do not infer publisher credential state
+from package availability; inspect the protected workflow's result when operating a new release.
 
 ## The package workflow
 
@@ -329,9 +329,12 @@ unavailable. Installing both Formulae or, once published, both Chocolatey packag
 supported; each command owns only its own executable, shim, and completion files, and uninstalling
 one never removes the other.
 
-Homebrew adds a trust prerequisite to the install path, proven with Homebrew 6.0.12 on `macos-15`:
-`brew install` refuses a Formula from an untrusted third-party tap, while `brew style` and
-`brew audit` accept one. Trust survives every upgrade of a Formula that stays installed: entries are
+Homebrew adds a trust prerequisite to Formula loading. The Homebrew 7.0.11 native rehearsal
+proved that `brew audit --strict --formula`, as well as `brew install`, refuses an untrusted
+third-party Formula. The harness verifies the generated pair and tap ownership with `brew style`,
+then captures and grants only the pair’s scoped trust before auditing; cleanup restores the
+pre-run trust state. Selecting audit also selects its style and trust prerequisites.
+Trust survives every upgrade of a Formula that stays installed: entries are
 name-keyed plain JSON in `${XDG_CONFIG_HOME}/homebrew/trust.json`, or in `~/.homebrew/trust.json`
 when `XDG_CONFIG_HOME` is unset (verified on Homebrew 6.0.15).
 `brew trust --formula pashifika/tap/<id>` trusts one Formula; `brew trust pashifika/tap` trusts
@@ -377,10 +380,10 @@ Installs only the `asm` command from the checked Apple Silicon release archive. 
 completions are generated through `asm completions <shell>`, register only `asm`, and are owned and
 removed by this Formula alone. No user profile is edited.
 
-Version-transition testing is not yet applicable: `v0.2.0` is the first published Formula pair,
-and `v0.1.0` predates the `completions` command that both Formulae require during installation.
-`brew upgrade` is the supported command for future releases; the next completion-capable release
-must exercise that transition before publication.
+`v0.2.0` is the first published Formula pair; `v0.1.0` predates the required `completions`
+command. The `v0.3.0` promotion gate therefore requires the native upgrade rehearsal from
+`v0.2.0` with `--prior-tag v0.2.0 --require-upgrade`; a missing prior archive or skipped transition
+fails that gate. `brew upgrade` remains the supported operator command.
 
 ### Chocolatey `skillmount` — unavailable
 
@@ -413,3 +416,45 @@ Downloads and checksum-verifies the matching x86 or x64 release archive, retains
 and exposes only the ordinary `asm` shim. The package installs no completion files and never edits
 a PowerShell profile; generate PowerShell completion manually with `asm completions powershell`
 and dot-source the saved file from your own profile.
+
+## Pinned-shell CI provisioning
+
+The completion job keeps its reviewed Homebrew/core revisions and exact shell-version checks.
+Hosted images can carry local core-tap edits (CI run `39031627849` failed when checking out the
+pin over `Formula/r/rustup.rb`). `provision_native_shells.py` prepares an independent pinned core
+checkout before temporarily swapping it into the tap location for installation. A `finally` guard
+restores the original directory, including local and untracked files, on successful or failed
+installation, including ordinary interruption and handled termination signals. It never resets, cleans, or recursively deletes the original tap. Recovery directories
+remain under `RUNNER_TEMP`; identity mismatches or restoration failures stop with the original
+retained there. Like any process cleanup, this cannot run after SIGKILL or host loss, so the helper
+refuses execution outside disposable macOS Actions runners. It is not a local Homebrew maintenance
+command. Regression tests exercise successful and failed installation scopes and refused local use.
+
+## Upgrade-rehearsal cleanup
+
+The acceptance harness disables automatic Homebrew cleanup, so a successful upgrade can retain
+both the old and new kegs. Ordinary uninstall scenarios still use `brew uninstall --formula`.
+Final cleanup and the upgrade-stage finalizer use `brew uninstall --formula --force` only for
+recorded installations of the isolated acceptance Formula pair, after the preflight has refused
+any pre-existing product installation. Homebrew's formula-specific `--force` removes all installed
+versions before uninstall drops formula trust and the harness untaps, as confirmed in the observed
+[Homebrew 7.0.11 uninstall implementation](https://github.com/Homebrew/brew/blob/7.0.11/Library/Homebrew/cmd/uninstall.rb).
+The harness verifies that the recorded cellar is absent or empty before dropping installation
+tracking; unknown or remaining entries retain tracking and fail the report. It does not run broad
+`brew cleanup`, ignore dependencies, or remove unrelated Formulae. Nonzero cleanup remains a
+failed report, even when every lifecycle phase passed.
+
+This fixes the v0.3.0 promotion rehearsal in
+[CI run 41051878406](https://github.com/pashifika/skillmount/actions/runs/41051878406): all lifecycle
+phases, including the v0.2.0 upgrade, passed, but cleanup left the old v0.2.0 keg and subsequent
+untap failed because uninstall had dropped formula trust. That historical run remains failed.
+
+The October 30 promotion rehearsal (run `41054007543`, artifact `12975343691`) verified the
+all-version cleanup repair, but its reported audit success was invalid: both audit commands
+exited 1 on untrusted-tap refusals before examining the Formulae. That report is cleanup evidence,
+not a successful audit. The corrected harness treats unknown diagnostics, empty nonzero output,
+and mixed local-archive/other failures as failures. Only an explicit recognized local stable-URL
+exception can explain exit 1 for a `file://` rehearsal; published archives receive no exception.
+Broad `https` or `file://` keyword matching is not an allowance. Native audit must pass again.
+The output structure follows [Homebrew 7.0.11 audit](https://github.com/Homebrew/brew/blob/7.0.11/Library/Homebrew/dev-cmd/audit.rb);
+new or changed diagnostics fail closed rather than silently extending the exception.

@@ -29,10 +29,65 @@ mod windows_ffi;
 
 #[cfg(not(any(unix, windows)))]
 compile_error!("child process supervision supports only Unix and Windows targets");
+/// Shell family that can safely receive a rendered recovery command.
+///
+/// This is advisory presentation evidence only. `Unknown` is the mandatory fallback whenever
+/// ancestry cannot be observed unambiguously.
+// Supported command encoders remain testable on every host, but only Windows can detect them.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InvocationShell {
+    /// Windows PowerShell or PowerShell 7.
+    PowerShell,
+    /// Windows Command Prompt.
+    CommandPrompt,
+    /// No single supported shell family was proved.
+    Unknown,
+}
+
+/// Captures one best-effort startup hint for recovery rendering.
+#[must_use]
+pub(crate) fn invocation_shell() -> InvocationShell {
+    #[cfg(windows)]
+    {
+        windows_ffi::observe_invocation_shell().unwrap_or(InvocationShell::Unknown)
+    }
+    #[cfg(not(windows))]
+    {
+        InvocationShell::Unknown
+    }
+}
+
+/// Classifies an already ordered ancestor-image observation without treating wrappers as shells.
+#[cfg(any(windows, test))]
+fn classify_invocation_shell(ancestor_images: &[OsString]) -> InvocationShell {
+    let mut powershell = false;
+    let mut command_prompt = false;
+    for image in ancestor_images {
+        let name = Path::new(image).file_name().unwrap_or_default();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("powershell.exe") || name.eq_ignore_ascii_case("pwsh.exe") {
+            powershell = true;
+        } else if name.eq_ignore_ascii_case("cmd.exe") {
+            command_prompt = true;
+        }
+        if powershell && command_prompt {
+            return InvocationShell::Unknown;
+        }
+    }
+    match (powershell, command_prompt) {
+        (true, false) => InvocationShell::PowerShell,
+        (false, true) => InvocationShell::CommandPrompt,
+        (false, false) | (true, true) => InvocationShell::Unknown,
+    }
+}
 
 /// Native helpers exposed only to feature-gated integration fixtures.
 #[cfg(all(windows, feature = "test-fixtures"))]
 pub mod test_support {
+    use std::ffi::OsString;
     use std::io;
 
     /// Sends `CTRL_BREAK_EVENT` to a console process group created by a test controller.
@@ -51,6 +106,63 @@ pub mod test_support {
     /// Returns the operating-system error when the process cannot be opened or queried.
     pub fn process_is_running(process_id: u32) -> io::Result<bool> {
         super::windows_ffi::process_is_running(process_id)
+    }
+    /// Shell encoder selected by a native recovery-rendering fixture.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RecoveryShell {
+        /// PowerShell argument-mode parsing.
+        PowerShell,
+        /// Command Prompt plus Windows native argument parsing.
+        CommandPrompt,
+    }
+
+    /// Renders one accepted native operation for a real-shell round-trip fixture.
+    ///
+    /// `None` means the selected production encoder rejected at least one value and would emit the
+    /// labelled native-vector fallback.
+    #[must_use]
+    pub fn render_recovery_command(shell: RecoveryShell, operation: &[OsString]) -> Option<String> {
+        let shell = match shell {
+            RecoveryShell::PowerShell => super::InvocationShell::PowerShell,
+            RecoveryShell::CommandPrompt => super::InvocationShell::CommandPrompt,
+        };
+        crate::render::shell_command(shell, operation).map(|(_, command)| command)
+    }
+}
+
+/// A dedicated process domain for one bounded captured command.
+///
+/// The caller must terminate the domain before reaping its root, then mark the root reaped and
+/// prove the domain empty. Dropping an unreaped domain requests best-effort forceful termination
+/// without waiting.
+pub(crate) struct CaptureDomain {
+    inner: platform::CaptureDomain,
+}
+
+impl CaptureDomain {
+    /// Configures platform containment before spawning the command.
+    pub(crate) fn prepare(command: &mut Command) -> io::Result<Self> {
+        platform::CaptureDomain::prepare(command).map(|inner| Self { inner })
+    }
+
+    /// Attaches a newly spawned root process to the prepared domain.
+    pub(crate) fn attach(&mut self, child: &Child) -> io::Result<()> {
+        self.inner.attach(child)
+    }
+
+    /// Requests forceful termination before the root process is reaped.
+    pub(crate) fn terminate(&self, child: &mut Child) -> io::Result<()> {
+        self.inner.terminate(child)
+    }
+
+    /// Records that the root status was collected, disabling unsafe identifier-based force.
+    pub(crate) fn mark_root_reaped(&mut self) {
+        self.inner.mark_root_reaped();
+    }
+
+    /// Probes whether the contained process domain is empty without sending another signal.
+    pub(crate) fn is_empty(&self) -> io::Result<bool> {
+        self.inner.is_empty()
     }
 }
 
@@ -883,8 +995,9 @@ mod tests {
 
     use super::{
         ChildOutcome, ChildStatus, CleanupFailure, CleanupGuard, CleanupOutcome, ExitDecision,
-        ForceTermination, InterruptDelivery, InterruptKind, InterruptPath, ProcessFailure,
-        ProcessStage, SupervisionDiagnostic, SupervisionOutcome, defer_cleanup, map_exit,
+        ForceTermination, InterruptDelivery, InterruptKind, InterruptPath, InvocationShell,
+        ProcessFailure, ProcessStage, SupervisionDiagnostic, SupervisionOutcome,
+        classify_invocation_shell, defer_cleanup, map_exit,
     };
 
     fn failure(stage: ProcessStage, kind: io::ErrorKind) -> ProcessFailure {
@@ -939,6 +1052,44 @@ mod tests {
         for case in cases {
             assert_eq!(map_exit(&case.outcome), case.expected, "{}", case.name);
         }
+    }
+
+    #[test]
+    fn one_supported_shell_family_survives_non_shell_wrappers() {
+        let powershell = [
+            OsString::from("conhost.exe"),
+            OsString::from("pwsh.EXE"),
+            OsString::from("WindowsTerminal.exe"),
+        ];
+        let command_prompt = [
+            OsString::from("wrapper.exe"),
+            OsString::from("CMD.EXE"),
+            OsString::from("explorer.exe"),
+        ];
+
+        assert_eq!(
+            classify_invocation_shell(&powershell),
+            InvocationShell::PowerShell
+        );
+        assert_eq!(
+            classify_invocation_shell(&command_prompt),
+            InvocationShell::CommandPrompt
+        );
+    }
+
+    #[test]
+    fn mixed_or_absent_supported_shell_families_are_unknown() {
+        let mixed = [OsString::from("cmd.exe"), OsString::from("powershell.exe")];
+        let wrappers = [
+            OsString::from("conhost.exe"),
+            OsString::from("WindowsTerminal.exe"),
+        ];
+
+        assert_eq!(classify_invocation_shell(&mixed), InvocationShell::Unknown);
+        assert_eq!(
+            classify_invocation_shell(&wrappers),
+            InvocationShell::Unknown
+        );
     }
 
     #[test]

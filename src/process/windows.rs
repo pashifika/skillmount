@@ -24,6 +24,54 @@ pub(super) fn validate_executable(executable: &Path) -> io::Result<()> {
     }
 }
 
+pub(super) struct CaptureDomain {
+    job: JobObject,
+    attached: bool,
+}
+
+impl CaptureDomain {
+    #[allow(clippy::unused_self)]
+    pub(super) fn prepare(_command: &mut Command) -> io::Result<Self> {
+        Ok(Self {
+            job: JobObject::create()?,
+            attached: false,
+        })
+    }
+
+    pub(super) fn attach(&mut self, child: &Child) -> io::Result<()> {
+        self.job.assign(child)?;
+        self.attached = true;
+        Ok(())
+    }
+
+    pub(super) fn terminate(&self, child: &mut Child) -> io::Result<()> {
+        if !self.attached {
+            return child.kill();
+        }
+        match self.job.active_processes() {
+            Ok(0) => Ok(()),
+            Ok(_) | Err(_) => self.job.terminate(1).or_else(|job_error| {
+                child.kill().map_err(|child_error| {
+                    io::Error::other(format!(
+                        "cannot terminate capture Job Object ({job_error}) or root process ({child_error})"
+                    ))
+                })
+            }),
+        }
+    }
+
+    #[allow(clippy::unused_self)]
+    pub(super) fn mark_root_reaped(&mut self) {}
+
+    pub(super) fn is_empty(&self) -> io::Result<bool> {
+        if self.attached {
+            self.job.active_processes().map(|count| count == 0)
+        } else {
+            Ok(true)
+        }
+    }
+}
+
 pub(super) struct Platform {
     events: EventSession,
     job: Option<JobObject>,

@@ -460,7 +460,7 @@ pub enum AppError {
     /// Invalid catalog data.
     Catalog(CatalogError),
     /// A resolved catalog cannot be realized against the observed project state.
-    Plan(PlanError),
+    Plan(Box<PlanError>),
     /// A platform link backend could not complete an operation.
     Link(LinkError),
     /// A transaction journal could not be written, read, or interpreted.
@@ -478,6 +478,29 @@ pub enum AppError {
     Filesystem(String),
     /// Temporary lock or recovery failure.
     Temporary(String),
+    /// A temporary failure with independently escaped details and native recovery operations.
+    ///
+    /// An ordinary message is escaped as one value, which is what stops a path inside it from
+    /// forging a line. A few recovery diagnostics are deliberately structured, so they carry their
+    /// own lines. Native recovery operations stay separate until the application boundary appends
+    /// one detected-shell command or labelled-vector footer after every diagnostic.
+    TemporaryReport {
+        /// One-line summary written as the primary error.
+        summary: String,
+        /// Already-escaped detail lines, written after the summary.
+        detail: Vec<String>,
+        /// Executable-plus-argument sequences rendered only after all detail and guidance.
+        recovery: Box<[Vec<OsString>]>,
+    },
+    /// A filesystem failure with independently escaped details and native recovery operations.
+    FilesystemReport {
+        /// One-line summary written as the primary error.
+        summary: String,
+        /// Already-escaped detail lines, written after the summary.
+        detail: Vec<String>,
+        /// Executable-plus-argument sequences rendered only after all detail and guidance.
+        recovery: Box<[Vec<OsString>]>,
+    },
     /// User interrupt.
     Interrupted,
 }
@@ -490,7 +513,9 @@ impl AppError {
             Self::Usage(_) => ExitCategory::Usage,
             Self::Catalog(_) => ExitCategory::Data,
             // A destination conflict is a filesystem-state failure, not a catalog failure.
-            Self::Plan(_) | Self::Link(_) | Self::Filesystem(_) => ExitCategory::Filesystem,
+            Self::Plan(_) | Self::Link(_) | Self::Filesystem(_) | Self::FilesystemReport { .. } => {
+                ExitCategory::Filesystem
+            }
             Self::Journal(error) => {
                 if error.blocks_recovery() {
                     ExitCategory::Temporary
@@ -500,7 +525,7 @@ impl AppError {
             }
             Self::MissingInput { .. } => ExitCategory::MissingInput,
             Self::Internal(_) => ExitCategory::Internal,
-            Self::Temporary(_) => ExitCategory::Temporary,
+            Self::Temporary(_) | Self::TemporaryReport { .. } => ExitCategory::Temporary,
             Self::Interrupted => ExitCategory::Interrupted,
         }
     }
@@ -512,7 +537,13 @@ impl fmt::Display for AppError {
             Self::Usage(message)
             | Self::Internal(message)
             | Self::Filesystem(message)
-            | Self::Temporary(message) => formatter.write_str(message),
+            | Self::Temporary(message)
+            | Self::FilesystemReport {
+                summary: message, ..
+            }
+            | Self::TemporaryReport {
+                summary: message, ..
+            } => formatter.write_str(message),
             Self::Catalog(error) => error.fmt(formatter),
             Self::Plan(error) => error.fmt(formatter),
             Self::Link(error) => error.fmt(formatter),
@@ -533,7 +564,7 @@ impl Error for AppError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Catalog(error) => Some(error),
-            Self::Plan(error) => Some(error),
+            Self::Plan(error) => Some(error.as_ref()),
             Self::Link(error) => Some(error),
             Self::Journal(error) => Some(error),
             _ => None,
@@ -549,7 +580,7 @@ impl From<CatalogError> for AppError {
 
 impl From<PlanError> for AppError {
     fn from(error: PlanError) -> Self {
-        Self::Plan(error)
+        Self::Plan(Box::new(error))
     }
 }
 

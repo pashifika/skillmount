@@ -1,26 +1,44 @@
-//! Agent adapter boundary and read-only discovery inspection.
+//! Agent adapter boundary, read-only discovery inspection, and advisory version observation.
 //!
-//! An adapter observes and describes; it never mutates. Every method here returns a snapshot or a
+//! An adapter observes and describes; it never mutates. Every adapter method returns a snapshot or
 //! plan, and the shared application and transaction layers apply those values after the mutation
-//! boundary.
+//! boundary. The sibling `version` module may launch one bounded, shell-free `--version` process;
+//! it has no access to locks, journals, transactions, mount mutation, or cleanup identity.
 
 pub mod claude;
 pub mod codex;
+pub mod omp;
+pub(crate) mod version;
 
 #[cfg(test)]
 mod tests;
 
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::domain::{AgentId, RunContext, SkillCatalog, SkillNameKey};
+use crate::domain::{AgentId, CatalogPolicy, RunContext, SkillCatalog, SkillNameKey};
 use crate::error::AppError;
 use crate::lock::LockResource;
 use crate::mount::MountPlan;
 use crate::mount::resolve::{PathKind, ResolvedEntry, classify};
+
+/// Returns the single registered adapter for one supported Agent.
+///
+/// The reference is `'static` and allocation-free: every adapter is a stateless zero-sized value
+/// and the supported set is closed at compile time, so no `Box` is needed. Dynamic dispatch is
+/// confined to a handful of orchestration checkpoints whose cost is dominated by filesystem and
+/// process work. This is the one registration point: adding a compile-time Agent must not require
+/// an Agent-specific policy branch in any shared caller.
+pub(crate) fn adapter(agent: AgentId) -> &'static dyn AgentAdapter {
+    match agent {
+        AgentId::Codex => &codex::CodexAdapter,
+        AgentId::Claude => &claude::ClaudeAdapter,
+        AgentId::Omp => &omp::OmpAdapter,
+    }
+}
 
 /// Which namespace a discovery scope represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -53,6 +71,20 @@ pub enum ScopeKind {
     ClaudeStaging,
     /// A namespace made visible by a passthrough `--add-dir`.
     ClaudeAddDir,
+    /// The launch CWD's own `.omp/skills`, which an OMP session mounts into.
+    OmpProject,
+    /// An ancestor `.omp/skills` between the launch CWD and the OMP walk boundary.
+    OmpAncestor,
+    /// The active OMP agent directory's `skills/` root.
+    OmpUser,
+    /// A `skills/` root beside an enabled OMP extension package.
+    OmpPlugin,
+    /// A configured `skills.customDirectories` entry.
+    OmpCustom,
+    /// A compatibility provider root OMP reads for another Agent's layout.
+    OmpCompatibility,
+    /// Auto-learned Skills under the OMP agent directory's `managed-skills`.
+    OmpManaged,
 }
 
 impl ScopeKind {
@@ -74,6 +106,13 @@ impl ScopeKind {
             Self::ClaudeUser => "claude user",
             Self::ClaudeStaging => "claude staging",
             Self::ClaudeAddDir => "claude add-dir",
+            Self::OmpProject => "omp project",
+            Self::OmpAncestor => "omp ancestor",
+            Self::OmpUser => "omp user",
+            Self::OmpPlugin => "omp plugin",
+            Self::OmpCustom => "omp custom",
+            Self::OmpCompatibility => "omp compatibility",
+            Self::OmpManaged => "omp managed",
         }
     }
 }
@@ -184,6 +223,13 @@ pub struct DiscoverySnapshot {
     pub backing_store: PathBuf,
     /// Observed state of the backing store.
     pub backing_store_state: PathKind,
+    /// Canonical directory the backing store resolves to, when it resolves through a link.
+    ///
+    /// `None` when the store is the canonical directory itself or does not exist yet. Diagnostics
+    /// must show this whenever it is present: a mount planned through a directory link is applied to
+    /// a directory the logical path does not name, and an operator who cannot see that path cannot
+    /// tell which project the mount became visible to.
+    pub backing_store_canonical: Option<PathBuf>,
     /// Resources the transaction locks; acquisition derives a deduplicated, sorted key set.
     pub lock_resources: Vec<LockResource>,
     /// Non-fatal observations.
@@ -200,17 +246,53 @@ impl DiscoverySnapshot {
     }
 }
 
+/// Returns the canonical directory `store` resolves to, but only when that differs from `store`.
+///
+/// A store that is already the canonical directory needs no second path in a diagnostic, and a
+/// missing store has no identity to report yet. Every adapter uses this so the reported shape is the
+/// same for all three Agents.
+#[must_use]
+pub(crate) fn canonical_backing(store: &Path, state: &ResolvedEntry) -> Option<PathBuf> {
+    state
+        .terminal
+        .as_ref()
+        .filter(|terminal| terminal.as_path() != store)
+        .cloned()
+}
+
 /// A read-only agent adapter.
 ///
 /// Command mutation is intentionally absent from this trait. An adapter describes a
 /// [`crate::mount::LaunchPlan`], while the shared application and process layers create and own the
-/// child after the transaction is active.
-pub trait AgentAdapter {
-    /// Returns the adapter's agent.
-    fn id(&self) -> AgentId;
+/// child after the transaction is active. An adapter never opens a journal, acquires a lock,
+/// applies or removes a link, spawns a child, or selects error precedence; the application decides
+/// when each method below runs.
+pub(crate) trait AgentAdapter {
+    /// Returns the dated compatibility evidence this adapter was last tested against.
+    ///
+    /// Stable identity is not restated here: [`AgentId::descriptor`] is the single metadata source,
+    /// and version evidence is deliberately separate from it because it is evidence, not identity.
+    fn version_spec(&self) -> version::VersionSpec;
 
-    /// Returns the executable name looked up through `PATH` when none was supplied.
-    fn default_executable(&self) -> &'static OsStr;
+    /// Returns the Agent-required catalog facts for one selected Skill.
+    fn catalog_policy(&self) -> CatalogPolicy;
+
+    /// Resolves the catalog under this adapter's selection contract.
+    fn resolve_catalog(&self, context: &RunContext) -> Result<SkillCatalog, AppError> {
+        let destination_stores = self.destination_stores(context);
+        crate::catalog::resolve_catalog(
+            &context.skill_sources,
+            &crate::catalog::CatalogRequest {
+                agent: context.agent_id(),
+                policy: self.catalog_policy(),
+                validation: context.options.validation,
+                destination_stores: &destination_stores,
+            },
+        )
+    }
+
+    /// Returns every future destination store, used only for source/destination cycle rejection.
+    fn destination_stores(&self, context: &RunContext) -> Vec<PathBuf>;
 
     /// Checks passthrough arguments for combinations that would defeat Skill loading.
     ///
@@ -218,6 +300,16 @@ pub trait AgentAdapter {
     ///
     /// Returns [`AppError::Usage`] when an argument is incompatible with mounting Skills.
     fn validate_passthrough_args(&self, args: &[OsString]) -> Result<Vec<Diagnostic>, AppError>;
+
+    /// Re-checks release-independent hazards that can invalidate the inspected launch contract.
+    ///
+    /// This is read-only and repeatable. The application calls it before `SkillMount` state access
+    /// and again after the lock set stabilizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when configuration outside this release's supported contract is present.
+    fn validate_launch_invariants(&self, context: &RunContext) -> Result<(), AppError>;
 
     /// Returns agent-specific observations that depend on the selected catalog.
     fn catalog_diagnostics(
@@ -251,6 +343,25 @@ pub trait AgentAdapter {
         catalog: &SkillCatalog,
         discovery: &DiscoverySnapshot,
     ) -> Result<MountPlan, AppError>;
+
+    /// Revalidates the launch contract after apply and immediately before the child is spawned.
+    ///
+    /// The snapshot and plan are the locked pre-apply values, so an adapter can ignore exactly the
+    /// transaction-owned actions it just asked for. No version evidence is observed on any session
+    /// path, here or earlier: an Agent update is not launch authorization. See ADR 0036.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a hard invariant changed after the plan was applied.
+    fn validate_spawn_boundary(
+        &self,
+        context: &RunContext,
+        _catalog: &SkillCatalog,
+        _discovery: &DiscoverySnapshot,
+        _plan: &MountPlan,
+    ) -> Result<(), AppError> {
+        self.validate_launch_invariants(context)
+    }
 }
 
 /// Inspects one discovery namespace without modifying it.

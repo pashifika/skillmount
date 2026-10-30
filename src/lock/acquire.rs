@@ -14,16 +14,19 @@
 //! opposite orders therefore request them in the same order and cannot deadlock against each other.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fs4::{FileExt, TryLockError};
+use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
 use crate::state;
 
-use super::{LockKey, LockResource};
+use super::{LockAccess, LockKey, LockResource};
 
 /// Environment variable that overrides how long acquisition waits.
 ///
@@ -39,6 +42,12 @@ const DEFAULT_WAIT: Duration = Duration::from_secs(10);
 
 /// How often a contended lock is retried.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Maximum owner records inspected for one contended key.
+const MAX_HOLDER_RECORDS: usize = 8;
+
+/// Maximum bytes accepted from one advisory owner record.
+const MAX_HOLDER_BYTES: u64 = 1024;
 
 /// How long acquisition waits, and how often it retries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +121,7 @@ impl LockOwner {
 #[derive(Debug)]
 struct HeldLock {
     file: File,
+    access: LockAccess,
     description: PathBuf,
 }
 
@@ -140,6 +150,8 @@ pub struct HeldLocks {
 pub struct LockContention {
     /// Key that is unavailable.
     pub key: LockKey,
+    /// Access this session tried to acquire.
+    pub access: LockAccess,
     /// Lock file protecting it.
     pub path: PathBuf,
     /// Resource paths this session mapped onto the key.
@@ -164,6 +176,7 @@ pub(crate) enum AdvisoryLockState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdvisoryLockObservation {
     pub(crate) key: LockKey,
+    pub(crate) access: LockAccess,
     pub(crate) path: PathBuf,
     pub(crate) resources: Vec<PathBuf>,
     pub(crate) state: AdvisoryLockState,
@@ -175,15 +188,16 @@ pub(crate) fn observe(
 ) -> Result<Vec<AdvisoryLockObservation>, AppError> {
     let directory = state::lock_base()?;
     let mut observations = Vec::new();
-    for (key, resource_paths) in sorted_keys(resources) {
-        let path = directory.join(key.file_name());
+    for request in sorted_requests(resources) {
+        let path = directory.join(request.key.file_name());
         let file = match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 observations.push(AdvisoryLockObservation {
-                    key,
+                    key: request.key,
+                    access: request.access,
                     path,
-                    resources: resource_paths,
+                    resources: request.resources,
                     state: AdvisoryLockState::Free,
                 });
                 continue;
@@ -195,6 +209,8 @@ pub(crate) fn observe(
                 )));
             }
         };
+        // An exclusive probe conflicts with either a shared observer or an exclusive mutator.
+        // This reads kernel state without creating a lock file or owner record.
         let state = match FileExt::try_lock(&file) {
             Ok(()) => {
                 FileExt::unlock(&file).map_err(|error| {
@@ -206,7 +222,7 @@ pub(crate) fn observe(
                 AdvisoryLockState::Free
             }
             Err(TryLockError::WouldBlock) => AdvisoryLockState::Held {
-                holder: read_holder(&key),
+                holder: read_holder(&request.key),
             },
             Err(TryLockError::Error(error)) => {
                 return Err(AppError::Filesystem(format!(
@@ -216,9 +232,10 @@ pub(crate) fn observe(
             }
         };
         observations.push(AdvisoryLockObservation {
-            key,
+            key: request.key,
+            access: request.access,
             path,
-            resources: resource_paths,
+            resources: request.resources,
             state,
         });
     }
@@ -240,9 +257,21 @@ impl LockContention {
             .as_deref()
             .map_or_else(String::new, |holder| format!(" (held by {holder})"));
         format!(
-            "another SkillMount session holds {resources}{holder}; nothing was changed for this session"
+            "another SkillMount session blocks {} access to {resources}{holder}; nothing was changed for this session",
+            self.access.label()
         )
     }
+}
+
+/// Result of an immediate attempt to claim the locks this set does not already satisfy.
+#[derive(Debug)]
+pub enum MissingLockOutcome {
+    /// Every missing key was acquired.
+    Acquired(HeldLocks),
+    /// Another process holds a required key.
+    Contended(LockContention),
+    /// This set holds a key too weakly and must be released before reacquisition.
+    RequiresReacquire,
 }
 
 impl HeldLocks {
@@ -263,36 +292,40 @@ impl HeldLocks {
         Ok(held)
     }
 
-    /// Takes any lock in `resources` that is not already held, keeping the same sorted order.
+    /// Takes any request in `resources` that is not already satisfied, preserving global order.
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [`HeldLocks::acquire`].
+    /// Returns the same errors as [`HeldLocks::acquire`]. A missing earlier key or an access
+    /// promotion is an internal error: the application must release and reacquire the complete
+    /// strongest set instead.
     pub fn acquire_more(
         &mut self,
         resources: &[LockResource],
         policy: LockPolicy,
         owner: &LockOwner,
     ) -> Result<(), AppError> {
-        let missing = self.missing_keys(resources);
-        if self.requires_reacquire_for_keys(&missing) {
+        let missing = self.missing_requests(resources);
+        if self.requires_reacquire_for_requests(&missing) {
             return Err(AppError::Internal(
-                "additional resource locks would violate the global acquisition order; release \
-                 and reacquire the complete lock set before continuing"
+                "additional resource locks would violate global acquisition order or require an \
+                 access promotion; release and reacquire the complete strongest lock set before \
+                 continuing"
                     .to_owned(),
             ));
         }
-        for (key, paths) in missing {
-            match take(&key, policy, owner)? {
+        for request in missing {
+            match take(&request.key, request.access, policy, owner)? {
                 Taken::Held(lock) => {
-                    self.locks.insert(key, lock);
+                    self.locks.insert(request.key, lock);
                 }
                 Taken::Busy { path, holder } => {
                     return Err(AppError::Temporary(
                         LockContention {
-                            key,
+                            key: request.key,
+                            access: request.access,
                             path,
-                            resources: paths,
+                            resources: request.resources,
                             holder,
                         }
                         .describe(),
@@ -303,24 +336,19 @@ impl HeldLocks {
         Ok(())
     }
 
-    /// Returns whether acquiring the missing keys for `resources` would move backwards in the
-    /// global order.
+    /// Returns whether satisfying `resources` requires moving backwards or strengthening a key.
     ///
-    /// A caller that receives `true` must drop this set, reacquire the union in a fresh sorted
-    /// pass, then repeat any recovery and filesystem inspection performed across the unlocked
-    /// interval. Merely unlocking and continuing with a plan built before the gap would make the
-    /// order safe while leaving the plan racy.
+    /// A caller that receives `true` must drop this set, reacquire the strongest union in a fresh
+    /// sorted pass, then repeat recovery and filesystem inspection across the unlocked interval.
     #[must_use]
     pub fn requires_reacquire(&self, resources: &[LockResource]) -> bool {
-        self.requires_reacquire_for_keys(&self.missing_keys(resources))
+        self.requires_reacquire_for_requests(&self.missing_requests(resources))
     }
 
     /// Takes every lock in `resources` only if all of them are free right now.
     ///
-    /// Returns the contention that stopped it, without holding any of the locks it managed to take.
-    /// This is the lock-availability part of recovery eligibility: free locks prove there is no
-    /// live wrapper owner. Journal status separately decides whether child-domain uncertainty still
-    /// requires quarantine.
+    /// Returns the contention that stopped it, without holding any locks acquired earlier in the
+    /// attempt.
     ///
     /// # Errors
     ///
@@ -329,16 +357,20 @@ impl HeldLocks {
         resources: &[LockResource],
         owner: &LockOwner,
     ) -> Result<Result<Self, LockContention>, AppError> {
-        Self::default().try_acquire_missing(resources, owner)
+        match Self::default().try_acquire_missing(resources, owner)? {
+            MissingLockOutcome::Acquired(held) => Ok(Ok(held)),
+            MissingLockOutcome::Contended(contention) => Ok(Err(contention)),
+            MissingLockOutcome::RequiresReacquire => Err(AppError::Internal(
+                "an empty lock set cannot require access promotion".to_owned(),
+            )),
+        }
     }
 
-    /// Takes exactly the keys in `resources` that this set does not already hold.
+    /// Immediately takes requests this set does not already satisfy.
     ///
-    /// The returned set contains only newly acquired keys. Resource paths remain attached to each
-    /// key so a contention still names the journal resource an operator recognises. This is the
-    /// recovery claim operation: passing whole partly-overlapping resources to
-    /// [`HeldLocks::try_acquire_all`] would attempt to lock an already-held key again and falsely
-    /// classify the stale transaction as active.
+    /// The returned set contains only newly acquired keys. If this set already holds a key with
+    /// observation access while mutation is required, no in-place upgrade is attempted and
+    /// [`MissingLockOutcome::RequiresReacquire`] is returned.
     ///
     /// # Errors
     ///
@@ -347,29 +379,67 @@ impl HeldLocks {
         &self,
         resources: &[LockResource],
         owner: &LockOwner,
-    ) -> Result<Result<Self, LockContention>, AppError> {
+    ) -> Result<MissingLockOutcome, AppError> {
+        let missing = self.missing_requests(resources);
+        if self.requires_reacquire_for_requests(&missing) {
+            // Probe only genuinely new keys before asking the caller to release anything. A live
+            // transaction commonly shares observation keys with this session while holding a
+            // distinct mutation key; reporting that contention preserves independent-session
+            // concurrency. Promoted keys are excluded because our own observation would make an
+            // exclusive probe contend with itself.
+            let mut probes = Self::default();
+            for request in missing
+                .iter()
+                .filter(|request| !self.locks.contains_key(&request.key))
+            {
+                match take(&request.key, request.access, LockPolicy::immediate(), owner)? {
+                    Taken::Held(lock) => {
+                        probes.locks.insert(request.key.clone(), lock);
+                    }
+                    Taken::Busy { path, holder } => {
+                        return Ok(MissingLockOutcome::Contended(LockContention {
+                            key: request.key.clone(),
+                            access: request.access,
+                            path,
+                            resources: request.resources.clone(),
+                            holder,
+                        }));
+                    }
+                }
+            }
+            return Ok(MissingLockOutcome::RequiresReacquire);
+        }
+
         let mut held = Self::default();
-        for (key, paths) in self.missing_keys(resources) {
-            match take(&key, LockPolicy::immediate(), owner)? {
+        for request in missing {
+            match take(&request.key, request.access, LockPolicy::immediate(), owner)? {
                 Taken::Held(lock) => {
-                    held.locks.insert(key, lock);
+                    held.locks.insert(request.key, lock);
                 }
                 Taken::Busy { path, holder } => {
-                    return Ok(Err(LockContention {
-                        key,
+                    return Ok(MissingLockOutcome::Contended(LockContention {
+                        key: request.key,
+                        access: request.access,
                         path,
-                        resources: paths,
+                        resources: request.resources,
                         holder,
                     }));
                 }
             }
         }
-        Ok(Ok(held))
+        Ok(MissingLockOutcome::Acquired(held))
     }
 
     /// Absorbs another set, so recovery locks stay held for the rest of the session.
     pub fn absorb(&mut self, other: Self) {
-        self.locks.extend(other.locks);
+        for (key, lock) in other.locks {
+            if let Some(existing) = self.locks.get(&key) {
+                debug_assert!(existing.access.satisfies(lock.access));
+                drop(lock);
+            } else {
+                self.locks.insert(key, lock);
+            }
+        }
     }
 
     /// Returns whether `key` is currently held by this session.
@@ -378,13 +448,20 @@ impl HeldLocks {
         self.locks.contains_key(key)
     }
 
-    /// Returns whether every key the resources need is currently held.
+    /// Returns whether `key` is held with access sufficient for `required`.
+    #[must_use]
+    pub fn holds_at_least(&self, key: &LockKey, required: LockAccess) -> bool {
+        self.locks
+            .get(key)
+            .is_some_and(|held| held.access.satisfies(required))
+    }
+
+    /// Returns whether every key the resources need is held strongly enough.
     #[must_use]
     pub fn holds_all(&self, resources: &[LockResource]) -> bool {
-        resources
+        sorted_requests(resources)
             .iter()
-            .flat_map(LockResource::lock_keys)
-            .all(|key| self.holds(&key))
+            .all(|request| self.holds_at_least(&request.key, request.access))
     }
 
     /// Returns the held keys in acquisition order.
@@ -392,20 +469,26 @@ impl HeldLocks {
         self.locks.keys()
     }
 
-    fn missing_keys(&self, resources: &[LockResource]) -> Vec<(LockKey, Vec<PathBuf>)> {
-        sorted_keys(resources)
+    fn missing_requests(&self, resources: &[LockResource]) -> Vec<LockRequest> {
+        sorted_requests(resources)
             .into_iter()
-            .filter(|(key, _)| !self.locks.contains_key(key))
+            .filter(|request| !self.holds_at_least(&request.key, request.access))
             .collect()
     }
 
-    fn requires_reacquire_for_keys(&self, missing: &[(LockKey, Vec<PathBuf>)]) -> bool {
+    fn requires_reacquire_for_requests(&self, missing: &[LockRequest]) -> bool {
+        if missing
+            .iter()
+            .any(|request| self.locks.contains_key(&request.key))
+        {
+            return true;
+        }
         let Some(highest_held) = self.locks.last_key_value().map(|(key, _)| key) else {
             return false;
         };
         missing
             .first()
-            .is_some_and(|(lowest_missing, _)| lowest_missing < highest_held)
+            .is_some_and(|request| &request.key < highest_held)
     }
 }
 
@@ -418,41 +501,65 @@ enum Taken {
     },
 }
 
-/// Collapses resources onto their keys, deduplicated and sorted.
+/// One deduplicated lock request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockRequest {
+    key: LockKey,
+    access: LockAccess,
+    resources: Vec<PathBuf>,
+}
+
+/// Collapses resources onto their keys, retaining paths and the strongest access.
 ///
-/// Deduplication is what makes a Codex layout whose discovery entry links to its own backing store
-/// take one lock rather than deadlocking against itself, and sorting is what keeps two sessions
-/// that discovered the resources in different orders from deadlocking against each other. The
-/// resource paths are retained per key so a contention message names something the operator
-/// recognises rather than a digest.
-fn sorted_keys(resources: &[LockResource]) -> Vec<(LockKey, Vec<PathBuf>)> {
-    let mut grouped: BTreeMap<LockKey, Vec<PathBuf>> = BTreeMap::new();
+/// Deduplication is what makes a layout whose discovery entry links to its backing store take one
+/// physical lock rather than deadlocking against itself. Access is deliberately not part of the
+/// key: observation and mutation requests must meet on the same lock file.
+fn sorted_requests(resources: &[LockResource]) -> Vec<LockRequest> {
+    let mut grouped: BTreeMap<LockKey, (LockAccess, Vec<PathBuf>)> = BTreeMap::new();
     for resource in resources {
         for key in resource.lock_keys() {
-            let paths = grouped.entry(key).or_default();
+            let (access, paths) = grouped
+                .entry(key)
+                .or_insert_with(|| (resource.access, Vec::new()));
+            *access = (*access).max(resource.access);
             if !paths.contains(&resource.path) {
                 paths.push(resource.path.clone());
             }
         }
     }
-    grouped.into_iter().collect()
+    grouped
+        .into_iter()
+        .map(|(key, (access, resources))| LockRequest {
+            key,
+            access,
+            resources,
+        })
+        .collect()
 }
 
-/// Exposes the acquisition order so a test can assert it without taking real locks.
+/// Exposes acquisition order and folded access to unit tests without taking real locks.
 #[cfg(test)]
-pub(crate) fn sorted_keys_for_test(resources: &[LockResource]) -> Vec<(LockKey, Vec<PathBuf>)> {
-    sorted_keys(resources)
+pub(crate) fn sorted_keys_for_test(
+    resources: &[LockResource],
+) -> Vec<(LockKey, LockAccess, Vec<PathBuf>)> {
+    sorted_requests(resources)
+        .into_iter()
+        .map(|request| (request.key, request.access, request.resources))
+        .collect()
 }
 
-fn take(key: &LockKey, policy: LockPolicy, owner: &LockOwner) -> Result<Taken, AppError> {
+fn take(
+    key: &LockKey,
+    access: LockAccess,
+    policy: LockPolicy,
+    owner: &LockOwner,
+) -> Result<Taken, AppError> {
     let directory = state::lock_base()?;
     state::ensure_private_directory(&directory)?;
     let path = directory.join(key.file_name());
 
-    // The lock file stays empty; the holder description lives beside it. Windows byte-range locks
-    // are mandatory, so a locked file cannot be read through any other handle — including by the
-    // process that holds it. Writing the diagnostics into the locked file would therefore make them
-    // unreadable exactly when they are wanted, which is while somebody else holds the lock.
+    // The lock file stays empty; holder descriptions live in a bounded per-key directory. Windows
+    // byte-range locks are mandatory, so a locked file cannot be read through another handle.
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -465,10 +572,13 @@ fn take(key: &LockKey, policy: LockPolicy, owner: &LockOwner) -> Result<Taken, A
 
     let deadline = Instant::now() + policy.wait;
     loop {
-        // Fully qualified so this always reaches `fs4`. `std::fs::File` grew an inherent
-        // `try_lock` in Rust 1.89, and an inherent method wins over a trait one — which would
-        // silently raise the crate's minimum supported version above the pinned 1.85.0.
-        match FileExt::try_lock(&file) {
+        // Fully qualified so these always reach `fs4`. `std::fs::File` gained inherent lock methods
+        // after SkillMount's pinned Rust 1.85.0, and inherent methods would silently raise the MSRV.
+        let attempt = match access {
+            LockAccess::Observe => FileExt::try_lock_shared(&file),
+            LockAccess::Mutate => FileExt::try_lock(&file),
+        };
+        match attempt {
             Ok(()) => break,
             Err(TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
@@ -481,7 +591,8 @@ fn take(key: &LockKey, policy: LockPolicy, owner: &LockOwner) -> Result<Taken, A
             }
             Err(TryLockError::Error(error)) => {
                 return Err(AppError::Filesystem(format!(
-                    "cannot lock {}: {error}",
+                    "cannot acquire {} access to {}: {error}",
+                    access.label(),
                     path.display()
                 )));
             }
@@ -489,57 +600,96 @@ fn take(key: &LockKey, policy: LockPolicy, owner: &LockOwner) -> Result<Taken, A
     }
 
     state::restrict_to_owner(&path)?;
-    write_holder(key, owner);
+    let description = holder_path(key, owner)?;
+    write_holder(&description, owner);
     Ok(Taken::Held(HeldLock {
         file,
-        description: holder_path(key)?,
+        access,
+        description,
     }))
 }
 
-/// Returns the sidecar that carries the holder description for `key`.
-///
-/// # Errors
-///
-/// Returns [`AppError::MissingInput`] when the platform state location cannot be resolved.
-fn holder_path(key: &LockKey) -> Result<PathBuf, AppError> {
-    Ok(state::lock_base()?.join(format!("{key}.owner")))
+/// Returns the owner-record directory for `key`.
+fn holder_directory(key: &LockKey) -> Result<PathBuf, AppError> {
+    Ok(state::lock_base()?.join(format!("{key}.owners")))
 }
 
-/// Records who holds the lock, for diagnostics only.
-///
-/// Written to a sidecar rather than to the lock file, because a Windows byte-range lock is
-/// mandatory and would make the description unreadable while the lock is held. Best effort in every
-/// other respect too: a lock that is held but whose description could not be written is still held,
-/// and failing the session over an unwritten diagnostic would trade a correct outcome for a
-/// cosmetic one.
-fn write_holder(key: &LockKey, owner: &LockOwner) {
-    let Ok(path) = holder_path(key) else {
+/// Returns this holder's transaction-specific sidecar path.
+fn holder_path(key: &LockKey, owner: &LockOwner) -> Result<PathBuf, AppError> {
+    Ok(holder_directory(key)?.join(format!("{}.owner", holder_token(owner))))
+}
+
+fn holder_token(owner: &LockOwner) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((owner.transaction.len() as u64).to_be_bytes());
+    hasher.update(owner.transaction.as_bytes());
+    hasher.update(owner.pid.to_be_bytes());
+    let mut rendered = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        let _ = write!(rendered, "{byte:02x}");
+    }
+    rendered
+}
+
+/// Records one holder for diagnostics only.
+fn write_holder(path: &Path, owner: &LockOwner) {
+    let Some(directory) = path.parent() else {
         return;
     };
+    if state::ensure_private_directory(directory).is_err() {
+        return;
+    }
     let description = format!(
-        "transaction={} pid={}\nthis file records who last took the lock; neither it nor the lock file is evidence that anyone still holds it\n",
+        "transaction={} pid={}\nthis file records one advisory holder; neither it nor the lock file is evidence that anyone still holds it\n",
         owner.transaction, owner.pid
     );
-    if std::fs::write(&path, description).is_ok() {
-        let _ = state::restrict_to_owner(&path);
+    if std::fs::write(path, description).is_ok() {
+        let _ = state::restrict_to_owner(path);
     }
 }
 
-/// Removes the holder description once the lock is released.
-///
-/// Leaving it behind would be harmless — nothing reads it as liveness — but removing it keeps a
-/// contention message from naming a session that finished long ago.
+/// Removes only this holder's description once its handle releases the lock.
 fn clear_holder(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// Reads the holder description, which may be absent, stale, or unreadable.
-///
-/// Every one of those is expected. The description is written after the lock is taken and removed
-/// when it is released, so a reader can always catch it mid-flight, and a crashed holder leaves one
-/// behind. It is never treated as evidence that the lock is held.
+/// Reads a bounded set of holder descriptions, all advisory and potentially stale.
 fn read_holder(key: &LockKey) -> Option<String> {
-    let contents = std::fs::read_to_string(holder_path(key).ok()?).ok()?;
+    let entries = std::fs::read_dir(holder_directory(key).ok()?).ok()?;
+    let mut holders = Vec::with_capacity(MAX_HOLDER_RECORDS + 1);
+    for entry in entries.take(MAX_HOLDER_RECORDS + 1).flatten() {
+        if !entry.file_type().ok().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if let Some(holder) = read_holder_record(&entry.path()) {
+            holders.push(holder);
+        }
+    }
+    holders.sort();
+    holders.dedup();
+    let omitted = holders.len() > MAX_HOLDER_RECORDS;
+    holders.truncate(MAX_HOLDER_RECORDS);
+    if omitted {
+        holders.push("additional holder records omitted".to_owned());
+    }
+    (!holders.is_empty()).then(|| holders.join("; "))
+}
+
+fn read_holder_record(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_HOLDER_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(MAX_HOLDER_BYTES).expect("holder read bound fits usize"),
+    );
+    file.take(MAX_HOLDER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_HOLDER_BYTES {
+        return None;
+    }
+    let contents = String::from_utf8(bytes).ok()?;
     let first = contents.lines().next()?.trim();
     (!first.is_empty()).then(|| first.to_owned())
 }

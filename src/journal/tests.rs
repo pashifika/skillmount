@@ -10,46 +10,84 @@ use super::{
     TransactionId, TransactionJournal, TransactionStatus,
 };
 use crate::domain::AgentId;
+use crate::domain::LinkMode;
 use crate::error::{AppError, ExitCategory, JournalError};
 use crate::link::PlatformIdentity;
-use crate::lock::LockResourceKind;
-use crate::mount::PathPrecondition;
+use crate::lock::{LockAccess, LockResource, LockResourceKind};
+use crate::mount::{CleanupDisposition, MountAction, PathPrecondition};
 use crate::state::testing::StateRootGuard;
 use crate::test_support::TestDir;
 use sha2::Digest as _;
 
+fn sample_project_root() -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(r"C:\projects\app")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/projects/app")
+    }
+}
+
+fn shared_mutation_lock(path: &Path) -> JournalLock {
+    JournalLock::from(
+        &LockResource::describe_shared(LockResourceKind::DiscoveryEntry, LockAccess::Mutate, path)
+            .expect("the shared mutation path is absolute"),
+    )
+}
+
 /// Builds a journal that exercises every record type, including optional fields.
 fn sample(status: TransactionStatus) -> TransactionJournal {
+    let transaction_id = TransactionId::parse("00ff-0001-0002").expect("a legal identifier");
+    let project_root = sample_project_root();
+    let discovery_entry = project_root.join(".agents/skills");
+    let backing_store = project_root.join(".codex/skills");
+    let first_temporary = super::staged_sibling(&transaction_id, 1, &backing_store);
+    let second_final = backing_store.join("alpha");
+    let second_temporary = super::staged_sibling(&transaction_id, 2, &second_final);
+    let source = project_root.join("sources/alpha");
+    let mut backing_lock = JournalLock::from(
+        &LockResource::describe(
+            LockResourceKind::BackingStore,
+            LockAccess::Mutate,
+            &project_root,
+            &backing_store,
+        )
+        .expect("the backing store is beneath the project"),
+    );
+    backing_lock.physical = Some(PlatformIdentity::from_recorded("unix:1:00000000000000ff"));
+
     TransactionJournal {
-        transaction_id: TransactionId::parse("00ff-0001-0002").expect("a legal identifier"),
+        transaction_id,
         agent: AgentId::Codex,
         owner_pid: 4321,
         status,
-        project_root: PathBuf::from("/projects/app"),
-        launch_cwd: PathBuf::from("/projects/app/crates"),
-        discovery_entry: PathBuf::from("/projects/app/.agents/skills"),
-        backing_store: PathBuf::from("/projects/app/.codex/skills"),
+        project_root: project_root.clone(),
+        launch_cwd: project_root.join("crates"),
+        discovery_entry: discovery_entry.clone(),
+        backing_store: backing_store.clone(),
         keep_mounts: false,
         sources: vec![SourceResolution {
             mount_name: "alpha".to_owned(),
             source_ordinal: 0,
-            source_entry: PathBuf::from("/skills/alpha"),
-            source_canonical: PathBuf::from("/skills/alpha"),
+            source_entry: source.clone(),
+            source_canonical: source.clone(),
         }],
-        locks: vec![JournalLock {
-            kind: LockResourceKind::BackingStore,
-            path: PathBuf::from("/projects/app/.codex/skills"),
-            anchor: PathBuf::from("/projects/app"),
-            suffix: PathBuf::from(".codex/skills"),
-            physical: Some(PlatformIdentity::from_recorded("unix:1:00000000000000ff")),
-        }],
+        locks: vec![
+            shared_mutation_lock(&discovery_entry),
+            backing_lock,
+            shared_mutation_lock(&first_temporary),
+            shared_mutation_lock(&second_temporary),
+        ],
         actions: vec![
             JournalAction {
+                config_contents: None,
                 id: 1,
                 operation: ActionOperation::CreateDirectory,
                 expected_precondition: PathPrecondition::Missing,
-                temporary_path: Some(PathBuf::from("/projects/app/.codex/.skillmount-tmp")),
-                final_path: PathBuf::from("/projects/app/.codex/skills"),
+                temporary_path: Some(first_temporary),
+                final_path: backing_store.clone(),
                 source_canonical: None,
                 link_target: None,
                 kind: RecordedKind::Directory,
@@ -57,26 +95,26 @@ fn sample(status: TransactionStatus) -> TransactionJournal {
                 identity: Some(PlatformIdentity::from_recorded("unix:1:0000000000000001")),
             },
             JournalAction {
+                config_contents: None,
                 id: 2,
                 operation: ActionOperation::CreateDirectoryLink,
                 expected_precondition: PathPrecondition::Missing,
-                temporary_path: Some(PathBuf::from(
-                    "/projects/app/.codex/skills/.skillmount-2.tmp",
-                )),
-                final_path: PathBuf::from("/projects/app/.codex/skills/alpha"),
-                source_canonical: Some(PathBuf::from("/skills/alpha")),
-                link_target: Some(PathBuf::from("/skills/alpha")),
+                temporary_path: Some(second_temporary),
+                final_path: second_final,
+                source_canonical: Some(source.clone()),
+                link_target: Some(source.clone()),
                 kind: RecordedKind::Symlink,
                 status: ActionStatus::Staged,
                 identity: None,
             },
             JournalAction {
+                config_contents: None,
                 id: 3,
                 operation: ActionOperation::ReuseExistingLink,
                 expected_precondition: PathPrecondition::ExistingLinkToSource,
                 temporary_path: None,
-                final_path: PathBuf::from("/projects/app/.codex/skills/beta"),
-                source_canonical: Some(PathBuf::from("/skills/beta")),
+                final_path: backing_store.join("beta"),
+                source_canonical: Some(project_root.join("sources/beta")),
                 link_target: None,
                 kind: RecordedKind::Undecided,
                 status: ActionStatus::Reused,
@@ -89,8 +127,8 @@ fn sample(status: TransactionStatus) -> TransactionJournal {
 
 fn round_trip(journal: &TransactionJournal) -> Result<TransactionJournal, String> {
     let document = codec::render_document(&journal.to_lines());
-    let lines = codec::parse_document(&document).map_err(|error| error.to_string())?;
-    TransactionJournal::from_lines(&lines)
+    let parsed = codec::parse_document(&document).map_err(|error| error.to_string())?;
+    TransactionJournal::from_lines(&parsed.lines, parsed.schema_version)
 }
 
 #[test]
@@ -104,6 +142,229 @@ fn every_record_and_optional_field_survives_a_round_trip() {
         decoded.actions[1].identity.is_none(),
         "an omitted identity must not decode as an empty one, because a recorded-but-empty \
          identity would be compared and a missing one refuses removal"
+    );
+}
+
+#[test]
+fn schema_one_locks_decode_conservatively_as_mutation() {
+    let mut journal = sample(TransactionStatus::Applying);
+    journal.locks.retain(|lock| {
+        !lock
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".skillmount-"))
+    });
+    let mut lines = journal.to_lines();
+    for line in &mut lines {
+        if line.record == "lock" {
+            line.remove_field("access");
+        }
+    }
+    let document = codec::render_document_for_schema(&lines, 1);
+    let parsed = codec::parse_document(&document).expect("schema one remains readable");
+
+    let decoded =
+        TransactionJournal::from_lines(&parsed.lines, parsed.schema_version).expect("legacy body");
+
+    assert_eq!(parsed.schema_version, 1);
+    assert_eq!(
+        decoded.locks.len(),
+        2,
+        "legacy journals did not record staged-sibling locks"
+    );
+    assert!(
+        decoded
+            .locks
+            .iter()
+            .all(|lock| lock.access == LockAccess::Mutate)
+    );
+}
+
+#[test]
+fn schema_two_rejects_a_missing_or_unknown_lock_access() {
+    let journal = sample(TransactionStatus::Planned);
+    for access in [None, Some("execute")] {
+        let mut lines = journal.to_lines();
+        let lock = lines
+            .iter_mut()
+            .find(|line| line.record == "lock")
+            .expect("sample lock");
+        if let Some(access) = access {
+            lock.set_field("access", codec::encode_text(access));
+        } else {
+            lock.remove_field("access");
+        }
+        let document = codec::render_document_for_schema(&lines, super::SCHEMA_VERSION);
+        let parsed = codec::parse_document(&document).expect("document framing");
+
+        let error = TransactionJournal::from_lines(&parsed.lines, parsed.schema_version)
+            .expect_err("schema two requires a known access label");
+
+        assert!(error.contains("access"), "{error}");
+    }
+}
+
+#[test]
+fn schema_two_rejects_an_all_observe_lock_set() {
+    let mut journal = sample(TransactionStatus::Planned);
+    for lock in &mut journal.locks {
+        lock.access = LockAccess::Observe;
+    }
+
+    let error = round_trip(&journal)
+        .expect_err("compatible observation access is never durable cleanup authority");
+
+    assert!(
+        error.contains("at least one resource lock with mutate access"),
+        "{error}"
+    );
+}
+
+#[test]
+fn schema_two_uses_the_logical_identity_when_the_diagnostic_path_spelling_differs() {
+    let mut journal = sample(TransactionStatus::Planned);
+    journal.locks[0].path = sample_project_root().join("diagnostic-only-spelling");
+
+    let decoded = round_trip(&journal)
+        .expect("the durable logical key, not its diagnostic spelling, grants authority");
+
+    assert_eq!(decoded, journal);
+}
+
+#[test]
+fn schema_two_rejects_an_unrelated_mutation_identity() {
+    let mut journal = sample(TransactionStatus::Planned);
+    for lock in &mut journal.locks {
+        lock.access = LockAccess::Observe;
+    }
+    journal.locks.push(JournalLock {
+        kind: LockResourceKind::DiscoveryEntry,
+        access: LockAccess::Mutate,
+        // A forged diagnostic path cannot make the unrelated durable logical identity
+        // authoritative.
+        path: journal.discovery_entry.clone(),
+        anchor: PathBuf::from("/unrelated"),
+        suffix: PathBuf::from("identity"),
+        physical: None,
+    });
+
+    let error =
+        round_trip(&journal).expect_err("authority comes from the durable logical lock identity");
+
+    assert!(error.contains("logical identity"), "{error}");
+    assert!(error.contains("discovery entry"), "{error}");
+}
+
+#[test]
+fn schema_two_rejects_mutation_under_the_wrong_logical_resource_kind() {
+    let mut journal = sample(TransactionStatus::Planned);
+    journal.locks[0].kind = LockResourceKind::BackingStore;
+
+    let error = round_trip(&journal)
+        .expect_err("a backing-store key cannot replace the missing discovery-entry key");
+
+    assert!(error.contains("discovery entry"), "{error}");
+}
+
+#[test]
+fn schema_two_rejects_partial_authority_over_action_paths() {
+    let mut journal = sample(TransactionStatus::Applying);
+    let final_path = sample_project_root().join("unlocked/created");
+    journal.actions[1].final_path = final_path.clone();
+    let temporary = super::staged_sibling(
+        &journal.transaction_id,
+        journal.actions[1].id,
+        &journal.actions[1].final_path,
+    );
+    journal.actions[1].temporary_path = Some(temporary.clone());
+    journal.locks.push(JournalLock::from(
+        &LockResource::describe_shared(
+            LockResourceKind::DiscoveryEntry,
+            LockAccess::Mutate,
+            &temporary,
+        )
+        .expect("the staged sibling is absolute"),
+    ));
+
+    let error = round_trip(&journal)
+        .expect_err("every transaction-created action path needs mutation authority");
+
+    assert!(error.contains("action 2 final path"), "{error}");
+    assert!(error.contains(&final_path.display().to_string()), "{error}");
+}
+
+#[test]
+fn schema_two_rejects_a_temporary_path_without_its_exact_mutation_key() {
+    let mut journal = sample(TransactionStatus::Applying);
+    let temporary = journal.actions[1]
+        .temporary_path
+        .clone()
+        .expect("the creating action has a staged sibling");
+    journal.locks.retain(|lock| lock.path != temporary);
+
+    let error = round_trip(&journal)
+        .expect_err("an ancestor mutation key cannot replace the staged sibling's exact key");
+
+    assert!(error.contains("exact mutation lock resource"), "{error}");
+    assert!(error.contains("action 2 temporary path"), "{error}");
+}
+
+#[test]
+fn schema_two_rejects_an_alternate_anchor_split_for_a_staged_path() {
+    let mut journal = sample(TransactionStatus::Applying);
+    let temporary = journal.actions[1]
+        .temporary_path
+        .clone()
+        .expect("the creating action has a staged sibling");
+    let project_root = sample_project_root();
+    let lock = journal
+        .locks
+        .iter_mut()
+        .find(|lock| lock.path == temporary)
+        .expect("the exact staged lock is recorded");
+    lock.anchor = project_root.clone();
+    lock.suffix = temporary
+        .strip_prefix(&project_root)
+        .expect("the staged sibling is beneath the project")
+        .to_path_buf();
+
+    let error = round_trip(&journal)
+        .expect_err("joined-path equality cannot replace the volume-root logical key");
+
+    assert!(error.contains("exact mutation lock resource"), "{error}");
+    assert!(error.contains("action 2 temporary path"), "{error}");
+}
+
+#[test]
+fn schema_two_rejects_a_forged_temporary_candidate_path() {
+    let mut journal = sample(TransactionStatus::Applying);
+    journal.actions[1].temporary_path = Some(sample_project_root().join("unlocked/operator-entry"));
+
+    let error = round_trip(&journal)
+        .expect_err("a journal cannot redirect staged cleanup outside its lock");
+
+    assert!(error.contains("action 2 temporary path"), "{error}");
+    assert!(
+        error.contains("transaction-unique staged sibling"),
+        "{error}"
+    );
+}
+
+#[test]
+fn schema_two_accepts_access_aware_authority_for_every_owned_path() {
+    let journal = sample(TransactionStatus::Applying);
+
+    let decoded =
+        round_trip(&journal).expect("the discovery, store, and action paths all have authority");
+
+    assert_eq!(decoded, journal);
+    assert!(
+        decoded
+            .locks
+            .iter()
+            .any(|lock| lock.access == LockAccess::Mutate && lock.physical.is_some()),
+        "valid authority retains its recorded physical-key evidence"
     );
 }
 
@@ -188,13 +449,33 @@ fn a_journal_from_the_other_platform_is_refused() {
 fn a_non_unicode_path_round_trips_byte_for_byte() {
     let mut journal = sample(TransactionStatus::Planned);
     let awkward = non_unicode_path();
+    let final_path = awkward.join("alpha");
+    let temporary =
+        super::staged_sibling(&journal.transaction_id, journal.actions[1].id, &final_path);
     journal.project_root = awkward.clone();
-    journal.actions[1].final_path = awkward.join("alpha");
+    journal.actions[1].final_path = final_path.clone();
+    journal.actions[1].temporary_path = Some(temporary.clone());
+    journal.locks.push(JournalLock::from(
+        &LockResource::describe_shared(
+            LockResourceKind::DiscoveryEntry,
+            LockAccess::Mutate,
+            &temporary,
+        )
+        .expect("the non-Unicode staged sibling remains absolute"),
+    ));
+    journal.locks.push(JournalLock::from(
+        &LockResource::describe_shared(
+            LockResourceKind::DiscoveryEntry,
+            LockAccess::Mutate,
+            &final_path,
+        )
+        .expect("the non-Unicode final path remains absolute"),
+    ));
 
     let decoded = round_trip(&journal).expect("a native path is always representable");
 
     assert_eq!(decoded.project_root, awkward);
-    assert_eq!(decoded.actions[1].final_path, awkward.join("alpha"));
+    assert_eq!(decoded.actions[1].final_path, final_path);
 }
 
 #[test]
@@ -241,6 +522,37 @@ fn validation_rejects_states_no_apply_sequence_can_produce() {
             .expect_err("a link with no source can never be verified")
             .contains("canonical source")
     );
+
+    for (label, operation, kind) in [
+        (
+            "directory creation recorded as a link",
+            ActionOperation::CreateDirectory,
+            RecordedKind::Symlink,
+        ),
+        (
+            "link creation recorded as a directory",
+            ActionOperation::CreateDirectoryLink,
+            RecordedKind::Directory,
+        ),
+        (
+            "reused link recorded as transaction-created",
+            ActionOperation::ReuseExistingLink,
+            RecordedKind::Junction,
+        ),
+    ] {
+        let mut inconsistent = sample(TransactionStatus::Planned);
+        inconsistent.actions[1].operation = operation;
+        inconsistent.actions[1].kind = kind;
+        if operation == ActionOperation::ReuseExistingLink {
+            inconsistent.actions[1].status = ActionStatus::Reused;
+        }
+        assert!(
+            round_trip(&inconsistent)
+                .expect_err(label)
+                .contains("cannot record"),
+            "{label}"
+        );
+    }
 }
 
 #[test]
@@ -250,7 +562,7 @@ fn an_unknown_record_name_is_refused_rather_than_skipped() {
     unknown.push("data", codec::encode_text("value"));
     lines.push(unknown);
 
-    let error = TransactionJournal::from_lines(&lines)
+    let error = TransactionJournal::from_lines(&lines, super::SCHEMA_VERSION)
         .expect_err("an unrecognised record may carry ownership evidence this build would ignore");
 
     assert!(error.contains("unknown journal record"));
@@ -449,19 +761,143 @@ fn incomplete_and_terminal_statuses_are_partitioned_exhaustively() {
     }
 }
 
+/// The plan and the journal must classify one operation the same way.
+///
+/// Both impls match exhaustively, so the compiler already refuses a new operation that is left
+/// unclassified. What it cannot catch is the two modules disagreeing: one side would then stage an
+/// entry the other refuses to reconcile, or reconcile one the other never created.
 #[test]
-fn recovery_walks_owned_actions_newest_first_and_skips_reuse() {
+fn the_plan_and_the_journal_classify_every_operation_identically() {
+    let destination = PathBuf::from("/projects/app/.agents/skills/alpha");
+    let source = PathBuf::from("/skills/alpha");
+    for (planned, recorded, label, disposition) in [
+        (
+            MountAction::CreateDirectory {
+                path: PathBuf::from("/projects/app/.agents/skills"),
+            },
+            ActionOperation::CreateDirectory,
+            "mkdir",
+            CleanupDisposition::BestEffort,
+        ),
+        (
+            MountAction::CreateConfigFile {
+                path: destination.clone(),
+                contents: "skills: {}\n".to_owned(),
+            },
+            ActionOperation::CreateConfigFile,
+            "config",
+            CleanupDisposition::Required,
+        ),
+        (
+            MountAction::CreateDirectoryLink {
+                source: source.clone(),
+                destination: destination.clone(),
+                mode: LinkMode::Auto,
+            },
+            ActionOperation::CreateDirectoryLink,
+            "link",
+            CleanupDisposition::Required,
+        ),
+        (
+            MountAction::ReuseExistingLink {
+                source: source.clone(),
+                destination: destination.clone(),
+            },
+            ActionOperation::ReuseExistingLink,
+            "reuse",
+            CleanupDisposition::None,
+        ),
+    ] {
+        assert_eq!(
+            recorded.label(),
+            label,
+            "the on-disk label must stay stable"
+        );
+        assert_eq!(ActionOperation::parse(label), Some(recorded), "{label}");
+        assert_eq!(recorded.cleanup_disposition(), disposition, "{label}");
+        assert_eq!(
+            planned.cleanup_disposition(),
+            recorded.cleanup_disposition(),
+            "{label}"
+        );
+        assert_eq!(planned.creates_entry(), recorded.creates_entry(), "{label}");
+        assert_eq!(
+            recorded.creates_entry(),
+            disposition != CleanupDisposition::None,
+            "only a created entry can have a cleanup disposition: {label}"
+        );
+    }
+}
+
+/// A journal written before dispositions existed receives the new policy without a schema change.
+///
+/// The evidence is at the byte level. Nothing is serialized beside the operation label, so a
+/// pre-change file and one this build writes are the same document, and both derive the policy from
+/// the `op` value they already record.
+#[test]
+fn a_pre_change_journal_receives_the_cleanup_policy_without_a_schema_change() {
+    let journal = sample(TransactionStatus::Cleaning);
+    let document = codec::render_document(&journal.to_lines());
+    let text = String::from_utf8(document).expect("the rendered journal is ASCII");
+
+    assert!(
+        !text.contains("cleanup=") && !text.contains("disposition="),
+        "the disposition must stay derived rather than recorded: {text}"
+    );
+    let decoded = round_trip(&journal).expect("a pre-change document must still decode");
+    assert_eq!(
+        decoded
+            .actions
+            .iter()
+            .map(|action| (
+                action.operation.label(),
+                action.operation.cleanup_disposition()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("mkdir", CleanupDisposition::BestEffort),
+            ("link", CleanupDisposition::Required),
+            ("reuse", CleanupDisposition::None),
+        ]
+    );
+}
+
+#[test]
+fn cleanup_walks_created_actions_newest_first_and_skips_reuse() {
     let journal = sample(TransactionStatus::Applying);
 
     let ids = journal
-        .reversible_actions()
+        .cleanup_candidates()
         .map(|action| action.id)
         .collect::<Vec<_>>();
 
     assert_eq!(
         ids,
         [2, 1],
-        "a helper directory must be undone after the links inside it, and a reused entry never"
+        "a helper directory must be visited after the links inside it, and a reused entry never"
+    );
+}
+
+/// A reconciled action leaves the candidate set whatever its disposition was.
+///
+/// For a preserved helper directory that is the whole point of the best-effort rule: the action
+/// records that cleanup has no remaining responsibility, so a later pass must not revisit a
+/// directory it already decided to leave alone.
+#[test]
+fn a_reconciled_action_is_no_longer_a_cleanup_candidate() {
+    let mut journal = sample(TransactionStatus::Cleaning);
+    for action in &mut journal.actions {
+        if action.operation == ActionOperation::CreateDirectory {
+            action.status = ActionStatus::RolledBack;
+        }
+    }
+
+    assert_eq!(
+        journal
+            .cleanup_candidates()
+            .map(|action| action.id)
+            .collect::<Vec<_>>(),
+        [2]
     );
 }
 
@@ -554,4 +990,29 @@ fn a_journal_path_is_derived_from_the_transaction_id_alone() {
             .join("transactions")
             .join("00ff-0001-0002.journal")
     );
+}
+
+#[test]
+fn config_file_contents_round_trip_and_are_required_only_for_config_actions() {
+    let mut journal = sample(TransactionStatus::Applying);
+    let action = &mut journal.actions[1];
+    action.operation = ActionOperation::CreateConfigFile;
+    action.kind = RecordedKind::File;
+    action.source_canonical = None;
+    action.link_target = None;
+    action.config_contents =
+        Some("skills:\n  customDirectories: [\"/日本語/skills\"]\n".to_owned());
+    assert_eq!(round_trip(&journal).unwrap(), journal);
+    let legacy_document = codec::render_document_for_schema(&journal.to_lines(), 1);
+    let parsed = codec::parse_document(&legacy_document).unwrap();
+    let legacy_error =
+        TransactionJournal::from_lines(&parsed.lines, parsed.schema_version).unwrap_err();
+    assert!(legacy_error.contains("configuration files require schema two"));
+    journal.actions[1].config_contents = None;
+    assert!(round_trip(&journal).is_err());
+    journal.actions[1].config_contents = Some("x".repeat(crate::link::MAX_CONFIG_BYTES + 1));
+    assert!(round_trip(&journal).is_err());
+    let mut non_config = sample(TransactionStatus::Applying);
+    non_config.actions[0].config_contents = Some("unexpected".to_owned());
+    assert!(round_trip(&non_config).is_err());
 }

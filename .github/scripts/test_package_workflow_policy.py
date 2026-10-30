@@ -24,6 +24,17 @@ GOVERNED_WORKFLOWS = (
 CHECKOUT_SHA = "a" * 40
 UPLOAD_SHA = "b" * 40
 CACHE_SHA = "c" * 40
+CI_WORKFLOW = "ci.yml"
+CI_CLASSIFY_JOB = "branch-policy"
+CI_GATE_JOB = "gate"
+CI_ACCEPTANCE_JOBS = ("package-homebrew-macos", "package-chocolatey-windows")
+CI_ACCEPTANCE_OUTPUT = "package-acceptance"
+CI_ACCEPTANCE_EXPRESSION = (
+    "github.base_ref == 'main' || github.event_name == 'workflow_dispatch'"
+)
+CI_ACCEPTANCE_CONDITION = (
+    f"needs.{CI_CLASSIFY_JOB}.outputs.{CI_ACCEPTANCE_OUTPUT} == 'true'"
+)
 
 # A minimal workflow that satisfies all twelve policies. Every policy test mutates exactly one
 # construct here, so a mutation that trips the wrong policy or none at all is a test failure.
@@ -874,6 +885,134 @@ class RealWorkflowTests(unittest.TestCase):
             for name, job in document["jobs"].items()
             for step in job.get("steps") or []
             if isinstance(step.get("run"), str) and "${{" in step["run"]
+        ]
+        self.assertEqual(offenders, [])
+
+
+def _job_needs(job: dict) -> list[str]:
+    """Return a job's dependencies from either the scalar or the sequence form."""
+
+    needs = job.get("needs")
+    if needs is None:
+        return []
+    return list(needs) if isinstance(needs, list) else [needs]
+
+
+class CiWorkflowContractTests(unittest.TestCase):
+    """Pin the CI workflow's event topology and its package-acceptance wiring."""
+
+    def setUp(self) -> None:
+        self.text = (WORKFLOW_DIRECTORY / CI_WORKFLOW).read_text(encoding="utf-8")
+        self.document = governance.parse_yaml(self.text)
+        self.jobs = self.document["jobs"]
+
+    def classifying_step(self) -> dict:
+        """Return the branch-policy step the package-acceptance output is published from."""
+
+        job = self.jobs[CI_CLASSIFY_JOB]
+        reference = (job.get("outputs") or {}).get(CI_ACCEPTANCE_OUTPUT)
+        pattern = (
+            r"\$\{\{ steps\.([A-Za-z0-9_-]+)\.outputs\."
+            + re.escape(CI_ACCEPTANCE_OUTPUT)
+            + r" \}\}"
+        )
+        match = re.fullmatch(pattern, reference or "")
+        self.assertIsNotNone(
+            match,
+            f"expected jobs.{CI_CLASSIFY_JOB}.outputs.{CI_ACCEPTANCE_OUTPUT} to name a step "
+            f"output, observed {reference!r}",
+        )
+        assert match is not None
+        steps = [step for step in job["steps"] if step.get("id") == match.group(1)]
+        self.assertEqual(
+            len(steps), 1, f"expected exactly one step with id {match.group(1)!r}"
+        )
+        return steps[0]
+
+    def test_ci_runs_for_pull_requests_development_pushes_and_dispatch(self) -> None:
+        """CI covers both pull-request bases, only development-line pushes, and dispatch."""
+
+        triggers = self.document["on"]
+        self.assertEqual(triggers["pull_request"]["branches"], ["main", "dev/**"])
+        self.assertEqual(triggers["push"]["branches"], ["dev/**"])
+        self.assertIn("workflow_dispatch", triggers)
+
+    def test_branch_policy_publishes_one_package_acceptance_classification(self) -> None:
+        """One step derives the classification through env: and publishes it as a job output."""
+
+        step = self.classifying_step()
+        script = step.get("run") or ""
+        self.assertIn('>> "$GITHUB_OUTPUT"', script)
+        binding = re.search(
+            re.escape(CI_ACCEPTANCE_OUTPUT) + r"=\$([A-Za-z_][A-Za-z0-9_]*)", script
+        )
+        self.assertIsNotNone(
+            binding, f"expected the classification to be published from env, observed {script!r}"
+        )
+        assert binding is not None
+        environment = step.get("env") or {}
+        self.assertEqual(
+            environment.get(binding.group(1)),
+            "${{ " + CI_ACCEPTANCE_EXPRESSION + " }}",
+        )
+        self.assertEqual(
+            self.text.count(CI_ACCEPTANCE_EXPRESSION),
+            1,
+            "the classification expression must be written exactly once",
+        )
+
+    def test_both_package_acceptance_jobs_consume_the_classification(self) -> None:
+        """Neither acceptance job runs unless the published classification includes it."""
+
+        for name in CI_ACCEPTANCE_JOBS:
+            with self.subTest(job=name):
+                job = self.jobs[name]
+                self.assertEqual(_job_needs(job), [CI_CLASSIFY_JOB])
+                self.assertEqual(job.get("if"), CI_ACCEPTANCE_CONDITION)
+
+    def test_gate_represents_every_predecessor_and_binds_the_classification(self) -> None:
+        """The gate depends on every job, reads each result, and reads the classification."""
+
+        gate = self.jobs[CI_GATE_JOB]
+        needs = _job_needs(gate)
+        self.assertEqual(
+            sorted(needs),
+            sorted(
+                [
+                    CI_CLASSIFY_JOB,
+                    "quality",
+                    "test",
+                    "shell-completions-macos",
+                    "shell-completions-windows",
+                    *CI_ACCEPTANCE_JOBS,
+                ]
+            ),
+        )
+        steps = gate["steps"]
+        self.assertEqual(len(steps), 1, "expected the gate to carry one aggregate step")
+        environment = steps[0].get("env") or {}
+        for name in needs:
+            variable = name.upper().replace("-", "_") + "_RESULT"
+            self.assertEqual(
+                environment.get(variable), "${{ needs." + name + ".result }}"
+            )
+        self.assertEqual(
+            environment.get("PACKAGE_ACCEPTANCE"),
+            "${{ needs."
+            + CI_CLASSIFY_JOB
+            + ".outputs."
+            + CI_ACCEPTANCE_OUTPUT
+            + " }}",
+        )
+
+    def test_no_ci_run_script_interpolates_a_github_expression(self) -> None:
+        """Event-controlled values reach a CI shell through env:, never through expansion."""
+
+        offenders = [
+            (name, step.get("name"))
+            for name, job in self.jobs.items()
+            for step in job.get("steps") or []
+            if isinstance(step.get("run"), str) and "${{ github." in step["run"]
         ]
         self.assertEqual(offenders, [])
 
