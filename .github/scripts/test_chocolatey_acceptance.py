@@ -7,10 +7,11 @@ import io
 import json
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 import zipfile
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
@@ -1019,6 +1020,124 @@ def install_evidence(folder: Path) -> harness.InstallEvidence:
         shim_metadata="",
         sidecars=harness.read_download_sidecars(folder, names),
     )
+
+
+class CleanupCommandTests(unittest.TestCase):
+    """Cleanup status remains required even after filesystem absence is established."""
+
+    def context(self, returncode: int = 0) -> harness.Context:
+        gateway = mock.Mock()
+        gateway.root = Path(CHOCO_ROOT)
+        gateway.install.return_value = harness.CommandResult(("choco", "install"), 0, "installed")
+        gateway.uninstall.return_value = harness.CommandResult(
+            ("choco", "uninstall", "skillmount"), returncode, "cleanup diagnostic"
+        )
+        return phase_context(gateway, work=Path("unused"))
+
+    def test_final_cleanup_preserves_status_arguments_and_full_output(self) -> None:
+        for code in (0, 1):
+            with self.subTest(code=code):
+                context = self.context(code)
+                with harness.installed(
+                    context, "skillmount", version=VERSION,
+                    source=Path("source"), architecture="x64"
+                ):
+                    pass
+                (phase,) = context.cleanup_phases
+                self.assertEqual(phase.ok, code == 0)
+                evidence = phase.as_json()["evidence"]
+                self.assertEqual(
+                    json.loads(evidence["arguments"]), ["choco", "uninstall", "skillmount"]
+                )
+                self.assertEqual(evidence["returncode"], str(code))
+                self.assertEqual(evidence["output"], "cleanup diagnostic")
+
+    def test_body_exception_still_runs_and_retains_failed_cleanup(self) -> None:
+        context = self.context(1)
+        with self.assertRaisesRegex(RuntimeError, "body failure"):
+            with harness.installed(
+                context, "skillmount", version=VERSION, source=Path("source"), architecture="x86"
+            ):
+                raise RuntimeError("body failure")
+        context.gateway.uninstall.assert_called_once_with("skillmount")
+        self.assertFalse(context.cleanup_phases[0].ok)
+
+    def test_cross_uninstall_nonzero_fails_even_when_removal_and_survivor_checks_pass(self) -> None:
+        context = self.context(1)
+        success = (harness.Finding("fixture", True, "observed"),)
+        with (
+            mock.patch.object(harness, "listing", return_value=None),
+            mock.patch.object(harness, "cleanup_findings", return_value=success),
+            mock.patch.object(harness, "survivor_findings", return_value=success),
+            mock.patch.object(harness, "installed_version_finding", return_value=success[0]),
+        ):
+            phase = harness.cross_uninstall_phase(context, SKILLMOUNT, ASM)
+        self.assertFalse(phase.ok)
+        self.assertEqual([f.check for f in phase.findings if not f.ok], ["uninstall-status"])
+        self.assertFalse(context.cleanup_phases[0].ok)
+
+    def test_cleanup_operational_exception_does_not_replace_primary_failure(self) -> None:
+        errors = (
+            OSError("cleanup unavailable"),
+            subprocess.TimeoutExpired("choco", 1, output=b"partial output", stderr=b"diagnostic"),
+        )
+        for error in errors:
+            with self.subTest(error=error):
+                context = self.context()
+                context.gateway.uninstall.side_effect = error
+                with self.assertRaisesRegex(harness.ChocolateyAcceptanceError, "primary"):
+                    with harness.installed(
+                        context, "skillmount", version=VERSION,
+                        source=Path("source"), architecture="x64",
+                    ):
+                        raise harness.ChocolateyAcceptanceError("primary")
+                self.assertFalse(context.cleanup_phases[0].ok)
+                evidence = context.cleanup_phases[0].as_json()["evidence"]
+                self.assertIn(repr(error), evidence["exception"])
+                if isinstance(error, subprocess.TimeoutExpired):
+                    self.assertEqual(evidence["stdout"], repr(b"partial output"))
+                    self.assertEqual(evidence["stderr"], repr(b"diagnostic"))
+                    self.assertNotIn("returncode", evidence)
+
+    def test_report_preserves_primary_failure_and_final_cleanup_failure(self) -> None:
+        context = self.context(1)
+        options = mock.Mock(package=(), template_directory=Path("templates"))
+        success = harness.PhaseResult("pack", "skillmount", "", (
+            harness.Finding("fixture", True, "packed"),
+        ))
+        patches = {
+            "require_opt_in": None, "load_channels": FakeChannels(),
+            "ChocoGateway": context.gateway, "require_clean_host": None,
+            "collect_environment": {}, "selected_packages": (SKILLMOUNT,),
+            "requested_phases": ("install-x64",), "pack_phase": success,
+            "resolve_inputs": (context.inputs, {}), "render_sources": {},
+            "create_residue_targets": context.residue_targets, "collect_path_values": {},
+            "residue_snapshot": {}, "Context": context, "inputs_summary": {},
+        }
+
+        def fail_session(*args: object, **kwargs: object) -> None:
+            with harness.installed(
+                context, "skillmount", version=VERSION, source=Path("source"), architecture="x64"
+            ):
+                raise harness.ChocolateyAcceptanceError("primary observation failure")
+
+        with ExitStack() as stack:
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(harness, name, return_value=value))
+            stack.enter_context(
+                mock.patch.object(harness, "run_install_session", side_effect=fail_session)
+            )
+            report = harness.run_acceptance(options, Path("unused"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            harness.write_report(path, report)
+            retained = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(retained["status"], "failed")
+        self.assertEqual([p["phase"] for p in retained["phases"]], ["execution", "cleanup"])
+        self.assertIn("primary observation failure", retained["phases"][0]["findings"][0]["detail"])
+        self.assertEqual(retained["phases"][1]["evidence"]["returncode"], "1")
+        self.assertEqual(retained["phases"][1]["evidence"]["output"], "cleanup diagnostic")
+        self.assertTrue(harness.failed_checks(retained))
 
 
 class PhaseWiringTests(unittest.TestCase):
