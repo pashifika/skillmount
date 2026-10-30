@@ -19,6 +19,7 @@ from pathlib import Path
 from live_agent_smoke import (
     AGENT_CASES,
     CommandResult,
+    WindowsJob,
     OMP_SHA256,
     capture_cli_probe,
     main,
@@ -305,6 +306,45 @@ class LiveAgentSmokeTests(unittest.TestCase):
             self.assertTrue(started.exists(), "the descendant was not started by the fixture")
             time.sleep(2.2)
             self.assertFalse(marker.exists(), "the exited parent left a live descendant")
+
+
+class WindowsJobTeardownTests(unittest.TestCase):
+    def test_teardown_waits_for_all_owned_descendants(self) -> None:
+        job = WindowsJob(1)
+        with patch.object(job, "terminate") as terminate, \
+             patch.object(job, "active_processes", side_effect=[2, 1, 0]) as active, \
+             patch("live_agent_smoke.time.sleep"):
+            job.terminate_and_wait()
+        terminate.assert_called_once()
+        self.assertEqual(active.call_count, 3)
+
+    def test_teardown_timeout_and_query_failure_are_not_success(self) -> None:
+        job = WindowsJob(1)
+        with patch.object(job, "terminate"), patch.object(job, "active_processes", return_value=1):
+            with self.assertRaisesRegex(RuntimeError, "did not become empty"):
+                job.terminate_and_wait(timeout=0)
+        with patch.object(job, "terminate"), \
+             patch.object(job, "active_processes", side_effect=RuntimeError("query failed")):
+            with self.assertRaisesRegex(RuntimeError, "query failed"):
+                job.terminate_and_wait()
+
+    @unittest.skipUnless(os.name == "nt", "native Windows Job Object lifecycle")
+    def test_successful_parent_descendant_releases_probe_cwd_before_return(self) -> None:
+        child = "import time; time.sleep(60)"
+        parent = (
+            "import subprocess, sys; "
+            "subprocess.Popen([sys.executable, '-c', sys.argv[1]], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            cwd = Path(temporary) / "probe-cwd"
+            cwd.mkdir()
+            result = run_command([sys.executable, "-c", parent, child],
+                                 environment=os.environ.copy(), timeout=5, cwd=cwd)
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse(result.timed_out)
+            # An alive descendant retains this current directory on Windows.
+            cwd.rmdir()
 
 
 class OptInOmpCaseTests(unittest.TestCase):
