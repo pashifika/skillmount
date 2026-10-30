@@ -897,7 +897,12 @@ Because `src/cli.rs` resolves the product identity from `argv[0]` and rejects a 
 package may install, symlink, or shim either executable under another name. Publication is
 pair-aware but not atomic: an identical existing member is an idempotent success, only absent
 members are created, and any member with mismatched immutable metadata blocks the pair fail-closed
-for human review.
+for human review. For Homebrew upgrades, ADR 0041 permits an older stable default-branch Formula
+only when its canonical same-repository archive URL, selected executable, and SHA-256 match the
+published prior release asset metadata. The publisher proposes the new pair on its version branch;
+it never rewrites the default branch. An interrupted version branch may retain only the exact
+verified old default-branch bytes. Same-version conflicts, downgrades, foreign sources, unverified
+prior digests, and other version-branch edits remain failures.
 
 The channels also introduce external state and credential boundaries. The separately managed and
 protected `pashifika/homebrew-tap` repository owns the published Formulae, their CI, and their

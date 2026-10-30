@@ -133,7 +133,7 @@ def formula_identity(text: str) -> FormulaIdentity:
 
     archive_url = unique_match(FORMULA_URL_PATTERN, text)
     version = unique_match(FORMULA_VERSION_PATTERN, text)
-    if version is None and archive_url is not None:
+    if not FORMULA_VERSION_PATTERN.search(text) and archive_url is not None:
         tag_match = RELEASE_TAG_PATTERN.search(archive_url)
         if tag_match is not None:
             try:
@@ -192,11 +192,14 @@ class FormulaMember:
     branch: str
     default_text: str | None
     branch_text: str | None
+    previous: FormulaIdentity | None = None
 
     @property
     def default_classification(self) -> tuple[FormulaState, str | None]:
         """Classify this Formula as observed on the tap default branch."""
 
+        if self.previous is not None:
+            return "stale", None
         return classify_formula(
             self.default_text, expected_text=self.expected_text, expected=self.expected
         )
@@ -205,6 +208,10 @@ class FormulaMember:
     def branch_classification(self) -> tuple[FormulaState, str | None]:
         """Classify this Formula as observed on the version branch."""
 
+        # A new version branch inherits the old pair before either write. Resume only
+        # those exact verified default-branch bytes, not another old-version edit.
+        if self.previous is not None and self.branch_text == self.default_text:
+            return "stale", None
         return classify_formula(
             self.branch_text, expected_text=self.expected_text, expected=self.expected
         )
@@ -270,6 +277,9 @@ class TapGateway(Protocol):
 
     def branch_commit(self, branch: str) -> str | None:
         """Return the branch head commit, or None when the branch is absent."""
+
+    def release_for_tag(self, repository: str, tag: str) -> dict[str, Any]:
+        """Read published release metadata without downloading or executing assets."""
 
     def create_branch(self, branch: str, commit: str) -> None:
         """Create one new branch at *commit* without moving an existing branch."""
@@ -421,6 +431,65 @@ def pull_request_state(pull_request: Mapping[str, Any]) -> str:
     return str(state)
 
 
+def verified_previous_formula(
+    gateway: TapGateway,
+    inputs: channels.PackageInputs,
+    identity: channels.PackageIdentity,
+    text: str | None,
+    releases: dict[str, dict[str, Any]],
+) -> FormulaIdentity | None:
+    """Recognize only an older same-project release with independently matching digest."""
+
+    if text is None:
+        return None
+    observed = formula_identity(text)
+    if (
+        not observed.complete
+        or observed.installed_binary != identity.command
+        or observed.command != identity.command
+    ):
+        return None
+    try:
+        version = release_assets.validate_stable_version(str(observed.version))
+    except release_assets.ReleaseError:
+        return None
+    if tuple(map(int, version.split("."))) >= tuple(map(int, inputs.version.split("."))):
+        return None
+    tag = f"v{version}"
+    name = release_assets.asset_name(tag, channels.MACOS_ARM64)
+    url = f"https://github.com/{inputs.repository}/releases/download/{tag}/{name}"
+    if (
+        observed.archive_url != url
+        or not HEX64_PATTERN.fullmatch(str(observed.archive_sha256))
+    ):
+        return None
+    if tag not in releases:
+        releases[tag] = gateway.release_for_tag(inputs.repository, tag)
+    payload = releases[tag]
+    if (
+        not isinstance(payload, dict)
+        or payload.get("tag_name") != tag
+        or payload.get("draft") is not False
+        or payload.get("prerelease") is not False
+        or not payload.get("published_at")
+        or not isinstance(payload.get("assets"), list)
+    ):
+        raise PublicationError(f"cannot verify published prior release {inputs.repository}/{tag}")
+    assets = [
+        asset for asset in payload["assets"]
+        if isinstance(asset, dict) and asset.get("name") == name
+    ]
+    if len(assets) != 1 or any((
+        assets[0].get("browser_download_url") != url,
+        assets[0].get("state") != "uploaded",
+        assets[0].get("digest") != f"sha256:{observed.archive_sha256}",
+    )):
+        raise PublicationError(
+            f"prior Formula digest or archive identity differs from published {inputs.repository}/{tag}"
+        )
+    return observed
+
+
 def reconcile_tap(
     gateway: TapGateway,
     inputs: channels.PackageInputs,
@@ -443,8 +512,11 @@ def reconcile_tap(
 
     existing_branch_commit = gateway.branch_commit(branch)
     members: list[FormulaMember] = []
+    releases: dict[str, dict[str, Any]] = {}
     for identity in channels.PACKAGES:
         path = identity.formula_path
+        default_text = gateway.file_text(default_branch, path)
+        previous = verified_previous_formula(gateway, inputs, identity, default_text, releases)
         members.append(
             FormulaMember(
                 identity=identity,
@@ -452,7 +524,8 @@ def reconcile_tap(
                 expected=expected_formula_identity(inputs, identity),
                 default_branch=default_branch,
                 branch=branch,
-                default_text=gateway.file_text(default_branch, path),
+                default_text=default_text,
+                previous=previous,
                 branch_text=(
                     None
                     if existing_branch_commit is None
@@ -959,6 +1032,11 @@ class GhTapGateway:
             raise PublicationError(
                 f"tap file {path!r} on {ref!r} is not base64-encoded UTF-8 text"
             ) from error
+
+    def release_for_tag(self, repository: str, tag: str) -> dict[str, Any]:
+        """Read prior public release metadata through the fixed GitHub API boundary."""
+
+        return self._api(f"repos/{repository}/releases/tags/{quote(tag, safe='')}")
 
     def create_branch(self, branch: str, commit: str) -> None:
         """Create one new branch at *commit* without moving an existing branch."""
