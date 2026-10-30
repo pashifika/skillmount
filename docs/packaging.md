@@ -329,9 +329,12 @@ unavailable. Installing both Formulae or, once published, both Chocolatey packag
 supported; each command owns only its own executable, shim, and completion files, and uninstalling
 one never removes the other.
 
-Homebrew adds a trust prerequisite to the install path, proven with Homebrew 6.0.12 on `macos-15`:
-`brew install` refuses a Formula from an untrusted third-party tap, while `brew style` and
-`brew audit` accept one. Trust survives every upgrade of a Formula that stays installed: entries are
+Homebrew adds a trust prerequisite to Formula loading. The Homebrew 7.0.11 native rehearsal
+proved that `brew audit --strict --formula`, as well as `brew install`, refuses an untrusted
+third-party Formula. The harness verifies the generated pair and tap ownership with `brew style`,
+then captures and grants only the pair’s scoped trust before auditing; cleanup restores the
+pre-run trust state. Selecting audit also selects its style and trust prerequisites.
+Trust survives every upgrade of a Formula that stays installed: entries are
 name-keyed plain JSON in `${XDG_CONFIG_HOME}/homebrew/trust.json`, or in `~/.homebrew/trust.json`
 when `XDG_CONFIG_HOME` is unset (verified on Homebrew 6.0.15).
 `brew trust --formula pashifika/tap/<id>` trusts one Formula; `brew trust pashifika/tap` trusts
@@ -445,3 +448,13 @@ This fixes the v0.3.0 promotion rehearsal in
 [CI run 41051878406](https://github.com/pashifika/skillmount/actions/runs/41051878406): all lifecycle
 phases, including the v0.2.0 upgrade, passed, but cleanup left the old v0.2.0 keg and subsequent
 untap failed because uninstall had dropped formula trust. That historical run remains failed.
+
+The October 30 promotion rehearsal (run `41054007543`, artifact `12975343691`) verified the
+all-version cleanup repair, but its reported audit success was invalid: both audit commands
+exited 1 on untrusted-tap refusals before examining the Formulae. That report is cleanup evidence,
+not a successful audit. The corrected harness treats unknown diagnostics, empty nonzero output,
+and mixed local-archive/other failures as failures. Only an explicit recognized local stable-URL
+exception can explain exit 1 for a `file://` rehearsal; published archives receive no exception.
+Broad `https` or `file://` keyword matching is not an allowance. Native audit must pass again.
+The output structure follows [Homebrew 7.0.11 audit](https://github.com/Homebrew/brew/blob/7.0.11/Library/Homebrew/dev-cmd/audit.rb);
+new or changed diagnostics fail closed rather than silently extending the exception.
