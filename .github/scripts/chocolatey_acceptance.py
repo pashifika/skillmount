@@ -1809,8 +1809,20 @@ class ChocoGateway:
             arguments.append("--forcex86")
         return self._run(arguments)
 
+    def registered_package(self, package_id: str) -> CommandResult:
+        """Query exactly one local registration in Chocolatey's machine-readable format."""
+
+        version = self.choco_version()
+        match = re.fullmatch(r"([0-9]+)\..+", version)
+        if match is None or int(match.group(1)) not in (1, 2):
+            raise ChocolateyAcceptanceError(f"cannot select local-list syntax for {version!r}")
+        arguments = [self.choco, "list", package_id, "--exact", "--limit-output"]
+        if int(match.group(1)) == 1:
+            arguments.append("--local-only")
+        return self._run(arguments)
+
     def uninstall(self, package_id: str) -> CommandResult:
-        """Uninstall one package, tolerating an already-absent package."""
+        """Uninstall one package; the caller proves absence before skipping this command."""
 
         return self._run([self.choco, "uninstall", package_id, "--yes", "--no-progress"])
 
@@ -1948,10 +1960,48 @@ class Context:
     def uninstall(self, package_id: str) -> PhaseResult:
         """Retain every cleanup command outcome, even when no files remain afterward."""
 
+        evidence: tuple[tuple[str, str], ...] = ()
         try:
+            registration = self.gateway.registered_package(package_id)
+            evidence = (
+                ("registration_arguments", json.dumps(registration.arguments)),
+                ("registration_returncode", str(registration.returncode)),
+                ("registration_output", registration.output),
+            )
+            output = registration.output.strip()
+            if registration.returncode != 0 or (output and re.fullmatch(
+                re.escape(package_id) + r"\|[0-9][^\s|]*", output, re.IGNORECASE
+            ) is None):
+                raise ChocolateyAcceptanceError("local package registration query is ambiguous")
+            if not output:
+                selection = selection_for(self.identities[package_id])
+                paths = (self.package_folder(package_id), self.shim(selection.command))
+                absent = []
+                for path in paths:
+                    try:
+                        path.lstat()
+                    except FileNotFoundError:
+                        absent.append(True)
+                    else:
+                        absent.append(False)
+                evidence += tuple(
+                    (f"absence:{path}", str(missing)) for path, missing in zip(paths, absent)
+                )
+                if all(absent):
+                    phase = PhaseResult(
+                        name="cleanup", package_id=package_id, architecture="",
+                        findings=(Finding(
+                            "already-absent", True,
+                            "uninstall not invoked: exact local registration, package folder, "
+                            "and owned shim are all absent",
+                        ),),
+                        evidence=evidence,
+                    )
+                    self.cleanup_phases.append(phase)
+                    return phase
             result = self.gateway.uninstall(package_id)
-        except (OSError, subprocess.SubprocessError) as error:
-            evidence = (("exception", repr(error)),)
+        except (ChocolateyAcceptanceError, OSError, subprocess.SubprocessError) as error:
+            evidence += (("exception", repr(error)),)
             if isinstance(error, (subprocess.TimeoutExpired, subprocess.CalledProcessError)):
                 evidence += (
                     ("arguments", repr(error.cmd)),
@@ -1962,7 +2012,7 @@ class Context:
                 name="cleanup",
                 package_id=package_id,
                 architecture="",
-                findings=(Finding("uninstall-status", False, f"uninstall raised {error!r}"),),
+                findings=(Finding("uninstall-status", False, f"cleanup validation or uninstall raised {error!r}"),),
                 evidence=evidence,
             )
             self.cleanup_phases.append(phase)
@@ -1978,7 +2028,7 @@ class Context:
                     f"expected {result.command} to succeed; observed status {result.returncode}",
                 ),
             ),
-            evidence=(
+            evidence=evidence + (
                 ("arguments", json.dumps(result.arguments)),
                 ("returncode", str(result.returncode)),
                 ("output", result.output),

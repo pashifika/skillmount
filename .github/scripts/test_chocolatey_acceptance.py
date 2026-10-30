@@ -1032,7 +1032,84 @@ class CleanupCommandTests(unittest.TestCase):
         gateway.uninstall.return_value = harness.CommandResult(
             ("choco", "uninstall", "skillmount"), returncode, "cleanup diagnostic"
         )
+        gateway.registered_package.return_value = harness.CommandResult(
+            ("choco", "list", "skillmount", "--exact", "--limit-output"),
+            0, "skillmount|0.3.0",
+        )
         return phase_context(gateway, work=Path("unused"))
+
+    def test_absence_skips_only_when_registration_folder_and_shim_are_absent(self) -> None:
+        context = self.context()
+        context.identities = {i.package_id: i for i in FakeChannels().PACKAGES}
+        context.gateway.registered_package.return_value = harness.CommandResult(
+            ("choco", "list", "skillmount", "--exact", "--limit-output"), 0, ""
+        )
+        with mock.patch.object(Path, "lstat", side_effect=FileNotFoundError):
+            phase = context.uninstall("skillmount")
+        self.assertTrue(phase.ok)
+        self.assertEqual(phase.findings[0].check, "already-absent")
+        context.gateway.uninstall.assert_not_called()
+        self.assertNotIn("returncode", phase.as_json()["evidence"])
+        self.assertEqual(phase.as_json()["evidence"]["registration_returncode"], "0")
+
+    def test_registration_absence_does_not_waive_folder_or_shim_residue(self) -> None:
+        for observations in ((object(), FileNotFoundError()), (FileNotFoundError(), object())):
+            with self.subTest(observations=observations):
+                context = self.context(1)
+                context.identities = {i.package_id: i for i in FakeChannels().PACKAGES}
+                context.gateway.registered_package.return_value = harness.CommandResult(
+                    ("choco", "list"), 0, ""
+                )
+                with mock.patch.object(Path, "lstat", side_effect=observations):
+                    phase = context.uninstall("skillmount")
+                context.gateway.uninstall.assert_called_once_with("skillmount")
+                self.assertFalse(phase.ok)
+
+    def test_ambiguous_registration_or_unreadable_path_never_passes(self) -> None:
+        for code, output in (
+            (1, ""), (0, "warning"), (0, "skillmount-asm|0.3.0"),
+            (0, "skillmount|0.3.0\nskillmount-asm|0.3.0"),
+        ):
+            with self.subTest(code=code, output=output):
+                context = self.context()
+                context.gateway.registered_package.return_value = harness.CommandResult(
+                    ("choco", "list"), code, output
+                )
+                self.assertFalse(context.uninstall("skillmount").ok)
+                context.gateway.uninstall.assert_not_called()
+        context = self.context()
+        context.identities = {i.package_id: i for i in FakeChannels().PACKAGES}
+        context.gateway.registered_package.return_value = harness.CommandResult(
+            ("choco", "list"), 0, ""
+        )
+        with mock.patch.object(Path, "lstat", side_effect=PermissionError("denied")):
+            self.assertFalse(context.uninstall("skillmount").ok)
+        context.gateway.uninstall.assert_not_called()
+
+    def test_local_query_selects_only_local_syntax_for_each_manager_major(self) -> None:
+        for version in ("1.4.0", "2.7.4"):
+            with self.subTest(version=version):
+                gateway = object.__new__(harness.ChocoGateway)
+                gateway.choco = "choco"
+                with (mock.patch.object(gateway, "choco_version", return_value=version),
+                      mock.patch.object(gateway, "_run") as run):
+                    gateway.registered_package("skillmount")
+                arguments = run.call_args.args[0]
+                self.assertEqual(
+                    arguments[:5], ["choco", "list", "skillmount", "--exact", "--limit-output"]
+                )
+                self.assertEqual("--local-only" in arguments, version.startswith("1."))
+
+    def test_unknown_manager_major_cannot_supply_absence_evidence(self) -> None:
+        gateway = object.__new__(harness.ChocoGateway)
+        gateway.choco = "choco"
+        for version in ("3.0.0", "0.12.0", "unexpected banner"):
+            with self.subTest(version=version):
+                with (mock.patch.object(gateway, "choco_version", return_value=version),
+                      mock.patch.object(gateway, "_run") as run):
+                    with self.assertRaises(harness.ChocolateyAcceptanceError):
+                        gateway.registered_package("skillmount")
+                run.assert_not_called()
 
     def test_final_cleanup_preserves_status_arguments_and_full_output(self) -> None:
         for code in (0, 1):
