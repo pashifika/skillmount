@@ -113,7 +113,7 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
       - name: Upload the validated package inputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: package-inputs
           path: ${{ runner.temp }}/package-inputs/*
@@ -172,7 +172,7 @@ jobs:
             --directory "$CANDIDATES_DIRECTORY"
 
       - name: Upload the inspected candidates
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: package-candidates
           path: ${{ runner.temp }}/package-candidates
@@ -311,7 +311,7 @@ jobs:
           }
 
       - name: Upload the inspected nupkgs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: chocolatey-nupkgs
           path: ${{ runner.temp }}/chocolatey-nupkgs/*
