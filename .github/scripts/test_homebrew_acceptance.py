@@ -936,6 +936,38 @@ class FormulaTextTests(FixtureCase):
         self.assertEqual(len(findings), 2)
         self.assertEqual(harness.audit_findings("skillmount:\n\n", local_archive=False), ())
 
+    def test_audit_failure_needs_only_exact_local_archive_diagnostics(self) -> None:
+        """Never turn an empty parser result or a mixed failure into audit success."""
+
+        expected = "  * line 5: Please use a secure URL for the stable url\n"
+        refused = (
+            "::error::Refusing to load formula skillmount-acceptance/tap/skillmount "
+            "from untrusted tap skillmount-acceptance/tap.%0ARun `brew trust` to trust it."
+        )
+        for diagnostic in (
+            "", "skillmount:\n", "Error: 1 problem in 1 formula detected.",
+            refused, "RuntimeError: cannot load formula", "network timeout at https://example.test",
+            "  * line 5: Cannot read file:///tmp/archive.tar.gz",
+            "  * desc must not start with an article",
+            expected + refused, expected + "Error: unknown failure",
+            expected + "  * line 9: unexpected HTTPS policy failure",
+            expected + "Error: 2 problems in 1 formula detected.",
+            expected + "::erroranything::Please use a secure URL for the stable url",
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                self.assertTrue(harness.audit_findings(
+                    diagnostic, local_archive=True, returncode=1,
+                ))
+        accepted = "skillmount:\n" + expected + "Error: 1 problem in 1 formula detected.\n"
+        self.assertEqual(harness.audit_findings(accepted, local_archive=True, returncode=1), ())
+        self.assertTrue(harness.audit_findings(accepted, local_archive=False, returncode=1))
+        self.assertTrue(harness.audit_findings(accepted, local_archive=True, returncode=2))
+        self.assertTrue(harness.audit_findings("  * Invalid description", local_archive=True))
+        self.assertEqual(harness.audit_findings("", local_archive=False), ())
+        self.assertTrue(harness.audit_findings("Error: 1 problem in 1 formula detected.", local_archive=True))
+        annotation = "::error file=formula.rb,line=5::Please use a secure URL for the stable url"
+        self.assertEqual(harness.audit_findings(accepted + annotation, local_archive=True, returncode=1), ())
+
     def test_version_output_must_match_exactly(self) -> None:
         """Require the packaged version banner both executables print."""
 
@@ -1001,7 +1033,7 @@ class SelectionTests(FixtureCase):
             harness.expand_phases(["upgrade-from-prior"]), ("trust", "upgrade-from-prior")
         )
         self.assertEqual(harness.expand_phases(["style"]), ("style",))
-        self.assertEqual(harness.expand_phases(["audit"]), ("audit",))
+        self.assertEqual(harness.expand_phases(["audit"]), ("style", "trust", "audit"))
         with self.assertRaises(harness.HomebrewAcceptanceError) as caught:
             harness.expand_phases(["install"])
         self.assertIn("install", str(caught.exception))
@@ -1430,6 +1462,81 @@ class CoverageTests(FixtureCase):
         for phase in harness.PHASE_ORDER:
             self.assertIn(phase, rendered)
         self.assertIn("gaps: none", rendered)
+
+
+class AuditOrchestrationTests(FixtureCase):
+    """Keep trust and audit ordering explicit without touching a real Homebrew prefix."""
+
+    def test_lifecycle_establishes_scoped_trust_before_audit(self) -> None:
+        subject = harness.Harness(ForbiddenGateway(), options_for(self.root))
+        calls = []
+        def stage(name):
+            def run(*args, **kwargs):
+                calls.append(name)
+                if name in subject.phases:
+                    subject.phases[name].status = "passed"
+                return {} if name == "render_formulae" else subject.options.archive
+            return run
+        methods = {
+            "build_archive": "build_archive", "render_formulae": "render_formulae",
+            "create_tap": "create_tap", "place_formulae": "place_formulae",
+            "phase_style": "style", "phase_trust": "trust", "phase_audit": "audit",
+            "stage_alone": "install", "stage_co_install": "co-install", "stage_upgrade": "upgrade",
+        }
+        with contextlib.ExitStack() as stack:
+            for method, name in methods.items():
+                stack.enter_context(mock.patch.object(subject, method, side_effect=stage(name)))
+            subject.lifecycle(self.root)
+        self.assertLess(calls.index("style"), calls.index("trust"))
+        self.assertLess(calls.index("trust"), calls.index("audit"))
+        self.assertLess(calls.index("audit"), calls.index("install"))
+
+    def test_failed_style_never_grants_trust(self) -> None:
+        subject = harness.Harness(ForbiddenGateway(), options_for(self.root))
+        with contextlib.ExitStack() as stack:
+            for method in ("build_archive", "render_formulae", "create_tap", "place_formulae"):
+                stack.enter_context(mock.patch.object(subject, method))
+            stack.enter_context(mock.patch.object(subject, "phase_style"))
+            trust = stack.enter_context(mock.patch.object(subject, "phase_trust"))
+            subject.phases["style"].status = "failed"
+            with self.assertRaisesRegex(harness.HomebrewAcceptanceError, "before trust"):
+                subject.lifecycle(self.root)
+            trust.assert_not_called()
+
+    def test_audit_phase_retains_failed_command_as_failed_evidence(self) -> None:
+        for status, output, expected in (
+            (1, "::error::Refusing to load formula from untrusted tap", "failed"),
+            (1, "", "failed"),
+            (0, "", "passed"),
+            (1, "* line 5: Please use a secure URL for the stable url", "passed"),
+        ):
+            with self.subTest(status=status, output=output):
+                gateway = ScriptedGateway({("brew", "audit"): (status, output, "")})
+                subject = harness.Harness(gateway, options_for(self.root, formula_ids=("skillmount",)))
+                subject.archive = subject.options.archive
+                subject.phases["style"].status = "passed"
+                subject.phases["trust"].status = "passed"
+                formula = self.root / "skillmount.rb"
+                formula.write_text("", encoding="utf-8")
+                subject.formula_paths["skillmount"] = formula
+                with mock.patch.object(harness, "platform_findings", return_value=()), mock.patch.object(
+                    subject, "inspect_rendered_pair"
+                ):
+                    subject.phase_audit({})
+                phase = subject.phases["audit"]
+                self.assertEqual(phase.status, expected)
+                self.assertEqual(phase.commands[0].returncode, status)
+
+    def test_audit_requires_successful_style_and_trust(self) -> None:
+        for style, trust in (("passed", "failed"), ("failed", "passed"), ("passed", "pending")):
+            with self.subTest(style=style, trust=trust):
+                subject = harness.Harness(ForbiddenGateway(), options_for(self.root))
+                subject.archive = subject.options.archive
+                subject.phases["style"].status = style
+                subject.phases["trust"].status = trust
+                subject.phase_audit({})
+                self.assertEqual(subject.phases["audit"].status, "failed")
+                self.assertFalse(subject.phases["audit"].commands)
 
 
 class GatewayTests(FixtureCase):
@@ -2173,7 +2280,7 @@ class TrustTests(FixtureCase):
         self.assertIn("re-asserted", str(recorded["reassert"]))
         joined = " ".join(phase.observations)
         self.assertIn("keys trust by name", joined)
-        self.assertIn("scoped to the install path", joined)
+        self.assertIn("trust only this disposable pair before audit", joined)
         self.assertIn("one `brew trust --formula` per run is not enough", joined)
         self.assertIn(
             "still lists skillmount-acceptance/tap/skillmount immediately before installing it",

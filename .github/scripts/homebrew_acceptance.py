@@ -73,8 +73,8 @@ HOMEBREW_PINS = {
 }
 PHASE_ORDER = (
     "style",
-    "audit",
     "trust",
+    "audit",
     "install-skillmount-alone",
     "selected-only",
     "completions",
@@ -87,6 +87,7 @@ PHASE_ORDER = (
     "sentinel-unchanged",
 )
 PHASE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "audit": ("style", "trust"),
     "selected-only": ("install-skillmount-alone", "install-asm-alone"),
     "completions": ("install-skillmount-alone", "install-asm-alone"),
     "brew-test": ("install-skillmount-alone", "install-asm-alone"),
@@ -104,15 +105,13 @@ PACKAGE_TABLE_PINS = {
 CARGO_PACKAGE_HEADER = "[package]"
 CARGO_VERSION_PATTERN = re.compile(r'^version = "([^"\n]+)"[ \t]*$', re.MULTILINE)
 CARGO_SECTION_PATTERN = re.compile(r"^\[", re.MULTILINE)
-AUDIT_OFFENSE_PATTERN = re.compile(r"^\s*(?:\*\s+)?(?:line \d+:|.*\bline \d+, col \d+\b)", re.I)
+AUDIT_OFFENSE_PATTERN = re.compile(r"^(?:\*\s+)?(?:line \d+(?:, col \d+)?:\s*)?(.*)$")
 LOCAL_ARCHIVE_AUDIT_ALLOWANCES = (
-    # `brew audit --strict` requires an HTTPS stable URL. The local rehearsal deliberately
-    # renders a `file://` release archive before the candidate tag is published.
-    re.compile(r"(?i)file://"),
-    re.compile(r"(?i)\bhttps\b"),
-    re.compile(r"(?i)\bsecure\b.*\burl\b"),
-    re.compile(r"(?i)\bunversioned\b|\bstable url\b|\bversion\b.*\bdetected from url\b"),
+    # Exact historical local-archive diagnostic, not arbitrary mentions of HTTPS/file://.
+    re.compile(r"Please use a secure URL for the stable url\.?", re.I),
 )
+AUDIT_SUMMARY_PATTERN = re.compile(r"(?:Error: |::error::)?(\d+) problems? in 1 formula detected\.")
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 TRUST_JSON_VERSION = "v1"
 TRUST_SECTIONS = ("casks", "commands", "formulae", "taps")
 TRUST_STORE_UNDER_XDG = "homebrew/trust.json"
@@ -128,9 +127,9 @@ TRUST_HELP_NOTICE = (
     "trusted by name, and this harness owns a disposable tap"
 )
 TRUST_SCOPE_NOTICE = (
-    "notice: `brew style` and `brew audit --strict --formula` load an untrusted third-party tap "
-    "without complaint, so trust is scoped to the install path: `brew install`, `brew test`, "
-    "`brew upgrade`, and `brew uninstall`"
+    "notice: Homebrew 7.0.11 refuses audit as well as install for an untrusted third-party "
+    "Formula. After style verifies ownership, trust only this disposable pair before audit; "
+    "restore the captured trust state during cleanup."
 )
 TRUST_NAME_NOTICE = (
     "notice: Homebrew keys trust by name, never by content, so one `brew trust --formula` "
@@ -1036,19 +1035,45 @@ def platform_findings(text: str, *, formula_class: str) -> tuple[str, ...]:
     return tuple(findings)
 
 
-def audit_findings(output: str, *, local_archive: bool) -> tuple[str, ...]:
-    """Return `brew audit` offences that the local archive rehearsal does not explain."""
+def audit_findings(
+    output: str, *, local_archive: bool, returncode: int = 0,
+    reference: str = "skillmount",
+) -> tuple[str, ...]:
+    """Fail closed unless every diagnostic is an explicit local-archive exception."""
 
     findings: list[str] = []
-    for line in output.splitlines():
+    waived = 0
+    summaries: list[int] = []
+    headers = {reference, reference.rsplit("/", 1)[-1]}
+    if "/" in reference:
+        headers.add(canonical_reference(reference))
+    for line in ANSI_ESCAPE_PATTERN.sub("", output).splitlines():
         candidate = line.strip()
-        if not candidate or AUDIT_OFFENSE_PATTERN.search(candidate) is None:
+        if not candidate or candidate.removesuffix(":") in headers:
             continue
-        if local_archive and any(
-            allowance.search(candidate) for allowance in LOCAL_ARCHIVE_AUDIT_ALLOWANCES
-        ):
+        summary = AUDIT_SUMMARY_PATTERN.fullmatch(candidate)
+        if summary:
+            summaries.append(int(summary.group(1)))
+            continue
+        # Actions duplicates audit problems as annotations. Decode only its documented
+        # message escaping; unknown annotations and multiline diagnostics remain failures.
+        annotation = re.match(r"^::error(?: [^:\r\n]+)?::", candidate) is not None
+        if annotation:
+            candidate = candidate.split("::", 2)[2]
+            candidate = candidate.replace("%0A", "\n").replace("%0D", "\r").replace("%25", "%")
+        match = AUDIT_OFFENSE_PATTERN.fullmatch(candidate)
+        message = match.group(1) if match else candidate
+        if local_archive and any(rule.fullmatch(message) for rule in LOCAL_ARCHIVE_AUDIT_ALLOWANCES):
+            if not annotation:
+                waived += 1
             continue
         findings.append(f"brew audit reported {candidate!r}")
+    if summaries and any(count != waived or not waived for count in summaries):
+        findings.append("brew audit summary does not match recognized local-archive offences")
+    if returncode != 0 and not findings and (returncode != 1 or not waived):
+        findings.append(
+            f"brew audit exited {returncode} without exclusively recognized local-archive offences"
+        )
     return tuple(findings)
 
 
@@ -2256,11 +2281,16 @@ class Harness:
             return
         phase = self.phase("audit")
         archive = self.require_archive()
+        if self.phases["style"].status != "passed" or self.phases["trust"].status != "passed":
+            phase.add(("audit requires successful owned-Formula style and scoped trust phases",))
+            phase.settle()
+            return
         for package_id in self.options.formula_ids:
             reference = self.formula_reference(package_id)
             evidence = phase.record(self.gateway.brew("audit", "--strict", "--formula", reference))
             offences = audit_findings(
-                f"{evidence.stdout}\n{evidence.stderr}", local_archive=archive.local
+                f"{evidence.stdout}\n{evidence.stderr}", local_archive=archive.local,
+                returncode=evidence.returncode, reference=reference,
             )
             phase.add(offences)
             if evidence.returncode != 0 and not offences:
@@ -2769,8 +2799,10 @@ class Harness:
         self.create_tap()
         self.place_formulae(rendered)
         self.phase_style()
-        self.phase_audit(rendered)
+        if self.enabled("style") and self.phases["style"].status != "passed":
+            raise HomebrewAcceptanceError("owned-Formula style verification failed before trust")
         self.phase_trust()
+        self.phase_audit(rendered)
         self.stage_alone(FORMULA_IDS[0], "install-skillmount-alone")
         self.stage_alone(FORMULA_IDS[1], "install-asm-alone")
         self.stage_co_install()

@@ -1943,6 +1943,49 @@ class Context:
     residue_targets: ResidueTargets
     residue_before: dict[str, str]
     help_outputs: dict[str, str]
+    cleanup_phases: list[PhaseResult] = dataclasses.field(default_factory=list)
+
+    def uninstall(self, package_id: str) -> PhaseResult:
+        """Retain every cleanup command outcome, even when no files remain afterward."""
+
+        try:
+            result = self.gateway.uninstall(package_id)
+        except (OSError, subprocess.SubprocessError) as error:
+            evidence = (("exception", repr(error)),)
+            if isinstance(error, (subprocess.TimeoutExpired, subprocess.CalledProcessError)):
+                evidence += (
+                    ("arguments", repr(error.cmd)),
+                    ("stdout", repr(error.stdout)),
+                    ("stderr", repr(error.stderr)),
+                )
+            phase = PhaseResult(
+                name="cleanup",
+                package_id=package_id,
+                architecture="",
+                findings=(Finding("uninstall-status", False, f"uninstall raised {error!r}"),),
+                evidence=evidence,
+            )
+            self.cleanup_phases.append(phase)
+            return phase
+        phase = PhaseResult(
+            name="cleanup",
+            package_id=package_id,
+            architecture="",
+            findings=(
+                Finding(
+                    "uninstall-status",
+                    result.returncode == 0,
+                    f"expected {result.command} to succeed; observed status {result.returncode}",
+                ),
+            ),
+            evidence=(
+                ("arguments", json.dumps(result.arguments)),
+                ("returncode", str(result.returncode)),
+                ("output", result.output),
+            ),
+        )
+        self.cleanup_phases.append(phase)
+        return phase
 
     @property
     def version(self) -> str:
@@ -2110,7 +2153,7 @@ def installed(
     try:
         yield result
     finally:
-        context.gateway.uninstall(package_id)
+        context.uninstall(package_id)
 
 
 def pack_phase(context: Context, selection: PackageSelection) -> PhaseResult:
@@ -2753,7 +2796,7 @@ def cross_uninstall_phase(
 ) -> PhaseResult:
     """Judge that uninstalling one co-installed package leaves the other functional."""
 
-    context.gateway.uninstall(removed.package_id)
+    cleanup = context.uninstall(removed.package_id)
     removed_folder = context.package_folder(removed.package_id)
     findings = list(
         cleanup_findings(
@@ -2763,6 +2806,7 @@ def cross_uninstall_phase(
             package_folder=str(removed_folder),
         )
     )
+    findings.extend(cleanup.findings)
     retained_folder = context.package_folder(retained.package_id)
     findings.extend(
         survivor_findings(
@@ -3341,29 +3385,52 @@ def run_acceptance(options: argparse.Namespace, work: Path) -> dict[str, Any]:
     )
 
     phases: list[PhaseResult] = []
-    packed = [pack_phase(context, selection) for selection in selections]
-    if "pack" in requested:
-        phases.extend(packed)
-    if "inspect" in requested and len(selections) == 2:
-        phases.append(inspect_phase(context, selections))
-    for selection in selections:
-        phases.extend(
-            run_install_session(context, selection, architecture="x64", requested=requested)
-        )
-        if "upgrade" in requested:
-            phases.append(upgrade_phase(context, selection))
-        phases.extend(
-            run_install_session(context, selection, architecture="x86", requested=requested)
-        )
-    if len(selections) == 2:
-        phases.extend(pair_phases(context, selections, requested=requested))
-    for selection in selections:
-        for phase in NEGATIVE_PHASES:
-            if phase in requested:
-                phases.append(negative_phase(context, selection, phase))
-    if "residue" in requested:
-        phases.append(residue_phase(context))
+    try:
+        packed = [pack_phase(context, selection) for selection in selections]
+        if "pack" in requested:
+            phases.extend(packed)
+        if "inspect" in requested and len(selections) == 2:
+            phases.append(inspect_phase(context, selections))
+        for selection in selections:
+            phases.extend(
+                run_install_session(context, selection, architecture="x64", requested=requested)
+            )
+            if "upgrade" in requested:
+                phases.append(upgrade_phase(context, selection))
+            phases.extend(
+                run_install_session(context, selection, architecture="x86", requested=requested)
+            )
+        if len(selections) == 2:
+            phases.extend(pair_phases(context, selections, requested=requested))
+        for selection in selections:
+            for phase in NEGATIVE_PHASES:
+                if phase in requested:
+                    phases.append(negative_phase(context, selection, phase))
+        if "residue" in requested:
+            phases.append(residue_phase(context))
 
+    except (
+        ChocolateyAcceptanceError,
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        release.ReleaseError,
+        subprocess.SubprocessError,
+        zipfile.BadZipFile,
+    ) as error:
+        # Preserve the primary observation failure as well as finally-block cleanup evidence.
+        phases.append(
+            PhaseResult(
+                name="execution",
+                package_id="pair",
+                architecture="",
+                findings=(Finding("execution-error", False, repr(error)),),
+            )
+        )
+
+    # Context-manager cleanup happens after the functional phase is constructed. Include
+    # all outcomes here so a successful lifecycle cannot conceal a failed final uninstall.
+    phases.extend(context.cleanup_phases)
     coverage = coverage_findings(
         requested_phases=requested,
         requested_packages=tuple(selection.package_id for selection in selections),
