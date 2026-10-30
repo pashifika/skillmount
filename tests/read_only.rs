@@ -94,7 +94,7 @@ impl Fixture {
             )
             .env_remove("CLAUDE_CODE_SAFE_MODE")
             .env_remove("CLAUDE_CODE_SIMPLE")
-            .env("SKILLMOUNT_TEST_OMP_VERSION", "omp/17.2.9")
+            .env("SKILLMOUNT_TEST_OMP_VERSION", "omp/18.14.0")
             // OMP resolves its roots from the environment, so the developer's real profile,
             // configuration overlay, and XDG bases must never reach a fixture.
             .env_remove("OMP_PROFILE")
@@ -404,7 +404,7 @@ fn inspect_reports_every_registered_agent_without_touching_anything() {
     assert!(rendered.contains("Overlay: 1 Skill(s)"));
     assert!(rendered.contains("codex-cli 0.146.0"));
     assert!(rendered.contains("2.1.220 (Claude Code)"));
-    assert!(rendered.contains("omp/17.2.9"));
+    assert!(rendered.contains("omp/18.14.0"));
     assert_eq!(rendered.matches("executable not queried").count(), 3);
     assert_access_aware_lock_plan(&rendered);
 }
@@ -430,7 +430,7 @@ fn inspect_can_be_filtered_to_omp() {
     );
     let rendered = String::from_utf8_lossy(&output.stdout);
     assert!(rendered.contains("Agent:          omp"), "{rendered}");
-    assert!(rendered.contains("LINK"), "{rendered}");
+    assert!(rendered.contains("CONFIG"), "{rendered}");
     assert!(!rendered.contains("Agent:          codex"));
     assert!(!rendered.contains("Agent:          claude"));
 }
@@ -1575,131 +1575,47 @@ fn assert_no_omp_residue(fixture: &Fixture) {
 }
 
 #[test]
-fn an_omp_dry_run_plans_the_project_scope_without_creating_it() {
+fn an_omp_dry_run_plans_a_private_config_without_creating_it() {
     let fixture = Fixture::new("dry-run-omp");
-    let source = fixture.skill("alpha");
+    fixture.skill("alpha");
     let sources = fixture.sources.to_string_lossy().into_owned();
-    let canonical_source = fs::canonicalize(&source).expect("canonical Skill source");
-    let agent_bin = fixture.agent_bin.to_string_lossy().into_owned();
-
-    let output = fixture.assert_unchanged(&[
-        "omp",
-        "--skills-dir",
-        &sources,
-        "--agent-bin",
-        &agent_bin,
-        "--dry-run",
-    ]);
-
+    let output = fixture.assert_unchanged(&["omp", "--skills-dir", &sources, "--dry-run"]);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     let rendered = String::from_utf8_lossy(&output.stdout);
-    // The whole chain is planned in dependency order: the `.omp` scope, its `skills` directory,
-    // then the Skill itself. Nothing else is created, because OMP receives no injected argument.
-    assert!(rendered.contains("MKDIR  .omp\n"), "{rendered}");
-    assert!(
-        rendered.contains("MKDIR  .omp/skills") || rendered.contains("MKDIR  .omp\\skills"),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains("LINK   .omp/skills/alpha")
-            || rendered.contains("LINK   .omp\\skills\\alpha"),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains(canonical_source.to_string_lossy().as_ref()),
-        "the planned link must name the canonical source: {rendered}"
-    );
-    assert!(rendered.contains("omp/17.2.9"), "{rendered}");
-    assert!(rendered.contains("advisory evidence; executable not queried"));
-    assert_access_aware_lock_plan(&rendered);
-    // A dry run records the executable an operator named and never resolves, validates, or queries
-    // it, so the rendered path is the one that was passed while the banner stays advisory.
-    assert!(
-        rendered.contains(&format!("Executable:\n  {agent_bin}")),
-        "{rendered}"
-    );
-    // The fixture's `.git` anchor is the repository root, so the ancestor walk contributes nothing
-    // above the project. An `omp ancestor` scope here would mean the walk escaped the fixture and a
-    // directory on the developer's machine is deciding what this test observes.
-    assert!(
-        !rendered.contains("omp ancestor"),
-        "the repository anchor must keep the ancestor walk inside the fixture: {rendered}"
-    );
+    assert!(rendered.contains("CONFIG"), "{rendered}");
+    assert!(rendered.contains("--config"), "{rendered}");
+    assert!(rendered.contains("delegated"), "{rendered}");
+    assert!(!rendered.contains("LINK   .omp"), "{rendered}");
     assert_no_omp_residue(&fixture);
 }
 
-/// A destination reached through a directory link must report its canonical target too.
-///
-/// The logical path and the directory the mount is actually applied to are different paths here.
-/// Printing only the logical one would hide which project the mount became visible to, which is the
-/// shared-backing hazard ADR 0034 records.
 #[test]
-fn an_omp_dry_run_reports_the_canonical_backing_of_a_linked_scope() {
+fn an_omp_dry_run_does_not_mutate_an_existing_linked_scope() {
     let fixture = Fixture::new("omp-linked-scope");
     fixture.skill("alpha");
-    let sources = fixture.sources.to_string_lossy().into_owned();
-    let agent_bin = fixture.agent_bin.to_string_lossy().into_owned();
-
-    let shared = fixture.root.join("shared-store");
-    fs::create_dir_all(&shared).expect("shared backing directory");
     let scope = fixture.project.join(".omp");
-    fs::create_dir_all(&scope).expect("OMP project scope");
+    fs::create_dir_all(&scope).unwrap();
+    let shared = fixture.root.join("shared-store");
+    fs::create_dir_all(&shared).unwrap();
     if !create_broken_directory_link(&scope.join("skills"), &shared) {
         return;
     }
-    let canonical_shared = fs::canonicalize(&shared).expect("canonical shared backing");
-
-    let output = fixture.assert_unchanged(&[
-        "omp",
-        "--skills-dir",
-        &sources,
-        "--agent-bin",
-        &agent_bin,
-        "--dry-run",
-    ]);
-
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let output = fixture.assert_unchanged(&["omp", "--skills-dir", &sources, "--dry-run"]);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let rendered = String::from_utf8_lossy(&output.stdout);
-    // The logical entry stays the path OMP reads, and the canonical backing is reported beside it.
-    assert!(
-        rendered.contains("Backing store:  .omp/skills")
-            || rendered.contains("Backing store:  .omp\\skills"),
-        "{rendered}"
+    assert_eq!(
+        fs::canonicalize(scope.join("skills")).unwrap(),
+        fs::canonicalize(shared).unwrap()
     );
-    assert!(
-        rendered.contains("Store state:    directory link"),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains(&format!(
-            "Store target:   {}",
-            canonical_shared.to_string_lossy()
-        )),
-        "the canonical backing directory must be named: {rendered}"
-    );
-    // The link itself is never a planned mutation, so only the Skill is linked.
-    assert!(!rendered.contains("MKDIR  .omp"), "{rendered}");
-    assert!(
-        rendered.contains("LINK   .omp/skills/alpha")
-            || rendered.contains("LINK   .omp\\skills\\alpha"),
-        "{rendered}"
-    );
-    assert!(
-        !fixture.root.join("state").exists(),
-        "a read-only path must not create SkillMount state"
-    );
-    assert!(
-        !fixture.launch_sentinel.exists(),
-        "a read-only path must not launch a child process"
-    );
+    assert!(!fixture.root.join("state").exists());
 }
 
 #[test]
@@ -1856,16 +1772,6 @@ const OMP_REJECTED_PASSTHROUGH: &[OmpRejection] = &[
         forwarded: &["--config=skills.enabled=false"],
         named: "--config",
         fragment: "relocates the discovery root",
-    },
-    OmpRejection {
-        forwarded: &["--no-skills"],
-        named: "--no-skills",
-        fragment: "changes the Skill",
-    },
-    OmpRejection {
-        forwarded: &["--skills", "other-skills"],
-        named: "--skills",
-        fragment: "changes the Skill",
     },
     OmpRejection {
         forwarded: &["-e", "extension"],
@@ -2126,7 +2032,7 @@ fn one_agents_inspect_refusal_keeps_the_other_agents_reports() {
 }
 
 #[test]
-fn a_corrupt_omp_global_configuration_is_a_data_error_that_changes_nothing() {
+fn a_corrupt_omp_global_configuration_fails_without_changes() {
     let fixture = Fixture::new("omp-corrupt-global-config");
     fixture.skill("alpha");
     let agent_dir = fixture.home.join(".omp/agent");
@@ -2147,9 +2053,9 @@ fn a_corrupt_omp_global_configuration_is_a_data_error_that_changes_nothing() {
 
     // OMP's own global file is trusted configuration it quarantines and then throws on, so planning
     // against an empty reading of it would model the wrong namespace.
-    assert_eq!(output.status.code(), Some(65), "{stderr}");
+    assert_eq!(output.status.code(), Some(66), "{stderr}");
     assert!(
-        stderr.contains("OMP settings input cannot be interpreted"),
+        stderr.contains("cannot preserve OMP customDirectories"),
         "{stderr}"
     );
     assert!(stderr.contains("config.yml"), "{stderr}");
@@ -2158,7 +2064,7 @@ fn a_corrupt_omp_global_configuration_is_a_data_error_that_changes_nothing() {
 
 /// A third-party provider file OMP only warns about must not fail a session OMP itself starts.
 #[test]
-fn a_malformed_third_party_omp_project_settings_layer_is_only_skipped() {
+fn a_malformed_third_party_omp_project_settings_layer_fails_closed() {
     let fixture = Fixture::new("omp-malformed-third-party-settings");
     fixture.skill("alpha");
     fs::create_dir_all(fixture.project.join(".cursor")).expect("third-party project scope");
@@ -2176,26 +2082,13 @@ fn a_malformed_third_party_omp_project_settings_layer_is_only_skipped() {
         "--dry-run",
     ]);
 
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let rendered = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        rendered.contains("LINK   .omp/skills/alpha")
-            || rendered.contains("LINK   .omp\\skills\\alpha"),
-        "{rendered}"
-    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot preserve OMP"));
     assert_no_omp_residue(&fixture);
 }
 
-/// Proves the Codex project layer really is one of OMP's own settings inputs.
-///
-/// A `[skills] enabled = false` written for Codex disables every OMP Skill, so a mount would be
-/// applied and then ignored. Refusing it is what keeps the OMP path from succeeding silently.
 #[test]
-fn a_codex_project_configuration_disabling_skills_fails_the_omp_plan() {
+fn a_codex_project_configuration_disabling_skills_is_delegated_to_omp() {
     let fixture = Fixture::new("omp-codex-project-gate");
     fixture.skill("alpha");
     fs::create_dir_all(fixture.project.join(".codex")).expect("Codex project scope");
@@ -2217,18 +2110,12 @@ fn a_codex_project_configuration_disabling_skills_fails_the_omp_plan() {
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(65), "{stderr}");
-    assert!(stderr.contains("invalid selected Skill"), "{stderr}");
-    assert!(stderr.contains("skills.enabled is false"), "{stderr}");
+    assert!(output.status.success(), "{stderr}");
     assert_no_omp_residue(&fixture);
 }
 
-/// An unresolvable destination has no identity a later mutation could rely on.
-///
-/// Planning a directory over a broken link would describe a change apply must then refuse, so the
-/// session fails here with the exact state instead, and the link is left exactly as it was.
 #[test]
-fn a_broken_omp_destination_link_fails_closed_without_mutation() {
+fn a_broken_omp_destination_link_is_left_to_native_discovery() {
     let fixture = Fixture::new("omp-broken-destination-link");
     fixture.skill("alpha");
     let scope = fixture.project.join(".omp");
@@ -2249,16 +2136,8 @@ fn a_broken_omp_destination_link_fails_closed_without_mutation() {
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(73), "{stderr}");
-    assert!(stderr.contains("resolves as broken link"), "{stderr}");
-    assert!(
-        stderr.contains("no safe mount destination exists"),
-        "{stderr}"
-    );
-    assert!(
-        !fixture.root.join("state").exists(),
-        "reporting an unresolvable destination must not create SkillMount state"
-    );
+    assert!(output.status.success(), "{stderr}");
+    assert!(!fixture.root.join("state").exists());
 }
 
 #[test]

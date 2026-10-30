@@ -584,11 +584,11 @@ fn check_discovery(
             findings.push(DoctorFinding::new(
                 FindingSeverity::Pass,
                 component.clone(),
-                format!(
-                    "inspected {} scope(s) and {} visible logical Skill name(s)",
-                    snapshot.scopes.len(),
-                    snapshot.visible_skills.len()
-                ),
+                if context.agent_id().descriptor().native_skill_directories() {
+                    "native directory settings inspected; Skill selection and discovery are delegated to the Agent".to_owned()
+                } else {
+                    format!("inspected {} scope(s) and {} visible logical Skill name(s)", snapshot.scopes.len(), snapshot.visible_skills.len())
+                },
             ));
             discovery_observations(&component, &snapshot, findings);
             check_resource_locks(&component, &snapshot, findings);
@@ -596,8 +596,9 @@ fn check_discovery(
                 FindingSeverity::Unverified,
                 format!("{} live compatibility", context.agent_id().label()),
                 format!(
-                    "filesystem inspection does not prove that an authenticated {} process loads mounted Skills; run the live-agent smoke workflow and record the result in docs/compatibility.md",
-                    context.agent_id().label()
+                    "filesystem inspection does not prove that an authenticated {} process loads {}; run the live-agent smoke workflow and record the result in docs/compatibility.md",
+                    context.agent_id().label(),
+                    if context.agent_id().descriptor().native_skill_directories() { "native Skill directories" } else { "mounted Skills" }
                 ),
             ));
         }

@@ -60,6 +60,16 @@ fn run() -> io::Result<ExitCode> {
         recorder.os("env:CODEX_HOME", &codex_home)?;
     }
     recorder.os("cwd", &env::current_dir()?.into_os_string())?;
+    if let Some(destination) = env::var_os("SKILLMOUNT_FAKE_OMP_CONFIG_RECORD") {
+        let index = arguments
+            .iter()
+            .position(|arg| arg == "--config")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing OMP config"))?;
+        let source = arguments.get(index + 1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing OMP config path")
+        })?;
+        fs::write(destination, fs::read(source)?)?;
+    }
     verify_expected_paths(&recorder)?;
     verify_add_dir_skills(&recorder, &arguments)?;
     create_requested_file(&recorder)?;

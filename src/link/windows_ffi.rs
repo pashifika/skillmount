@@ -90,6 +90,8 @@ pub(super) enum Access {
     Delete,
     /// Enough to delete the opened entry while excluding ordinary writers and deleters.
     Remove,
+    /// Reads a configuration file and mutates that same object while excluding writers.
+    ReadRemove,
     /// Enough to write a reparse buffer and roll back while excluding ordinary peer mutation.
     WriteReparseData,
     /// Attribute-only reparse mutation used to prove the Windows share-mode boundary.
@@ -102,6 +104,9 @@ impl Access {
         match self {
             Self::Inspect => FILE_READ_ATTRIBUTES,
             Self::Delete | Self::Remove => FILE_READ_ATTRIBUTES | DELETE,
+            Self::ReadRemove => {
+                windows_sys::Win32::Foundation::GENERIC_READ | FILE_READ_ATTRIBUTES | DELETE
+            }
             Self::WriteReparseData => GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE,
             #[cfg(test)]
             Self::AttributeWrite => FILE_WRITE_ATTRIBUTES,
@@ -117,7 +122,7 @@ impl Access {
             // Removal and creation rollback exclude ordinary write and delete access. Windows does
             // not apply share modes to attribute-only access, so ADR 0016 scopes kind and target as
             // eligibility checks while the retained identity remains the object authority.
-            Self::Remove | Self::WriteReparseData => FILE_SHARE_READ,
+            Self::Remove | Self::ReadRemove | Self::WriteReparseData => FILE_SHARE_READ,
             #[cfg(test)]
             Self::AttributeWrite => FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         }
@@ -601,4 +606,15 @@ mod tests {
         assert_eq!(offset_of!(FILE_RENAME_INFO, FileName), name_offset);
         assert_eq!(size_of::<FILE_RENAME_INFO>(), expected_size);
     }
+}
+
+/// Exclusively creates a regular configuration file, retaining a writable object handle.
+pub(super) fn create_config_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
 }

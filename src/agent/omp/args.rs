@@ -1,4 +1,4 @@
-//! Bounded classification of OMP 17.2.9 root-command arguments.
+//! Bounded classification of OMP 18.14.0 root-command arguments.
 //!
 //! Every table here is transcribed from the tagged OMP source recorded in ADR 0034, not from OMP's
 //! help output or its shipped completion scripts: several functional flags are absent from both.
@@ -15,6 +15,11 @@ use crate::error::AppError;
 /// string `--resume` the prompt rather than resuming a session. Classification must agree, or
 /// `SkillMount` would reject an argument OMP never treats as a control.
 const REQUIRED_VALUE_FLAGS: &[&str] = &[
+    "--goal",
+    "--warn-cost",
+    "--max-cost",
+    "--system-prompt-template",
+    "--trusted-extension",
     "--add-dir",
     "--alias",
     "--api-key",
@@ -49,7 +54,7 @@ const REQUIRED_VALUE_FLAGS: &[&str] = &[
 ];
 
 /// Flags that consume the next token only when it exists, is non-empty, and is not flag-shaped.
-const OPTIONAL_VALUE_FLAGS: &[&str] = &["--resume", "--session", "-r"];
+const OPTIONAL_VALUE_FLAGS: &[&str] = &["--resume", "--restore", "--session", "-r"];
 
 /// Built-ins a same-named boolean extension flag may shadow, so OMP applies extension-style
 /// consumption: a flag-shaped successor stays a fresh flag instead of becoming this flag's value.
@@ -60,6 +65,10 @@ const SHADOWABLE_VALUE_FLAGS: &[&str] = &["--plan"];
 
 /// Flags that never consume a value.
 const NO_VALUE_FLAGS: &[&str] = &[
+    "--wait-async",
+    "--external-thinking",
+    "--no-context-files",
+    "--no-ui",
     "--advisor",
     "--allow-home",
     "--auto-approve",
@@ -97,17 +106,17 @@ const ROOT_CHANGING_FLAGS: &[&str] = &["--alias", "--config", "--cwd", "--profil
 
 /// Options that change the discovered or selected Skill set outside persistent configuration.
 const DISCOVERY_CHANGING_FLAGS: &[&str] = &[
+    "--trusted-extension",
     "--extension",
     "--hook",
     "--no-extensions",
-    "--no-skills",
     "--plugin-dir",
-    "--skills",
     "-e",
 ];
 
 /// Options that resume, fork, import, relocate, or replace the new-session contract.
 const NON_SESSION_FLAGS: &[&str] = &[
+    "--restore",
     "--continue",
     "--export",
     "--fork",
@@ -124,6 +133,29 @@ const REJECTED_MODES: &[&str] = &["acp", "rpc", "rpc-ui"];
 
 /// Every command OMP dispatches instead of starting a session, including its hidden entries.
 const NON_SESSION_COMMANDS: &[&str] = &[
+    "auth",
+    "anonymize",
+    "collab",
+    "compress",
+    "find",
+    "git",
+    "images",
+    "img",
+    "if-bench",
+    "login",
+    "plugins",
+    "predict",
+    "ps",
+    "clip",
+    "play",
+    "share",
+    "session",
+    "render",
+    "skill",
+    "skills",
+    "stream",
+    "toks",
+    "web-search",
     "__complete",
     "acp",
     "agents",
@@ -494,9 +526,6 @@ mod tests {
     #[test]
     fn skill_and_provider_controls_are_rejected() {
         for rejected_args in [
-            vec!["--no-skills"],
-            vec!["--skills", "git-*"],
-            vec!["--skills=git-*"],
             vec!["-e", "./ext.ts"],
             vec!["--extension", "./ext.ts"],
             vec!["--hook", "./hook.ts"],
@@ -618,8 +647,7 @@ mod tests {
         );
         let message = rejected(&["--plan", "--alias", "omp-work"]);
         assert!(message.contains("--alias"), "{message}");
-        let message = rejected(&["--plan", "--no-skills"]);
-        assert!(message.contains("--no-skills"), "{message}");
+        assert!(validate(&args(&["--plan", "--no-skills"])).is_ok());
 
         // A value-like successor is still the flag's value, so the built-in form keeps working and
         // a bare `--plan` at the end of the list consumes nothing.

@@ -22,10 +22,10 @@ implemented.
 ## Product definition
 
 SkillMount is a Rust wrapper CLI that makes Agent Skills stored in external directories visible for
-the intended lifetime of a Codex CLI, Claude Code CLI, or Oh My Pi (OMP) session. It resolves an
-ordered catalog, inspects the discovery scopes implemented by the selected adapter, produces a
-deterministic mount or preservation outcome for each selected Skill, and removes only entries that
-still match the transaction's recorded ownership evidence.
+the intended lifetime of a Codex CLI, Claude Code CLI, or Oh My Pi (OMP) session. For Codex/Claude it resolves an
+ordered catalog and plans deterministic mounts; for OMP it delegates native directory discovery
+through a session-owned configuration. All modes remove only entries still matching recorded
+ownership evidence.
 
 Its responsibility stops at that lifetime. After an adapter's release-independent discovery and
 lifecycle controls accept a foreground launch, mount visibility and removal are established by the
@@ -382,7 +382,11 @@ catalog + agent snapshot -> mount plan -> transaction policy -> sealed link muta
 
 ## Catalog and planning rules
 
-Every `--skills-dir` occurrence is retained with its ordinal and provenance. The occurrences form
+The following selected-Skill overlay and conflict rules apply to Codex/Claude. OMP delegates
+selection to its native custom-directory loader (ADR 0040), preserves input order and has no
+SkillMount-selected winner or link conflict policy.
+
+Every `--skills-dir` occurrence is retained with its ordinal and provenance. For Codex/Claude they form
 an ordered overlay: the rightmost candidate for a logical mount-name key wins. Selection happens
 before validation. An invalid selected winner is a hard error; SkillMount never falls back to an
 earlier shadowed candidate.
@@ -390,11 +394,11 @@ earlier shadowed candidate.
 Source precedence chooses only among caller-supplied candidates. It never authorizes replacement
 of a project-owned or otherwise pre-existing Skill in an inspected scope. Planning checks every
 scope in the current adapter discovery model, not just the destination directory, because relying
-on undocumented duplicate precedence would make the selected Skill ambiguous. Each session
+on undocumented duplicate precedence would make the selected Skill ambiguous. Each link-based session
 adapter must reconcile that model with the supported agent versions and cover every scope the child
 will search before its launch boundary is enabled.
 
-Adapters materialize those observations as one deterministic visible-name index that retains every
+Codex/Claude adapters materialize those observations as one deterministic visible-name index that retains every
 same-name declaration and its scope. Immediate occupancy of the namespace receiving new mounts is
 separate evidence: recursive frontmatter identity answers what the child can select, while direct
 path identity answers whether a destination can be created. Conflict policy consumes both indexes.
@@ -408,11 +412,11 @@ unsound; [ADR 0010](adr/0010-discovery-entry-identity.md) records this decision.
 
 | Concern | Codex | Claude Code | OMP |
 |---|---|---|---|
-| Current modeled discovery | Codex 0.146.0 recursive regular-file `SKILL.md` discovery under project and ancestor `.agents/skills` and `.codex/skills`, `$HOME/.agents/skills`, deprecated `$CODEX_HOME/skills`, bundled `$CODEX_HOME/skills/.system`, and the platform administrator root; file links are ignored, logical identity uses the supported frontmatter parser and directory-name fallback, and all same-name declarations are retained | Claude Code 2.1.220 direct-entry discovery in the platform managed Skill root, project `.claude/skills` from launch CWD through project root, the effective `CLAUDE_CONFIG_DIR/skills` user scope, the selected destination, and user-supplied `--add-dir` scopes; descendant collisions below launch CWD are namespace-qualified and custom standalone Skills override bundled names | OMP 17.2.9 priority-first, non-recursive `<root>/<entry>/SKILL.md` discovery across nine registered providers — `native` 100 (ancestor `.omp/skills` from the launch CWD up to the repository root or home, nearest first, plus the user `<agentDir>/skills`), `omp-plugins` 90 (each enabled extension package's `skills/` directory), `claude` 80, `claude-plugins` 70, `agents` 70, `codex` 70, `opencode` 55, `github` 30, and `omp-managed` 5 — plus a second-pass `skills.customDirectories` scan that overrides same-named provider Skills; an entry must be a directory or directory link, the first name wins, and `native`, `omp-plugins`, `github`, `omp-managed`, and custom directories require a non-empty description; the five-layer settings stack (schema defaults, `<agentDir>/config.yml`, project provider files folded so the lowest-priority provider wins a conflicting key, the `PI_CONFIG_FILES`/`--config` overlays SkillMount rejects as input, and in-memory runtime overrides) merges maps recursively, replaces arrays wholesale, and can disable or filter any name |
-| Compatibility | `.codex/skills` is a visible legacy conflict scope but never a placement candidate; an existing `.agents/skills -> .codex/skills` link is respected as operator configuration | No project compatibility store is created | Every cross-agent provider root — `.claude/skills` at user and ancestor scope, marketplace plugin caches, `.agent`/`.agents/skills`, `.codex/skills`, opencode's user and project scopes, `.github/skills`, and OMP's own user, plugin, and managed scopes — is a visible conflict scope but never a placement candidate; `<cwd>/.codex/config.toml` and the other agents' project settings files are parsed because they join the settings fold that can hide a selected Skill |
-| Planned destination | Always `<project>/.agents/skills`; a missing path is planned as a non-critical regular directory chain | Default: unique state-root staging tree at `<session>/root/.claude/skills`; project mode: `<project>/.claude/skills`; a missing chain in either mode is non-critical scaffolding | Always `<launch-cwd>/.omp/skills` under `--mount-mode=auto` or `--mount-mode=project`; `--mount-mode=staging` is a usage error, and missing `.omp` and `skills` directories are planned as non-critical scaffolding |
-| Project mutation | Created Skill links may be added only through `.agents/skills` | Project mode may add created entries; default staging does not modify the project namespace | Created Skill links may be added only through `.omp/skills`; every visible provider root contributes its logical lock resource and each canonical terminal directory a physical lock key |
-| Launch integration | Implemented for bounded `exec` and `review` launches; no version process runs, and release-independent hard launch invariants repeat after lock stabilization and at the spawn boundary; interactive TUI is rejected because it can reload higher-precedence managed configuration after spawn; child `current_dir`, canonical explicit `CODEX_HOME`, injected native `-C` and session discovery overrides, validated passthrough, and no `--add-dir` | Implemented with the same repeated hard-invariant boundaries and no version process; default staging injects one `--add-dir <session>/root` pair and every mode injects a session-only selected-name `skillOverrides` object before unchanged validated passthrough | Implemented for one new supervised foreground session; no version process runs, the release-independent hard launch invariants repeat after lock stabilization and at the spawn boundary, and a pre-spawn recheck refuses to launch when non-owned discovery evidence moved; no argument or environment override is injected — child argv is exactly the validated operator passthrough and the child runs in the launch CWD; rejected before state access: root-relocating `--cwd`, `--profile`, `--alias`, and `--config`, selection-changing `--no-skills`, `--skills`, `-e`/`--extension`, `--hook`, `--no-extensions`, and `--plugin-dir`, lifecycle-reusing `-c`/`--continue`, `-r`/`--resume`/`--session`, `--fork`, `--from-claude`, `--from-codex`, and `--export`, `--mode` with `rpc`, `rpc-ui`, or `acp`, every recognized OMP subcommand, the `OMP_PROFILE`/`PI_PROFILE`/`PI_CONFIG_FILES` environment overlays, and a home launch CWD without the operator's own `--allow-home` |
+| Current modeled discovery | Codex 0.146.0 recursive regular-file `SKILL.md` discovery under project and ancestor `.agents/skills` and `.codex/skills`, `$HOME/.agents/skills`, deprecated `$CODEX_HOME/skills`, bundled `$CODEX_HOME/skills/.system`, and the platform administrator root; file links are ignored, logical identity uses the supported frontmatter parser and directory-name fallback, and all same-name declarations are retained | Claude Code 2.1.220 direct-entry discovery in the platform managed Skill root, project `.claude/skills` from launch CWD through project root, the effective `CLAUDE_CONFIG_DIR/skills` user scope, the selected destination, and user-supplied `--add-dir` scopes; descendant collisions below launch CWD are namespace-qualified and custom standalone Skills override bundled names | Native OMP 18.14.0 custom-directory discovery delegated to the child; no Skill inventory or metadata emulation. Existing effective configured roots precede CLI collection roots; first occurrence keeps bare name and different duplicates may remain namespaced (ADR 0040). |
+| Compatibility | `.codex/skills` is a visible legacy conflict scope but never a placement candidate; an existing `.agents/skills -> .codex/skills` link is respected as operator configuration | No project compatibility store is created | Bounded settings-array projection preserves effective customDirectories; malformed or unsupported configuration fails closed. Native filters/provider policy remain OMP-owned. |
+| Planned destination | Always `<project>/.agents/skills`; a missing path is planned as a non-critical regular directory chain | Default: unique state-root staging tree at `<session>/root/.claude/skills`; project mode: `<project>/.claude/skills`; a missing chain in either mode is non-critical scaffolding | Private session directory plus owned omp-config.yml; auto resolves to staging, project mode is rejected. No Skill links. |
+| Project mutation | Created Skill links may be added only through `.agents/skills` | Project mode may add created entries; default staging does not modify the project namespace | None: project settings and existing Skill stores are untouched. Config/source inputs are observed; only private session files are mutation-locked. |
+| Launch integration | Implemented for bounded `exec` and `review` launches; no version process runs, and release-independent hard launch invariants repeat after lock stabilization and at the spawn boundary; interactive TUI is rejected because it can reload higher-precedence managed configuration after spawn; child `current_dir`, canonical explicit `CODEX_HOME`, injected native `-C` and session discovery overrides, validated passthrough, and no `--add-dir` | Implemented with the same repeated hard-invariant boundaries and no version process; default staging injects one `--add-dir <session>/root` pair and every mode injects a session-only selected-name `skillOverrides` object before unchanged validated passthrough | One new supervised foreground session; injected --config file before unchanged validated passthrough. Native filters allowed; root/config/profile relocation, extension CLI, resume/fork/restore/import and server/operator modes rejected. Snapshot and owned-file evidence repeat at spawn; no version process. |
 
 Scopes that resolve to one terminal directory and use the same traversal policy are folded for
 conflict evaluation while their visible aliases remain available for diagnostics. A bundled-system
@@ -543,38 +547,24 @@ outrank command-line settings, arrive asynchronously, and refresh during a child
 SkillMount does not bypass that policy; managed-policy sessions, authenticated real-agent link
 loading, and native Windows junction loading remain explicit compatibility-hardening gaps.
 
-The OMP model was read on 2026-08-06 from the tagged source rather than documentation: `oh-my-pi`
-`v17.2.9`, commit `f7f8e040ee04710414fbd775431091fa301b9786`, with the installed binary reporting
-`omp/17.2.9`. [ADR 0034](adr/0034-pin-the-omp-session-discovery-contract.md) records the pinned
-contract, the rejected alternatives, and the launch and journal decisions. `src/agent/omp/` owns
-that contract as data plus bounded no-follow inspection — the root-command argument arity tables,
-the nine-provider discovery model, the extension-package and marketplace-plugin roots, and the
-settings fold — and never imports or executes plugin, extension, or hook code: a contribution that
-cannot be proven from declarative manifests and on-disk state fails the session as an unsupported
-environment. Parsing `<cwd>/.codex/config.toml` inside that fold is why the crate carries the
-parse-only `toml` dependency: a Codex project file really can disable every OMP Skill, so it is
-read rather than guessed at. Because the destination is OMP's highest-priority provider scope, a
-mounted Skill wins over the operator's other sources by OMP's own precedence; planning therefore
-checks the complete namespace first, never replaces a project-owned entry, and refuses a plan
-whose selected Skills the operator's own configuration — `skills.enabled`, a source toggle,
-`ignoredSkills`, `includeSkills`, or `disabledExtensions` — would hide. Global OMP state that has
-not yet migrated into `config.yml` (a legacy `settings.json` or `agent.db` beside no YAML) is
-rejected as an unsupported environment because the effective values are visible in no file a
-static inspector can read. A readable non-empty description stays an OMP catalog requirement even
-under `--validation none`, and a present frontmatter name must equal the portable mount name,
-because the child would otherwise silently drop the Skill or load it under a name SkillMount never
-planned.
+OMP discovery is delegated through native `skills.customDirectories`, not a mirrored provider
+catalog. [ADR 0040](adr/0040-delegate-omp-discovery-through-owned-config.md) replaces the OMP
+placement/selection rules of ADR 0034/0035. Existing effective configured roots precede CLI roots
+in declared order; OMP owns bare names, aliases, duplicates, metadata and filters. The adapter only
+projects the initial settings array and rejects unsupported input instead of discarding it.
+The session-owned `--config` document is retained for the entire managed process-domain lifetime.
+Configuration arrays are a launch snapshot; edits to base customDirectories need a new session.
+No project file or Skill link is created. The new cleanup-critical config operation records bounded
+exact contents and regular-file identity, verifies both before launch and removal, and preserves
+mismatches. Existing schema 1/2 link journals remain readable; old binaries reject the new operation.
 
-Two asymmetries against OMP's own error handling are deliberate, and both fail closed. An
-unreadable extension-package lockfile or Skill root fails the session where OMP itself would
-silently see nothing, because a namespace SkillMount cannot enumerate cannot be proven
-conflict-free. And a `local`-scope marketplace plugin entry is admitted into the conflict index
-without reproducing Claude Code's project-path encoding, which can only over-report a pre-existing
-Skill — a conflict the operator can resolve — and never under-report one, which would let a mount
-silently shadow it. In the journal, `omp` is a new value of the existing agent field rather than a
-schema change: an older SkillMount fails closed on the unknown value and retains the state, so
-downgrading below the OMP-capable release requires clearing active OMP journals with `asm cleanup`
-first.
+Additional 2026-10-30 upstream review covers Codex rust-v0.166.0 and Claude official current docs.
+Codex rejects `exec fork` and worktree relocation; selected `agents/openai.yaml` product restrictions
+must permit Codex. Claude rejects new operator/restricted modes and reserved `synced` and
+`anthropic-skills` names. Linked worktrees without their own root `.claude/skills` fail closed because
+main-checkout fallback is not modeled. Claude's injected `--settings` prevents live-background resume
+autoattach; stopped sessions can resume. These are source/docs and regression-test evidence, not
+new authenticated runtime certification. Permission settings are never weakened.
 
 ### Codex permission separation
 
@@ -775,7 +765,7 @@ records the native evidence, residual containment limits, and replacement of ADR
 The following are product rules rather than style preferences:
 
 1. Platform-native paths and arguments remain lossless end to end.
-2. Source occurrences are rightmost-wins, validate-after-select, with no fallback from an invalid
+2. Codex/Claude source occurrences are rightmost-wins, validate-after-select, with no fallback from an invalid
    winner.
 3. Source precedence never overrides a pre-existing Skill in an inspected discovery scope.
 4. `inspect` and `--dry-run` create no directories, links, locks, journals, recovery mutations, or
@@ -987,11 +977,9 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
 - complete Claude session composition through isolated staging, ancestor/user/add-dir preflight,
   exact passthrough injection, repeated hard controls, fake-child acceptance, concurrent roots, and
   the same liveness-gated cleanup and exit precedence;
-- complete OMP session composition through the same hard-control preflight, project `.omp/skills`
-  mounting with non-critical directory scaffolding, complete-namespace conflict and
-  operator-visibility checks, a pre-spawn non-owned discovery-evidence recheck, unchanged validated
-  passthrough with no injected argument or environment override, fake-child acceptance, and the
-  shared liveness-gated cleanup and exit precedence;
+- OMP native-directory composition with bounded read-only config projection, private owned YAML,
+  config/source observations, repeated pre-spawn contents/identity checks, no project mutations,
+  delegated selection, and the shared liveness-gated cleanup and exit precedence;
 - session acceptance proving every mutating run spawns exactly one Agent process — the supervised
   child — for a last-tested, drifted, or unobservable installed release;
 - `doctor` as the single surface that observes an Agent version, with typed
@@ -1002,7 +990,7 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
   engines, including active, corrupt, supervising, kept, replaced, missing, preserved-scaffolding,
   and mixed outcomes;
 - operator quick-start, lifecycle, recovery, safety, compatibility, and manual smoke-test
-  documentation, plus a dispatch-only native real-agent evidence workflow with integrity-locked
+  documentation, plus a native credential-free PR probes and manual authenticated real-agent evidence workflow with integrity-locked
   agent packages, provider-scoped credentials, redacted artifacts, and process-tree timeouts;
 - stable-tag and read-only manual release preflight, fixed native target builds, deterministic
   dual-binary archives, complete-set SHA-256 verification, and least-privilege marker-owned draft
@@ -1027,9 +1015,9 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
 
 ### Reserved work
 
-- executed authenticated real-agent certification for every supported Agent, platform, and link
-  combination, and native Windows junction discovery — for OMP unrecorded on x64 and permanently
-  unavailable on x86, because 17.2.9 publishes no 32-bit Windows asset;
+- executed authenticated real-agent certification for every supported Agent/platform mechanism,
+  including Codex/Claude Windows junction discovery and OMP native-directory wrapper sessions;
+  both Windows wrapper architectures use an x64 OMP child on the x64 runner, not a 32-bit agent;
 - asynchronously delivered Claude managed-policy handling;
 - lock-file reclamation;
 - binding a public transaction's lifetime to the lock guard validated when it is opened or adopted;

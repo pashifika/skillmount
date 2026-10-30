@@ -263,6 +263,8 @@ impl ActionStatus {
 pub enum ActionOperation {
     /// Create a helper directory the plan needs.
     CreateDirectory,
+    /// Create an owned session configuration file.
+    CreateConfigFile,
     /// Create a directory link for a selected Skill.
     CreateDirectoryLink,
     /// Record an entry that already satisfies the mount and that this transaction did not create.
@@ -275,6 +277,7 @@ impl ActionOperation {
     pub const fn label(self) -> &'static str {
         match self {
             Self::CreateDirectory => "mkdir",
+            Self::CreateConfigFile => "config",
             Self::CreateDirectoryLink => "link",
             Self::ReuseExistingLink => "reuse",
         }
@@ -285,6 +288,7 @@ impl ActionOperation {
     pub fn parse(label: &str) -> Option<Self> {
         match label {
             "mkdir" => Some(Self::CreateDirectory),
+            "config" => Some(Self::CreateConfigFile),
             "link" => Some(Self::CreateDirectoryLink),
             "reuse" => Some(Self::ReuseExistingLink),
             _ => None,
@@ -296,7 +300,7 @@ impl ActionOperation {
     #[must_use]
     pub const fn creates_entry(self) -> bool {
         match self {
-            Self::CreateDirectory | Self::CreateDirectoryLink => true,
+            Self::CreateDirectory | Self::CreateDirectoryLink | Self::CreateConfigFile => true,
             Self::ReuseExistingLink => false,
         }
     }
@@ -309,7 +313,7 @@ impl ActionOperation {
     #[must_use]
     pub const fn cleanup_disposition(self) -> CleanupDisposition {
         match self {
-            Self::CreateDirectoryLink => CleanupDisposition::Required,
+            Self::CreateDirectoryLink | Self::CreateConfigFile => CleanupDisposition::Required,
             Self::CreateDirectory => CleanupDisposition::BestEffort,
             Self::ReuseExistingLink => CleanupDisposition::None,
         }
@@ -319,6 +323,8 @@ impl ActionOperation {
 /// The kind of entry an action produces, as recorded for later verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordedKind {
+    /// A regular session configuration file.
+    File,
     /// A regular directory recorded at this transaction's initial evidence boundary.
     Directory,
     /// A directory symbolic link.
@@ -335,6 +341,7 @@ impl RecordedKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Directory => "directory",
+            Self::File => "file",
             Self::Symlink => "symlink",
             Self::Junction => "junction",
             Self::Undecided => "undecided",
@@ -346,6 +353,7 @@ impl RecordedKind {
     pub fn parse(label: &str) -> Option<Self> {
         match label {
             "directory" => Some(Self::Directory),
+            "file" => Some(Self::File),
             "symlink" => Some(Self::Symlink),
             "junction" => Some(Self::Junction),
             "undecided" => Some(Self::Undecided),
@@ -379,6 +387,8 @@ pub struct SourceResolution {
 /// One durable action record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalAction {
+    /// Exact configuration bytes, present only for a configuration-file action.
+    pub config_contents: Option<String>,
     /// Plan position, starting at 1.
     pub id: u32,
     /// What the action does.
@@ -618,6 +628,10 @@ impl TransactionJournal {
                 .push("status", codec::encode_text(action.status.label()))
                 .push("final", codec::encode_path(&action.final_path))
                 .push_optional(
+                    "contents",
+                    action.config_contents.as_deref().map(codec::encode_text),
+                )
+                .push_optional(
                     "temp",
                     action.temporary_path.as_deref().map(codec::encode_path),
                 )
@@ -709,6 +723,7 @@ impl TransactionJournal {
                         .map(|value| PlatformIdentity::from_recorded(&value)),
                 }),
                 "action" => journal.actions.push(JournalAction {
+                    config_contents: optional_text(line, "contents")?,
                     id: text(line, "id")?
                         .parse()
                         .map_err(|_| "an action id is not a number".to_owned())?,
@@ -759,21 +774,12 @@ impl TransactionJournal {
             }
             previous = action.id;
 
-            let valid_kind = match action.operation {
-                ActionOperation::CreateDirectory => action.kind == RecordedKind::Directory,
-                ActionOperation::CreateDirectoryLink => matches!(
-                    action.kind,
-                    RecordedKind::Undecided | RecordedKind::Symlink | RecordedKind::Junction
-                ),
-                ActionOperation::ReuseExistingLink => action.kind == RecordedKind::Undecided,
-            };
-            if !valid_kind {
-                return Err(format!(
-                    "a {} action cannot record the {} entry kind",
-                    action.operation.label(),
-                    action.kind.label()
-                ));
+            if schema_version == LEGACY_SCHEMA_VERSION
+                && action.operation == ActionOperation::CreateConfigFile
+            {
+                return Err("configuration files require schema two mutation authority".to_owned());
             }
+            validate_action_kind_and_config_evidence(action)?;
 
             if action.operation == ActionOperation::ReuseExistingLink
                 && action.status != ActionStatus::Reused
@@ -841,6 +847,38 @@ impl TransactionJournal {
             )?;
         }
         Ok(())
+    }
+}
+
+/// Checks entry kinds and keeps config byte evidence separate from link and directory records.
+fn validate_action_kind_and_config_evidence(action: &JournalAction) -> Result<(), String> {
+    let valid_kind = match action.operation {
+        ActionOperation::CreateDirectory => action.kind == RecordedKind::Directory,
+        ActionOperation::CreateConfigFile => action.kind == RecordedKind::File,
+        ActionOperation::CreateDirectoryLink => matches!(
+            action.kind,
+            RecordedKind::Undecided | RecordedKind::Symlink | RecordedKind::Junction
+        ),
+        ActionOperation::ReuseExistingLink => action.kind == RecordedKind::Undecided,
+    };
+    if !valid_kind {
+        return Err(format!(
+            "a {} action cannot record the {} entry kind",
+            action.operation.label(),
+            action.kind.label()
+        ));
+    }
+
+    match (&action.config_contents, action.operation) {
+        (Some(contents), ActionOperation::CreateConfigFile)
+            if contents.len() <= crate::link::MAX_CONFIG_BYTES
+                && action.source_canonical.is_none()
+                && action.link_target.is_none() =>
+        {
+            Ok(())
+        }
+        (None, operation) if operation != ActionOperation::CreateConfigFile => Ok(()),
+        _ => Err("configuration action has invalid content evidence".to_owned()),
     }
 }
 

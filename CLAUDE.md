@@ -28,7 +28,8 @@ of a Codex CLI, Claude Code CLI, or Oh My Pi (OMP) session. The package installs
 primary binary and `skillmount` as a behaviorally identical fallback; both delegate to
 `skillmount::run_from`.
 
-The catalog is a deterministic rightmost-wins overlay. SkillMount validates only the selected
+The Codex/Claude catalog is a deterministic rightmost-wins overlay. OMP delegates native
+selection and duplicates through session-owned customDirectories configuration (ADR 0040). SkillMount validates only the selected
 winner, never falls back from an invalid winner, and never lets source precedence replace a
 project-owned Skill. It treats selected Skills as trusted user code and does not transform them,
 manage authentication, elevate privileges, or weaken agent permissions.
@@ -36,8 +37,8 @@ manage authentication, elevate privileges, or weaken agent permissions.
 Read `docs/architecture.md` before changing cross-module behavior. Its implementation-status
 section distinguishes working catalog/planning/transaction/process-supervision behavior from
 reserved ownership binding and release work. Each session adapter pins one Agent release: Codex
-`codex-cli 0.146.0` (ADR 0023), Claude Code `2.1.220 (Claude Code)` (ADR 0024), and OMP `omp/17.2.9`
-(ADR 0034). A banner is advisory evidence, never authorization (ADR 0033).
+`codex-cli 0.146.0` (ADR 0023), Claude Code `2.1.220 (Claude Code)` (ADR 0024), and OMP native directory behavior `omp/18.14.0`
+(ADR 0040). A banner is advisory evidence, never authorization (ADR 0033).
 
 ## Commands
 

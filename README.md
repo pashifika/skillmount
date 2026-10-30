@@ -31,7 +31,7 @@ and `skillmount`, a descriptive fallback that behaves the same way.
 
 - **Session-scoped mounts:** Skills appear when the agent starts and disappear when it exits, so
   your project directory stays clean.
-- **Layered catalogs:** repeat `--skills-dir` to stack Skill collections; the rightmost source
+- **Layered catalogs (Codex/Claude):** repeat `--skills-dir` to stack Skill collections; the rightmost source
   wins each Skill name.
 - **Conflict safety:** an existing Skill is never replaced, and a name clash stops the session
   before anything changes.
@@ -146,8 +146,8 @@ to Claude through `--add-dir`, so the project itself is not modified:
 asm claude --skills-dir ~/agent-skills -- -p "Review the staged diff with the team review Skill"
 ```
 
-Oh My Pi mounts into the project's own `.omp/skills`, the first place OMP searches, and removes
-the links it created when the session ends:
+Oh My Pi receives native `skills.customDirectories` through a temporary session configuration;
+no Skill links or project settings are written:
 
 ```bash
 asm omp --skills-dir ~/agent-skills -- -p "Summarize this project's build steps"
@@ -162,72 +162,64 @@ them visible to an agent.
 
 ## Oh My Pi sessions
 
-`asm omp` and `skillmount omp` support exactly one scope: a new foreground Oh My Pi (OMP) session
-that SkillMount launches itself. The selected Skills are linked into `<launch CWD>/.omp/skills` —
-the first place OMP searches — and SkillMount creates the `.omp` and `.omp/skills` directories
-when they are missing, then removes every link it created after OMP exits:
+`asm omp` and `skillmount omp` launch a new supervised foreground OMP session. Unlike
+Codex/Claude, OMP owns Skill discovery, selection, filters, aliases and duplicate resolution.
+SkillMount adds collection roots through OMP's native `skills.customDirectories`, using a private
+session-only `--config` file. It never edits your `.omp/config.yml` or creates `.omp/skills` links.
 
 ```bash
 asm omp --skills-dir ~/agent-skills -- -p "Summarize this project's build steps"
-skillmount omp --skills-dir ~/agent-skills -- --mode json "Summarize this project's build steps"
-```
-
-Preview and health checks stay read-only, like the other agents:
-
-```bash
-asm inspect --agent omp --skills-dir ~/agent-skills
+asm omp --skills-dir ~/rust-skills --skills-dir ~/fe-skills -- --skills 'rust-*'
 asm omp --skills-dir ~/agent-skills --dry-run
+asm inspect --agent omp --skills-dir ~/agent-skills
 asm doctor --project-root . --omp-bin /opt/homebrew/bin/omp
 ```
 
-Because the mount destination outranks every other Skill source in OMP's own precedence,
-SkillMount checks the complete OMP namespace before touching anything: all nine of OMP's Skill
-providers — including `.claude/skills`, marketplace plugin caches, `.agents/skills`, and
-`.codex/skills` — plus your `skills.customDirectories`. A provider is a Skill source, not a single
-directory: most contribute both a user root and a project root, so even a minimal project renders
-fourteen scanned roots under `asm omp --dry-run --verbose`, and project ancestors or installed
-plugins add more. SkillMount never replaces an existing Skill: `--conflict=error` stops the
-session and `--conflict=skip` keeps the existing winner. A Skill that your own OMP
-configuration hides (`skills.enabled: false`, a source toggle, `ignoredSkills`, `includeSkills`,
-or `disabledExtensions`) fails the plan instead of mounting something OMP would silently ignore.
+Already configured directories are preserved first; CLI roots follow in their declared order.
+OMP scans immediate `<root>/<entry>/SKILL.md` children, not individual `SKILL.md` roots or nested
+collections. Pass the containing collection, not an individual Skill. OMP gives the first custom
+occurrence its bare name; differing duplicates can remain under namespaced aliases, while identical
+content can collapse. **OMP does not use SkillMount's Codex/Claude rightmost-wins or conflict policy.**
+Default `inspect` covers all agents: an individual Skill input still reports Codex/Claude, but
+returns a partial failure naming OMP's collection-only requirement. Use a collection for all-agent
+success, or `inspect --agent codex` / `--agent claude` for a direct Skill.
 
-Arguments that would move or reshape that namespace after planning are rejected before anything is
-created, and each rejection names the token and the safe new-session alternative:
+Configured filters and `--skills`/`--no-skills` remain OMP policy; SkillMount does not promise that
+every directory entry will load or that only one duplicate remains visible.
 
-- launching from your home directory without your own `--allow-home`;
-- `--cwd`, `--profile`, `--alias`, `--config`, and the `OMP_PROFILE`, `PI_PROFILE`, and
-  `PI_CONFIG_FILES` environment variables;
-- Skill- and extension-set changes: `--no-skills`, `--skills`, `-e`/`--extension`, `--hook`,
-  `--no-extensions`, `--plugin-dir`;
-- session reuse: `-c`/`--continue`, `-r`/`--resume`, `--session`, `--fork`, `--from-claude`,
-  `--from-codex`, `--export`;
-- protocol-server modes (`--mode rpc`, `--mode rpc-ui`, `--mode acp`) and every OMP subcommand,
-  such as `omp config` or `omp plugin`.
+For example, existing project configuration needs no links and is not rewritten:
 
-Everything else — prompt text, `--print`, `--mode text`, `--mode json`, model and thinking
-selection, and approval flags you supplied yourself — passes through unchanged. SkillMount injects
-no argument and no environment variable into an OMP launch, does not manage OMP authentication,
-and never weakens OMP's permission or approval model: it forwards `--auto-approve`, `--yolo`, and
-`--approval-mode` only when you supplied them.
+```yaml
+skills:
+  customDirectories:
+    - ~/Work/omp-skills/rust-skills
+    - ~/Work/omp-skills/fe-skills
+```
 
-Cleanup uses the same journaled, crash-recoverable path as the other agents. Every Skill link
-SkillMount created remains cleanup-critical once the OMP process domain is dead. The `.omp` and
-`.omp/skills` directories it had to create are pruned too — but only while they are still empty and
-directories it recorded. If OMP, the operating system, or another program left something in one,
-SkillMount preserves that directory and its contents untouched, reports it, and still completes
-when no created link remains. Automatic and session cleanup reconcile a created link only after an
-identity-verified unlink; pathname absence cannot prove that the same object was not moved
-elsewhere, so an unverified link and its created enclosing helpers remain journal-backed. After
-checking the reported paths and establishing that the process domain is dead, run `asm cleanup`.
-That explicit command treats an all-absent set of recorded link paths as the operator's decision to
-release the stale ownership record, reports that no filesystem entry was removed, and completes the
-journal. It still leaves every existing mismatch untouched. This repairs a crash after unlink
-without adding a second recovery option; if the link was instead moved elsewhere, the command
-deliberately stops tracking that moved link. `asm doctor` helps inspect the interrupted session.
-Attaching to or hot-reloading Skills into an OMP process SkillMount did not launch is not supported
-— OMP loads Skills once at
-startup, so start a new session instead. The recorded OMP evidence, including the platforms it
-does and does not cover, lives in [docs/compatibility.md](docs/compatibility.md).
+Because OMP replaces arrays across settings layers, SkillMount snapshots the effective initial
+custom-directory array before appending CLI roots. Changes to that array during the session take
+effect in a **new** wrapped session; other settings retain OMP's own behavior. Projection is bounded:
+plain YAML/JSON/TOML settings only, at most 1 MiB per file and 1024 combined directories. Unsupported
+OpenCode JSONC syntax/substitutions, malformed settings, and unmigrated legacy settings fail with an
+explanation rather than silently discarding configuration. A database alone may be an ordinary
+default install, but SkillMount cannot prove it has no legacy settings without reading SQLite.
+Establish or migrate YAML through native OMP configuration, or run OMP directly; do not create an
+empty YAML file blindly, because that can suppress real migration. Start OMP directly for other
+unsupported input.
+
+OMP uses private staging only. Non-default `--link-mode`, `--conflict=skip`, `--validation`, and
+`--keep-mounts` are rejected rather than ignored. Root/profile/config relocation, extension-changing
+CLI flags, session resume/fork/restore/import, server modes and operator subcommands remain rejected.
+A home-directory launch requires your own `--allow-home`. Model, prompt, filters and approval flags
+are forwarded unchanged; SkillMount does not add permissions, authentication or auto-approval.
+
+The owned config stays available until the entire managed process domain is dead, including
+reloading and background children. Cleanup checks the exact recorded file identity and content;
+changed or replaced files are retained with recovery evidence, never removed as user-owned data.
+Old link-based journals remain readable for cleanup, but older binaries cannot clean the new config
+operation: finish or recover active sessions with this release before downgrading.
+See [the native-directory decision](docs/adr/0040-delegate-omp-discovery-through-owned-config.md)
+and [compatibility evidence](docs/compatibility.md).
 
 ## Concurrent sessions
 
@@ -361,7 +353,7 @@ exited.
 
 - Supported hosts: Windows 10 version 1709 or later (x64 and x86) and macOS on Apple Silicon.
 - The adapters' dated last-tested banners are `codex-cli 0.146.0`, `2.1.220 (Claude Code)`, and
-  `omp/17.2.9`. These are evidence baselines, not an exact-version allowlist. Normal sessions do
+  `omp/18.14.0`. These are evidence baselines, not an exact-version allowlist. Normal sessions do
   not query or warn about the installed banner; `asm doctor` classifies a different or unavailable
   banner as `unverified` until the live-agent workflow is recorded in
   [docs/compatibility.md](docs/compatibility.md).

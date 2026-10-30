@@ -65,6 +65,14 @@ pub(crate) fn render(report: &ReadOnlyReport<'_>) -> String {
 
 /// Renders the brief session summary emitted immediately before the child starts.
 pub(crate) fn render_session_start(report: &ReadOnlyReport<'_>) -> String {
+    if report.context.descriptor().native_skill_directories() {
+        return format!(
+            "Passing {} source directories to {} native Skill discovery (no Skill links).\nLaunching {}...\n",
+            report.context.skill_sources.len(),
+            report.context.descriptor().display_name(),
+            report.context.descriptor().label(),
+        );
+    }
     let selected = report
         .catalog
         .resolutions
@@ -162,6 +170,13 @@ fn sources(out: &mut String, report: &ReadOnlyReport<'_>) {
 
 /// Renders which source won each logical name, and every origin it displaced.
 fn overlay(out: &mut String, report: &ReadOnlyReport<'_>) {
+    if report.context.descriptor().native_skill_directories() {
+        let _ = writeln!(
+            out,
+            "\nSelection: delegated to the Agent; configured directories precede CLI directories in input order. No SkillMount rightmost-wins overlay or link conflict policy applies."
+        );
+        return;
+    }
     let overrides = report.catalog.override_count();
     let _ = writeln!(
         out,
@@ -261,6 +276,9 @@ fn plan(out: &mut String, report: &ReadOnlyReport<'_>) {
     }
     for action in &report.plan.actions {
         match &action.operation {
+            MountAction::CreateConfigFile { path, .. } => {
+                let _ = writeln!(out, "  CONFIG {}", report.path(path));
+            }
             MountAction::CreateDirectory { path } => {
                 let _ = writeln!(out, "  MKDIR  {}", report.path(path));
             }

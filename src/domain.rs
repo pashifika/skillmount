@@ -34,6 +34,7 @@ pub struct AgentDescriptor {
     default_mount_mode: MountMode,
     explicit_mount_modes: &'static [MountMode],
     project_layout_paths: &'static [&'static str],
+    native_skill_directories: bool,
 }
 
 static CODEX_DESCRIPTOR: AgentDescriptor = AgentDescriptor {
@@ -44,6 +45,7 @@ static CODEX_DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     default_mount_mode: MountMode::Project,
     explicit_mount_modes: &[MountMode::Project],
     project_layout_paths: &[".agents/skills", ".codex/skills"],
+    native_skill_directories: false,
 };
 
 static CLAUDE_DESCRIPTOR: AgentDescriptor = AgentDescriptor {
@@ -54,6 +56,7 @@ static CLAUDE_DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     default_mount_mode: MountMode::Staging,
     explicit_mount_modes: &[MountMode::Project, MountMode::Staging],
     project_layout_paths: &[".claude/skills"],
+    native_skill_directories: false,
 };
 
 static OMP_DESCRIPTOR: AgentDescriptor = AgentDescriptor {
@@ -61,12 +64,19 @@ static OMP_DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     label: "omp",
     display_name: "OMP",
     executable: "omp",
-    default_mount_mode: MountMode::Project,
-    explicit_mount_modes: &[MountMode::Project],
-    project_layout_paths: &[".omp/skills"],
+    default_mount_mode: MountMode::Staging,
+    explicit_mount_modes: &[MountMode::Staging],
+    project_layout_paths: &[],
+    native_skill_directories: true,
 };
 
 impl AgentDescriptor {
+    /// Whether the Agent, rather than `SkillMount`, owns directory discovery and name selection.
+    #[must_use]
+    pub const fn native_skill_directories(&self) -> bool {
+        self.native_skill_directories
+    }
+
     /// Returns the closed identity this descriptor describes.
     #[must_use]
     pub const fn id(&self) -> AgentId {

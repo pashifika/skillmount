@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::agent::version::VersionSpec;
@@ -36,18 +37,45 @@ const CLAUDE_VERSION_SPEC: VersionSpec =
 const SKILL_DISABLING_ARGS: [&str; 3] = ["--bare", "--safe-mode", "--disable-slash-commands"];
 
 /// Passthrough settings inputs that could undo `SkillMount`'s session visibility override.
-const SKILL_VISIBILITY_ARGS: [&str; 3] = ["--managed-settings", "--setting-sources", "--settings"];
+const SKILL_VISIBILITY_ARGS: [&str; 4] = [
+    "--managed-settings",
+    "--setting-sources",
+    "--settings",
+    "--restricted",
+];
 
 /// Passthrough controls that detach the logical session or relocate its discovery root.
-const SESSION_BOUNDARY_ARGS: [&str; 5] = ["--background", "--bg", "--tmux", "--worktree", "-w"];
+const SESSION_BOUNDARY_ARGS: [&str; 11] = [
+    "--background",
+    "--bg",
+    "--tmux",
+    "--worktree",
+    "-w",
+    "--cloud",
+    "--remote",
+    "--environment",
+    "--desktop",
+    "--teleport",
+    "--init-only",
+];
 
-/// Last-tested commands, plus implementation-time additions observed in Claude Code 2.1.222, that
-/// do not start a supervised foreground session.
+/// Last-tested commands plus official CLI-reference additions reviewed on 2026-10-30
+/// that do not start a supervised foreground session.
 ///
 /// Claude selects a command from the first unconsumed positional argument, including after a
 /// standalone `--`. Forwarding one of these commands would hand the staged root to an operator or
 /// service process whose lifetime and discovery behavior are outside this adapter's contract.
-const NON_SESSION_SUBCOMMANDS: [&str; 15] = [
+const NON_SESSION_SUBCOMMANDS: [&str; 25] = [
+    "attach",
+    "daemon",
+    "logs",
+    "purge",
+    "remote-control",
+    "respawn",
+    "rm",
+    "self-hosted-runner",
+    "stop",
+    "kill",
     "agents",
     "auth",
     "auto-mode",
@@ -71,7 +99,17 @@ const NON_SESSION_SUBCOMMANDS: [&str; 15] = [
 /// This table exists only to keep flag-shaped values opaque while locating Skill discovery
 /// controls. It is not a second Claude CLI parser and deliberately has no validation policy for
 /// these options.
-const SINGLE_VALUE_ARGS: [&str; 23] = [
+const SINGLE_VALUE_ARGS: [&str; 33] = [
+    "--advisor",
+    "--append-subagent-system-prompt",
+    "--append-subagent-system-prompt-file",
+    "--append-system-prompt-file",
+    "--max-turns",
+    "--permission-prompt-tool",
+    "--permission-prompts",
+    "--system-prompt-file",
+    "--system-prompt-snapshot",
+    "--teammate-mode",
     "--agent",
     "--agents",
     "--autocompact",
@@ -98,9 +136,8 @@ const SINGLE_VALUE_ARGS: [&str; 23] = [
 ];
 
 /// Pinned options whose value is optional and never consumes the next option token.
-const OPTIONAL_VALUE_ARGS: [&str; 9] = [
-    "--debug",
-    "-d",
+const OPTIONAL_VALUE_ARGS: [&str; 8] = [
+    "--rc",
     "--from-pr",
     "--prompt-suggestions",
     "--remote-control",
@@ -111,7 +148,9 @@ const OPTIONAL_VALUE_ARGS: [&str; 9] = [
 ];
 
 /// Pinned options that consume non-option values until the next option token.
-const VARIADIC_VALUE_ARGS: [&str; 9] = [
+const VARIADIC_VALUE_ARGS: [&str; 11] = [
+    "--channels",
+    "--dangerously-load-development-channels",
     "--allowedTools",
     "--allowed-tools",
     "--betas",
@@ -295,10 +334,12 @@ fn contains_os(values: &[&str], candidate: &OsStr) -> bool {
 fn session_boundary_arg(argument: &OsStr) -> Option<&'static str> {
     SESSION_BOUNDARY_ARGS
         .iter()
-        .find(|candidate| argument == OsStr::new(candidate))
+        .find(|candidate| {
+            argument == OsStr::new(candidate)
+                || (candidate.starts_with("--")
+                    && strip_prefix(argument, &format!("{candidate}=")).is_some())
+        })
         .copied()
-        .or_else(|| strip_prefix(argument, "--worktree=").map(|_| "--worktree"))
-        .or_else(|| strip_prefix(argument, "--tmux=").map(|_| "--tmux"))
         .or_else(|| {
             strip_prefix(argument, "-w")
                 .filter(|value| !value.is_empty())
@@ -468,6 +509,71 @@ fn claude_lock_resources(
     Ok(resources)
 }
 
+/// Claude 2.1.277+ may load the main checkout's Skills when a linked worktree has no
+/// root Skills directory. Until that extra root is modeled, do not claim a complete inventory.
+fn verify_worktree_discovery(project_root: &Path) -> Result<(), AppError> {
+    if classify(&project_root.join(SKILLS_SUFFIX))?.kind != crate::mount::resolve::PathKind::Missing
+    {
+        return Ok(());
+    }
+    let marker = project_root.join(".git");
+    let metadata = match fs::symlink_metadata(&marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(AppError::Usage(format!(
+                "cannot inspect Claude Git marker {}: {error}",
+                marker.display()
+            )));
+        }
+    };
+    let git_dir = if metadata.is_dir() {
+        marker
+    } else if metadata.is_file() {
+        let bytes = crate::catalog::frontmatter::read_bounded_regular_file(
+            &marker,
+            "Claude Git marker",
+            4096,
+        )
+        .map_err(AppError::Usage)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| {
+            AppError::Usage("Claude Git marker is not supported UTF-8 text".to_owned())
+        })?;
+        let Some(path) = text
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            return Ok(());
+        };
+        project_root.join(path)
+    } else {
+        return Err(AppError::Usage(
+            "Claude Git marker must be a regular file or directory for bounded discovery"
+                .to_owned(),
+        ));
+    };
+    match fs::symlink_metadata(git_dir.join("commondir")) {
+        Ok(_) => Err(AppError::Usage("Claude linked-worktree discovery can fall back to main-checkout Skills outside the inspected roots; run from the main checkout or provide the worktree's own .claude/skills directory".to_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::Usage(format!("cannot rule out Claude linked-worktree discovery: {error}"))),
+    }
+}
+
+fn verify_selected_names(catalog: &SkillCatalog) -> Result<(), AppError> {
+    for resolution in &catalog.resolutions {
+        let name = resolution.selected.mount_name.as_str();
+        if name.eq_ignore_ascii_case("synced") || name.eq_ignore_ascii_case("anthropic-skills") {
+            return Err(crate::error::CatalogError::InvalidSelectedSkill {
+                path: resolution.selected.origin.source_entry.clone(),
+                reason: format!("Claude reserves Skill name {name:?}; rename the selected Skill rather than mounting a name Claude will not load"),
+            }.into());
+        }
+    }
+    Ok(())
+}
+
 /// Verifies the Claude launch invariants that remain mandatory for every observed release.
 fn verify_launch_invariants() -> Result<(), AppError> {
     verify_environment()
@@ -552,7 +658,8 @@ impl AgentAdapter for ClaudeAdapter {
         }
     }
 
-    fn validate_launch_invariants(&self, _context: &RunContext) -> Result<(), AppError> {
+    fn validate_launch_invariants(&self, context: &RunContext) -> Result<(), AppError> {
+        verify_worktree_discovery(&context.project_root)?;
         verify_launch_invariants()
     }
 
@@ -582,6 +689,7 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     fn inspect_discovery(&self, context: &RunContext) -> Result<DiscoverySnapshot, AppError> {
+        verify_worktree_discovery(&context.project_root)?;
         let claude = context.agent.claude()?;
         let (discovery_entry, backing_store, layout) = Self::destination(context)?;
         let backing_state = classify(&backing_store)?;
@@ -650,6 +758,7 @@ impl AgentAdapter for ClaudeAdapter {
         catalog: &SkillCatalog,
         discovery: &DiscoverySnapshot,
     ) -> Result<MountPlan, AppError> {
+        verify_selected_names(catalog)?;
         // Directories at or above this boundary belong to every session, so they are never planned.
         let boundary = match context.options.mount_mode {
             MountMode::Staging => session_root_base()?,
@@ -678,6 +787,11 @@ impl AgentAdapter for ClaudeAdapter {
             .iter()
             .map(|resolution| (resolution.selected.mount_name.as_str(), "on"))
             .collect::<BTreeMap<_, _>>();
+        // This explicit settings layer also preserves the foreground resume boundary:
+        // Claude 2.1.285+ can auto-attach a live background session on --resume, but its
+        // documented session-config flag guard rejects that handoff when --settings is
+        // present. Keep this layer even when every selected Skill is already visible.
+        // With no selected Skills there are no mounted Skill lifetimes to transfer.
         if !overrides.is_empty() {
             let settings = serde_json::to_string(&serde_json::json!({
                 "skillOverrides": overrides,
@@ -767,6 +881,12 @@ mod tests {
             "-wreview",
             "--tmux",
             "--tmux=classic",
+            "--cloud",
+            "--remote=task",
+            "--environment=ccpool_x",
+            "--desktop",
+            "--teleport",
+            "--init-only",
         ] {
             let error = ClaudeAdapter
                 .validate_passthrough_args(&args(&[rejected]))
@@ -778,6 +898,16 @@ mod tests {
     #[test]
     fn non_session_subcommands_fail_before_planning() {
         for rejected in [
+            "attach",
+            "daemon",
+            "logs",
+            "purge",
+            "remote-control",
+            "respawn",
+            "rm",
+            "self-hosted-runner",
+            "stop",
+            "kill",
             "agents",
             "auth",
             "auto-mode",
@@ -822,12 +952,33 @@ mod tests {
             args(&["--managed-settings={}"]),
             args(&["--setting-sources", "user"]),
             args(&["--setting-sources=project"]),
+            args(&["--restricted"]),
         ] {
             let error = ClaudeAdapter
                 .validate_passthrough_args(&rejected)
                 .expect_err("user settings cannot override SkillMount's visibility contract");
             assert_eq!(error.category(), crate::error::ExitCategory::Usage);
         }
+    }
+
+    #[test]
+    fn latest_option_values_do_not_hide_operator_commands() {
+        for values in [
+            vec!["--advisor", "opus", "attach", "session"],
+            vec!["--max-turns", "2", "purge"],
+            vec!["--debug", "daemon"],
+            vec!["-d", "daemon"],
+        ] {
+            assert!(
+                ClaudeAdapter
+                    .validate_passthrough_args(&args(&values))
+                    .is_err(),
+                "{values:?}"
+            );
+        }
+        ClaudeAdapter
+            .validate_passthrough_args(&args(&["--advisor", "opus", "describe attach"]))
+            .expect("ordinary prompt");
     }
 
     #[test]

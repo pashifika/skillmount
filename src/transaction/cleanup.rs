@@ -29,7 +29,8 @@ use crate::journal::{
 };
 use crate::link::resolve::ComparablePath;
 use crate::link::{
-    CreatedLink, CreatedLinkKind, EntryKind, OwnedDirectory, OwnershipMismatch, RemoveOutcome,
+    CreatedLink, CreatedLinkKind, EntryKind, OwnedConfigFile, OwnedDirectory, OwnershipMismatch,
+    RemoveOutcome,
 };
 use crate::mount::CleanupDisposition;
 
@@ -389,10 +390,12 @@ impl Transaction {
         }
         let mut left_alone = residue_path.is_some();
         let incomplete_link_evidence = disposition == CleanupDisposition::Required
-            && matches!(action.kind, RecordedKind::Symlink | RecordedKind::Junction)
-            && (action.source_canonical.is_none()
-                || action.link_target.is_none()
-                || action.identity.is_none());
+            && ((matches!(action.kind, RecordedKind::Symlink | RecordedKind::Junction)
+                && (action.source_canonical.is_none()
+                    || action.link_target.is_none()
+                    || action.identity.is_none()))
+                || (action.kind == RecordedKind::File
+                    && (action.config_contents.is_none() || action.identity.is_none())));
         for path in action.candidate_paths() {
             if residue_path == Some(path.as_path()) {
                 continue;
@@ -534,6 +537,18 @@ impl Transaction {
         path: &Path,
     ) -> Result<RemoveOutcome, LinkError> {
         match action.kind {
+            RecordedKind::File => {
+                let Some(contents) = action.config_contents.clone() else {
+                    return Ok(RemoveOutcome::OwnershipMismatch(
+                        OwnershipMismatch::IdentityUnavailable,
+                    ));
+                };
+                self.backend.remove_config_file(&OwnedConfigFile {
+                    path: path.to_path_buf(),
+                    identity: action.identity.clone(),
+                    contents,
+                })
+            }
             RecordedKind::Directory => self.backend.remove_empty_directory(&OwnedDirectory {
                 path: path.to_path_buf(),
                 identity: action.identity.clone(),
@@ -590,8 +605,8 @@ impl Transaction {
             disposition,
             RetainedEntry {
                 path: action.current_path().clone(),
-                reason: "no recorded path contained the created Skill link, and pathname absence \
-                         cannot prove that the link identity was not moved elsewhere"
+                reason: "no recorded path contained the created entry, and pathname absence \
+                         cannot prove that the entry identity was not moved elsewhere"
                     .to_owned(),
             },
         );

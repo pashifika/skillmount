@@ -82,6 +82,7 @@ fn sample(status: TransactionStatus) -> TransactionJournal {
         ],
         actions: vec![
             JournalAction {
+                config_contents: None,
                 id: 1,
                 operation: ActionOperation::CreateDirectory,
                 expected_precondition: PathPrecondition::Missing,
@@ -94,6 +95,7 @@ fn sample(status: TransactionStatus) -> TransactionJournal {
                 identity: Some(PlatformIdentity::from_recorded("unix:1:0000000000000001")),
             },
             JournalAction {
+                config_contents: None,
                 id: 2,
                 operation: ActionOperation::CreateDirectoryLink,
                 expected_precondition: PathPrecondition::Missing,
@@ -106,6 +108,7 @@ fn sample(status: TransactionStatus) -> TransactionJournal {
                 identity: None,
             },
             JournalAction {
+                config_contents: None,
                 id: 3,
                 operation: ActionOperation::ReuseExistingLink,
                 expected_precondition: PathPrecondition::ExistingLinkToSource,
@@ -777,6 +780,15 @@ fn the_plan_and_the_journal_classify_every_operation_identically() {
             CleanupDisposition::BestEffort,
         ),
         (
+            MountAction::CreateConfigFile {
+                path: destination.clone(),
+                contents: "skills: {}\n".to_owned(),
+            },
+            ActionOperation::CreateConfigFile,
+            "config",
+            CleanupDisposition::Required,
+        ),
+        (
             MountAction::CreateDirectoryLink {
                 source: source.clone(),
                 destination: destination.clone(),
@@ -978,4 +990,29 @@ fn a_journal_path_is_derived_from_the_transaction_id_alone() {
             .join("transactions")
             .join("00ff-0001-0002.journal")
     );
+}
+
+#[test]
+fn config_file_contents_round_trip_and_are_required_only_for_config_actions() {
+    let mut journal = sample(TransactionStatus::Applying);
+    let action = &mut journal.actions[1];
+    action.operation = ActionOperation::CreateConfigFile;
+    action.kind = RecordedKind::File;
+    action.source_canonical = None;
+    action.link_target = None;
+    action.config_contents =
+        Some("skills:\n  customDirectories: [\"/日本語/skills\"]\n".to_owned());
+    assert_eq!(round_trip(&journal).unwrap(), journal);
+    let legacy_document = codec::render_document_for_schema(&journal.to_lines(), 1);
+    let parsed = codec::parse_document(&legacy_document).unwrap();
+    let legacy_error =
+        TransactionJournal::from_lines(&parsed.lines, parsed.schema_version).unwrap_err();
+    assert!(legacy_error.contains("configuration files require schema two"));
+    journal.actions[1].config_contents = None;
+    assert!(round_trip(&journal).is_err());
+    journal.actions[1].config_contents = Some("x".repeat(crate::link::MAX_CONFIG_BYTES + 1));
+    assert!(round_trip(&journal).is_err());
+    let mut non_config = sample(TransactionStatus::Applying);
+    non_config.actions[0].config_contents = Some("unexpected".to_owned());
+    assert!(round_trip(&non_config).is_err());
 }

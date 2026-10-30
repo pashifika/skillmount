@@ -760,6 +760,7 @@ fn inspect_codex_skill(
 fn verify_selected_plugin_namespaces(catalog: &SkillCatalog) -> Result<(), AppError> {
     for resolution in &catalog.resolutions {
         let source = &resolution.selected.origin.source_canonical;
+        verify_skill_product_policy(source)?;
         if let Some(manifest) = nearest_plugin_manifest(source)? {
             return Err(PlanError::UnsupportedLayout {
                 path: manifest,
@@ -770,6 +771,66 @@ fn verify_selected_plugin_namespaces(catalog: &SkillCatalog) -> Result<(), AppEr
             }
             .into());
         }
+    }
+    Ok(())
+}
+
+/// Optional metadata can suppress a Skill before name-based enable rules are applied.
+fn verify_skill_product_policy(source: &Path) -> Result<(), AppError> {
+    let path = source.join("agents/openai.yaml");
+    let failure = |reason: String| {
+        AppError::from(PlanError::UnsupportedLayout {
+            path: path.clone(),
+            reason: format!("cannot prove selected Codex Skill visibility: {reason}"),
+        })
+    };
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(failure(error.to_string())),
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(failure(
+                "optional metadata must be a regular file".to_owned(),
+            ));
+        }
+    }
+    let bytes = crate::catalog::frontmatter::read_bounded_regular_file(
+        &path,
+        "Codex optional Skill metadata",
+        64 * 1024,
+    )
+    .map_err(failure)?;
+    let value: serde_yaml_ng::Value = serde_yaml_ng::from_slice(&bytes)
+        .map_err(|error| failure(format!("invalid optional metadata: {error}")))?;
+    let Some(policy) = value.get("policy").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let Some(mapping) = policy.as_mapping() else {
+        return Err(failure("policy must be a mapping".to_owned()));
+    };
+    let Some(products) = mapping.get(serde_yaml_ng::Value::String("products".to_owned())) else {
+        return Ok(());
+    };
+    let Some(products) = products.as_sequence() else {
+        return Err(failure("policy.products must be an array".to_owned()));
+    };
+    if products.is_empty() {
+        return Ok(());
+    }
+    let mut allows_codex = false;
+    for product in products {
+        match product.as_str() {
+            Some("codex" | "CODEX") => allows_codex = true,
+            Some("chatgpt" | "CHATGPT" | "atlas" | "ATLAS") => {}
+            _ => {
+                return Err(failure(
+                    "policy.products contains an unrecognized product".to_owned(),
+                ));
+            }
+        }
+    }
+    if !allows_codex {
+        return Err(failure("policy.products excludes Codex; SkillMount does not override the Skill author's product restriction".to_owned()));
     }
     Ok(())
 }
@@ -841,7 +902,8 @@ fn is_hidden(name: &OsStr) -> bool {
 
 /// Returns whether a forwarded Codex argument changes the CWD used for project discovery.
 fn changes_codex_root(argument: &OsStr) -> bool {
-    argument == OsStr::new("-C")
+    argument == OsStr::new("--worktree")
+        || argument == OsStr::new("-C")
         || argument == OsStr::new("--cd")
         || os_starts_with(argument, "--cd=")
         || (os_starts_with(argument, "-C") && argument != OsStr::new("-C"))
@@ -928,7 +990,7 @@ fn validate_codex_command(args: &[OsString]) -> Result<(), AppError> {
     }
     if command == OsStr::new("exec") || command == OsStr::new("e") {
         if let Some((_, nested)) = first_exec_positional(&args[command_index + 1..]) {
-            if nested == OsStr::new("resume") {
+            if nested == OsStr::new("resume") || nested == OsStr::new("fork") {
                 return Err(unsupported_resume(nested));
             }
             if nested == OsStr::new("help") {
@@ -1020,9 +1082,16 @@ fn option_consumes_value(argument: &OsStr, option_set: RootOptionSet) -> bool {
         return true;
     }
     matches!(option_set, RootOptionSet::Exec)
-        && ["--output-schema", "--color", "-o", "--output-last-message"]
-            .iter()
-            .any(|option| argument == OsStr::new(option))
+        && [
+            "--output-schema",
+            "--color",
+            "-o",
+            "--output-last-message",
+            "--thread-source",
+            "--cyber-access-program",
+        ]
+        .iter()
+        .any(|option| argument == OsStr::new(option))
 }
 
 fn unsupported_resume(command: &OsStr) -> AppError {
@@ -1384,8 +1453,38 @@ mod tests {
         MAX_DISCOVERY_RESPONSE_BYTES, codex_directory_entry_name_is_representable,
         codex_path_uri_upper_bound, reserve_codex_response_bytes, version_spec,
     };
+    use crate::agent::AgentAdapter;
     use std::ffi::OsString;
     use std::path::Path;
+
+    #[test]
+    fn latest_codex_relocation_and_nested_fork_are_rejected() {
+        for values in [
+            vec!["--worktree", "exec", "prompt"],
+            vec!["exec", "--worktree", "prompt"],
+            vec!["exec", "fork", "session-id"],
+            vec!["exec", "--thread-source", "cli", "fork", "session-id"],
+            vec![
+                "exec",
+                "--cyber-access-program",
+                "standard",
+                "fork",
+                "session-id",
+            ],
+        ] {
+            let args = values.iter().map(OsString::from).collect::<Vec<_>>();
+            assert!(
+                super::CodexAdapter
+                    .validate_passthrough_args(&args)
+                    .is_err(),
+                "{values:?}"
+            );
+        }
+        let args = ["exec", "--thread-source", "cli", "describe fork"].map(OsString::from);
+        super::CodexAdapter
+            .validate_passthrough_args(&args)
+            .expect("ordinary prompt");
+    }
 
     #[test]
     fn codex_walk_response_budget_accepts_the_boundary_and_rejects_the_next_entry() {

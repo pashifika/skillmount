@@ -29,12 +29,12 @@ files. The supported package targets are Apple Silicon macOS for Homebrew and Wi
 for Chocolatey. Homebrew Core, casks, bottles, Linux, macOS Intel, Windows ARM64, WinGet, Scoop,
 and crates.io are out of scope.
 
-Current state: the protected `pashifika/homebrew-tap` exists in its never-published bootstrap state,
-but no Formula or publisher credential exists. Chocolatey profile
-[`pashifika`](https://community.chocolatey.org/profiles/pashifika) exists with no published package;
-neither ID appears in the public feed, ownership remains unobserved until first submission, and the
-protected publisher credential is absent. Package-manager version `0.2.0` is not yet publicly
-available, so every install command in this document remains unavailable and is documented as such.
+Current state: both Homebrew Formulae are published at `0.2.0` in
+[`pashifika/homebrew-tap`](https://github.com/pashifika/homebrew-tap/tree/main/Formula), with
+selected-only native installation evidence recorded below. Chocolatey publication and moderation
+remain separate per-package states; the commands below are not advertised as available until their
+public endpoints and clean Windows installations pass. Do not infer publisher credential state
+from package availability; inspect the protected workflow's result when operating a new release.
 
 ## The package workflow
 
@@ -377,10 +377,10 @@ Installs only the `asm` command from the checked Apple Silicon release archive. 
 completions are generated through `asm completions <shell>`, register only `asm`, and are owned and
 removed by this Formula alone. No user profile is edited.
 
-Version-transition testing is not yet applicable: `v0.2.0` is the first published Formula pair,
-and `v0.1.0` predates the `completions` command that both Formulae require during installation.
-`brew upgrade` is the supported command for future releases; the next completion-capable release
-must exercise that transition before publication.
+`v0.2.0` is the first published Formula pair; `v0.1.0` predates the required `completions`
+command. The `v0.3.0` promotion gate therefore requires the native upgrade rehearsal from
+`v0.2.0` with `--prior-tag v0.2.0 --require-upgrade`; a missing prior archive or skipped transition
+fails that gate. `brew upgrade` remains the supported operator command.
 
 ### Chocolatey `skillmount` — unavailable
 
@@ -413,3 +413,16 @@ Downloads and checksum-verifies the matching x86 or x64 release archive, retains
 and exposes only the ordinary `asm` shim. The package installs no completion files and never edits
 a PowerShell profile; generate PowerShell completion manually with `asm completions powershell`
 and dot-source the saved file from your own profile.
+
+## Pinned-shell CI provisioning
+
+The completion job keeps its reviewed Homebrew/core revisions and exact shell-version checks.
+Hosted images can carry local core-tap edits (CI run `39031627849` failed when checking out the
+pin over `Formula/r/rustup.rb`). `provision_native_shells.py` prepares an independent pinned core
+checkout before temporarily swapping it into the tap location for installation. A `finally` guard
+restores the original directory, including local and untracked files, on successful or failed
+installation, including ordinary interruption and handled termination signals. It never resets, cleans, or recursively deletes the original tap. Recovery directories
+remain under `RUNNER_TEMP`; identity mismatches or restoration failures stop with the original
+retained there. Like any process cleanup, this cannot run after SIGKILL or host loss, so the helper
+refuses execution outside disposable macOS Actions runners. It is not a local Homebrew maintenance
+command. Regression tests exercise successful and failed installation scopes and refused local use.
