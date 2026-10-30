@@ -43,6 +43,8 @@ OMP_INTEGRITY = (
 OMP_SHA256 = {
     "aarch64-apple-darwin": "608843959ab34295d52460dd09dd7d548b6c903c08a83c67954c2d4c36fd1f5a",
     "x86_64-pc-windows-msvc": "620a5935cdb6a9ed52d8b0c93892d6b5bb84155244a98f3be82af0455177bf29",
+    # A 32-bit wrapper on the x64 runner launches the same native x64 child.
+    "i686-pc-windows-msvc": "620a5935cdb6a9ed52d8b0c93892d6b5bb84155244a98f3be82af0455177bf29",
 }
 WINDOWS_JOB_BOOTSTRAP = "--_skillmount-windows-job-bootstrap"
 SENSITIVE_NAME_FRAGMENTS = (
@@ -133,9 +135,6 @@ AGENT_CASES: dict[str, AgentCase] = {
             expected_response=f"{BASE_TOKEN} SKILLMOUNT_LIVE_WINNER_1",
             displaced_tokens=("SKILLMOUNT_LIVE_WINNER_2", "SKILLMOUNT_LIVE_WINNER_3"),
             opt_in=True,
-            unsupported_targets=(
-                ("i686-pc-windows-msvc", "no 32-bit OMP asset is published for 18.14.0"),
-            ),
         ),
     )
 }
@@ -150,7 +149,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent-manifest", required=True, type=Path)
     parser.add_argument("--codex-bin", type=Path)
     parser.add_argument("--claude-bin", type=Path)
-    parser.add_argument("--omp-bin", type=Path)
+    omp = parser.add_mutually_exclusive_group()
+    omp.add_argument("--omp-bin", type=Path, help="OMP binary selected for authenticated discovery")
+    omp.add_argument("--omp-probe-bin", type=Path,
+                     help="OMP binary for credential-free probes and doctor only")
     parser.add_argument(
         "--probes-only", action="store_true",
         help="Observe isolated version/help/doctor only; never claim Skill discovery or use credentials",
@@ -892,6 +894,9 @@ def main() -> int:
         "os": platform.system(),
         "architecture": platform.machine(),
         "wrapper_target": args.wrapper_target,
+        "agent_binary_target": ("x86_64-pc-windows-msvc"
+                                if args.wrapper_target in ("i686-pc-windows-msvc", "x86_64-pc-windows-msvc")
+                                else args.wrapper_target),
         "requested_link_kind_for_codex_claude": args.link_mode,
         "scenario": ("credential-free CLI/native-loader observations; authenticated wrapper discovery unverified"
                      if args.probes_only else
@@ -905,7 +910,7 @@ def main() -> int:
         explicit = {
             "codex": args.codex_bin,
             "claude": args.claude_bin,
-            "omp": args.omp_bin,
+            "omp": args.omp_bin or args.omp_probe_bin,
         }
         binaries: dict[str, Path] = {}
         for case in AGENT_CASES.values():
@@ -926,6 +931,7 @@ def main() -> int:
         )
         if "omp" in binaries and binary_digests["omp"] != OMP_SHA256.get(args.wrapper_target):
             raise RuntimeError("OMP binary does not match its committed release SHA-256")
+        summary["diagnostic_only_agents"] = ["omp"] if args.omp_probe_bin else []
         summary["binary_sha256"] = binary_digests
         summary["agent_integrity"] = {name: AGENT_CASES[name].integrity for name in binaries}
         summary["skillmount_version"] = capture_version(asm, base_environment)
@@ -1032,7 +1038,8 @@ def main() -> int:
                 reason = skip_reason(
                     case,
                     wrapper_target=args.wrapper_target,
-                    binary=binaries.get(case.name),
+                    binary=(None if case.opt_in and args.omp_bin is None
+                            else binaries.get(case.name)),
                     credential=credentials.get(case.credential_name),
                     banner_reason=banner_reasons.get(case.name),
                 )

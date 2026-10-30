@@ -66,7 +66,7 @@ class LiveAgentSmokeTests(unittest.TestCase):
             manifest.write_text("{}", encoding="utf-8")
             args = SimpleNamespace(
                 asm=Path(sys.executable), codex_bin=Path(sys.executable),
-                claude_bin=Path(sys.executable), omp_bin=None, agent_manifest=manifest,
+                claude_bin=Path(sys.executable), omp_bin=None, omp_probe_bin=None, agent_manifest=manifest,
                 evidence_dir=root / "evidence", wrapper_target="aarch64-apple-darwin",
                 link_mode="symlink", probes_only=True,
             )
@@ -87,6 +87,37 @@ class LiveAgentSmokeTests(unittest.TestCase):
             self.assertEqual(summary["schema"], 2)
             self.assertEqual({r["outcome"] for r in summary["results"]}, {"unverified"})
             self.assertIn("authenticated wrapper discovery unverified", summary["scenario"])
+
+    def test_diagnostic_omp_binary_reaches_doctor_but_never_authenticated_case(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = Path(sys.executable)
+            manifest = root / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            args = SimpleNamespace(
+                asm=binary, codex_bin=binary, claude_bin=binary, omp_bin=None,
+                omp_probe_bin=binary, agent_manifest=manifest, evidence_dir=root / "evidence",
+                wrapper_target="aarch64-apple-darwin", link_mode="symlink", probes_only=False,
+            )
+            with patch("live_agent_smoke.parse_args", return_value=args), \
+                 patch("live_agent_smoke.load_agent_manifest", return_value={}), \
+                 patch.dict(OMP_SHA256, {"aarch64-apple-darwin": sha256_file(binary)}), \
+                 patch("live_agent_smoke.capture_version", side_effect=["SkillMount test", *[
+                     case.banner for case in AGENT_CASES.values()
+                 ]]), \
+                 patch("live_agent_smoke.run_command", return_value=CommandResult(0, "doctor", "", False)) as doctor, \
+                 patch("live_agent_smoke.run_agent", side_effect=lambda **kw: {
+                     "agent": kw["name"], "outcome": "pass",
+                 }) as launch, \
+                 patch("builtins.print"), \
+                 patch.dict(os.environ, {"CODEX_API_KEY": "unit-secret", "ANTHROPIC_API_KEY": "other-secret"}):
+                self.assertEqual(main(), 0)
+                self.assertIn("--omp-bin", doctor.call_args.args[0])
+                self.assertEqual([call.kwargs["name"] for call in launch.call_args_list], ["codex", "claude"])
+            summary = json.loads((args.evidence_dir / "summary.json").read_text())
+            self.assertEqual(summary["diagnostic_only_agents"], ["omp"])
+            self.assertEqual(summary["results"][-1]["outcome"], "unknown")
+            self.assertIn("--omp-bin was not supplied", summary["results"][-1]["reason"])
 
     def test_native_omp_probe_checks_sources_and_aliases_without_wrapper_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -373,39 +404,19 @@ class OptInOmpCaseTests(unittest.TestCase):
             )
         )
 
-    def test_windows_x86_is_skipped_because_18_14_0_publishes_no_32_bit_asset(self) -> None:
+    def test_both_windows_wrapper_targets_exercise_the_published_x64_omp(self) -> None:
         case = AGENT_CASES["omp"]
-        skipped = skip_reason(
-            case,
-            wrapper_target="i686-pc-windows-msvc",
-            binary=Path(sys.executable),
-            credential="unit-credential",
-            banner_reason=None,
-        )
-        self.assertEqual(skipped, "no 32-bit OMP asset is published for 18.14.0")
-        self.assertEqual(unknown_result(case, skipped)["outcome"], "unknown")
-        # The x86 workflow leg supplies no binary either, and the published-asset reason still wins
-        # over the unselected one so the evidence names why that runner can never exercise OMP.
-        self.assertEqual(
-            skip_reason(
-                case,
-                wrapper_target="i686-pc-windows-msvc",
-                binary=None,
-                credential=None,
-                banner_reason=None,
-            ),
-            skipped,
-        )
-        # 18.14.0 does publish omp-windows-x64.exe, so the 64-bit Windows leg stays exercised.
-        self.assertIsNone(
-            skip_reason(
-                case,
-                wrapper_target="x86_64-pc-windows-msvc",
-                binary=Path(sys.executable),
-                credential="unit-credential",
-                banner_reason=None,
-            )
-        )
+        for target in ("i686-pc-windows-msvc", "x86_64-pc-windows-msvc"):
+            with self.subTest(wrapper_target=target):
+                self.assertIsNone(skip_reason(
+                    case, wrapper_target=target, binary=Path(sys.executable),
+                    credential="unit-credential", banner_reason=None,
+                ))
+                self.assertEqual(OMP_SHA256[target], OMP_SHA256["x86_64-pc-windows-msvc"])
+        workflow = (Path(__file__).parents[1] / "workflows" / "live-agent-smoke.yml").read_text()
+        self.assertNotIn("matrix.arch == 'x64'", workflow)
+        self.assertEqual(workflow.count("name: Fetch the integrity-locked OMP diagnostic binary"), 2)
+        self.assertEqual(workflow.count("|| format('--omp-probe-bin"), 2)
 
     def test_no_built_command_line_carries_the_credential_the_child_reads_from_its_environment(
         self,

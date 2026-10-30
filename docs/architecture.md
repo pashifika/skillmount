@@ -1015,9 +1015,9 @@ shell or PowerShell profiles, and running SkillMount release binaries in credent
 
 ### Reserved work
 
-- executed authenticated real-agent certification for every supported Agent, platform, and link
-  combination, and native Windows junction discovery — for OMP unrecorded on x64 and permanently
-  unavailable on x86, because 17.2.9 publishes no 32-bit Windows asset;
+- executed authenticated real-agent certification for every supported Agent/platform mechanism,
+  including Codex/Claude Windows junction discovery and OMP native-directory wrapper sessions;
+  both Windows wrapper architectures use an x64 OMP child on the x64 runner, not a 32-bit agent;
 - asynchronously delivered Claude managed-policy handling;
 - lock-file reclamation;
 - binding a public transaction's lifetime to the lock guard validated when it is opened or adopted;

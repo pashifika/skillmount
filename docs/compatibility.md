@@ -36,7 +36,7 @@ in the matrix below.
 | OMP | 17.2.9 | macOS / Apple Silicon | n/a | `omp --version` reports the adapter's last-tested banner | 2026-08-06 | observed | Local command output at SkillMount revision `5807efdc4ae0e843f4c4c79a24ba46ed088a6f06` from the Homebrew-installed binary: `omp/17.2.9`; contract read from source tag `v17.2.9`, commit `f7f8e040ee04710414fbd775431091fa301b9786` |
 | OMP | 17.2.9 | macOS / Apple Silicon | directory symlink | Rightmost overlay and non-shadowed base Skills are discoverable in a real authenticated session | 2026-08-06 | unverified | Live smoke has not run at SkillMount revision `5807efdc4ae0e843f4c4c79a24ba46ed088a6f06` |
 | OMP | 17.2.9 | Windows / x86_64 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-06 | unverified | No native live-agent run recorded at SkillMount revision `5807efdc4ae0e843f4c4c79a24ba46ed088a6f06`; the opt-in smoke has not run against the published `omp-windows-x64.exe` |
-| OMP | 17.2.9 | Windows / i686 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-06 | unverified | At SkillMount revision `5807efdc4ae0e843f4c4c79a24ba46ed088a6f06`, OMP publishes no 32-bit Windows asset for 17.2.9, so no native run is possible for this version; a missing asset, not a failed scenario |
+| OMP | 17.2.9 | Windows / i686 | explicit junction | Rightmost overlay and non-shadowed base Skills are discoverable through a requested junction | 2026-08-06 | unverified | At SkillMount revision `5807efdc4ae0e843f4c4c79a24ba46ed088a6f06`, the historical harness omitted OMP for the i686 wrapper. No 32-bit OMP binary exists, but an i686 wrapper on an x64 host can launch the x64 agent; this row remains unverified |
 
 ## Documentation review
 
@@ -81,8 +81,8 @@ launch contract. The GitHub release for the tag publishes `omp-darwin-arm64`, `o
 `omp-linux-arm64`, `omp-linux-x64`, `omp-linux-musl-arm64`, `omp-linux-musl-x64`, and
 `omp-windows-x64.exe`; there is no 32-bit Windows asset, and 17.2.9 publishes no `SHA256SUMS.txt`
 — that file first appears at 17.2.10 — so this exact release cannot be integrity-locked from a
-published digest file. Windows x86 OMP evidence is therefore permanently unavailable for this
-version, while every other native OMP cell — macOS Apple Silicon and Windows x64 junction loading
+published digest file. The historical harness omitted the x86-wrapper OMP case; that is not proof
+that an x86 wrapper on an x64 host cannot launch the x64 agent. Every other native OMP cell — macOS Apple Silicon and Windows x64 junction loading
 included — is `unverified` only because the opt-in native smoke has not run, not because the
 platform is unsupported. No authenticated OMP session ran during this review and no live OMP row
 was promoted. The deterministic fake-agent read-only, session, and transaction suites at SkillMount
@@ -121,9 +121,9 @@ lacks passing live junction evidence in the matrix. The adapter's last-tested ba
 context, not proof that the junction was exercised. The warning is a compatibility boundary, not a
 cleanup warning: transaction-owned junctions still use the same journal, lock, and verified-removal
 path.
-For OMP, 17.2.9 publishes a 64-bit Windows binary but no 32-bit one: the x64 junction combination
-stays `unverified` until the opt-in native smoke records it, and no 17.2.9 junction evidence can
-ever exist on Windows x86.
+These historical OMP junction rows predate the v0.3.0 native-directory mechanism and do not
+certify it. OMP has no 32-bit Windows binary; both wrapper architectures can nevertheless launch
+the x64 OMP binary on the x64 CI host. This is not support for a 32-bit Windows operating system.
 Operators who prefer fail-closed capability behavior can pass `--link-mode=symlink`; SkillMount
 does not request elevation or change Windows privilege policy.
 
@@ -151,7 +151,7 @@ Sources:
 - https://registry.npmjs.org/@anthropic-ai%2Fclaude-code-darwin-arm64/2.1.314
 - https://registry.npmjs.org/@anthropic-ai%2Fclaude-code-win32-x64/2.1.314
 
-OMP's macOS arm64 and Windows x64 SHA-256 values were checked in both the official release API asset metadata and the published SHA256SUMS.txt. Downloads now fail closed against those committed values before execution; the harness also checks the selected OMP binary against the matching target digest and rechecks its hash before any credential-bearing launch. Unlike 17.2.9, this release has a published checksum file. It still has no Windows x86 agent binary, so the x86 OMP case remains unavailable.
+OMP's macOS arm64 and Windows x64 SHA-256 values were checked in both the official release API asset metadata and the published SHA256SUMS.txt. Downloads now fail closed against those committed values before execution; the harness also checks the selected OMP binary against the matching target digest and rechecks its hash before any credential-bearing launch. Unlike 17.2.9, this release has a published checksum file. It still has no Windows x86 agent binary. Both Windows wrapper rows now use the checksum-verified x64 OMP child on an x64 runner, as they already do for Codex/Claude; this does not claim a 32-bit OMP build or 32-bit Windows OS support.
 
 https://github.com/can1357/oh-my-pi/releases/download/v18.14.0/SHA256SUMS.txt
 
@@ -161,7 +161,7 @@ The OMP authenticated scenario follows native first-custom-root bare-name semant
 
 Native execution and authenticated discovery for these new pins are still unverified until actual runs are recorded. Do not promote compatibility matrix rows from these preparation checks or deterministic harness tests alone.
 
-Pull requests into main or dev/** now run the same native jobs in forced credential-free mode, including OMP on macOS arm64/Windows x64. Provider-secret expressions require a manual workflow_dispatch and probes_only=false; authenticated discovery remains manual-only. Summary schema is now 2 because the former global link-kind and winner-3 fields became agent-specific mechanism/expected-response evidence. The supply-chain manifest remains schema 1.
+Pull requests into main or dev/** now run the same native jobs in forced credential-free mode, including OMP on macOS arm64 and both Windows wrapper architectures (x64 child on an x64 host). Provider-secret expressions require a manual workflow_dispatch and probes_only=false; authenticated discovery remains manual-only. Summary schema is now 2 because the former global link-kind and winner-3 fields became agent-specific mechanism/expected-response evidence. The supply-chain manifest remains schema 1.
 
 Credential-free PR runs also execute a separate `omp skill list --json` native-loader probe using a temporary PI_CONFIG_FILES overlay (the subcommand does not forward root --config). It checks first-root bare-name identity, retained duplicate source aliases, a non-shadowed base, and tilde/relative directories containing spaces. It creates no project .omp/skills destination. A pass records raw OMP discovery only; authenticated SkillMount wrapper-session integration remains explicitly unverified. The same harness probe genuinely passed on Linux x86_64 using official OMP 18.14.0, SHA-256 e7dd2b606c4ebe9d1a7bcfad1b8820db968cd6b05409fed1c6bc8db0b6a95a8f, on 2026-10-30. Its private fixture was removed after the run. Native macOS/Windows results still require their actual CI runs.
 
@@ -173,3 +173,7 @@ Claude operator/restricted controls, reserved names and linked-worktree fallback
 banner baselines for Codex/Claude remain historical evidence; source review is not authenticated
 latest-runtime certification. OMP's older link-based rows above are historical and do not certify
 the v0.3.0 native-directory mechanism (ADR 0040).
+
+The OMP diagnostic binary is always provisioned for the all-agent doctor probe. Manual
+`include_omp` selects the authenticated OMP scenario only; leaving it false no longer removes
+OMP from mandatory diagnostics. `--omp-probe-bin` identifies this diagnostics-only role.

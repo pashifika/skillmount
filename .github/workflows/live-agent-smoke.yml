@@ -18,9 +18,10 @@ on:
           - windows
       include_omp:
         description: >-
-          Also exercise the opt-in OMP case. OMP 18.14.0 is verified against a committed
-          SHA-256 from its published SHA256SUMS.txt. It publishes
-          no 32-bit asset, so the Windows x86 leg reports the case as unknown.
+          Also exercise authenticated OMP discovery in manual runs; diagnostic probes always
+          receive OMP. OMP 18.14.0 is verified against a committed
+          SHA-256 from its published SHA256SUMS.txt. Both Windows wrapper architectures
+          launch the native x64 agent on the x64 runner; no 32-bit OMP build is claimed.
         required: false
         default: false
         type: boolean
@@ -54,8 +55,7 @@ jobs:
           python3 .github/scripts/prepare_live_agents.py
           --platform macos-arm64
           --output-dir "${{ runner.temp }}/live-agents"
-      - name: Fetch the opt-in OMP release asset
-        if: ${{ github.event_name == 'pull_request' || inputs.include_omp }}
+      - name: Fetch the integrity-locked OMP diagnostic binary
         env:
           OMP_TAG: v18.14.0
           OMP_ASSET: omp-darwin-arm64
@@ -85,7 +85,7 @@ jobs:
           --agent-manifest "${{ runner.temp }}/live-agents/manifest.json"
           --evidence-dir "${{ runner.temp }}/live-agent-evidence"
           ${{ (github.event_name == 'pull_request' || inputs.probes_only) && '--probes-only' || '' }}
-          ${{ (github.event_name == 'pull_request' || inputs.include_omp) && format('--omp-bin "{0}/live-agents/omp/omp"', runner.temp) || '' }}
+          ${{ (github.event_name == 'pull_request' || inputs.include_omp) && format('--omp-bin "{0}/live-agents/omp/omp"', runner.temp) || format('--omp-probe-bin "{0}/live-agents/omp/omp"', runner.temp) }}
       - name: Upload evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -118,14 +118,14 @@ jobs:
           python .github/scripts/prepare_live_agents.py `
             --platform windows-x64 `
             --output-dir "$env:RUNNER_TEMP/live-agents"
-      - name: Fetch the opt-in OMP release asset
-        if: ${{ (github.event_name == 'pull_request' || inputs.include_omp) && matrix.arch == 'x64' }}
+      - name: Fetch the integrity-locked OMP diagnostic binary
         shell: pwsh
         env:
           OMP_TAG: v18.14.0
           OMP_ASSET: omp-windows-x64.exe
         run: |
-          # 18.14.0 ships no 32-bit OMP asset. SHA-256 is from its SHA256SUMS.txt.
+          # Both x64 and x86 wrappers launch this x64 child on the x64 Windows host.
+          # SHA-256 is from the published v18.14.0 SHA256SUMS.txt.
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP/live-agents/omp" | Out-Null
           $ProgressPreference = 'SilentlyContinue'
           Invoke-WebRequest -MaximumRetryCount 3 -RetryIntervalSec 5 `
@@ -153,7 +153,7 @@ jobs:
           --agent-manifest "${{ runner.temp }}/live-agents/manifest.json"
           --evidence-dir "${{ runner.temp }}/live-agent-evidence"
           ${{ (github.event_name == 'pull_request' || inputs.probes_only) && '--probes-only' || '' }}
-          ${{ (github.event_name == 'pull_request' || inputs.include_omp) && matrix.arch == 'x64' && format('--omp-bin "{0}/live-agents/omp/omp.exe"', runner.temp) || '' }}
+          ${{ (github.event_name == 'pull_request' || inputs.include_omp) && format('--omp-bin "{0}/live-agents/omp/omp.exe"', runner.temp) || format('--omp-probe-bin "{0}/live-agents/omp/omp.exe"', runner.temp) }}
       - name: Upload evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

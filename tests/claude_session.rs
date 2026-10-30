@@ -54,6 +54,8 @@ impl Fixture {
         ] {
             fs::create_dir_all(directory).expect("fixture directory");
         }
+        // Never inherit a repository marker from the host temporary-directory ancestors.
+        fs::create_dir(fixture.project.join(".git")).expect("isolated repository root");
         fixture
     }
 
@@ -837,10 +839,10 @@ fn two_fake_claude_children_overlap_with_distinct_owned_roots() {
     let second_record = fixture.root.join("second.record");
     let release = fixture.root.join("release");
 
-    let first = spawn_waiting(&fixture, &first_record, "first.version", &release);
-    wait_until_ready(&first_record);
-    let second = spawn_waiting(&fixture, &second_record, "second.version", &release);
-    wait_until_ready(&second_record);
+    let mut first = spawn_waiting(&fixture, &first_record, "first.version", &release);
+    first.wait_until_ready();
+    let mut second = spawn_waiting(&fixture, &second_record, "second.version", &release);
+    second.wait_until_ready();
 
     let first_root = recorded_injected_root(&first_record);
     let second_root = recorded_injected_root(&second_record);
@@ -850,8 +852,8 @@ fn two_fake_claude_children_overlap_with_distinct_owned_roots() {
     assert_eq!(fixture.sessions().len(), 2);
 
     fs::write(&release, b"release\n").expect("release both fake children");
-    assert_success(&wait_output(first));
-    assert_success(&wait_output(second));
+    first.finish();
+    second.finish();
     assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
     assert_eq!(fixture.journal_count(), 0);
 }
@@ -888,8 +890,127 @@ fn both_installed_binary_names_run_the_same_claude_session_contract() {
     assert_eq!(fixture.journal_count(), 0);
 }
 
-fn spawn_waiting(fixture: &Fixture, record: &Path, version_name: &str, release: &Path) -> Child {
-    fixture
+// Setup includes filesystem identity checks and stale-journal observation. Its budget is
+// distinct from the fake agent's startup handshake; neither is a product performance SLA.
+const START_PHASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct WaitingSession {
+    child: Option<Child>,
+    record: PathBuf,
+    log: PathBuf,
+    release: PathBuf,
+}
+
+impl WaitingSession {
+    fn wait_until_ready(&mut self) {
+        let mut deadline = Instant::now() + START_PHASE_TIMEOUT;
+        let mut launched = false;
+        loop {
+            let record = fs::read_to_string(&self.record).unwrap_or_default();
+            if record.contains("event=ready\n") {
+                return;
+            }
+            let log = fs::read_to_string(&self.log).unwrap_or_default();
+            let status = self
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .expect("inspect wrapper status");
+            assert!(
+                status.is_none(),
+                "wrapper exited before ready: {status:?}\n{log}\n{record}"
+            );
+            // Reset exactly once at the launch boundary, never on arbitrary log activity.
+            if !launched && log.contains("Launching claude...") {
+                launched = true;
+                deadline = Instant::now() + START_PHASE_TIMEOUT;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} timed out in {} phase; wrapper still running\n{log}\n{record}",
+                self.record.display(),
+                if launched {
+                    "agent readiness"
+                } else {
+                    "wrapper setup"
+                }
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn finish(mut self) {
+        let deadline = Instant::now() + START_PHASE_TIMEOUT;
+        loop {
+            if let Some(status) = self
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .expect("wrapper status")
+            {
+                assert!(
+                    status.success(),
+                    "wrapper failed: {status}\n{}",
+                    fs::read_to_string(&self.log).unwrap_or_default()
+                );
+                self.child.take();
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "wrapper did not exit after release\n{}",
+                fs::read_to_string(&self.log).unwrap_or_default()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for WaitingSession {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        // Also runs during assertion unwinding, before the fixture removes the release path.
+        let _ = fs::write(&self.release, b"release\n");
+        let deadline = Instant::now() + START_PHASE_TIMEOUT;
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Windows owns the child tree in a kill-on-close Job Object. On Unix stop the
+        // recorded fake agent's supervised process group before killing/reaping its wrapper.
+        #[cfg(unix)]
+        if let Ok(record) = fs::read_to_string(&self.record) {
+            if let Some(pid) = record.lines().find_map(|line| {
+                line.strip_prefix("pid=")
+                    .and_then(|p| p.parse::<i32>().ok())
+                    .filter(|pid| *pid > 0)
+            }) {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn spawn_waiting(
+    fixture: &Fixture,
+    record: &Path,
+    version_name: &str,
+    release: &Path,
+) -> WaitingSession {
+    let log = record.with_extension("log");
+    let output = fs::File::create(&log).expect("wrapper diagnostic log");
+    let child = fixture
         .command()
         .arg("--")
         .arg("prompt")
@@ -900,8 +1021,40 @@ fn spawn_waiting(fixture: &Fixture, record: &Path, version_name: &str, release: 
         )
         .env("SKILLMOUNT_FAKE_BEHAVIOR", "wait-for-file")
         .env("SKILLMOUNT_FAKE_RELEASE_FILE", release)
+        .stdout(Stdio::from(output.try_clone().expect("clone log handle")))
+        .stderr(Stdio::from(output))
         .spawn()
-        .expect("spawn waiting Claude session")
+        .expect("spawn waiting Claude session");
+    WaitingSession {
+        child: Some(child),
+        record: record.to_owned(),
+        log,
+        release: release.to_owned(),
+    }
+}
+
+#[test]
+fn waiting_claude_is_released_and_reaped_when_an_assertion_panics() {
+    let fixture = Fixture::new("panic-cleanup");
+    fixture.skill(&fixture.left, "alpha", "fixture");
+    let release = fixture.root.join("release");
+    let result = std::panic::catch_unwind(|| {
+        let mut session = spawn_waiting(&fixture, &fixture.record, "version", &release);
+        session.wait_until_ready();
+        panic!("exercise test guard unwinding");
+    });
+    let panic = result.expect_err("deliberate assertion must unwind");
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"exercise test guard unwinding")
+    );
+    assert!(
+        fs::read_to_string(&fixture.record)
+            .unwrap()
+            .contains("event=released\n")
+    );
+    assert_eq!(fixture.sessions(), Vec::<PathBuf>::new());
+    assert_eq!(fixture.journal_count(), 0);
 }
 
 fn wait_until_ready(record: &Path) {
@@ -927,12 +1080,6 @@ fn recorded_injected_root(record: &Path) -> PathBuf {
         .find(|pair| pair[0] == OsStr::new("--add-dir"))
         .map(|pair| PathBuf::from(&pair[1]))
         .expect("fake Claude record has an injected --add-dir pair")
-}
-
-fn wait_output(child: Child) -> Output {
-    child
-        .wait_with_output()
-        .expect("waiting Claude session exits")
 }
 
 fn assert_success(output: &Output) {

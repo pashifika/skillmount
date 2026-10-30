@@ -201,7 +201,11 @@ custom-directory array before appending CLI roots. Changes to that array during 
 effect in a **new** wrapped session; other settings retain OMP's own behavior. Projection is bounded:
 plain YAML/JSON/TOML settings only, at most 1 MiB per file and 1024 combined directories. Unsupported
 OpenCode JSONC syntax/substitutions, malformed settings, and unmigrated legacy settings fail with an
-explanation rather than silently discarding configuration. Start OMP directly for unsupported input.
+explanation rather than silently discarding configuration. A database alone may be an ordinary
+default install, but SkillMount cannot prove it has no legacy settings without reading SQLite.
+Establish or migrate YAML through native OMP configuration, or run OMP directly; do not create an
+empty YAML file blindly, because that can suppress real migration. Start OMP directly for other
+unsupported input.
 
 OMP uses private staging only. Non-default `--link-mode`, `--conflict=skip`, `--validation`, and
 `--keep-mounts` are rejected rather than ignored. Root/profile/config relocation, extension-changing

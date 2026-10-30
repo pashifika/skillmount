@@ -58,7 +58,7 @@ pub(super) fn load(agent_dir: &Path, cwd: &Path, home: &Path) -> Result<Configur
         if !global_found && classify(&legacy)?.kind != PathKind::Missing {
             return Err(invalid_settings(
                 &legacy,
-                "legacy settings have not been migrated; start OMP directly once before using SkillMount",
+                "legacy settings may require migration; establish or migrate YAML through native OMP configuration before using SkillMount, or run OMP directly",
             ));
         }
     }

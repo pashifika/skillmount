@@ -66,7 +66,7 @@ static OMP_DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     executable: "omp",
     default_mount_mode: MountMode::Staging,
     explicit_mount_modes: &[MountMode::Staging],
-    project_layout_paths: &[".omp/config.yml"],
+    project_layout_paths: &[],
     native_skill_directories: true,
 };
 

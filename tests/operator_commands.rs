@@ -65,7 +65,7 @@ impl Fixture {
                 "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
                 self.root.join("admin-skills"),
             )
-            .env("SKILLMOUNT_TEST_OMP_VERSION", "omp/17.2.9")
+            .env("SKILLMOUNT_TEST_OMP_VERSION", "omp/18.14.0")
             // OMP resolves its roots from the environment, so the developer's real profile,
             // configuration overlay, and XDG bases must never reach a fixture.
             .env_remove("OMP_PROFILE")
@@ -171,11 +171,11 @@ fn healthy_doctor_reports_versions_and_leaves_project_and_state_untouched() {
     assert!(rendered.contains("[PASS] claude executable"));
     assert!(rendered.contains("2.1.220 (Claude Code)"));
     assert!(rendered.contains("[PASS] omp executable"));
-    assert!(rendered.contains("omp/17.2.9"));
+    assert!(rendered.contains("omp/18.14.0"));
     assert!(rendered.contains("[UNVERIFIED] codex live compatibility"));
     assert!(rendered.contains("[UNVERIFIED] claude live compatibility"));
     assert!(rendered.contains("[UNVERIFIED] omp live compatibility"));
-    assert!(rendered.contains("[PASS] project .omp/skills"));
+    assert!(!rendered.contains("project .omp/skills"));
     assert!(rendered.contains("[PASS] omp discovery"));
     assert!(rendered.contains("docs/compatibility.md"));
     #[cfg(not(windows))]
@@ -201,10 +201,10 @@ fn healthy_doctor_reports_versions_and_leaves_project_and_state_untouched() {
 
 /// `doctor` must diagnose OMP without letting it decide another Agent's finding.
 ///
-/// An unsettled OMP global configuration is an OMP-only hard failure, so it must produce exactly
-/// one failure while every Codex, Claude, layout, link, lock, and transaction finding still runs.
+/// An unsettled OMP global configuration fails its launch invariant and directory projection,
+/// while every Codex, Claude, layout, link, lock, and transaction finding still runs.
 #[test]
-fn an_unsettled_omp_configuration_fails_only_the_omp_finding() {
+fn an_unsettled_omp_configuration_fails_only_the_omp_findings() {
     let fixture = Fixture::new("doctor-omp-unsettled");
     let project_before = snapshot(&fixture.project);
     let agent_dir = fixture.home.join(".omp/agent");
@@ -216,39 +216,44 @@ fn an_unsettled_omp_configuration_fails_only_the_omp_finding() {
     assert_eq!(output.status.code(), Some(65));
     let rendered = String::from_utf8_lossy(&output.stdout);
     assert!(rendered.contains("[FAIL] omp executable"), "{rendered}");
-    assert!(rendered.contains("has not yet migrated"), "{rendered}");
+    assert!(
+        rendered.contains("legacy settings may require migration"),
+        "{rendered}"
+    );
     assert!(rendered.contains("[PASS] codex executable"), "{rendered}");
     assert!(rendered.contains("[PASS] claude executable"), "{rendered}");
     assert!(rendered.contains("[PASS] codex discovery"), "{rendered}");
     assert!(rendered.contains("[PASS] claude discovery"), "{rendered}");
-    assert!(rendered.contains("1 failure"), "{rendered}");
+    assert!(rendered.contains("2 failure"), "{rendered}");
     assert_eq!(snapshot(&fixture.project), project_before);
     assert!(!fixture.state.exists());
 }
 
-/// An `agent.db` with no `config.yml` is OMP's ordinary steady state, not unmigrated settings.
-///
-/// Every OMP start creates `agent.db` for sessions and usage, and 17.2.9 writes settings only to
-/// `config.yml`: `AgentStorage.getSettings` returns null for an empty `settings` table, so
-/// `#migrateFromLegacy` never writes the YAML file. Treating the database as evidence of pending
-/// migration refused every install that had simply never customized a global setting, and no OMP
-/// run could clear the refusal.
+/// A binary legacy database may contain settings unavailable to bounded file projection.
 #[test]
-fn an_omp_database_without_a_config_file_is_not_an_unsettled_configuration() {
+fn an_omp_database_without_yaml_fails_closed_without_reading_or_changing_it() {
     let fixture = Fixture::new("doctor-omp-database-only");
     let agent_dir = fixture.home.join(".omp/agent");
     fs::create_dir_all(&agent_dir).expect("OMP agent directory");
-    fs::write(agent_dir.join("agent.db"), b"SQLite format 3\0").expect("OMP session database");
-
+    let bytes = [0xff, 0x00, 0xfe];
+    fs::write(agent_dir.join("agent.db"), bytes).expect("OMP legacy database");
     let output = fixture.doctor();
-
     let rendered = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(65), "{rendered}");
     assert!(
-        !rendered.contains("has not yet migrated"),
-        "an OMP database alone must not refuse the session: {rendered}"
+        rendered.contains("legacy settings may require migration"),
+        "{rendered}"
     );
-    assert!(rendered.contains("[PASS] omp discovery"), "{rendered}");
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(fs::read(agent_dir.join("agent.db")).unwrap(), bytes);
+    assert!(!fixture.state.exists());
+    // Empty YAML intentionally suppresses native legacy migration, without reading SQLite.
+    fs::write(agent_dir.join("config.yml"), "").unwrap();
+    let output = fixture.doctor();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 #[test]
@@ -268,14 +273,14 @@ fn a_drifted_omp_banner_is_unverified_without_failing_doctor() {
         "{rendered}"
     );
     assert!(rendered.contains("omp/99.0.0"), "{rendered}");
-    assert!(rendered.contains("omp/17.2.9"), "{rendered}");
+    assert!(rendered.contains("omp/18.14.0"), "{rendered}");
     assert!(rendered.contains("[PASS] codex executable"), "{rendered}");
     assert!(rendered.contains("0 failure"), "{rendered}");
 }
 
 #[cfg(unix)]
 #[test]
-fn a_broken_omp_project_link_reports_its_chain_without_mutation() {
+fn a_broken_omp_project_skill_link_is_left_to_native_discovery() {
     let fixture = Fixture::new("doctor-omp-broken-link");
     fs::create_dir_all(fixture.project.join(".omp")).expect("OMP project scope");
     std::os::unix::fs::symlink(
@@ -287,14 +292,13 @@ fn a_broken_omp_project_link_reports_its_chain_without_mutation() {
 
     let output = fixture.doctor();
 
-    assert_eq!(output.status.code(), Some(65));
-    let rendered = String::from_utf8_lossy(&output.stdout);
     assert!(
-        rendered.contains("[FAIL] project .omp/skills"),
-        "{rendered}"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
     );
-    assert!(rendered.contains("exact chain:"), "{rendered}");
-    assert!(rendered.contains("no changes were made"), "{rendered}");
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(!rendered.contains("project .omp/skills"), "{rendered}");
     assert_eq!(snapshot(&fixture.project), project_before);
     assert!(!fixture.state.exists());
 }
