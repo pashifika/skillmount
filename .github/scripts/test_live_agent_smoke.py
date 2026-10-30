@@ -22,6 +22,8 @@ from live_agent_smoke import (
     WindowsJob,
     OMP_SHA256,
     capture_cli_probe,
+    cleanup_temporary_directory,
+    owned_temporary_directory,
     main,
     create_sources,
     probe_omp_discovery,
@@ -329,22 +331,74 @@ class WindowsJobTeardownTests(unittest.TestCase):
                 job.terminate_and_wait()
 
     @unittest.skipUnless(os.name == "nt", "native Windows Job Object lifecycle")
-    def test_successful_parent_descendant_releases_probe_cwd_before_return(self) -> None:
+    def test_successful_parent_descendant_allows_bounded_probe_cleanup(self) -> None:
         child = "import time; time.sleep(60)"
         parent = (
             "import subprocess, sys; "
             "subprocess.Popen([sys.executable, '-c', sys.argv[1]], "
             "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"
         )
-        with tempfile.TemporaryDirectory() as temporary:
+        with owned_temporary_directory(prefix="skillmount-job-cleanup-") as temporary:
             cwd = Path(temporary) / "probe-cwd"
             cwd.mkdir()
             result = run_command([sys.executable, "-c", parent, child],
                                  environment=os.environ.copy(), timeout=5, cwd=cwd)
             self.assertEqual(result.returncode, 0)
             self.assertFalse(result.timed_out)
-            # An alive descendant retains this current directory on Windows.
-            cwd.rmdir()
+        # This exercises the same bounded cleanup as real CLI probes. Job-zero remains a
+        # separate required condition; transient filesystem sharing is not a liveness witness.
+        self.assertFalse(Path(temporary).exists())
+
+
+class TemporaryCleanupTests(unittest.TestCase):
+    @staticmethod
+    def sharing_violation() -> OSError:
+        error = PermissionError("directory is still shared")
+        error.winerror = 32
+        return error
+
+    def test_retries_only_transient_windows_sharing_violation(self) -> None:
+        temporary = SimpleNamespace(cleanup=lambda: None)
+        with patch.object(temporary, "cleanup", side_effect=[self.sharing_violation(), None]) as cleanup, \
+             patch("live_agent_smoke.time.sleep") as sleep:
+            cleanup_temporary_directory(temporary)
+        self.assertEqual(cleanup.call_count, 2)
+        sleep.assert_called_once_with(0.01)
+
+    def test_persistent_sharing_violation_remains_failure_at_deadline(self) -> None:
+        temporary = SimpleNamespace(cleanup=lambda: None)
+        with patch.object(temporary, "cleanup", side_effect=self.sharing_violation()) as cleanup, \
+             patch("live_agent_smoke.time.monotonic", side_effect=[0.0, 0.0, 5.0]), \
+             patch("live_agent_smoke.time.sleep"):
+            with self.assertRaises(PermissionError):
+                cleanup_temporary_directory(temporary)
+        self.assertEqual(cleanup.call_count, 2)
+
+    def test_other_cleanup_errors_are_not_retried(self) -> None:
+        for error in (PermissionError("denied"), OSError("filesystem failure")):
+            with self.subTest(error=error):
+                temporary = SimpleNamespace(cleanup=lambda: None)
+                with patch.object(temporary, "cleanup", side_effect=error) as cleanup:
+                    with self.assertRaises(OSError):
+                        cleanup_temporary_directory(temporary)
+                cleanup.assert_called_once_with()
+
+    def test_cleanup_does_not_hide_process_teardown_failure(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "Job query failed"):
+            with owned_temporary_directory(prefix="skillmount-cleanup-error-") as temporary:
+                root = Path(temporary)
+                raise RuntimeError("Job query failed")
+        self.assertFalse(root.exists())
+
+    def test_process_failure_keeps_precedence_when_cleanup_also_fails(self) -> None:
+        temporary = SimpleNamespace(name="owned-temporary", cleanup=lambda: None)
+        cleanup_error = PermissionError("cleanup denied")
+        with patch("live_agent_smoke.tempfile.TemporaryDirectory", return_value=temporary), \
+             patch.object(temporary, "cleanup", side_effect=cleanup_error):
+            with self.assertRaisesRegex(RuntimeError, "Job query failed") as caught:
+                with owned_temporary_directory(prefix="skillmount-cleanup-error-"):
+                    raise RuntimeError("Job query failed")
+        self.assertIs(caught.exception.__cause__, cleanup_error)
 
 
 class OptInOmpCaseTests(unittest.TestCase):

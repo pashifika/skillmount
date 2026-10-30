@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -417,6 +418,7 @@ class WindowsJob:
         # Kill-on-close requests termination but is asynchronous: communicate() only waits for
         # the direct bootstrap. Detached-output descendants can still hold the probe CWD open.
         # Prove the owned Job empty while the handle remains queryable, then release it.
+        # This does not promise that unrelated filesystem handles have also been released.
         try:
             self.terminate_and_wait()
         finally:
@@ -579,8 +581,39 @@ def isolated_probe_environment(environment: dict[str, str], root: Path) -> dict[
     return clean
 
 
+def cleanup_temporary_directory(temporary: tempfile.TemporaryDirectory[str], timeout: float = 5.0) -> None:
+    """Retry only Windows sharing violations while removing a directory we created."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            temporary.cleanup()
+            return
+        except OSError as error:
+            # Job membership has already been checked separately by run_command. A filesystem
+            # handle outside that Job can briefly prevent deletion even after its count is zero.
+            # Never turn access errors, persistent locks, or process teardown failures into success.
+            if getattr(error, "winerror", None) != 32 or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+@contextmanager
+def owned_temporary_directory(*, prefix: str) -> Iterator[str]:
+    temporary = tempfile.TemporaryDirectory(prefix=prefix)
+    try:
+        yield temporary.name
+    except BaseException as error:
+        try:
+            cleanup_temporary_directory(temporary)
+        except OSError as cleanup_error:
+            raise error from cleanup_error
+        raise
+    else:
+        cleanup_temporary_directory(temporary)
+
+
 def capture_cli_probe(binary: Path, flag: str, environment: dict[str, str]) -> CommandResult:
-    with tempfile.TemporaryDirectory(prefix="skillmount-agent-probe-") as temporary:
+    with owned_temporary_directory(prefix="skillmount-agent-probe-") as temporary:
         root = Path(temporary)
         completed = run_command(
             [str(binary), flag], environment=isolated_probe_environment(environment, root),
@@ -1028,7 +1061,7 @@ def main() -> int:
             elif not case.opt_in and not args.probes_only:
                 raise RuntimeError(f"required credential {case.credential_name} is unavailable")
 
-        with tempfile.TemporaryDirectory(prefix="skillmount live smoke-") as temporary:
+        with owned_temporary_directory(prefix="skillmount live smoke-") as temporary:
             root = Path(temporary)
             project = root / "project"
             project.mkdir()
