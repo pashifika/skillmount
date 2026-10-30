@@ -180,6 +180,10 @@ OMP scans immediate `<root>/<entry>/SKILL.md` children, not individual `SKILL.md
 collections. Pass the containing collection, not an individual Skill. OMP gives the first custom
 occurrence its bare name; differing duplicates can remain under namespaced aliases, while identical
 content can collapse. **OMP does not use SkillMount's Codex/Claude rightmost-wins or conflict policy.**
+Default `inspect` covers all agents: an individual Skill input still reports Codex/Claude, but
+returns a partial failure naming OMP's collection-only requirement. Use a collection for all-agent
+success, or `inspect --agent codex` / `--agent claude` for a direct Skill.
+
 Configured filters and `--skills`/`--no-skills` remain OMP policy; SkillMount does not promise that
 every directory entry will load or that only one duplicate remains visible.
 
