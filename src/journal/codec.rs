@@ -149,6 +149,20 @@ impl Line {
             .map(|(_, value)| value.as_str())
     }
 
+    #[cfg(test)]
+    pub(crate) fn remove_field(&mut self, key: &str) {
+        self.fields.retain(|(name, _)| name != key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_field(&mut self, key: &str, token: String) {
+        if let Some((_, value)) = self.fields.iter_mut().find(|(name, _)| name == key) {
+            *value = token;
+        } else {
+            self.push(key, token);
+        }
+    }
+
     /// Renders the line without its trailing newline.
     pub(crate) fn render(&self) -> String {
         let mut rendered = self.record.clone();
@@ -213,16 +227,24 @@ impl std::fmt::Display for DecodeError {
     }
 }
 
-/// Renders a header and body into the exact bytes a journal file holds.
+/// Renders a header and body into the exact bytes a current journal file holds.
 pub(crate) fn render_document(lines: &[Line]) -> Vec<u8> {
+    render_document_with_schema(lines, super::SCHEMA_VERSION)
+}
+
+#[cfg(test)]
+pub(crate) fn render_document_for_schema(lines: &[Line], schema_version: u32) -> Vec<u8> {
+    render_document_with_schema(lines, schema_version)
+}
+
+fn render_document_with_schema(lines: &[Line], schema_version: u32) -> Vec<u8> {
     let mut body = String::new();
     for line in lines {
         body.push_str(&line.render());
         body.push('\n');
     }
     let header = format!(
-        "{MAGIC} {} {PLATFORM} {}\n",
-        super::SCHEMA_VERSION,
+        "{MAGIC} {schema_version} {PLATFORM} {}\n",
         checksum(body.as_bytes())
     );
     let mut document = header.into_bytes();
@@ -230,8 +252,15 @@ pub(crate) fn render_document(lines: &[Line]) -> Vec<u8> {
     document
 }
 
-/// Validates the header and checksum and returns the parsed body lines.
-pub(crate) fn parse_document(document: &[u8]) -> Result<Vec<Line>, DecodeError> {
+#[derive(Debug)]
+/// A checksum-verified document and the schema needed to interpret its body.
+pub(crate) struct ParsedDocument {
+    pub(crate) schema_version: u32,
+    pub(crate) lines: Vec<Line>,
+}
+
+/// Validates the header and checksum and returns the schema plus parsed body lines.
+pub(crate) fn parse_document(document: &[u8]) -> Result<ParsedDocument, DecodeError> {
     let text = std::str::from_utf8(document)
         .map_err(|_| DecodeError::Malformed("the file is not valid UTF-8".to_owned()))?;
     let (header, body) = text
@@ -261,9 +290,13 @@ pub(crate) fn parse_document(document: &[u8]) -> Result<Vec<Line>, DecodeError> 
 
     // The version is checked before the checksum so a future journal reports the reason an
     // operator can act on rather than a checksum whose algorithm may itself have changed.
-    if version != super::SCHEMA_VERSION.to_string() {
+    let schema_version = if version == super::SCHEMA_VERSION.to_string() {
+        super::SCHEMA_VERSION
+    } else if version == super::LEGACY_SCHEMA_VERSION.to_string() {
+        super::LEGACY_SCHEMA_VERSION
+    } else {
         return Err(DecodeError::UnsupportedVersion(version.to_owned()));
-    }
+    };
     if platform != PLATFORM {
         return Err(DecodeError::ForeignPlatform(platform.to_owned()));
     }
@@ -285,7 +318,10 @@ pub(crate) fn parse_document(document: &[u8]) -> Result<Vec<Line>, DecodeError> 
             DecodeError::Malformed("a record line is not `name key=value ...`".to_owned())
         })?);
     }
-    Ok(lines)
+    Ok(ParsedDocument {
+        schema_version,
+        lines,
+    })
 }
 
 /// Returns the lowercase hexadecimal SHA-256 digest of `bytes`.

@@ -65,6 +65,8 @@ pub enum Checkpoint {
     ActionApplied,
     /// Every action is applied and the transaction is durably active.
     JournalActive,
+    /// Every action is applied and the pre-spawn launch-invariant recheck has not run yet.
+    SpawnBoundary,
     /// Child supervision intent is durable; process-domain death has not been proved.
     JournalSupervising,
     /// Cleanup has durably begun and nothing has been removed yet.
@@ -73,6 +75,8 @@ pub enum Checkpoint {
     EntryRemoved,
     /// A helper directory has been removed and the journal has not recorded it yet.
     DirectoryRemoved,
+    /// A preserved helper directory's action is durably reconciled while the directory remains.
+    ScaffoldingReconciled,
     /// Cleanup is durably complete and the terminal journal has not been retired yet.
     JournalCompleted,
     /// The terminal journal has been durably renamed out of the scanner namespace.
@@ -94,17 +98,19 @@ impl Checkpoint {
             Self::FinalPlaced => "final-placed",
             Self::ActionApplied => "action-applied",
             Self::JournalActive => "journal-active",
+            Self::SpawnBoundary => "spawn-boundary",
             Self::JournalSupervising => "journal-supervising",
             Self::JournalCleaning => "journal-cleaning",
             Self::EntryRemoved => "entry-removed",
             Self::DirectoryRemoved => "directory-removed",
+            Self::ScaffoldingReconciled => "scaffolding-reconciled",
             Self::JournalCompleted => "journal-completed",
             Self::JournalRetired => "journal-retired",
         }
     }
 
     /// Every boundary, so a test suite can assert it covers all of them.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::DiscoveryInspected,
         Self::JournalScanComplete,
         Self::JournalPlanned,
@@ -115,10 +121,12 @@ impl Checkpoint {
         Self::FinalPlaced,
         Self::ActionApplied,
         Self::JournalActive,
+        Self::SpawnBoundary,
         Self::JournalSupervising,
         Self::JournalCleaning,
         Self::EntryRemoved,
         Self::DirectoryRemoved,
+        Self::ScaffoldingReconciled,
         Self::JournalCompleted,
         Self::JournalRetired,
     ];

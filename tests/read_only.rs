@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ASM: &str = env!("CARGO_BIN_EXE_asm");
 const SKILLMOUNT: &str = env!("CARGO_BIN_EXE_skillmount");
+#[cfg(feature = "test-fixtures")]
+const FAKE_AGENT: &str = env!("CARGO_BIN_EXE_skillmount-fake-agent");
 
 /// A fixture holding a project, a Skill source, and a private home directory.
 ///
@@ -42,6 +44,10 @@ impl Fixture {
         for path in [&project, &sources, &home, &root.join("codex-home")] {
             fs::create_dir_all(path).expect("fixture directory");
         }
+        // OMP's Skill-root ancestor walk stops at the nearest directory holding a `.git` entry
+        // (`capability/fs.ts:84-95`), so an unanchored project walks to the filesystem root and
+        // lets a directory above the shared temporary root decide what the fixture discovers.
+        fs::create_dir(project.join(".git")).expect("project repository anchor");
         let launch_sentinel = root.join("agent-was-launched");
         let agent_bin = fake_agent_executable(&root, &launch_sentinel);
         Self {
@@ -88,6 +94,15 @@ impl Fixture {
             )
             .env_remove("CLAUDE_CODE_SAFE_MODE")
             .env_remove("CLAUDE_CODE_SIMPLE")
+            .env("SKILLMOUNT_TEST_OMP_VERSION", "omp/18.14.0")
+            // OMP resolves its roots from the environment, so the developer's real profile,
+            // configuration overlay, and XDG bases must never reach a fixture.
+            .env_remove("OMP_PROFILE")
+            .env_remove("PI_PROFILE")
+            .env_remove("PI_CONFIG_FILES")
+            .env_remove("PI_CONFIG_DIR")
+            .env_remove("PI_CODING_AGENT_DIR")
+            .env_remove("XDG_DATA_HOME")
             .env("SKILLMOUNT_STATE_DIR", self.root.join("state"))
             .env(
                 "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
@@ -123,28 +138,65 @@ impl Fixture {
     }
 
     fn assert_roots_unchanged(&self, roots: &[PathBuf], arguments: &[&str]) -> Output {
+        self.assert_command_unchanged(roots, self.command(arguments), &arguments.join(" "))
+    }
+
+    /// The same guarantee for a command the caller had to configure itself.
+    fn assert_command_unchanged(
+        &self,
+        roots: &[PathBuf],
+        mut command: Command,
+        label: &str,
+    ) -> Output {
         let before = roots
             .iter()
             .map(|root| (root.clone(), snapshot(root)))
             .collect::<Vec<_>>();
 
-        let output = self.run(arguments);
+        let output = command.output().expect("asm should run");
 
         for (root, expected) in before {
             assert_eq!(
                 snapshot(&root),
                 expected,
-                "`asm {}` modified {}",
-                arguments.join(" "),
+                "`asm {label}` modified {}",
                 root.display()
             );
         }
         assert!(
             !self.launch_sentinel.exists(),
-            "`asm {}` launched a child process",
-            arguments.join(" ")
+            "`asm {label}` launched a child process"
         );
         output
+    }
+
+    /// Asserts an inspection changed nothing, with every Agent name resolving inside the fixture.
+    ///
+    /// `inspect` takes no `--agent-bin`, so a fixture-owned `PATH` is the only way to hand an
+    /// inspection a launchable Agent. Without one nothing can write `launch_sentinel`, so "launched
+    /// no child" would assert nothing, and the developer's own installed Agent would be the process
+    /// a regression actually started.
+    fn assert_inspection_unchanged(&self, arguments: &[&str]) -> Output {
+        let mut command = self.command(arguments);
+        command.env("PATH", self.agent_search_path());
+        self.assert_command_unchanged(&self.watched(), command, &arguments.join(" "))
+    }
+
+    /// A search path resolving every Agent executable name to the launch sentinel.
+    ///
+    /// The path holds nothing else, so an `inspect` given it cannot reach the developer's installed
+    /// Agents, and `fake_agent_executable` records the launch with a shell redirection rather than
+    /// an external utility precisely so a fixture-only search path stays enough to write it.
+    fn agent_search_path(&self) -> std::ffi::OsString {
+        let bin = self.root.join("agent-path");
+        fs::create_dir_all(&bin).expect("PATH fixture");
+        for agent in ["codex", "claude", "omp"] {
+            let executable = bin.join(format!("{agent}{}", std::env::consts::EXE_SUFFIX));
+            if !executable.exists() {
+                fs::copy(&self.agent_bin, &executable).expect("fixture Agent executable");
+            }
+        }
+        std::env::join_paths([&bin]).expect("PATH fixture encoding")
     }
 }
 
@@ -154,6 +206,27 @@ impl Drop for Fixture {
     }
 }
 
+fn assert_access_aware_lock_plan(rendered: &str) {
+    let has = |access: &str, kind: &str| {
+        rendered.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next() == Some(access) && fields.next() == Some(kind)
+        })
+    };
+    assert!(
+        has("observe", "discovery-entry"),
+        "the read-only plan must label observed discovery evidence: {rendered}"
+    );
+    assert!(
+        has("mutate", "discovery-entry"),
+        "the read-only plan must label its mutation-capable namespace: {rendered}"
+    );
+    assert!(
+        has("mutate", "backing-store"),
+        "the read-only plan must label its mutation-capable backing store: {rendered}"
+    );
+}
+
 /// Provides a native executable for the mutation-boundary launch sentinel.
 fn fake_agent_executable(root: &Path, sentinel: &Path) -> PathBuf {
     #[cfg(unix)]
@@ -161,7 +234,13 @@ fn fake_agent_executable(root: &Path, sentinel: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let path = root.join("fake-agent");
-        fs::write(&path, format!("#!/bin/sh\ntouch {}\n", sentinel.display())).expect("fake agent");
+        // A shell redirection, not `touch`: a copy of this script placed on a fixture-only `PATH`
+        // has no external utility to resolve, so the sentinel still records the launch.
+        fs::write(
+            &path,
+            format!("#!/bin/sh\n: > \"{}\"\n", sentinel.display()),
+        )
+        .expect("fake agent");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("fake agent mode");
         path
     }
@@ -174,7 +253,12 @@ fn fake_agent_executable(root: &Path, sentinel: &Path) -> PathBuf {
     }
 }
 
-fn create_broken_directory_link(link: &Path, missing_target: &Path) {
+/// Creates a broken directory link, returning whether the host allowed it.
+///
+/// Windows needs Developer Mode or an elevated process, so a contributor without either still gets
+/// a usable suite while `SKILLMOUNT_REQUIRE_LINKS` keeps CI from silently losing link coverage.
+#[must_use]
+fn create_broken_directory_link(link: &Path, missing_target: &Path) -> bool {
     #[cfg(unix)]
     let result = std::os::unix::fs::symlink(missing_target, link);
     #[cfg(windows)]
@@ -186,7 +270,9 @@ fn create_broken_directory_link(link: &Path, missing_target: &Path) {
             "required broken-link fixture could not be created at {}: {error}",
             link.display()
         );
+        return false;
     }
+    true
 }
 
 /// Records a tree without following links, so a replaced link shows up as a difference.
@@ -251,7 +337,9 @@ fn completions_ignore_invalid_state_and_leave_every_sentinel_unchanged() {
     fs::write(fixture.sources.join("source-sentinel"), b"source bytes").expect("source sentinel");
     let discovery = fixture.project.join(".agents/skills");
     fs::create_dir_all(&discovery).expect("discovery directory");
-    create_broken_directory_link(
+    // Completion generation must ignore this entry whether or not the host admits the link, so a
+    // skipped fixture only narrows the state this case presents, never its expectation.
+    let _ = create_broken_directory_link(
         &discovery.join("broken-skill"),
         &fixture.root.join("missing-discovery-target"),
     );
@@ -297,18 +385,54 @@ fn completions_ignore_invalid_state_and_leave_every_sentinel_unchanged() {
 }
 
 #[test]
-fn inspect_reports_both_agents_without_touching_anything() {
+fn inspect_reports_every_registered_agent_without_touching_anything() {
     let fixture = Fixture::new("inspect");
     fixture.skill("alpha");
     let sources = fixture.sources.to_string_lossy().into_owned();
 
-    let output = fixture.assert_unchanged(&["inspect", "--skills-dir", &sources]);
+    let output = fixture.assert_inspection_unchanged(&["inspect", "--skills-dir", &sources]);
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let rendered = String::from_utf8_lossy(&output.stdout);
     assert!(rendered.contains("Agent:          codex"));
     assert!(rendered.contains("Agent:          claude"));
+    assert!(rendered.contains("Agent:          omp"));
     assert!(rendered.contains("Overlay: 1 Skill(s)"));
+    assert!(rendered.contains("codex-cli 0.146.0"));
+    assert!(rendered.contains("2.1.220 (Claude Code)"));
+    assert!(rendered.contains("omp/18.14.0"));
+    assert_eq!(rendered.matches("executable not queried").count(), 3);
+    assert_access_aware_lock_plan(&rendered);
+}
+
+#[test]
+fn inspect_can_be_filtered_to_omp() {
+    let fixture = Fixture::new("inspect-omp");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let output = fixture.assert_inspection_unchanged(&[
+        "inspect",
+        "--skills-dir",
+        &sources,
+        "--agent",
+        "omp",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("Agent:          omp"), "{rendered}");
+    assert!(rendered.contains("CONFIG"), "{rendered}");
+    assert!(!rendered.contains("Agent:          codex"));
+    assert!(!rendered.contains("Agent:          claude"));
 }
 
 #[test]
@@ -324,6 +448,254 @@ fn inspect_can_be_filtered_to_one_agent() {
     let rendered = String::from_utf8_lossy(&output.stdout);
     assert!(rendered.contains("Agent:          claude"));
     assert!(!rendered.contains("Agent:          codex"));
+}
+
+/// A selected session must not be decided by configuration belonging to the other Agent.
+///
+/// The variable names a process this run will never launch, so honouring it would report a failure
+/// the operator cannot act on. The same value must still be fatal when its own Agent is selected,
+/// which is what keeps this isolation rather than a weakened check.
+#[test]
+fn a_selected_claude_session_ignores_codex_configuration_that_fails_codex() {
+    let fixture = Fixture::new("isolate-codex-home");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let missing = fixture.root.join("no-such-codex-home");
+
+    let claude = fixture
+        .command(&["claude", "--dry-run", "--skills-dir", &sources])
+        .env("CODEX_HOME", &missing)
+        .output()
+        .expect("asm should run");
+    assert!(
+        claude.status.success(),
+        "Claude must ignore CODEX_HOME: {}",
+        String::from_utf8_lossy(&claude.stderr)
+    );
+
+    let codex = fixture
+        .command(&[
+            "codex",
+            "--dry-run",
+            "--skills-dir",
+            &sources,
+            "--",
+            "exec",
+            "fixture",
+        ])
+        .env("CODEX_HOME", &missing)
+        .output()
+        .expect("asm should run");
+    assert_eq!(
+        codex.status.code(),
+        Some(66),
+        "Codex must still reject its own unusable configuration: {}",
+        String::from_utf8_lossy(&codex.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&codex.stderr).contains("CODEX_HOME"),
+        "the selected Agent's diagnostic must name the variable"
+    );
+    assert_no_read_only_residue(&fixture);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_selected_codex_session_ignores_a_drive_relative_claude_config_dir() {
+    let fixture = Fixture::new("isolate-claude-config");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let codex = fixture
+        .command(&[
+            "codex",
+            "--dry-run",
+            "--skills-dir",
+            &sources,
+            "--",
+            "exec",
+            "fixture",
+        ])
+        .env("CLAUDE_CONFIG_DIR", "C:relative-claude")
+        .output()
+        .expect("asm should run");
+    assert!(
+        codex.status.success(),
+        "Codex must ignore CLAUDE_CONFIG_DIR: {}",
+        String::from_utf8_lossy(&codex.stderr)
+    );
+
+    let claude = fixture
+        .command(&["claude", "--dry-run", "--skills-dir", &sources])
+        .env("CLAUDE_CONFIG_DIR", "C:relative-claude")
+        .output()
+        .expect("asm should run");
+    assert_eq!(
+        claude.status.code(),
+        Some(64),
+        "Claude must still reject an ambiguous drive-relative root: {}",
+        String::from_utf8_lossy(&claude.stderr)
+    );
+    assert_no_read_only_residue(&fixture);
+}
+
+/// Proves isolation without weakening the selected Agent's platform-native handling.
+///
+/// The relocated Claude user root holds a conflicting `alpha`, so Claude must fail on it while
+/// Codex succeeds — the value is honoured verbatim for its own Agent and never read for the other.
+// macOS rejects a non-UTF-8 filename outright, so the platform-native case is asserted where the
+// filesystem admits one. The Windows drive-relative case above covers that platform's own spelling.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_non_unicode_claude_config_dir_reaches_claude_only() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new("isolate-non-unicode-claude");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let mut relocated = fixture.root.clone().into_os_string().into_vec();
+    relocated.extend_from_slice(b"/claude-\xFF");
+    let relocated = PathBuf::from(OsString::from_vec(relocated));
+    let existing = relocated.join("skills/alpha");
+    fs::create_dir_all(&existing).expect("relocated Claude user scope");
+    fs::write(
+        existing.join("SKILL.md"),
+        "---\nname: alpha\ndescription: relocated user alpha\n---\n",
+    )
+    .expect("relocated SKILL.md");
+
+    let codex = fixture
+        .command(&[
+            "codex",
+            "--dry-run",
+            "--skills-dir",
+            &sources,
+            "--",
+            "exec",
+            "fixture",
+        ])
+        .env("CLAUDE_CONFIG_DIR", &relocated)
+        .output()
+        .expect("asm should run");
+    assert!(
+        codex.status.success(),
+        "Codex must never read CLAUDE_CONFIG_DIR: {}",
+        String::from_utf8_lossy(&codex.stderr)
+    );
+
+    let claude = fixture
+        .command(&["claude", "--dry-run", "--skills-dir", &sources])
+        .env("CLAUDE_CONFIG_DIR", &relocated)
+        .output()
+        .expect("asm should run");
+    assert_eq!(
+        claude.status.code(),
+        Some(73),
+        "Claude must honour the non-Unicode root it was given: {}",
+        String::from_utf8_lossy(&claude.stderr)
+    );
+    assert_no_read_only_residue(&fixture);
+}
+
+/// Asserts that a read-only path created no `SkillMount` state and launched no child.
+///
+/// A dry run resolves configuration, so a test that changes an Agent variable must still prove the
+/// resolution stayed read-only rather than only checking the exit code.
+fn assert_no_read_only_residue(fixture: &Fixture) {
+    assert!(
+        !fixture.root.join("state").exists(),
+        "a read-only path must not create SkillMount state"
+    );
+    assert!(
+        !fixture.launch_sentinel.exists(),
+        "a read-only path must not launch a child process"
+    );
+    assert!(
+        !fixture.project.join(".agents").exists(),
+        "a read-only path must not create a destination directory"
+    );
+    assert!(
+        !fixture.project.join(".claude").exists(),
+        "a read-only path must not create a destination directory"
+    );
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn inspect_and_both_dry_runs_launch_neither_version_observation_nor_child_process() {
+    let fixture = Fixture::new("all-read-only-process-free");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let fake_agent = Path::new(FAKE_AGENT).to_string_lossy().into_owned();
+    let version_record = fixture.root.join("version-process.record");
+    let child_record = fixture.root.join("child-process.record");
+    let bin = fixture.root.join("agent-bin");
+    fs::create_dir(&bin).expect("PATH fixture");
+    for name in ["codex", "claude"] {
+        fs::copy(
+            FAKE_AGENT,
+            bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .expect("copy native fake Agent");
+    }
+    let search_path = std::env::join_paths([&bin]).expect("PATH fixture encoding");
+
+    let mut commands = [
+        fixture.command(&["inspect", "--skills-dir", &sources]),
+        fixture.command(&[
+            "codex",
+            "--skills-dir",
+            &sources,
+            "--agent-bin",
+            &fake_agent,
+            "--dry-run",
+            "--",
+            "exec",
+            "fixture",
+        ]),
+        fixture.command(&[
+            "claude",
+            "--skills-dir",
+            &sources,
+            "--agent-bin",
+            &fake_agent,
+            "--dry-run",
+        ]),
+    ];
+    for (index, command) in commands.iter_mut().enumerate() {
+        let before = snapshot(&fixture.root);
+        let output = command
+            .env("PATH", &search_path)
+            .env_remove("SKILLMOUNT_TEST_CODEX_VERSION")
+            .env_remove("SKILLMOUNT_TEST_CLAUDE_VERSION")
+            .env("SKILLMOUNT_FAKE_VERSION_RECORD", &version_record)
+            .env("SKILLMOUNT_FAKE_RECORD", &child_record)
+            .output()
+            .expect("read-only command should run");
+
+        assert!(
+            output.status.success(),
+            "read-only case {index}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            snapshot(&fixture.root),
+            before,
+            "read-only case {index} changed the fixture"
+        );
+        assert!(
+            !version_record.exists(),
+            "read-only case {index} launched --version"
+        );
+        assert!(
+            !child_record.exists(),
+            "read-only case {index} launched the Agent child"
+        );
+        let rendered = String::from_utf8_lossy(&output.stdout);
+        assert!(rendered.contains("advisory evidence; executable not queried"));
+    }
 }
 
 #[test]
@@ -354,6 +726,56 @@ fn a_codex_dry_run_plans_the_whole_layout_without_creating_it() {
     );
     assert!(!fixture.project.join(".codex").exists());
     assert!(!fixture.project.join(".agents").exists());
+    assert!(rendered.contains("codex-cli 0.146.0"));
+    assert!(rendered.contains("advisory evidence; executable not queried"));
+    assert_access_aware_lock_plan(&rendered);
+}
+
+/// A verbose read-only plan says which entries a later cleanup is obliged to reconcile.
+///
+/// The disposition is part of the plan an operator reads before anything is mutated: a created Skill
+/// link is cleanup-critical, the discovery chain beneath it is scaffolding a later pass may leave
+/// behind. Rendering it must still create nothing.
+#[test]
+fn a_verbose_dry_run_marks_only_created_skill_links_as_cleanup_critical() {
+    let fixture = Fixture::new("dry-run-disposition");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let output = fixture.assert_unchanged(&[
+        "codex",
+        "--skills-dir",
+        &sources,
+        "--dry-run",
+        "--verbose",
+        "--",
+        "exec",
+        "fixture",
+    ]);
+
+    assert!(output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    // Every action carries a disposition, and the counts pin which kind gets which: the observed
+    // plan is `MKDIR .agents`, `MKDIR .agents/skills`, then the mounted Skill link, so exactly one
+    // action is cleanup-critical and the two directories beneath it are scaffolding.
+    assert_eq!(
+        rendered.matches("cleanup=cleanup-critical").count(),
+        1,
+        "{rendered}"
+    );
+    assert_eq!(
+        rendered.matches("cleanup=scaffolding").count(),
+        2,
+        "{rendered}"
+    );
+    // The directories are established before the link that needs them, so the first disposition the
+    // plan reports is scaffolding.
+    assert!(
+        rendered.find("cleanup=scaffolding") < rendered.find("cleanup=cleanup-critical"),
+        "{rendered}"
+    );
+    assert!(!fixture.project.join(".agents").exists());
+    assert!(!fixture.project.join(".codex").exists());
 }
 
 #[test]
@@ -522,6 +944,9 @@ fn a_claude_dry_run_never_creates_a_session_root() {
             && !fixture.home.join("AppData/Local/skillmount").exists(),
         "no session or transaction storage may be created"
     );
+    assert!(rendered.contains("2.1.220 (Claude Code)"));
+    assert!(rendered.contains("advisory evidence; executable not queried"));
+    assert_access_aware_lock_plan(&rendered);
 }
 
 #[test]
@@ -1131,4 +1556,625 @@ fn read_only_output_is_identical_across_runs() {
 
     assert_eq!(first.stdout, second.stdout);
     assert_eq!(first.stderr, second.stderr);
+}
+
+/// Asserts that no OMP read-only path left a destination, state, or child behind.
+fn assert_no_omp_residue(fixture: &Fixture) {
+    assert!(
+        !fixture.project.join(".omp").exists(),
+        "an OMP read-only path must not create the project scope it plans"
+    );
+    assert!(
+        !fixture.root.join("state").exists(),
+        "an OMP read-only path must not create SkillMount state"
+    );
+    assert!(
+        !fixture.launch_sentinel.exists(),
+        "an OMP read-only path must not launch a child process"
+    );
+}
+
+#[test]
+fn an_omp_dry_run_plans_a_private_config_without_creating_it() {
+    let fixture = Fixture::new("dry-run-omp");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let output = fixture.assert_unchanged(&["omp", "--skills-dir", &sources, "--dry-run"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("CONFIG"), "{rendered}");
+    assert!(rendered.contains("--config"), "{rendered}");
+    assert!(rendered.contains("delegated"), "{rendered}");
+    assert!(!rendered.contains("LINK   .omp"), "{rendered}");
+    assert_no_omp_residue(&fixture);
+}
+
+#[test]
+fn an_omp_dry_run_does_not_mutate_an_existing_linked_scope() {
+    let fixture = Fixture::new("omp-linked-scope");
+    fixture.skill("alpha");
+    let scope = fixture.project.join(".omp");
+    fs::create_dir_all(&scope).unwrap();
+    let shared = fixture.root.join("shared-store");
+    fs::create_dir_all(&shared).unwrap();
+    if !create_broken_directory_link(&scope.join("skills"), &shared) {
+        return;
+    }
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let output = fixture.assert_unchanged(&["omp", "--skills-dir", &sources, "--dry-run"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::canonicalize(scope.join("skills")).unwrap(),
+        fs::canonicalize(shared).unwrap()
+    );
+    assert!(!fixture.root.join("state").exists());
+}
+
+#[test]
+fn both_executables_render_an_identical_omp_dry_run() {
+    let fixture = Fixture::new("omp-dry-run-both-names");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let agent_bin = fixture.agent_bin.to_string_lossy().into_owned();
+    let arguments = [
+        "omp",
+        "--skills-dir",
+        &sources,
+        "--agent-bin",
+        &agent_bin,
+        "--dry-run",
+    ];
+
+    let [asm, skillmount] = [ASM, SKILLMOUNT].map(|binary| {
+        fixture
+            .command_for(binary, &arguments)
+            .output()
+            .expect("an OMP dry run should run under either installed name")
+    });
+
+    assert!(
+        asm.status.success() && skillmount.status.success(),
+        "{}",
+        String::from_utf8_lossy(&asm.stderr)
+    );
+    // The plan describes the OMP session, never the wrapper that printed it, so the installed name
+    // may not leak into a single byte of it.
+    assert_eq!(asm.stdout, skillmount.stdout);
+    assert_eq!(asm.stderr, skillmount.stderr);
+    assert_no_omp_residue(&fixture);
+}
+
+#[test]
+fn omp_read_only_output_is_identical_across_runs() {
+    let fixture = Fixture::new("omp-deterministic");
+    fixture.skill("gamma");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let agent_bin = fixture.agent_bin.to_string_lossy().into_owned();
+    let search_path = fixture.agent_search_path();
+
+    for arguments in [
+        ["inspect", "--skills-dir", &sources, "--agent", "omp"].as_slice(),
+        [
+            "omp",
+            "--skills-dir",
+            &sources,
+            "--agent-bin",
+            &agent_bin,
+            "--dry-run",
+        ]
+        .as_slice(),
+    ] {
+        // `inspect` has no `--agent-bin`, so the fixture search path is what makes an accidental
+        // child launch land on the sentinel instead of the developer's installed OMP.
+        let run = || {
+            fixture
+                .command(arguments)
+                .env("PATH", &search_path)
+                .output()
+                .expect("asm should run")
+        };
+        let first = run();
+        let second = run();
+
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(first.stdout, second.stdout, "{arguments:?}");
+        assert_eq!(first.stderr, second.stderr, "{arguments:?}");
+    }
+    assert_no_omp_residue(&fixture);
+}
+
+#[test]
+fn a_missing_omp_executable_fails_before_any_project_or_state_is_created() {
+    let fixture = Fixture::new("omp-missing-executable");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let empty_bin = fixture.root.join("empty-bin");
+    fs::create_dir(&empty_bin).expect("PATH fixture");
+    let search_path = std::env::join_paths([&empty_bin]).expect("PATH fixture encoding");
+    let before = fixture
+        .watched()
+        .into_iter()
+        .map(|root| (root.clone(), snapshot(&root)))
+        .collect::<Vec<_>>();
+
+    // A mutating session resolves the executable, and OMP is the only Agent whose destination lives
+    // in the launch CWD, so an unresolvable executable must be refused before that scope appears.
+    let output = fixture
+        .command(&["omp", "--skills-dir", &sources])
+        .env("PATH", &search_path)
+        .output()
+        .expect("asm should run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(66), "{stderr}");
+    assert!(stderr.contains("input omp is unavailable"), "{stderr}");
+    for (root, expected) in before {
+        assert_eq!(snapshot(&root), expected, "{}", root.display());
+    }
+    assert_no_omp_residue(&fixture);
+}
+
+/// One OMP passthrough rejection class and the tokens that must reach it.
+struct OmpRejection {
+    /// Tokens forwarded after `--`, in the spelling an operator would type.
+    forwarded: &'static [&'static str],
+    /// The offending token exactly as the diagnostic names it.
+    ///
+    /// A flag is reported without its value, `--mode` is reported with the selector that made it a
+    /// protocol server, and a subcommand is reported quoted. Asserting this spelling is what proves
+    /// the operator is told which token to remove rather than only which contract refused it.
+    named: &'static str,
+    /// The diagnostic fragment naming the contract that refused them.
+    fragment: &'static str,
+}
+
+/// Every OMP passthrough class `SkillMount` refuses, with both value spellings where they differ.
+const OMP_REJECTED_PASSTHROUGH: &[OmpRejection] = &[
+    OmpRejection {
+        forwarded: &["--cwd", "other"],
+        named: "--cwd",
+        fragment: "relocates the discovery root",
+    },
+    OmpRejection {
+        forwarded: &["--cwd=other"],
+        named: "--cwd",
+        fragment: "relocates the discovery root",
+    },
+    OmpRejection {
+        forwarded: &["--profile", "work"],
+        named: "--profile",
+        fragment: "relocates the discovery root",
+    },
+    OmpRejection {
+        forwarded: &["--alias", "shortcut"],
+        named: "--alias",
+        fragment: "relocates the discovery root",
+    },
+    OmpRejection {
+        forwarded: &["--config", "skills.enabled=false"],
+        named: "--config",
+        fragment: "relocates the discovery root",
+    },
+    OmpRejection {
+        forwarded: &["--config=skills.enabled=false"],
+        named: "--config",
+        fragment: "relocates the discovery root",
+    },
+    OmpRejection {
+        forwarded: &["-e", "extension"],
+        named: "-e",
+        fragment: "changes the Skill",
+    },
+    OmpRejection {
+        forwarded: &["--extension", "extension"],
+        named: "--extension",
+        fragment: "changes the Skill",
+    },
+    OmpRejection {
+        forwarded: &["--hook", "hook"],
+        named: "--hook",
+        fragment: "changes the Skill",
+    },
+    OmpRejection {
+        forwarded: &["--no-extensions"],
+        named: "--no-extensions",
+        fragment: "changes the Skill",
+    },
+    OmpRejection {
+        forwarded: &["--plugin-dir", "packages"],
+        named: "--plugin-dir",
+        fragment: "changes the Skill",
+    },
+    OmpRejection {
+        forwarded: &["-c"],
+        named: "-c",
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--continue"],
+        named: "--continue",
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["-r"],
+        named: "-r",
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--resume"],
+        named: "--resume",
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--session"],
+        named: "--session",
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--fork", "01JEXAMPLE"],
+        named: "--fork",
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--from-claude"],
+        named: "--from-claude",
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--from-codex"],
+        named: "--from-codex",
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--export", "transcript.md"],
+        named: "--export",
+        fragment: "resumes, forks, imports",
+    },
+    OmpRejection {
+        forwarded: &["--mode", "rpc"],
+        named: "--mode=rpc",
+        fragment: "protocol server",
+    },
+    OmpRejection {
+        forwarded: &["--mode=rpc-ui"],
+        named: "--mode=rpc-ui",
+        fragment: "protocol server",
+    },
+    OmpRejection {
+        forwarded: &["--mode", "acp"],
+        named: "--mode=acp",
+        fragment: "protocol server",
+    },
+    OmpRejection {
+        forwarded: &["acp"],
+        named: "\"acp\"",
+        fragment: "does not start a supervised foreground session",
+    },
+    OmpRejection {
+        forwarded: &["config"],
+        named: "\"config\"",
+        fragment: "does not start a supervised foreground session",
+    },
+    OmpRejection {
+        forwarded: &["plugin"],
+        named: "\"plugin\"",
+        fragment: "does not start a supervised foreground session",
+    },
+    OmpRejection {
+        forwarded: &["shell"],
+        named: "\"shell\"",
+        fragment: "does not start a supervised foreground session",
+    },
+    OmpRejection {
+        forwarded: &["worktree"],
+        named: "\"worktree\"",
+        fragment: "does not start a supervised foreground session",
+    },
+    OmpRejection {
+        forwarded: &["wt"],
+        named: "\"wt\"",
+        fragment: "does not start a supervised foreground session",
+    },
+    OmpRejection {
+        forwarded: &["q"],
+        named: "\"q\"",
+        fragment: "does not start a supervised foreground session",
+    },
+    OmpRejection {
+        forwarded: &["gc"],
+        named: "\"gc\"",
+        fragment: "does not start a supervised foreground session",
+    },
+];
+
+/// Both spellings of a session must refuse the same passthrough token at the same point.
+///
+/// A dry run never resolves an executable and a mutating run does, so only asserting the read-only
+/// path would leave open that validation moved behind lock and journal storage on the path that can
+/// actually mutate.
+#[test]
+fn omp_refuses_every_passthrough_class_on_the_read_only_and_the_mutating_path() {
+    let fixture = Fixture::new("omp-rejected-passthrough");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let agent_bin = fixture.agent_bin.to_string_lossy().into_owned();
+    let read_only = ["--dry-run", "--agent-bin", agent_bin.as_str()];
+    let mutating = ["--agent-bin", agent_bin.as_str()];
+
+    for case in OMP_REJECTED_PASSTHROUGH {
+        for mode in [read_only.as_slice(), mutating.as_slice()] {
+            let mut arguments = vec!["omp", "--skills-dir", &sources];
+            arguments.extend(mode.iter().copied());
+            arguments.push("--");
+            arguments.extend(case.forwarded.iter().copied());
+
+            let output = fixture.assert_unchanged(&arguments);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert_eq!(
+                output.status.code(),
+                Some(64),
+                "{:?} under {mode:?}: {stderr}",
+                case.forwarded
+            );
+            assert!(
+                stderr.contains(case.named),
+                "the refusal must name {} under {mode:?}: {stderr}",
+                case.named
+            );
+            assert!(
+                stderr.contains(case.fragment),
+                "{:?} under {mode:?}: {stderr}",
+                case.forwarded
+            );
+            assert_no_omp_residue(&fixture);
+        }
+    }
+}
+
+/// The variables that relocate every OMP root must be fatal before anything is reported.
+///
+/// `inspect` and `--dry-run` only describe a namespace, which is exactly why they have to refuse:
+/// a relocated root would make them describe a namespace the child never reads.
+#[test]
+fn omp_refuses_its_root_relocating_environment_on_every_read_only_path() {
+    let fixture = Fixture::new("omp-rejected-environment");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let agent_bin = fixture.agent_bin.to_string_lossy().into_owned();
+    let search_path = fixture.agent_search_path();
+
+    for variable in ["OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_FILES"] {
+        for arguments in [
+            ["inspect", "--skills-dir", &sources, "--agent", "omp"].as_slice(),
+            [
+                "omp",
+                "--skills-dir",
+                &sources,
+                "--agent-bin",
+                &agent_bin,
+                "--dry-run",
+            ]
+            .as_slice(),
+        ] {
+            let output = fixture
+                .command(arguments)
+                .env("PATH", &search_path)
+                .env(variable, "relocated")
+                .output()
+                .expect("asm should run");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert_eq!(
+                output.status.code(),
+                Some(64),
+                "{variable} under {arguments:?}: {stderr}"
+            );
+            assert!(stderr.contains(variable), "{stderr}");
+            assert!(
+                stderr.contains("unset it or run the agent directly"),
+                "{stderr}"
+            );
+            assert_no_omp_residue(&fixture);
+        }
+    }
+}
+
+/// One Agent's refusal must not discard the reports the other Agents already produced.
+///
+/// The default `inspect` selection is every Agent, and OMP is the only one with an environment
+/// gate inside its discovery. Propagating that refusal blanked the Codex and Claude sections too,
+/// so an operator who simply exports `OMP_PROFILE` lost the whole diagnostic.
+#[test]
+fn one_agents_inspect_refusal_keeps_the_other_agents_reports() {
+    let fixture = Fixture::new("inspect-agent-isolation");
+    fixture.skill("alpha");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let search_path = fixture.agent_search_path();
+
+    for variable in ["OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_FILES"] {
+        let output = fixture
+            .command(["inspect", "--skills-dir", &sources].as_slice())
+            .env("PATH", &search_path)
+            .env(variable, "relocated")
+            .output()
+            .expect("asm should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(stdout.contains("Agent:          codex"), "{stdout}");
+        assert!(stdout.contains("Agent:          claude"), "{stdout}");
+        assert!(
+            !stdout.contains("Agent:          omp"),
+            "the refusing Agent must not be reported: {stdout}"
+        );
+        assert!(
+            stderr.contains("OMP inspection was skipped") && stderr.contains(variable),
+            "the refusal must still be named: {stderr}"
+        );
+        // The refusal keeps its own exit category, so a script still sees the failure.
+        assert_eq!(output.status.code(), Some(64), "{stderr}");
+        assert_no_omp_residue(&fixture);
+    }
+}
+
+#[test]
+fn a_corrupt_omp_global_configuration_fails_without_changes() {
+    let fixture = Fixture::new("omp-corrupt-global-config");
+    fixture.skill("alpha");
+    let agent_dir = fixture.home.join(".omp/agent");
+    fs::create_dir_all(&agent_dir).expect("OMP agent directory");
+    fs::write(agent_dir.join("config.yml"), "skills: {enabled\n").expect("corrupt OMP config");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let agent_bin = fixture.agent_bin.to_string_lossy().into_owned();
+
+    let output = fixture.assert_unchanged(&[
+        "omp",
+        "--skills-dir",
+        &sources,
+        "--agent-bin",
+        &agent_bin,
+        "--dry-run",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // OMP's own global file is trusted configuration it quarantines and then throws on, so planning
+    // against an empty reading of it would model the wrong namespace.
+    assert_eq!(output.status.code(), Some(66), "{stderr}");
+    assert!(
+        stderr.contains("cannot preserve OMP customDirectories"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("config.yml"), "{stderr}");
+    assert_no_omp_residue(&fixture);
+}
+
+/// A third-party provider file OMP only warns about must not fail a session OMP itself starts.
+#[test]
+fn a_malformed_third_party_omp_project_settings_layer_fails_closed() {
+    let fixture = Fixture::new("omp-malformed-third-party-settings");
+    fixture.skill("alpha");
+    fs::create_dir_all(fixture.project.join(".cursor")).expect("third-party project scope");
+    fs::write(fixture.project.join(".cursor/settings.json"), "{not json")
+        .expect("malformed third-party settings");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let agent_bin = fixture.agent_bin.to_string_lossy().into_owned();
+
+    let output = fixture.assert_unchanged(&[
+        "omp",
+        "--skills-dir",
+        &sources,
+        "--agent-bin",
+        &agent_bin,
+        "--dry-run",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot preserve OMP"));
+    assert_no_omp_residue(&fixture);
+}
+
+#[test]
+fn a_codex_project_configuration_disabling_skills_is_delegated_to_omp() {
+    let fixture = Fixture::new("omp-codex-project-gate");
+    fixture.skill("alpha");
+    fs::create_dir_all(fixture.project.join(".codex")).expect("Codex project scope");
+    fs::write(
+        fixture.project.join(".codex/config.toml"),
+        "[skills]\nenabled = false\n",
+    )
+    .expect("Codex project configuration");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let agent_bin = fixture.agent_bin.to_string_lossy().into_owned();
+
+    let output = fixture.assert_unchanged(&[
+        "omp",
+        "--skills-dir",
+        &sources,
+        "--agent-bin",
+        &agent_bin,
+        "--dry-run",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr}");
+    assert_no_omp_residue(&fixture);
+}
+
+#[test]
+fn a_broken_omp_destination_link_is_left_to_native_discovery() {
+    let fixture = Fixture::new("omp-broken-destination-link");
+    fixture.skill("alpha");
+    let scope = fixture.project.join(".omp");
+    fs::create_dir(&scope).expect("OMP project scope");
+    if !create_broken_directory_link(&scope.join("skills"), &fixture.root.join("no-such-store")) {
+        return;
+    }
+    let sources = fixture.sources.to_string_lossy().into_owned();
+    let agent_bin = fixture.agent_bin.to_string_lossy().into_owned();
+
+    let output = fixture.assert_unchanged(&[
+        "omp",
+        "--skills-dir",
+        &sources,
+        "--agent-bin",
+        &agent_bin,
+        "--dry-run",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr}");
+    assert!(!fixture.root.join("state").exists());
+}
+
+#[test]
+fn an_existing_transaction_record_is_reported_by_omp_inspect_and_left_alone() {
+    let fixture = Fixture::new("omp-recovery");
+    fixture.skill("alpha");
+    let transactions = fixture.root.join("state/transactions");
+    fs::create_dir_all(&transactions).expect("transaction directory");
+    let record = transactions.join("01JEXAMPLE.journal");
+    fs::write(&record, "not a journal this build wrote\n").expect("transaction record");
+    let sources = fixture.sources.to_string_lossy().into_owned();
+
+    let output = fixture.assert_inspection_unchanged(&[
+        "inspect",
+        "--skills-dir",
+        &sources,
+        "--agent",
+        "omp",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("WOULD RETAIN"),
+        "a journal this build cannot interpret must be reported rather than ignored: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(&record).expect("record still readable"),
+        "not a journal this build wrote\n",
+        "an inspection must not recover, rewrite, or remove a transaction journal"
+    );
+    assert!(
+        !fixture.project.join(".omp").exists(),
+        "an inspection must not create the project scope it plans"
+    );
 }

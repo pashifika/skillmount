@@ -44,6 +44,15 @@ fn run(executable: &str, arguments: &[&str]) -> Output {
             "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
             home.join("admin-skills"),
         )
+        .env("SKILLMOUNT_TEST_OMP_VERSION", "omp/17.2.9")
+        // OMP resolves its roots from the environment, so the developer's real profile,
+        // configuration overlay, and XDG bases must never reach a fixture.
+        .env_remove("OMP_PROFILE")
+        .env_remove("PI_PROFILE")
+        .env_remove("PI_CONFIG_FILES")
+        .env_remove("PI_CONFIG_DIR")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("XDG_DATA_HOME")
         .output()
         .expect("smoke-test executable should run")
 }
@@ -94,6 +103,15 @@ fn run_session(
             "SKILLMOUNT_CODEX_ADMIN_SKILLS_DIR",
             home.join("admin-skills"),
         )
+        .env("SKILLMOUNT_TEST_OMP_VERSION", "omp/17.2.9")
+        // OMP resolves its roots from the environment, so the developer's real profile,
+        // configuration overlay, and XDG bases must never reach a fixture.
+        .env_remove("OMP_PROFILE")
+        .env_remove("PI_PROFILE")
+        .env_remove("PI_CONFIG_FILES")
+        .env_remove("PI_CONFIG_DIR")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("XDG_DATA_HOME")
         .env("SKILLMOUNT_STATE_DIR", state)
         .current_dir(project)
         .output()
@@ -241,8 +259,36 @@ fn inspect_and_codex_session_preserve_binary_parity() {
     )
     .expect("valid SKILL.md");
 
-    let inspect = run(ASM, &["inspect", "--skills-dir", &skill.to_string_lossy()]);
-    assert!(inspect.status.success());
+    // All-agent success needs a collection: OMP deliberately does not broaden an individual
+    // Skill to its parent, while Codex/Claude still support the direct Skill input.
+    let inspect = run(
+        ASM,
+        &["inspect", "--skills-dir", &fixture.to_string_lossy()],
+    );
+    assert!(
+        inspect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let fallback_inspect = run(
+        SKILLMOUNT,
+        &["inspect", "--skills-dir", &fixture.to_string_lossy()],
+    );
+    assert_eq!(inspect.status, fallback_inspect.status);
+    assert_eq!(inspect.stdout, fallback_inspect.stdout);
+    assert_eq!(inspect.stderr, fallback_inspect.stderr);
+
+    let leaf = run(ASM, &["inspect", "--skills-dir", &skill.to_string_lossy()]);
+    assert_eq!(leaf.status.code(), Some(64));
+    let partial = String::from_utf8_lossy(&leaf.stdout);
+    assert!(partial.contains("Agent:          codex"));
+    assert!(partial.contains("Agent:          claude"));
+    assert!(!partial.contains("Agent:          omp"));
+    let error = String::from_utf8_lossy(&leaf.stderr);
+    assert!(
+        error.contains("OMP inspection was skipped") && error.contains("collection"),
+        "{error}"
+    );
     let inspected = String::from_utf8_lossy(&inspect.stdout);
     assert!(inspected.contains("Overlay: 1 Skill(s), 0 source override(s)"));
     assert!(

@@ -100,3 +100,12 @@ fn os_result(result: libc::c_int) -> io::Result<()> {
         Err(io::Error::last_os_error())
     }
 }
+
+/// Opens only the named file, refusing links and avoiding a blocking FIFO open.
+pub(super) fn open_config_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}

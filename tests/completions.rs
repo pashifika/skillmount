@@ -195,6 +195,7 @@ fn generated_scripts_expose_the_shared_command_graph() {
         for expected in [
             "codex",
             "claude",
+            "omp",
             "inspect",
             "doctor",
             "cleanup",
@@ -203,9 +204,14 @@ fn generated_scripts_expose_the_shared_command_graph() {
             assert!(script.contains(expected), "{shell} omitted {expected}");
         }
         let option_markers = if shell == "fish" {
-            ["-l skills-dir", "-l project-root", "-l agent-bin"]
+            [
+                "-l skills-dir",
+                "-l project-root",
+                "-l agent-bin",
+                "-l omp-bin",
+            ]
         } else {
-            ["--skills-dir", "--project-root", "--agent-bin"]
+            ["--skills-dir", "--project-root", "--agent-bin", "--omp-bin"]
         };
         for expected in option_markers {
             assert!(script.contains(expected), "{shell} omitted {expected}");

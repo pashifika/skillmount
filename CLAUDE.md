@@ -24,22 +24,26 @@ machine-local paths, but agents must still stage product files explicitly. Machi
 ## Product definition
 
 SkillMount is a Rust wrapper CLI that makes external Agent Skills visible for the intended lifetime
-of a Codex CLI or Claude Code CLI session. The package installs `asm` as the primary binary and
-`skillmount` as a behaviorally identical fallback; both delegate to `skillmount::run_from`.
+of a Codex CLI, Claude Code CLI, or Oh My Pi (OMP) session. The package installs `asm` as the
+primary binary and `skillmount` as a behaviorally identical fallback; both delegate to
+`skillmount::run_from`.
 
-The catalog is a deterministic rightmost-wins overlay. SkillMount validates only the selected
+The Codex/Claude catalog is a deterministic rightmost-wins overlay. OMP delegates native
+selection and duplicates through session-owned customDirectories configuration (ADR 0040). SkillMount validates only the selected
 winner, never falls back from an invalid winner, and never lets source precedence replace a
 project-owned Skill. It treats selected Skills as trusted user code and does not transform them,
 manage authentication, elevate privileges, or weaken agent permissions.
 
 Read `docs/architecture.md` before changing cross-module behavior. Its implementation-status
 section distinguishes working catalog/planning/transaction/process-supervision behavior from
-reserved agent-launch integration, operator commands, ownership binding, and release work.
+reserved ownership binding and release work. Each session adapter pins one Agent release: Codex
+`codex-cli 0.146.0` (ADR 0023), Claude Code `2.1.220 (Claude Code)` (ADR 0024), and OMP native directory behavior `omp/18.14.0`
+(ADR 0040). A banner is advisory evidence, never authorization (ADR 0033).
 
 ## Commands
 
 ```bash
-SKILLMOUNT_REQUIRE_LINKS=1 cargo test --locked --all-targets
+SKILLMOUNT_REQUIRE_LINKS=1 cargo test --locked --all-targets --all-features
 cargo test --locked --test read_only
 cargo test --locked --test transaction
 cargo test --locked --all-features --test process_supervision
@@ -49,16 +53,25 @@ env RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 cargo deny --locked check
 cargo run --locked --bin asm -- inspect --skills-dir path/to/skills
 cargo run --locked --bin asm -- codex --skills-dir path/to/skills --dry-run --verbose -- exec "prompt"
+cargo run --locked --bin asm -- omp --skills-dir path/to/skills --dry-run --verbose
 ```
 
 `SKILLMOUNT_REQUIRE_LINKS=1` turns an unavailable directory-link fixture into a failure. A skipped
 fixture otherwise reports test success, so use the guard whenever claiming link coverage. CI sets
-it for every job.
+it for every job. `--all-features` is required because the Codex, Claude, and OMP session
+acceptance suites and the supervisor harness are compiled only under the `test-fixtures` feature,
+so a run without it reports success while silently skipping them; CI's gate is
+`cargo test --locked --all-features`.
 
 `tests/transaction.rs` kills and stalls real `asm` processes at named checkpoints. A test that runs
 a mutating session must redirect both the project through `--project-root` and SkillMount state
 through `SKILLMOUNT_STATE_DIR`. Omitting either can modify this checkout or the developer's real
 application-support state. Failure injection is debug-only and lives in `src/checkpoint.rs`.
+
+OMP resolves every root from the process environment, so any fixture that exercises `omp` must
+redirect `HOME`/`USERPROFILE` and remove `OMP_PROFILE`, `PI_PROFILE`, `PI_CONFIG_FILES`,
+`PI_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, and `XDG_DATA_HOME`. Leaving one set lets the developer's
+real OMP profile decide a test result. `SKILLMOUNT_TEST_OMP_VERSION` pins the observed banner.
 
 CI additionally builds the MSRV, release binaries, Windows x64 and x86 targets, and Apple Silicon
 macOS. Platform-conditional behavior needs tests on each affected native side; a cross-compile does
@@ -69,11 +82,14 @@ not prove native link, console, or filesystem behavior.
 The read-only pipeline is:
 
 ```text
-cli -> paths -> catalog -> agent discovery -> mount plan -> render
+cli -> paths -> launch gates (dry-run) -> catalog -> agent discovery -> mount plan -> render
 ```
 
 `inspect` and `--dry-run` stop there and create no directories, links, locks, journals, recovery
-mutations, or child processes. Extend `tests/read_only.rs` whenever adding a read-only path.
+mutations, or child processes. A session `--dry-run` runs the adapter's passthrough and hard
+launch-invariant checks before building any plan; `inspect` certifies no launch and reports each
+requested Agent independently (ADR 0035). Extend `tests/read_only.rs` whenever adding a read-only
+path.
 
 A mutating session performs discovery, locks the observed resources, recovers incomplete
 transactions, builds the complete plan under locks, stabilizes any expanded lock set, persists the
@@ -86,6 +102,19 @@ Agent adapters observe and describe their discovery model; they never mutate. Sh
 and transaction code owns ordering and application. `src/link/` is the sealed boundary for
 platform-specific discovery-entry and mount-link classification and for every mount-link creation,
 placement, and removal. It exposes no recursive removal operation.
+
+`AgentId::descriptor()` is the single source of every Agent's journal label, display name, default
+executable, mount-mode support, and project layout paths, and `crate::agent::adapter()` is the one
+registry that maps an identity to its `&'static dyn AgentAdapter`. A `RunContext` carries one closed
+`ResolvedAgent` variant, and `paths` resolves only the selected Agent's roots — an unselected
+Agent's configuration must never decide or fail the selected command. Adding a compile-time Agent
+may need explicit CLI and journal identity plus one registry entry, and must not add an
+Agent-specific launch, version, catalog, path-selection, `doctor`, or render branch to a shared
+caller.
+
+An adapter never imports or executes third-party Agent extension, plugin, or hook code. Where a
+contribution cannot be proven from declarative manifests and on-disk state, fail closed instead of
+guessing.
 
 `unsafe_code` is denied crate-wide. Only `src/agent/codex/macos_ffi.rs`,
 `src/paths/windows_ffi.rs`, `src/link/unix_ffi.rs`, `src/link/windows_ffi.rs`,

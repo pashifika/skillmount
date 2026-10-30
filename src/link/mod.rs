@@ -12,7 +12,13 @@
 //! Applying a mount plan, journaling, and recovery remain outside this module: it exposes the
 //! primitives a transaction needs and takes no policy decision about when to use them.
 
+mod config_file;
 pub mod resolve;
+
+use config_file::{config_file_matches, verify_config_ownership};
+
+/// Maximum session configuration payload retained in one journal action.
+pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 
 #[cfg(any(windows, test))]
 mod reparse;
@@ -318,6 +324,28 @@ impl PlacementMismatch {
     }
 }
 
+/// Ownership evidence for one regular session configuration file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedConfigFile {
+    /// Path currently occupied by the file.
+    pub path: PathBuf,
+    /// Identity captured from the created file object.
+    pub identity: Option<PlatformIdentity>,
+    /// Exact contents that must still match before placement or removal.
+    pub contents: String,
+}
+
+impl OwnedConfigFile {
+    /// Returns identical ownership evidence at a new path.
+    #[must_use]
+    pub fn relocated_to(&self, path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            ..self.clone()
+        }
+    }
+}
+
 /// An entry placement left untouched because ownership could not be established.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacementResidue {
@@ -348,6 +376,10 @@ pub enum OwnershipMismatch {
     NotALink,
     /// The path no longer holds a regular directory.
     NotADirectory,
+    /// The entry is not a regular configuration file.
+    NotAFile,
+    /// The configuration file contents differ from recorded bytes.
+    ContentsChanged,
     /// The link implementation differs from the recorded one.
     KindChanged,
     /// The link points somewhere other than the recorded target.
@@ -366,6 +398,8 @@ impl OwnershipMismatch {
             Self::RegularDirectory => "a regular directory replaced the entry",
             Self::NotALink => "the entry is no longer a directory link",
             Self::NotADirectory => "the entry is no longer a regular directory",
+            Self::NotAFile => "the entry is no longer a regular file",
+            Self::ContentsChanged => "the configuration file contents changed",
             Self::KindChanged => "the link implementation changed",
             Self::TargetChanged => "the link points somewhere else",
             Self::IdentityChanged => "the entry was replaced by a different one",
@@ -479,6 +513,35 @@ pub trait LinkBackend: sealed::Sealed + Send + Sync {
         staged: &OwnedDirectory,
         destination: &Path,
     ) -> Result<PlacementOutcome<OwnedDirectory>, LinkError>;
+
+    /// Checks a configuration file without mutation, requiring exact identity and contents.
+    ///
+    /// # Errors
+    /// Returns an error if a no-follow bounded observation fails.
+    fn verify_config_file(&self, file: &OwnedConfigFile) -> Result<bool, LinkError>;
+
+    /// Creates a bounded configuration file exclusively, flushes it, and records its identity.
+    ///
+    /// # Errors
+    /// Returns an error on an occupied path, oversized content, or failed durable write.
+    fn create_config_file(&self, path: &Path, contents: &str)
+    -> Result<OwnedConfigFile, LinkError>;
+
+    /// Places a verified configuration file atomically without replacing a destination.
+    ///
+    /// # Errors
+    /// Returns an error when inspection or native no-replace placement fails.
+    fn place_config_file_no_replace(
+        &self,
+        file: &OwnedConfigFile,
+        destination: &Path,
+    ) -> Result<PlacementOutcome<OwnedConfigFile>, LinkError>;
+
+    /// Removes only the regular file matching both recorded identity and exact contents.
+    ///
+    /// # Errors
+    /// Returns an error when bounded no-follow observation or native removal fails.
+    fn remove_config_file(&self, file: &OwnedConfigFile) -> Result<RemoveOutcome, LinkError>;
 
     /// Removes one link entry after it matches the recorded evidence.
     ///

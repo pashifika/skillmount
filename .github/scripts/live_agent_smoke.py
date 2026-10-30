@@ -4,6 +4,11 @@
 Agent installation is deliberately outside this harness. The workflow supplies native binaries
 from integrity-locked packages, while this process gives each agent only its own credential and
 never writes an unredacted child stream to disk.
+
+Every agent is one `AgentCase` record. An opt-in case is selected only by an explicit binary path;
+a case this run deliberately did not exercise is recorded as `unknown` with a reason and never
+grades the run, while `unverified` stays reserved for a case that ran without producing a
+compatibility observation.
 """
 
 from __future__ import annotations
@@ -23,11 +28,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-CODEX_VERSION = "codex-cli 0.146.0"
-CLAUDE_VERSION = "2.1.220 (Claude Code)"
 BASE_TOKEN = "SKILLMOUNT_LIVE_BASE"
 WINNER_TOKEN = "SKILLMOUNT_LIVE_WINNER_3"
 EXPECTED_RESPONSE = f"{BASE_TOKEN} {WINNER_TOKEN}"
+PROMPT_TOKEN = "{skillmount-live-prompt}"
+LOCKED_INTEGRITY = (
+    "npm package pinned to a committed SRI digest in prepare_live_agents.py and rebound to this run "
+    "by the agent supply-chain manifest"
+)
+OMP_INTEGRITY = (
+    "GitHub release asset v18.14.0 pinned to a committed SHA-256 from SHA256SUMS.txt; "
+    "the harness verifies the binary before every credential-bearing launch"
+)
+OMP_SHA256 = {
+    "aarch64-apple-darwin": "608843959ab34295d52460dd09dd7d548b6c903c08a83c67954c2d4c36fd1f5a",
+    "x86_64-pc-windows-msvc": "620a5935cdb6a9ed52d8b0c93892d6b5bb84155244a98f3be82af0455177bf29",
+    # A 32-bit wrapper on the x64 runner launches the same native x64 child.
+    "i686-pc-windows-msvc": "620a5935cdb6a9ed52d8b0c93892d6b5bb84155244a98f3be82af0455177bf29",
+}
 WINDOWS_JOB_BOOTSTRAP = "--_skillmount-windows-job-bootstrap"
 SENSITIVE_NAME_FRAGMENTS = (
     "API_KEY",
@@ -48,6 +66,80 @@ class CommandResult:
     timed_out: bool
 
 
+@dataclass(frozen=True)
+class AgentCase:
+    """How one agent is launched, read, gated, and recorded by this harness.
+
+    An `opt_in` case is absent from the committed supply-chain manifest, is selected only by an
+    explicit `--<name>-bin`, and is reported as `unknown` rather than graded when it is skipped.
+    `unsupported_targets` maps a wrapper target with no published agent asset to the reason it
+    cannot be exercised there.
+    """
+
+    name: str
+    executable: str
+    banner: str
+    credential_name: str
+    destination: str | None
+    passthrough: tuple[str, ...]
+    text_response: bool
+    integrity: str
+    expected_response: str = EXPECTED_RESPONSE
+    displaced_tokens: tuple[str, ...] = ("SKILLMOUNT_LIVE_WINNER_1", "SKILLMOUNT_LIVE_WINNER_2")
+    opt_in: bool = False
+    unsupported_targets: tuple[tuple[str, str], ...] = ()
+
+
+AGENT_CASES: dict[str, AgentCase] = {
+    case.name: case
+    for case in (
+        AgentCase(
+            name="codex",
+            executable="codex",
+            banner="codex-cli 0.166.0",
+            credential_name="CODEX_API_KEY",
+            destination=".agents/skills",
+            passthrough=("exec", "--skip-git-repo-check", "--json", PROMPT_TOKEN),
+            text_response=False,
+            integrity=LOCKED_INTEGRITY,
+        ),
+        AgentCase(
+            name="claude",
+            executable="claude",
+            banner="2.1.314 (Claude Code)",
+            credential_name="ANTHROPIC_API_KEY",
+            destination=".claude/skills",
+            passthrough=("-p", PROMPT_TOKEN, "--output-format", "text"),
+            text_response=True,
+            integrity=LOCKED_INTEGRITY,
+        ),
+        AgentCase(
+            name="omp",
+            executable="omp",
+            banner="omp/18.14.0",
+            credential_name="ANTHROPIC_API_KEY",
+            destination=None,
+            # `--print` keeps the session headless, `--mode text` makes the answer one plain
+            # response, `--no-session` keeps the transcript out of the runner's home, and
+            # `--auto-approve` stops a tool approval prompt from stalling a non-interactive run.
+            passthrough=(
+                "--print",
+                "--mode",
+                "text",
+                "--no-session",
+                "--auto-approve",
+                PROMPT_TOKEN,
+            ),
+            text_response=True,
+            integrity=OMP_INTEGRITY,
+            expected_response=f"{BASE_TOKEN} SKILLMOUNT_LIVE_WINNER_1",
+            displaced_tokens=("SKILLMOUNT_LIVE_WINNER_2", "SKILLMOUNT_LIVE_WINNER_3"),
+            opt_in=True,
+        ),
+    )
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--asm", required=True, type=Path)
@@ -57,6 +149,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent-manifest", required=True, type=Path)
     parser.add_argument("--codex-bin", type=Path)
     parser.add_argument("--claude-bin", type=Path)
+    omp = parser.add_mutually_exclusive_group()
+    omp.add_argument("--omp-bin", type=Path, help="OMP binary selected for authenticated discovery")
+    omp.add_argument("--omp-probe-bin", type=Path,
+                     help="OMP binary for credential-free probes and doctor only")
+    parser.add_argument(
+        "--probes-only", action="store_true",
+        help="Observe isolated version/help/doctor only; never claim Skill discovery or use credentials",
+    )
     return parser.parse_args()
 
 
@@ -328,9 +428,11 @@ def terminate_process_tree(
 
 
 def run_command(
-    command: list[str], *, environment: dict[str, str], timeout: float
+    command: list[str], *, environment: dict[str, str], timeout: float, cwd: Path | None = None
 ) -> CommandResult:
     options: dict[str, object] = {}
+    if cwd is not None:
+        options["cwd"] = cwd
     launched_command = command
     if os.name == "nt":
         options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -411,15 +513,39 @@ def run_command(
             windows_job.close()
 
 
-def capture_version(binary: Path, environment: dict[str, str]) -> str:
-    completed = run_command(
-        [str(binary), "--version"], environment=environment, timeout=30
-    )
+def isolated_probe_environment(environment: dict[str, str], root: Path) -> dict[str, str]:
+    clean, _ = split_environment(environment)
+    for key in ("OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_FILES", "PI_CONFIG_DIR"):
+        clean.pop(key, None)
+    for key, relative in {
+        "HOME": "home", "USERPROFILE": "home", "CODEX_HOME": "codex",
+        "CLAUDE_CONFIG_DIR": "claude", "PI_CODING_AGENT_DIR": "omp",
+        "XDG_CONFIG_HOME": "config", "XDG_DATA_HOME": "data",
+        "APPDATA": "appdata", "LOCALAPPDATA": "localappdata",
+    }.items():
+        path = root / relative
+        path.mkdir(parents=True, exist_ok=True)
+        clean[key] = str(path)
+    clean["DISABLE_AUTOUPDATER"] = "1"
+    return clean
+
+
+def capture_cli_probe(binary: Path, flag: str, environment: dict[str, str]) -> CommandResult:
+    with tempfile.TemporaryDirectory(prefix="skillmount-agent-probe-") as temporary:
+        root = Path(temporary)
+        completed = run_command(
+            [str(binary), flag], environment=isolated_probe_environment(environment, root),
+            timeout=30, cwd=root,
+        )
     if completed.timed_out:
-        raise RuntimeError(f"{binary.name} --version timed out")
+        raise RuntimeError(f"{binary.name} {flag} timed out")
     if completed.returncode != 0:
-        raise RuntimeError(f"{binary.name} --version exited {completed.returncode}")
-    return completed.stdout.strip()
+        raise RuntimeError(f"{binary.name} {flag} exited {completed.returncode}")
+    return completed
+
+
+def capture_version(binary: Path, environment: dict[str, str]) -> str:
+    return capture_cli_probe(binary, "--version", environment).stdout.strip()
 
 
 def sha256_file(path: Path) -> str:
@@ -503,6 +629,58 @@ def create_sources(root: Path, overlay_name: str, base_name: str) -> list[Path]:
     return sources
 
 
+def probe_omp_discovery(
+    binary: Path, root: Path, project: Path, sources: list[Path],
+    overlay_name: str, base_name: str, environment: dict[str, str],
+    evidence: Path, secrets: dict[str, str],
+) -> dict[str, object]:
+    """Exercises OMP's own loader, not SkillMount's supervised authenticated launch."""
+    clean = isolated_probe_environment(environment, root / "omp-probe-home")
+    extra_sources = {
+        "skillmount-native-tilde": Path(clean["HOME"]) / "tilde skills",
+        "skillmount-native-relative": project / "relative skills",
+    }
+    for name, source in extra_sources.items():
+        skill = source / name
+        skill.mkdir(parents=True, exist_ok=True)
+        (skill / "SKILL.md").write_text(skill_body(name, "NATIVE_PROBE"), encoding="utf-8")
+    config = root / "omp-discovery.json"
+    directories = [str(p) for p in sources] + ["~/tilde skills", "relative skills"]
+    config.write_text(json.dumps({"skills": {"customDirectories": directories}}), encoding="utf-8")
+    # The `skill` subcommand does not forward root --config, but uses this settings overlay.
+    clean["PI_CONFIG_FILES"] = str(config)
+    completed = run_command([str(binary), "skill", "list", "--json"], environment=clean,
+                            timeout=60, cwd=project)
+    write_evidence(evidence / "omp.discovery.stdout.log", completed.stdout, secrets)
+    write_evidence(evidence / "omp.discovery.stderr.log", completed.stderr, secrets)
+    if completed.timed_out or completed.returncode != 0:
+        raise RuntimeError("OMP native discovery probe did not complete")
+    try:
+        payload = json.loads(completed.stdout)
+        skills = payload["skills"]
+        if not isinstance(skills, list):
+            raise ValueError("skills is not an array")
+        observed = {entry["name"]: Path(entry["filePath"]).resolve() for entry in skills}
+    except (ValueError, KeyError, TypeError) as error:
+        raise RuntimeError("OMP native discovery returned invalid JSON records") from error
+    expected_base = (sources[0] / base_name / "SKILL.md").resolve()
+    expected_bare = (sources[0] / overlay_name / "SKILL.md").resolve()
+    if observed.get(base_name) != expected_base or observed.get(overlay_name) != expected_bare:
+        raise RuntimeError("OMP native discovery did not preserve the first-root bare name and base")
+    for name, source in extra_sources.items():
+        if observed.get(name) != (source / name / "SKILL.md").resolve():
+            raise RuntimeError("OMP native discovery did not resolve tilde/relative paths with spaces")
+    for source in sources[1:]:
+        expected = (source / overlay_name / "SKILL.md").resolve()
+        if not any(name != overlay_name and path == expected for name, path in observed.items()):
+            raise RuntimeError("OMP native discovery did not retain a duplicate under an alias")
+    if (project / ".omp" / "skills").exists():
+        raise RuntimeError("OMP native discovery unexpectedly created a project skills destination")
+    return {"outcome": "pass", "scenario": "raw OMP customDirectories first-root and aliases",
+            "wrapper_session_integration": "unverified", "link_kind": "none",
+            "skill_count": len(skills), "exit_code": completed.returncode}
+
+
 def wrapper_prefix(
     asm: Path,
     agent: str,
@@ -522,11 +700,11 @@ def wrapper_prefix(
             str(project),
             "--agent-bin",
             str(agent_bin),
-            "--link-mode",
-            link_mode,
-            "--",
         )
     )
+    if agent != "omp":
+        command.extend(("--link-mode", link_mode))
+    command.append("--")
     return command
 
 
@@ -542,11 +720,12 @@ def string_values(value: object) -> Iterator[str]:
 
 
 def evaluate_output(name: str, stdout: str) -> tuple[bool, bool, bool]:
-    displaced = ("SKILLMOUNT_LIVE_WINNER_1", "SKILLMOUNT_LIVE_WINNER_2")
-    if name == "claude":
+    case = AGENT_CASES[name]
+    displaced = case.displaced_tokens
+    if AGENT_CASES[name].text_response:
         normalized = stdout.strip()
         return (
-            normalized == EXPECTED_RESPONSE,
+            normalized == case.expected_response,
             any(token in normalized for token in displaced),
             True,
         )
@@ -557,10 +736,58 @@ def evaluate_output(name: str, stdout: str) -> tuple[bool, bool, bool]:
         return False, any(token in stdout for token in displaced), False
     values = [text.strip() for record in records for text in string_values(record)]
     return (
-        EXPECTED_RESPONSE in values,
+        case.expected_response in values,
         any(token in text for text in values for token in displaced),
         True,
     )
+
+
+def case_command(
+    *,
+    asm: Path,
+    case: AgentCase,
+    sources: list[Path],
+    project: Path,
+    binary: Path,
+    link_mode: str,
+    prompt: str,
+) -> list[str]:
+    command = wrapper_prefix(asm, case.name, sources, project, binary, link_mode)
+    command.extend(prompt if token == PROMPT_TOKEN else token for token in case.passthrough)
+    return command
+
+
+def skip_reason(
+    case: AgentCase,
+    *,
+    wrapper_target: str,
+    binary: Path | None,
+    credential: str | None,
+    banner_reason: str | None,
+) -> str | None:
+    """Why an opt-in case is deliberately not exercised here, or None when it must run.
+
+    `banner_reason` carries an already-observed version drift or unavailable banner, which keeps an
+    opt-in case out of the run instead of aborting it the way a locked agent's banner does.
+    """
+    unsupported = dict(case.unsupported_targets).get(wrapper_target)
+    if unsupported is not None:
+        return unsupported
+    if binary is None:
+        return f"--{case.name}-bin was not supplied, so the opt-in {case.name} case is unselected"
+    if banner_reason is not None:
+        return banner_reason
+    if not credential:
+        return (
+            f"{case.credential_name} is unavailable, so the {case.name} case has no credential to "
+            "authenticate with"
+        )
+    return None
+
+
+def unknown_result(case: AgentCase, reason: str) -> dict[str, object]:
+    """Records a case this run did not exercise; an unknown outcome never grades the run."""
+    return {"agent": case.name, "outcome": "unknown", "reason": reason}
 
 
 def run_agent(
@@ -608,7 +835,8 @@ def run_agent(
         "exit_code": completed.returncode,
         "timed_out": completed.timed_out,
         "machine_output_valid": machine_output_valid,
-        "base_and_winner_3_observed_as_exact_response": winner,
+        "expected_response": AGENT_CASES[name].expected_response,
+        "base_and_selected_winner_observed_as_exact_response": winner,
         "displaced_winner_observed": displaced,
         "journal_residue_count": len(journals),
         "stdout_sha256": sha256_text(redact(completed.stdout, secrets)),
@@ -660,59 +888,98 @@ def main() -> int:
     base_environment["DISABLE_AUTOUPDATER"] = "1"
     started = dt.datetime.now(dt.timezone.utc)
     summary: dict[str, object] = {
-        "schema": 1,
+        "schema": 2,
         "started_at": started.isoformat(),
         "date": started.date().isoformat(),
         "os": platform.system(),
         "architecture": platform.machine(),
         "wrapper_target": args.wrapper_target,
-        "link_kind": args.link_mode,
-        "scenario": "three-source rightmost-wins and non-shadowed base Skill discovery",
+        "agent_binary_target": ("x86_64-pc-windows-msvc"
+                                if args.wrapper_target in ("i686-pc-windows-msvc", "x86_64-pc-windows-msvc")
+                                else args.wrapper_target),
+        "requested_link_kind_for_codex_claude": args.link_mode,
+        "scenario": ("credential-free CLI/native-loader observations; authenticated wrapper discovery unverified"
+                     if args.probes_only else
+                     "three-source Skill discovery: Codex/Claude rightmost overlay; OMP native first-root bare name"),
         "workflow": workflow_context(inherited_environment),
         "results": [],
     }
 
     try:
         asm = args.asm.resolve(strict=True)
-        codex = agent_executable(args.codex_bin, "codex")
-        claude = agent_executable(args.claude_bin, "claude")
+        explicit = {
+            "codex": args.codex_bin,
+            "claude": args.claude_bin,
+            "omp": args.omp_bin or args.omp_probe_bin,
+        }
+        binaries: dict[str, Path] = {}
+        for case in AGENT_CASES.values():
+            # An opt-in case is never resolved from PATH: selecting it must be an operator act.
+            if case.opt_in and explicit[case.name] is None:
+                continue
+            binaries[case.name] = agent_executable(explicit[case.name], case.executable)
+        locked = {
+            name: binary for name, binary in binaries.items() if not AGENT_CASES[name].opt_in
+        }
         manifest_path = args.agent_manifest.resolve(strict=True)
-        binaries = {"codex": codex, "claude": claude}
         binary_digests = {
             "asm": sha256_file(asm),
-            "codex": sha256_file(codex),
-            "claude": sha256_file(claude),
+            **{name: sha256_file(binary) for name, binary in binaries.items()},
         }
         summary["agent_supply_chain"] = load_agent_manifest(
-            manifest_path, binaries, binary_digests, args.wrapper_target
+            manifest_path, locked, binary_digests, args.wrapper_target
         )
+        if "omp" in binaries and binary_digests["omp"] != OMP_SHA256.get(args.wrapper_target):
+            raise RuntimeError("OMP binary does not match its committed release SHA-256")
+        summary["diagnostic_only_agents"] = ["omp"] if args.omp_probe_bin else []
         summary["binary_sha256"] = binary_digests
+        summary["agent_integrity"] = {name: AGENT_CASES[name].integrity for name in binaries}
         summary["skillmount_version"] = capture_version(asm, base_environment)
-        versions = {
-            "codex": capture_version(codex, base_environment),
-            "claude": capture_version(claude, base_environment),
-        }
+
+        versions: dict[str, str] = {}
+        banner_reasons: dict[str, str] = {}
+        for name, binary in binaries.items():
+            case = AGENT_CASES[name]
+            try:
+                observed = capture_version(binary, base_environment)
+            except RuntimeError as error:
+                if not case.opt_in:
+                    raise
+                banner_reasons[name] = redact(str(error), secrets)
+                continue
+            versions[name] = observed
+            if observed == case.banner:
+                continue
+            if not case.opt_in:
+                raise RuntimeError(f"expected {name} {case.banner!r}, observed {observed!r}")
+            banner_reasons[name] = (
+                f"{name} reported {observed!r} rather than the last-tested {case.banner!r}"
+            )
         summary["versions"] = versions
-        if versions["codex"] != CODEX_VERSION:
-            raise RuntimeError(
-                f"expected Codex {CODEX_VERSION!r}, observed {versions['codex']!r}"
-            )
-        if versions["claude"] != CLAUDE_VERSION:
-            raise RuntimeError(
-                f"expected Claude {CLAUDE_VERSION!r}, observed {versions['claude']!r}"
-            )
-        for agent, binary in binaries.items():
-            if sha256_file(binary) != binary_digests[agent]:
-                raise RuntimeError(f"{agent} binary changed during its credential-free probe")
+        if args.probes_only:
+            if banner_reasons:
+                raise RuntimeError("selected agent version probe incomplete: " + str(banner_reasons))
+            summary["help"] = {}
+            for name, binary in binaries.items():
+                help_output = capture_cli_probe(binary, "--help", base_environment)
+                if not (help_output.stdout.strip() or help_output.stderr.strip()):
+                    raise RuntimeError(f"{name} --help returned no output")
+                write_evidence(evidence / f"{name}.help.stdout.log", help_output.stdout, secrets)
+                write_evidence(evidence / f"{name}.help.stderr.log", help_output.stderr, secrets)
+                summary["help"][name] = {"outcome": "observed", "exit_code": 0}
+        for name, binary in binaries.items():
+            if sha256_file(binary) != binary_digests[name]:
+                raise RuntimeError(f"{name} binary changed during its credential-free probe")
 
-        credentials = {}
-        for name in ("CODEX_API_KEY", "ANTHROPIC_API_KEY"):
-            value = inherited_environment.get(name)
-            if not value:
-                raise RuntimeError(f"required credential {name} is unavailable")
-            credentials[name] = value
+        credentials: dict[str, str] = {}
+        for case in AGENT_CASES.values():
+            value = None if args.probes_only else inherited_environment.get(case.credential_name)
+            if value:
+                credentials[case.credential_name] = value
+            elif not case.opt_in and not args.probes_only:
+                raise RuntimeError(f"required credential {case.credential_name} is unavailable")
 
-        with tempfile.TemporaryDirectory(prefix="skillmount-live-smoke-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="skillmount live smoke-") as temporary:
             root = Path(temporary)
             project = root / "project"
             project.mkdir()
@@ -725,19 +992,13 @@ def main() -> int:
                 "and return their required tokens."
             )
 
-            doctor_environment = base_environment.copy()
+            doctor_environment = isolated_probe_environment(base_environment, root / "doctor-home")
             doctor_environment["SKILLMOUNT_STATE_DIR"] = str(root / "doctor-state")
+            doctor_command = [str(asm), "doctor", "--project-root", str(project)]
+            for name, binary in binaries.items():
+                doctor_command.extend((f"--{name}-bin", str(binary)))
             doctor = run_command(
-                [
-                    str(asm),
-                    "doctor",
-                    "--project-root",
-                    str(project),
-                    "--codex-bin",
-                    str(codex),
-                    "--claude-bin",
-                    str(claude),
-                ],
+                doctor_command,
                 environment=doctor_environment,
                 timeout=120,
             )
@@ -754,43 +1015,66 @@ def main() -> int:
             if doctor.returncode != 0:
                 raise RuntimeError(f"asm doctor exited {doctor.returncode}")
 
-            codex_command = wrapper_prefix(
-                asm, "codex", sources, project, codex, args.link_mode
-            )
-            codex_command.extend(("exec", "--skip-git-repo-check", "--json", prompt))
-            summary["results"].append(
-                run_agent(
-                    name="codex",
-                    command=codex_command,
-                    state=root / "codex-state",
-                    evidence=evidence,
-                    binary=codex,
-                    expected_binary_sha256=binary_digests["codex"],
-                    base_environment=base_environment,
-                    credential_name="CODEX_API_KEY",
-                    credential=credentials["CODEX_API_KEY"],
-                    secrets=secrets,
-                )
-            )
+            if args.probes_only:
+                if "omp" in binaries:
+                    if sha256_file(binaries["omp"]) != binary_digests["omp"]:
+                        raise RuntimeError("OMP binary changed before its native discovery probe")
+                    summary["omp_native_discovery"] = probe_omp_discovery(
+                        binaries["omp"], root, project, sources, overlay_name, base_name,
+                        base_environment, evidence, secrets,
+                    )
+                summary["results"] = [
+                    {"agent": case.name, "outcome": "unverified",
+                     "reason": "credential-free probes do not exercise authenticated wrapper Skill discovery"}
+                    for case in AGENT_CASES.values()
+                ]
+                summary["outcome"] = "observed"
+                summary["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+                write_summary(evidence, summary, secrets)
+                print(json.dumps(summary, indent=2, sort_keys=True))
+                return 0
 
-            claude_command = wrapper_prefix(
-                asm, "claude", sources, project, claude, args.link_mode
-            )
-            claude_command.extend(("-p", prompt, "--output-format", "text"))
-            summary["results"].append(
-                run_agent(
-                    name="claude",
-                    command=claude_command,
-                    state=root / "claude-state",
+            for case in AGENT_CASES.values():
+                reason = skip_reason(
+                    case,
+                    wrapper_target=args.wrapper_target,
+                    binary=(None if case.opt_in and args.omp_bin is None
+                            else binaries.get(case.name)),
+                    credential=credentials.get(case.credential_name),
+                    banner_reason=banner_reasons.get(case.name),
+                )
+                if reason is not None:
+                    summary["results"].append(unknown_result(case, reason))
+                    continue
+                binary = binaries[case.name]
+                result = run_agent(
+                    name=case.name,
+                    command=case_command(
+                        asm=asm,
+                        case=case,
+                        sources=sources,
+                        project=project,
+                        binary=binary,
+                        link_mode=args.link_mode,
+                        prompt=prompt,
+                    ),
+                    state=root / f"{case.name}-state",
                     evidence=evidence,
-                    binary=claude,
-                    expected_binary_sha256=binary_digests["claude"],
+                    binary=binary,
+                    expected_binary_sha256=binary_digests[case.name],
                     base_environment=base_environment,
-                    credential_name="ANTHROPIC_API_KEY",
-                    credential=credentials["ANTHROPIC_API_KEY"],
+                    credential_name=case.credential_name,
+                    credential=credentials[case.credential_name],
                     secrets=secrets,
                 )
-            )
+                result["discovery_destination"] = (
+                    str(project / case.destination) if case.destination is not None else None
+                )
+                result["discovery_mechanism"] = (
+                    "directory-link" if case.destination is not None else "skills.customDirectories"
+                )
+                result["link_kind"] = args.link_mode if case.destination is not None else "none"
+                summary["results"].append(result)
     except Exception as error:  # Evidence must survive every expected operational failure.
         summary["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         summary["outcome"] = "unverified"
@@ -802,10 +1086,11 @@ def main() -> int:
     results = summary["results"]
     assert isinstance(results, list)
     summary["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
-    outcomes = {result["outcome"] for result in results}
-    if results and outcomes == {"pass"}:
+    # An `unknown` case was deliberately not exercised, so it can neither grade nor block the run.
+    graded = {result["outcome"] for result in results} - {"unknown"}
+    if graded == {"pass"}:
         summary["outcome"] = "pass"
-    elif "fail" in outcomes:
+    elif "fail" in graded:
         summary["outcome"] = "fail"
     else:
         summary["outcome"] = "unverified"
