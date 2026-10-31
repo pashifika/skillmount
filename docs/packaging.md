@@ -61,6 +61,21 @@ set, every digest, and the dual-binary archive layout. No job holding an externa
 out or executes triggering-tag code, extracts an archive, or runs a downloaded binary. Neither
 publish job depends on the other, and each uses a non-cancelling per-version concurrency group.
 
+## Upgrade an existing Homebrew pair
+
+The publisher verifies each older stable Formula against the prior public release's canonical
+Apple Silicon archive URL and GitHub SHA-256 asset digest before proposing an upgrade. Both
+selected executable identities must remain unchanged. Missing release metadata/digests, same-version
+conflicts, downgrades, or foreign sources stop without writes. The default branch is never changed
+directly; the new version branch and tap pull request retain the normal review and CI gates.
+Interrupted creation resumes only the exact verified prior Formula bytes inherited from default.
+
+If a publisher-only defect is repaired after a release, promote the repair normally, then dispatch
+`package.yml` from `main` with the existing published `tag`, `channels=homebrew`, and
+`verification_only=false`. Revalidate its preflight/generation/native acceptance before approving
+the `homebrew` environment. Rerunning an old failed job would reuse its old workflow checkout.
+Do not move the release tag, replace assets, or rerun Chocolatey merely to repair Homebrew.
+
 ## Run verification-only mode
 
 Rehearse the complete package path without production credentials. Verification-only runs execute
