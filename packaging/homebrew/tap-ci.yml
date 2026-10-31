@@ -394,6 +394,10 @@ jobs:
           require_completion_ownership "$TAP/skillmount" skillmount asm
           require_completion_ownership "$TAP/skillmount-asm" asm skillmount
 
+          # Automatic cleanup is disabled to preserve unrelated runner packages. Remove
+          # retained upgrade kegs only for this pair before asserting the final cellar state.
+          brew cleanup "$TAP/skillmount" "$TAP/skillmount-asm"
+
           for stale in "$(brew --cellar "$TAP/skillmount")" "$(brew --cellar "$TAP/skillmount-asm")"; do
             kegs="$(find "$stale" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d '[:space:]')"
             [ "$kegs" = "1" ] ||
