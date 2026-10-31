@@ -359,11 +359,15 @@ jobs:
             exit 0
           fi
 
+          # Earlier lifecycle phases may drop per-formula trust. Re-assert only the
+          # reviewed pair before loading each base/head revision; never trust the whole tap.
           head_revision="$(git rev-parse HEAD)"
           git checkout --quiet "$base" -- Formula/skillmount.rb Formula/skillmount-asm.rb
+          brew trust --formula "$TAP/skillmount" "$TAP/skillmount-asm"
           base_skillmount="$(formula_version "$TAP/skillmount")"
           base_asm="$(formula_version "$TAP/skillmount-asm")"
           git checkout --quiet "$head_revision" -- Formula/skillmount.rb Formula/skillmount-asm.rb
+          brew trust --formula "$TAP/skillmount" "$TAP/skillmount-asm"
           head_skillmount="$(formula_version "$TAP/skillmount")"
           head_asm="$(formula_version "$TAP/skillmount-asm")"
 
@@ -374,11 +378,13 @@ jobs:
           fi
 
           git checkout --quiet "$base" -- Formula/skillmount.rb Formula/skillmount-asm.rb
+          brew trust --formula "$TAP/skillmount" "$TAP/skillmount-asm"
           brew install --formula "$TAP/skillmount" "$TAP/skillmount-asm"
           require_reports_version skillmount "$base_skillmount"
           require_reports_version asm "$base_asm"
 
           git checkout --quiet "$head_revision" -- Formula/skillmount.rb Formula/skillmount-asm.rb
+          brew trust --formula "$TAP/skillmount" "$TAP/skillmount-asm"
           brew upgrade --formula "$TAP/skillmount" "$TAP/skillmount-asm"
 
           require_reports_version skillmount "$head_skillmount"
