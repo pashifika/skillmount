@@ -66,7 +66,7 @@ serde_yaml_ng = "=0.10.0"
 sha2 = { version = "=0.11.0", default-features = false }
 # OMP includes project Codex TOML in its settings fold. Parse only to preserve the effective
 # customDirectories array before injecting a session-only overlay (ADR 0040).
-toml = { version = "=1.1.4", default-features = false, features = ["parse", "serde"] }
+toml = { version = "=1.1.8", default-features = false, features = ["parse", "serde"] }
 
 # Placement needs an atomic no-replace rename, which `std::fs::rename` does not provide: it
 # replaces. macOS reaches `renameatx_np(RENAME_EXCL)` and other Unix hosts reach
