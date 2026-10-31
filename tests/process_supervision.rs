@@ -48,7 +48,7 @@ struct FakeRecord {
 #[test]
 fn direct_launch_preserves_executable_cwd_and_every_argument_layer() {
     let root = TestDir::new("argv");
-    let fake = copy_fake_agent(&root.0);
+    let fake = stage_fake_agent(&root.0);
     let cwd = root.0.join("launch cwd 日本語");
     fs::create_dir(&cwd).expect("create launch cwd");
     let record = root.0.join("record.txt");
@@ -82,7 +82,13 @@ fn direct_launch_preserves_executable_cwd_and_every_argument_layer() {
         .output()
         .expect("run supervisor harness");
 
-    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{output:?}\noutcome: {:?}\nrecord: {:?}",
+        fs::read_to_string(&outcome),
+        fs::read_to_string(&record),
+    );
     assert_eq!(cleanup_count(&cleanup), 1);
     assert!(
         !shell_sentinel.exists(),
@@ -729,6 +735,26 @@ fn exceptional_windows_status_is_retained_and_normalized() {
     assert!(outcome.contains(&raw_status.to_string()), "{outcome}");
 }
 
+#[cfg(unix)]
+#[test]
+fn staged_executable_is_a_link_and_cleanup_preserves_its_target() {
+    let source = fs::canonicalize(FAKE_AGENT).expect("resolve fake agent executable");
+    let root = TestDir::new("executable-link");
+    let staged = stage_fake_agent(&root.0);
+
+    assert!(
+        fs::symlink_metadata(&staged)
+            .expect("inspect staged entry")
+            .is_symlink()
+    );
+    assert_eq!(fs::read_link(&staged).expect("read staged link"), source);
+    drop(root);
+    assert!(
+        source.is_file(),
+        "fixture cleanup removed the source executable"
+    );
+}
+
 fn base_harness(
     executable: &Path,
     cwd: &Path,
@@ -766,9 +792,20 @@ fn waiting_harness(
     command
 }
 
-fn copy_fake_agent(root: &Path) -> PathBuf {
+fn stage_fake_agent(root: &Path) -> PathBuf {
     let suffix = if cfg!(windows) { ".exe" } else { "" };
     let destination = root.join(format!("fake agent 日本語{suffix}"));
+    // A concurrent fork can retain a copied executable's writable descriptor until exec,
+    // making a completed copy temporarily fail with ETXTBSY on Unix. A symlink exercises
+    // the same edge-case launch path without opening the executable for writing, including
+    // when the test directory and Cargo output are on different filesystems.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        fs::canonicalize(FAKE_AGENT).expect("resolve fake agent executable"),
+        &destination,
+    )
+    .expect("link fake agent at edge-case path");
+    #[cfg(windows)]
     fs::copy(FAKE_AGENT, &destination).expect("copy fake agent to edge-case path");
     destination
 }
