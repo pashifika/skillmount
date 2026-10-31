@@ -155,6 +155,8 @@ class FakeTapGateway:
         self.refusal: Exception | None = None
         self.write_refusal: Exception | None = None
         self.next_number = 41
+        self.releases: dict[str, dict[str, Any]] = {}
+        self.release_reads: list[str] = []
 
     def default_branch(self) -> str:
         if self.refusal is not None:
@@ -171,6 +173,12 @@ class FakeTapGateway:
 
     def branch_commit(self, branch: str) -> str | None:
         return self.branches.get(branch)
+
+    def release_for_tag(self, repository: str, tag: str) -> dict[str, Any]:
+        self.release_reads.append(tag)
+        if repository != REPOSITORY:
+            raise AssertionError("foreign release repository")
+        return self.releases[tag]
 
     def create_branch(self, branch: str, commit: str) -> None:
         self._guard_write(f"create branch {branch}")
@@ -396,6 +404,96 @@ class HomebrewTapTests(unittest.TestCase):
         self.assertEqual(gateway.created_branches, [])
         self.assertEqual(gateway.opened, [])
 
+    def prior_pair(self, gateway: FakeTapGateway, version: str = "0.1.9") -> dict[str, str]:
+        """Seed a genuine older release and its default-branch Formula pair."""
+
+        tag = f"v{version}"
+        name = release.asset_name(tag, channels.MACOS_ARM64)
+        url = f"https://github.com/{REPOSITORY}/releases/download/{tag}/{name}"
+        sha256 = digest(tag)
+        gateway.releases[tag] = {
+            "tag_name": tag, "draft": False, "prerelease": False,
+            "published_at": "2026-08-01T00:00:00Z",
+            "assets": [{"name": name, "browser_download_url": url,
+                        "state": "uploaded", "digest": f"sha256:{sha256}"}],
+        }
+        texts = {}
+        for identity in channels.PACKAGES:
+            text = formula_text(self.inputs, identity, version=version,
+                                archive_url=url, archive_sha256=sha256)
+            gateway.place(DEFAULT_BRANCH, identity.formula_path, text)
+            texts[identity.package_id] = text
+        return texts
+
+    def test_verified_older_pair_is_proposed_without_changing_default_branch(self) -> None:
+        gateway = FakeTapGateway()
+        prior = self.prior_pair(gateway)
+        outcome = self.reconcile(gateway)
+        self.assertEqual(gateway.release_reads, ["v0.1.9"])
+        self.assertEqual(set(outcome.formula_states.values()), {"created"})
+        self.assertEqual(len(gateway.writes), 2)
+        for identity in channels.PACKAGES:
+            self.assertEqual(gateway.files[(DEFAULT_BRANCH, identity.formula_path)], prior[identity.package_id])
+        self.reconcile(gateway)
+        self.assertEqual(len(gateway.writes), 2)
+        self.assertEqual(len(gateway.opened), 1)
+
+    def test_interrupted_upgrade_resumes_only_exact_inherited_prior_bytes(self) -> None:
+        for completed in (0, 1):
+            with self.subTest(completed=completed):
+                gateway = FakeTapGateway()
+                prior = self.prior_pair(gateway)
+                for index, identity in enumerate(channels.PACKAGES):
+                    text = self.formulae[identity.package_id] if index < completed else prior[identity.package_id]
+                    gateway.place(BRANCH, identity.formula_path, text)
+                self.reconcile(gateway)
+                self.assertEqual(len(gateway.writes), 2 - completed)
+                self.assertEqual(gateway.created_branches, [])
+        gateway = FakeTapGateway()
+        prior = self.prior_pair(gateway)
+        gateway.place(BRANCH, self.first.formula_path, prior[self.first.package_id] + "# foreign edit\n")
+        self.assert_conflict_reports_pair(gateway)
+
+    def test_upgrade_rejects_unverified_prior_metadata_before_any_write(self) -> None:
+        for mutation in ("digest", "missing-digest", "draft", "prerelease", "unpublished", "duplicate"):
+            with self.subTest(mutation=mutation):
+                gateway = FakeTapGateway()
+                self.prior_pair(gateway)
+                payload = gateway.releases["v0.1.9"]
+                asset = payload["assets"][0]
+                if mutation == "digest":
+                    asset["digest"] = f"sha256:{digest('tampered')}"
+                elif mutation == "missing-digest":
+                    del asset["digest"]
+                elif mutation in ("draft", "prerelease"):
+                    payload[mutation] = True
+                elif mutation == "unpublished":
+                    payload["published_at"] = None
+                else:
+                    payload["assets"].append(dict(asset))
+                with self.assertRaises(package_publish.PublicationError):
+                    self.reconcile(gateway)
+                self.assert_no_writes(gateway)
+
+    def test_upgrade_rejects_downgrade_foreign_source_and_wrong_executable(self) -> None:
+        for mutation in ("newer", "foreign", "binary", "command", "malformed", "ambiguous-version"):
+            with self.subTest(mutation=mutation):
+                gateway = FakeTapGateway()
+                prior = self.prior_pair(gateway, "0.3.0" if mutation == "newer" else "0.1.9")
+                text = prior[self.first.package_id]
+                if mutation == "foreign":
+                    text = text.replace(f"github.com/{REPOSITORY}/releases", "github.com/other/project/releases")
+                elif mutation == "binary":
+                    text = text.replace('bin.install "skillmount"', 'bin.install "asm"')
+                elif mutation == "command":
+                    text = text.replace('bin/"skillmount"', 'bin/"asm"')
+                elif mutation == "ambiguous-version":
+                    text = text.replace('version "0.1.9"', 'version "0.1.9"\n  version "9.0.0"')
+                elif mutation == "malformed":
+                    text = text.replace('version "0.1.9"', 'version "01.1.9"')
+                gateway.place(DEFAULT_BRANCH, self.first.formula_path, text)
+                self.assert_conflict_reports_pair(gateway)
+
     def test_tap_branch_names_the_exact_version(self) -> None:
         """Derive one immutable version branch from validated inputs."""
 
@@ -543,7 +641,7 @@ class HomebrewTapTests(unittest.TestCase):
 
         gateway = FakeTapGateway()
         foreign = (
-            f"https://github.com/{REPOSITORY}/releases/download/v0.1.9/"
+            "https://github.com/foreign/skillmount/releases/download/v0.1.9/"
             "skillmount-v0.1.9-aarch64-apple-darwin.tar.gz"
         )
         gateway.place(
