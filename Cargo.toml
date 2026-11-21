@@ -86,7 +86,7 @@ nix = { version = "=0.31.3", default-features = false, features = ["fs", "signal
 [target."cfg(windows)".dependencies]
 # The fake-agent fixture uses `ctrlc` to observe its inherited console events. Product supervision
 # preserves the raw event type through the audited process FFI module instead.
-ctrlc = { version = "=3.5.2", optional = true }
+ctrlc = { version = "=3.5.3", optional = true }
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Globalization",
